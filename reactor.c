@@ -6,15 +6,18 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "server.h"
 
 #define CONNECTION_SIZE 1024
 #define MAX_PORTS 20
+#define TIME_SUB_MS(tv1, tv2) (((tv1).tv_sec - (tv2).tv_sec) * 1000 + ((tv1).tv_usec - (tv2).tv_usec) / 1000)
 
 static struct conn conn_list[CONNECTION_SIZE];
 static int epfd = 0;
+static struct timeval expire_last;
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 static msg_handler kvs_handler;
@@ -84,9 +87,7 @@ static int recv_cb(int fd) {
             return -1;
         }
     }
-    if (kvs_stream_has_output(&conn_list[fd].stream)) {
-        set_event(fd, EPOLLIN | EPOLLOUT | EPOLLET, 0);
-    }
+    if (kvs_stream_has_output(&conn_list[fd].stream)) set_event(fd, EPOLLIN | EPOLLOUT | EPOLLET, 0);
     return 0;
 }
 
@@ -127,6 +128,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
     kvs_handler = handler;
     (void)kvs_handler;
     epfd = epoll_create(1);
+    gettimeofday(&expire_last, NULL);
     for (i = 0; i < MAX_PORTS; ++i) {
         int sockfd = r_init_server(port + i);
         conn_list[sockfd].fd = sockfd;
@@ -135,7 +137,13 @@ int reactor_start(unsigned short port, msg_handler handler) {
     }
     while (1) {
         struct epoll_event events[1024];
-        int nready = epoll_wait(epfd, events, 1024, -1);
+        int nready = epoll_wait(epfd, events, 1024, 100);
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        if (TIME_SUB_MS(now, expire_last) >= 100) {
+            kvs_active_expire_cycle(32);
+            expire_last = now;
+        }
         for (i = 0; i < nready; ++i) {
             int fd = events[i].data.fd;
             if (conn_list[fd].r_action.accept_callback == accept_cb) {

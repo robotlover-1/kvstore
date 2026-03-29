@@ -83,9 +83,7 @@ void kvs_stream_reset_request(kvs_stream_t *s) {
 
 void kvs_stream_compact_input(kvs_stream_t *s) {
     if (s->parse_pos == 0) return;
-    if (s->parse_pos < s->in_len) {
-        memmove(s->inbuf, s->inbuf + s->parse_pos, s->in_len - s->parse_pos);
-    }
+    if (s->parse_pos < s->in_len) memmove(s->inbuf, s->inbuf + s->parse_pos, s->in_len - s->parse_pos);
     s->in_len -= s->parse_pos;
     s->parse_pos = 0;
 }
@@ -94,12 +92,8 @@ static int parse_crlf_number(const unsigned char *buf, size_t len, size_t *consu
     size_t i = 0;
     int neg = 0;
     long long v = 0;
-
     if (len == 0) return 0;
-    if (buf[i] == '-') {
-        neg = 1;
-        i++;
-    }
+    if (buf[i] == '-') { neg = 1; i++; }
     if (i >= len) return 0;
     for (; i < len; ++i) {
         if (buf[i] == '\r') {
@@ -121,17 +115,10 @@ static int kvs_stream_enqueue_bytes(kvs_stream_t *s, const void *buf, size_t len
     node = (kvs_out_node_t *)calloc(1, sizeof(*node));
     if (!node) return -1;
     node->data = (unsigned char *)malloc(len);
-    if (!node->data) {
-        free(node);
-        return -1;
-    }
+    if (!node->data) { free(node); return -1; }
     memcpy(node->data, buf, len);
     node->len = len;
-    if (s->out_tail) {
-        s->out_tail->next = node;
-    } else {
-        s->out_head = node;
-    }
+    if (s->out_tail) s->out_tail->next = node; else s->out_head = node;
     s->out_tail = node;
     s->out_queued_bytes += len;
     return 0;
@@ -144,29 +131,18 @@ static int kvs_stream_enqueue_format(kvs_stream_t *s, const char *fmt, long long
 }
 
 static int reply_simple(kvs_stream_t *s, const char *msg) {
-    return kvs_stream_enqueue_bytes(s, "+", 1) ||
-           kvs_stream_enqueue_bytes(s, msg, strlen(msg)) ||
-           kvs_stream_enqueue_bytes(s, "\r\n", 2);
+    return kvs_stream_enqueue_bytes(s, "+", 1) || kvs_stream_enqueue_bytes(s, msg, strlen(msg)) || kvs_stream_enqueue_bytes(s, "\r\n", 2);
 }
 
 static int reply_error(kvs_stream_t *s, const char *msg) {
-    return kvs_stream_enqueue_bytes(s, "-ERR ", 5) ||
-           kvs_stream_enqueue_bytes(s, msg, strlen(msg)) ||
-           kvs_stream_enqueue_bytes(s, "\r\n", 2);
+    return kvs_stream_enqueue_bytes(s, "-ERR ", 5) || kvs_stream_enqueue_bytes(s, msg, strlen(msg)) || kvs_stream_enqueue_bytes(s, "\r\n", 2);
 }
 
-static int reply_integer(kvs_stream_t *s, long long v) {
-    return kvs_stream_enqueue_format(s, ":%lld\r\n", v);
-}
-
-static int reply_null(kvs_stream_t *s) {
-    return kvs_stream_enqueue_bytes(s, "$-1\r\n", 5);
-}
+static int reply_integer(kvs_stream_t *s, long long v) { return kvs_stream_enqueue_format(s, ":%lld\r\n", v); }
+static int reply_null(kvs_stream_t *s) { return kvs_stream_enqueue_bytes(s, "$-1\r\n", 5); }
 
 static int reply_bulk(kvs_stream_t *s, const kvs_blob_t *b) {
-    return kvs_stream_enqueue_format(s, "$%lld\r\n", (long long)b->len) ||
-           kvs_stream_enqueue_bytes(s, b->data, b->len) ||
-           kvs_stream_enqueue_bytes(s, "\r\n", 2);
+    return kvs_stream_enqueue_format(s, "$%lld\r\n", (long long)b->len) || kvs_stream_enqueue_bytes(s, b->data, b->len) || kvs_stream_enqueue_bytes(s, "\r\n", 2);
 }
 
 static int view_eq_cstr(const kvs_blob_t *b, const char *s) {
@@ -174,47 +150,136 @@ static int view_eq_cstr(const kvs_blob_t *b, const char *s) {
     return b->len == n && memcmp(b->data, s, n) == 0;
 }
 
-static int dispatch_request(kvs_stream_t *s, const kvs_resp_request_t *req) {
-    if (req->argc < 2) return reply_error(s, "wrong number of arguments");
-    const kvs_blob_t *cmd = &req->argv[0];
-    kvs_blob_view_t key = { req->argv[1].data, req->argv[1].len };
-    kvs_blob_view_t value = { NULL, 0 };
-    if (req->argc >= 3) {
-        value.data = req->argv[2].data;
-        value.len = req->argv[2].len;
+static int engine_exist(int engine, const kvs_blob_view_t *key) {
+    switch (engine) {
+#if ENABLE_ARRAY
+        case KVS_ENGINE_ARRAY: return kvs_array_exist(&global_array, key);
+#endif
+#if ENABLE_RBTREE
+        case KVS_ENGINE_RBTREE: return kvs_rbtree_exist(&global_rbtree, key);
+#endif
+#if ENABLE_HASH
+        case KVS_ENGINE_HASH: return kvs_hash_exist(&global_hash, key);
+#endif
+        default: return 1;
     }
+}
+
+static int engine_del(int engine, const kvs_blob_view_t *key) {
+    switch (engine) {
+#if ENABLE_ARRAY
+        case KVS_ENGINE_ARRAY: return kvs_array_del(&global_array, key);
+#endif
+#if ENABLE_RBTREE
+        case KVS_ENGINE_RBTREE: return kvs_rbtree_del(&global_rbtree, key);
+#endif
+#if ENABLE_HASH
+        case KVS_ENGINE_HASH: return kvs_hash_del(&global_hash, key);
+#endif
+        default: return 1;
+    }
+}
+
+static int lazy_expire_key(int engine, const kvs_blob_view_t *key) {
+    if (kvs_expire_is_expired(&global_expire, engine, key)) {
+        engine_del(engine, key);
+        kvs_expire_del(&global_expire, engine, key);
+        return 1;
+    }
+    return 0;
+}
+
+static int delete_with_expire(int engine, const kvs_blob_view_t *key) {
+    int ret = engine_del(engine, key);
+    kvs_expire_del(&global_expire, engine, key);
+    return ret;
+}
+
+static int handle_expire_cmd(kvs_stream_t *s, int engine, const kvs_blob_view_t *key, long long sec) {
+    lazy_expire_key(engine, key);
+    if (engine_exist(engine, key) != 0) return reply_integer(s, 0);
+    if (sec <= 0) {
+        delete_with_expire(engine, key);
+        return reply_integer(s, 1);
+    }
+    return kvs_expire_set(&global_expire, engine, key, sec * 1000) == 0 ? reply_integer(s, 1) : reply_error(s, "expire failed");
+}
+
+static int handle_ttl_cmd(kvs_stream_t *s, int engine, const kvs_blob_view_t *key) {
+    long long ttl;
+    lazy_expire_key(engine, key);
+    if (engine_exist(engine, key) != 0) return reply_integer(s, -2);
+    ttl = kvs_expire_ttl(&global_expire, engine, key);
+    if (ttl == -1) return reply_integer(s, -1);
+    if (ttl == -2) return reply_integer(s, -2);
+    return reply_integer(s, ttl);
+}
+
+static int handle_persist_cmd(kvs_stream_t *s, int engine, const kvs_blob_view_t *key) {
+    lazy_expire_key(engine, key);
+    if (engine_exist(engine, key) != 0) return reply_integer(s, 0);
+    return reply_integer(s, kvs_expire_persist(&global_expire, engine, key) == 0 ? 1 : 0);
+}
+
+static int parse_seconds_arg(const kvs_blob_t *arg, long long *sec) {
+    char tmp[64];
+    if (!arg || !sec || arg->len == 0 || arg->len >= sizeof(tmp)) return -1;
+    memcpy(tmp, arg->data, arg->len);
+    tmp[arg->len] = '\0';
+    char *end = NULL;
+    long long v = strtoll(tmp, &end, 10);
+    if (!end || *end != '\0') return -1;
+    *sec = v;
+    return 0;
+}
+
+static int dispatch_request(kvs_stream_t *s, const kvs_resp_request_t *req) {
+    const kvs_blob_t *cmd;
+    kvs_blob_view_t key, value;
+    long long sec;
+    if (req->argc < 1) return reply_error(s, "wrong number of arguments");
+    cmd = &req->argv[0];
+    key.data = req->argc >= 2 ? req->argv[1].data : NULL;
+    key.len = req->argc >= 2 ? req->argv[1].len : 0;
+    value.data = req->argc >= 3 ? req->argv[2].data : NULL;
+    value.len = req->argc >= 3 ? req->argv[2].len : 0;
 
 #if ENABLE_ARRAY
     if (view_eq_cstr(cmd, "SET")) return req->argc == 3 ? (kvs_array_set(&global_array, &key, &value) == 0 ? reply_simple(s, "OK") : reply_error(s, "set failed")) : reply_error(s, "wrong argc for SET");
-    if (view_eq_cstr(cmd, "GET")) { kvs_blob_t *v = kvs_array_get(&global_array, &key); return v ? reply_bulk(s, v) : reply_null(s); }
-    if (view_eq_cstr(cmd, "DEL")) return reply_integer(s, kvs_array_del(&global_array, &key) == 0 ? 1 : 0);
-    if (view_eq_cstr(cmd, "MOD")) return req->argc == 3 ? reply_integer(s, kvs_array_mod(&global_array, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for MOD");
-    if (view_eq_cstr(cmd, "EXIST")) return reply_integer(s, kvs_array_exist(&global_array, &key) == 0 ? 1 : 0);
+    if (view_eq_cstr(cmd, "GET")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); kvs_blob_t *v = kvs_array_get(&global_array, &key); return v ? reply_bulk(s, v) : reply_null(s); }
+    if (view_eq_cstr(cmd, "DEL")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); return reply_integer(s, delete_with_expire(KVS_ENGINE_ARRAY, &key) == 0 ? 1 : 0); }
+    if (view_eq_cstr(cmd, "MOD")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); return req->argc == 3 ? reply_integer(s, kvs_array_mod(&global_array, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for MOD"); }
+    if (view_eq_cstr(cmd, "EXIST")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); return reply_integer(s, kvs_array_exist(&global_array, &key) == 0 ? 1 : 0); }
+    if (view_eq_cstr(cmd, "EXPIRE")) { if (req->argc != 3) return reply_error(s, "wrong argc for EXPIRE"); if (parse_seconds_arg(&req->argv[2], &sec) != 0) return reply_error(s, "invalid seconds"); return handle_expire_cmd(s, KVS_ENGINE_ARRAY, &key, sec); }
+    if (view_eq_cstr(cmd, "TTL")) { if (req->argc != 2) return reply_error(s, "wrong argc for TTL"); return handle_ttl_cmd(s, KVS_ENGINE_ARRAY, &key); }
+    if (view_eq_cstr(cmd, "PERSIST")) { if (req->argc != 2) return reply_error(s, "wrong argc for PERSIST"); return handle_persist_cmd(s, KVS_ENGINE_ARRAY, &key); }
 #endif
 #if ENABLE_RBTREE
     if (view_eq_cstr(cmd, "RSET")) return req->argc == 3 ? (kvs_rbtree_set(&global_rbtree, &key, &value) == 0 ? reply_simple(s, "OK") : reply_error(s, "rset failed")) : reply_error(s, "wrong argc for RSET");
-    if (view_eq_cstr(cmd, "RGET")) { kvs_blob_t *v = kvs_rbtree_get(&global_rbtree, &key); return v ? reply_bulk(s, v) : reply_null(s); }
-    if (view_eq_cstr(cmd, "RDEL")) return reply_integer(s, kvs_rbtree_del(&global_rbtree, &key) == 0 ? 1 : 0);
-    if (view_eq_cstr(cmd, "RMOD")) return req->argc == 3 ? reply_integer(s, kvs_rbtree_mod(&global_rbtree, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for RMOD");
-    if (view_eq_cstr(cmd, "REXIST")) return reply_integer(s, kvs_rbtree_exist(&global_rbtree, &key) == 0 ? 1 : 0);
+    if (view_eq_cstr(cmd, "RGET")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); kvs_blob_t *v = kvs_rbtree_get(&global_rbtree, &key); return v ? reply_bulk(s, v) : reply_null(s); }
+    if (view_eq_cstr(cmd, "RDEL")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); return reply_integer(s, delete_with_expire(KVS_ENGINE_RBTREE, &key) == 0 ? 1 : 0); }
+    if (view_eq_cstr(cmd, "RMOD")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); return req->argc == 3 ? reply_integer(s, kvs_rbtree_mod(&global_rbtree, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for RMOD"); }
+    if (view_eq_cstr(cmd, "REXIST")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); return reply_integer(s, kvs_rbtree_exist(&global_rbtree, &key) == 0 ? 1 : 0); }
+    if (view_eq_cstr(cmd, "REXPIRE")) { if (req->argc != 3) return reply_error(s, "wrong argc for REXPIRE"); if (parse_seconds_arg(&req->argv[2], &sec) != 0) return reply_error(s, "invalid seconds"); return handle_expire_cmd(s, KVS_ENGINE_RBTREE, &key, sec); }
+    if (view_eq_cstr(cmd, "RTTL")) { if (req->argc != 2) return reply_error(s, "wrong argc for RTTL"); return handle_ttl_cmd(s, KVS_ENGINE_RBTREE, &key); }
+    if (view_eq_cstr(cmd, "RPERSIST")) { if (req->argc != 2) return reply_error(s, "wrong argc for RPERSIST"); return handle_persist_cmd(s, KVS_ENGINE_RBTREE, &key); }
 #endif
 #if ENABLE_HASH
     if (view_eq_cstr(cmd, "HSET")) return req->argc == 3 ? (kvs_hash_set(&global_hash, &key, &value) == 0 ? reply_simple(s, "OK") : reply_error(s, "hset failed")) : reply_error(s, "wrong argc for HSET");
-    if (view_eq_cstr(cmd, "HGET")) { kvs_blob_t *v = kvs_hash_get(&global_hash, &key); return v ? reply_bulk(s, v) : reply_null(s); }
-    if (view_eq_cstr(cmd, "HDEL")) return reply_integer(s, kvs_hash_del(&global_hash, &key) == 0 ? 1 : 0);
-    if (view_eq_cstr(cmd, "HMOD")) return req->argc == 3 ? reply_integer(s, kvs_hash_mod(&global_hash, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for HMOD");
-    if (view_eq_cstr(cmd, "HEXIST")) return reply_integer(s, kvs_hash_exist(&global_hash, &key) == 0 ? 1 : 0);
+    if (view_eq_cstr(cmd, "HGET")) { lazy_expire_key(KVS_ENGINE_HASH, &key); kvs_blob_t *v = kvs_hash_get(&global_hash, &key); return v ? reply_bulk(s, v) : reply_null(s); }
+    if (view_eq_cstr(cmd, "HDEL")) { lazy_expire_key(KVS_ENGINE_HASH, &key); return reply_integer(s, delete_with_expire(KVS_ENGINE_HASH, &key) == 0 ? 1 : 0); }
+    if (view_eq_cstr(cmd, "HMOD")) { lazy_expire_key(KVS_ENGINE_HASH, &key); return req->argc == 3 ? reply_integer(s, kvs_hash_mod(&global_hash, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for HMOD"); }
+    if (view_eq_cstr(cmd, "HEXIST")) { lazy_expire_key(KVS_ENGINE_HASH, &key); return reply_integer(s, kvs_hash_exist(&global_hash, &key) == 0 ? 1 : 0); }
+    if (view_eq_cstr(cmd, "HEXPIRE")) { if (req->argc != 3) return reply_error(s, "wrong argc for HEXPIRE"); if (parse_seconds_arg(&req->argv[2], &sec) != 0) return reply_error(s, "invalid seconds"); return handle_expire_cmd(s, KVS_ENGINE_HASH, &key, sec); }
+    if (view_eq_cstr(cmd, "HTTL")) { if (req->argc != 2) return reply_error(s, "wrong argc for HTTL"); return handle_ttl_cmd(s, KVS_ENGINE_HASH, &key); }
+    if (view_eq_cstr(cmd, "HPERSIST")) { if (req->argc != 2) return reply_error(s, "wrong argc for HPERSIST"); return handle_persist_cmd(s, KVS_ENGINE_HASH, &key); }
 #endif
     return reply_error(s, "unknown command");
 }
 
 static void kvs_stream_resync_input(kvs_stream_t *s, size_t start) {
     size_t i;
-    if (start >= s->in_len) {
-        s->in_len = 0;
-        s->parse_pos = 0;
-        return;
-    }
+    if (start >= s->in_len) { s->in_len = 0; s->parse_pos = 0; return; }
     for (i = start; i < s->in_len; ++i) {
         if (s->inbuf[i] == '*') {
             if (i > 0 && s->inbuf[i - 1] != '\n') continue;
@@ -238,9 +303,7 @@ static int kvs_stream_protocol_error(kvs_stream_t *s, const char *msg) {
 
 int kvs_stream_feed(kvs_stream_t *s, const unsigned char *data, size_t len) {
     if (len > 0) {
-        if (s->in_len + len > KVS_STREAM_IN_CAP) {
-            return kvs_stream_protocol_error(s, "input buffer overflow");
-        }
+        if (s->in_len + len > KVS_STREAM_IN_CAP) return kvs_stream_protocol_error(s, "input buffer overflow");
         memcpy(s->inbuf + s->in_len, data, len);
         s->in_len += len;
     }
@@ -250,7 +313,6 @@ int kvs_stream_feed(kvs_stream_t *s, const unsigned char *data, size_t len) {
             size_t consumed = 0;
             long long argc = 0;
             int pr;
-
             if (s->parse_pos >= s->in_len) break;
             if (s->inbuf[s->parse_pos] != '*') {
                 if (kvs_stream_protocol_error(s, "expected array") != 0) return -1;
@@ -275,7 +337,6 @@ int kvs_stream_feed(kvs_stream_t *s, const unsigned char *data, size_t len) {
             size_t consumed = 0;
             long long bulk = 0;
             int pr;
-
             if (s->parse_pos >= s->in_len) break;
             if (s->inbuf[s->parse_pos] != '$') {
                 if (kvs_stream_protocol_error(s, "expected bulk string") != 0) return -1;
@@ -321,17 +382,9 @@ int kvs_stream_feed(kvs_stream_t *s, const unsigned char *data, size_t len) {
     return 0;
 }
 
-int kvs_stream_has_output(const kvs_stream_t *s) {
-    return s->out_head != NULL;
-}
-
-const unsigned char *kvs_stream_output_ptr(const kvs_stream_t *s) {
-    return s->out_head ? s->out_head->data + s->out_head->sent : NULL;
-}
-
-size_t kvs_stream_output_len(const kvs_stream_t *s) {
-    return s->out_head ? (s->out_head->len - s->out_head->sent) : 0;
-}
+int kvs_stream_has_output(const kvs_stream_t *s) { return s->out_head != NULL; }
+const unsigned char *kvs_stream_output_ptr(const kvs_stream_t *s) { return s->out_head ? s->out_head->data + s->out_head->sent : NULL; }
+size_t kvs_stream_output_len(const kvs_stream_t *s) { return s->out_head ? (s->out_head->len - s->out_head->sent) : 0; }
 
 void kvs_stream_consume_output(kvs_stream_t *s, size_t n) {
     while (n > 0 && s->out_head) {
@@ -351,6 +404,32 @@ void kvs_stream_consume_output(kvs_stream_t *s, size_t n) {
     }
 }
 
+int kvs_active_expire_cycle(int budget) {
+    int removed = 0;
+    long long now = kvs_now_ms();
+    if (budget <= 0 || !global_expire.buckets) return 0;
+    for (int i = 0; i < global_expire.size && removed < budget; ++i) {
+        kvs_expire_item_t *cur = global_expire.buckets[i];
+        kvs_expire_item_t *prev = NULL;
+        while (cur && removed < budget) {
+            if (now >= cur->expire_at_ms) {
+                kvs_expire_item_t *dead = cur;
+                kvs_blob_view_t key = { dead->key.data, dead->key.len };
+                engine_del(dead->engine, &key);
+                if (prev) prev->next = cur->next; else global_expire.buckets[i] = cur->next;
+                cur = cur->next;
+                kvs_blob_free(&dead->key);
+                free(dead);
+                removed++;
+                continue;
+            }
+            prev = cur;
+            cur = cur->next;
+        }
+    }
+    return removed;
+}
+
 int init_kvengine(void) {
 #if ENABLE_ARRAY
     memset(&global_array, 0, sizeof(global_array));
@@ -364,6 +443,8 @@ int init_kvengine(void) {
     memset(&global_hash, 0, sizeof(global_hash));
     if (kvs_hash_create(&global_hash) != 0) return -1;
 #endif
+    memset(&global_expire, 0, sizeof(global_expire));
+    if (kvs_expire_create(&global_expire) != 0) return -1;
     return 0;
 }
 
@@ -377,6 +458,7 @@ void dest_kvengine(void) {
 #if ENABLE_HASH
     kvs_hash_destory(&global_hash);
 #endif
+    kvs_expire_destroy(&global_expire);
 }
 
 int main(int argc, char *argv[]) {

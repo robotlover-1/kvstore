@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/types.h>
 
 #define NETWORK_REACTOR 0
@@ -24,6 +25,11 @@
 #define KVS_MAX_ARGC 16
 #define KVS_STREAM_IN_CAP 65536
 #define KVS_READ_CHUNK 4096
+
+#define KVS_ENGINE_ARRAY 1
+#define KVS_ENGINE_RBTREE 2
+#define KVS_ENGINE_HASH 3
+#define KVS_EXPIRE_BUCKETS 1024
 
 typedef struct kvs_blob_s {
     unsigned char *data;
@@ -69,6 +75,18 @@ typedef struct kvs_stream_s {
     size_t out_queued_bytes;
 } kvs_stream_t;
 
+typedef struct kvs_expire_item_s {
+    kvs_blob_t key;
+    int engine;
+    long long expire_at_ms;
+    struct kvs_expire_item_s *next;
+} kvs_expire_item_t;
+
+typedef struct kvs_expire_table_s {
+    kvs_expire_item_t **buckets;
+    int size;
+} kvs_expire_table_t;
+
 typedef struct kvs_array_item_s {
     kvs_blob_t key;
     kvs_blob_t value;
@@ -108,6 +126,7 @@ typedef struct _rbtree kvs_rbtree_t;
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
+extern kvs_expire_table_t global_expire;
 extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
@@ -156,5 +175,15 @@ int kvs_blob_equal_view(const kvs_blob_t *a, const kvs_blob_view_t *b);
 int kvs_blob_compare_view(const kvs_blob_t *a, const kvs_blob_view_t *b);
 int kvs_blob_dup(kvs_blob_t *dst, const unsigned char *data, size_t len);
 void kvs_blob_free(kvs_blob_t *b);
+
+long long kvs_now_ms(void);
+int kvs_expire_create(kvs_expire_table_t *tab);
+void kvs_expire_destroy(kvs_expire_table_t *tab);
+int kvs_expire_set(kvs_expire_table_t *tab, int engine, const kvs_blob_view_t *key, long long ttl_ms);
+int kvs_expire_del(kvs_expire_table_t *tab, int engine, const kvs_blob_view_t *key);
+int kvs_expire_persist(kvs_expire_table_t *tab, int engine, const kvs_blob_view_t *key);
+int kvs_expire_is_expired(kvs_expire_table_t *tab, int engine, const kvs_blob_view_t *key);
+long long kvs_expire_ttl(kvs_expire_table_t *tab, int engine, const kvs_blob_view_t *key);
+int kvs_active_expire_cycle(int budget);
 
 #endif

@@ -3,10 +3,7 @@
 
 #include "kvstore.h"
 
-#define BUFFER_LENGTH 65536
-#define ENABLE_HTTP 0
-#define ENABLE_WEBSOCKET 0
-#define ENABLE_KVSTORE 1
+#define CONNECTION_SIZE 1024
 
 typedef int (*RCALLBACK)(int fd);
 

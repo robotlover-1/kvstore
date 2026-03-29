@@ -13,144 +13,92 @@ extern kvs_hash_t global_hash;
 void *kvs_malloc(size_t size) { return malloc(size); }
 void kvs_free(void *ptr) { free(ptr); }
 
-int kvs_blob_dup(kvs_blob_t *dst, const unsigned char *data, size_t len) {
-    dst->data = NULL;
-    dst->len = 0;
-    if (len == 0) return 0;
-    dst->data = (unsigned char *)malloc(len);
-    if (!dst->data) return -1;
-    memcpy(dst->data, data, len);
-    dst->len = len;
-    return 0;
-}
-
-void kvs_blob_free(kvs_blob_t *b) {
-    if (b && b->data) free(b->data);
-    if (b) {
-        b->data = NULL;
-        b->len = 0;
+static int str_eq_nocase(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a >= 'a' && *a <= 'z' ? *a - 32 : *a;
+        char cb = *b >= 'a' && *b <= 'z' ? *b - 32 : *b;
+        if (ca != cb) return 0;
+        ++a; ++b;
     }
+    return *a == 0 && *b == 0;
 }
 
-int kvs_blob_equal_view(const kvs_blob_t *a, const kvs_blob_view_t *b) {
-    return a && b && a->len == b->len && (a->len == 0 || memcmp(a->data, b->data, a->len) == 0);
+static char *dup_arg(const kvs_resp_arg_t *a) {
+    char *s = kvs_malloc(a->len + 1);
+    if (!s) return NULL;
+    memcpy(s, a->data, a->len);
+    s[a->len] = 0;
+    return s;
 }
 
-int kvs_blob_compare_view(const kvs_blob_t *a, const kvs_blob_view_t *b) {
-    size_t min = a->len < b->len ? a->len : b->len;
-    int cmp = min ? memcmp(a->data, b->data, min) : 0;
-    if (cmp != 0) return cmp;
-    if (a->len < b->len) return -1;
-    if (a->len > b->len) return 1;
-    return 0;
-}
-
-static void req_free(kvs_resp_request_t *req) {
-    for (int i = 0; i < req->argc; ++i) kvs_blob_free(&req->argv[i]);
+void kvs_resp_request_reset(kvs_resp_request_t *req) {
+    if (!req) return;
+    for (int i = 0; i < req->argc; ++i) kvs_free(req->argv[i].data);
     memset(req, 0, sizeof(*req));
 }
 
-static void kvs_stream_clear_output(kvs_stream_t *s) {
-    while (s->out_head) {
-        kvs_out_node_t *node = s->out_head;
-        s->out_head = node->next;
-        free(node->data);
-        free(node);
-    }
-    s->out_tail = NULL;
-    s->out_queued_bytes = 0;
-}
-
-void kvs_stream_init(kvs_stream_t *s) {
-    memset(s, 0, sizeof(*s));
-    s->state = KVS_RESP_STATE_ARRAY;
-    s->bulk_len = -1;
-}
-
-void kvs_stream_destroy(kvs_stream_t *s) {
-    req_free(&s->req);
-    kvs_stream_clear_output(s);
-    memset(s, 0, sizeof(*s));
-}
-
-void kvs_stream_reset_request(kvs_stream_t *s) {
-    req_free(&s->req);
-    s->state = KVS_RESP_STATE_ARRAY;
-    s->argc_expected = 0;
-    s->argc_read = 0;
-    s->bulk_len = -1;
-}
-
-void kvs_stream_compact_input(kvs_stream_t *s) {
-    if (s->parse_pos == 0) return;
-    if (s->parse_pos < s->in_len) memmove(s->inbuf, s->inbuf + s->parse_pos, s->in_len - s->parse_pos);
-    s->in_len -= s->parse_pos;
-    s->parse_pos = 0;
-}
-
-static int parse_crlf_number(const unsigned char *buf, size_t len, size_t *consumed, long long *value) {
-    size_t i = 0;
-    int neg = 0;
-    long long v = 0;
-    if (len == 0) return 0;
-    if (buf[i] == '-') { neg = 1; i++; }
-    if (i >= len) return 0;
-    for (; i < len; ++i) {
-        if (buf[i] == '\r') {
-            if (i + 1 >= len) return 0;
-            if (buf[i + 1] != '\n') return -1;
-            *consumed = i + 2;
-            *value = neg ? -v : v;
-            return 1;
-        }
-        if (!isdigit(buf[i])) return -1;
-        v = v * 10 + (buf[i] - '0');
+static int parse_line(const unsigned char *buf, size_t len, size_t start, size_t *line_end) {
+    for (size_t i = start; i + 1 < len; ++i) {
+        if (buf[i] == '\r' && buf[i+1] == '\n') { *line_end = i; return 1; }
     }
     return 0;
 }
 
-static int kvs_stream_enqueue_bytes(kvs_stream_t *s, const void *buf, size_t len) {
-    kvs_out_node_t *node;
+int kvs_resp_parse_one(const unsigned char *buf, size_t len, size_t *consumed, kvs_resp_request_t *req, char *errbuf, size_t errcap) {
+    *consumed = 0;
+    memset(req, 0, sizeof(*req));
     if (len == 0) return 0;
-    node = (kvs_out_node_t *)calloc(1, sizeof(*node));
-    if (!node) return -1;
-    node->data = (unsigned char *)malloc(len);
-    if (!node->data) { free(node); return -1; }
-    memcpy(node->data, buf, len);
-    node->len = len;
-    if (s->out_tail) s->out_tail->next = node; else s->out_head = node;
-    s->out_tail = node;
-    s->out_queued_bytes += len;
-    return 0;
+    if (buf[0] != '*') {
+        snprintf(errbuf, errcap, "invalid resp type");
+        return -1;
+    }
+    size_t line_end = 0;
+    if (!parse_line(buf, len, 1, &line_end)) return 0;
+    char tmp[32];
+    size_t nlen = line_end - 1;
+    if (nlen >= sizeof(tmp)) { snprintf(errbuf, errcap, "invalid array len"); return -1; }
+    memcpy(tmp, buf + 1, nlen); tmp[nlen] = 0;
+    int argc = atoi(tmp);
+    if (argc <= 0 || argc > KVS_MAX_ARGS) { snprintf(errbuf, errcap, "invalid array len"); return -1; }
+    req->argc = argc;
+    size_t pos = line_end + 2;
+    for (int i = 0; i < argc; ++i) {
+        if (pos >= len) return 0;
+        if (buf[pos] != '$') { snprintf(errbuf, errcap, "invalid bulk type"); kvs_resp_request_reset(req); return -1; }
+        if (!parse_line(buf, len, pos + 1, &line_end)) { kvs_resp_request_reset(req); return 0; }
+        nlen = line_end - (pos + 1);
+        if (nlen >= sizeof(tmp)) { snprintf(errbuf, errcap, "invalid bulk length"); kvs_resp_request_reset(req); return -1; }
+        memcpy(tmp, buf + pos + 1, nlen); tmp[nlen] = 0;
+        long blen = strtol(tmp, NULL, 10);
+        if (blen < 0 || blen > 1024 * 1024) { snprintf(errbuf, errcap, "invalid bulk length"); kvs_resp_request_reset(req); return -1; }
+        pos = line_end + 2;
+        if (pos + (size_t)blen + 2 > len) { kvs_resp_request_reset(req); return 0; }
+        req->argv[i].data = kvs_malloc((size_t)blen + 1);
+        memcpy(req->argv[i].data, buf + pos, (size_t)blen);
+        req->argv[i].data[blen] = 0;
+        req->argv[i].len = (size_t)blen;
+        if (buf[pos + blen] != '\r' || buf[pos + blen + 1] != '\n') { snprintf(errbuf, errcap, "invalid bulk tail"); kvs_resp_request_reset(req); return -1; }
+        pos += (size_t)blen + 2;
+    }
+    *consumed = pos;
+    return 1;
 }
 
-static int kvs_stream_enqueue_format(kvs_stream_t *s, const char *fmt, long long v) {
-    char tmp[64];
-    int n = snprintf(tmp, sizeof(tmp), fmt, v);
-    return n > 0 ? kvs_stream_enqueue_bytes(s, tmp, (size_t)n) : -1;
+static size_t encode_simple(unsigned char *out, size_t cap, const char *s) { return (size_t)snprintf((char*)out, cap, "+%s\r\n", s); }
+static size_t encode_error(unsigned char *out, size_t cap, const char *s) { return (size_t)snprintf((char*)out, cap, "-ERR %s\r\n", s); }
+static size_t encode_integer(unsigned char *out, size_t cap, long long v) { return (size_t)snprintf((char*)out, cap, ":%lld\r\n", v); }
+static size_t encode_null(unsigned char *out, size_t cap) { return (size_t)snprintf((char*)out, cap, "$-1\r\n"); }
+static size_t encode_bulk(unsigned char *out, size_t cap, const char *s) {
+    if (!s) return encode_null(out, cap);
+    size_t slen = strlen(s);
+    int n = snprintf((char*)out, cap, "$%zu\r\n", slen);
+    if (n < 0 || (size_t)n + slen + 2 > cap) return 0;
+    memcpy(out + n, s, slen);
+    memcpy(out + n + slen, "\r\n", 2);
+    return (size_t)n + slen + 2;
 }
 
-static int reply_simple(kvs_stream_t *s, const char *msg) {
-    return kvs_stream_enqueue_bytes(s, "+", 1) || kvs_stream_enqueue_bytes(s, msg, strlen(msg)) || kvs_stream_enqueue_bytes(s, "\r\n", 2);
-}
-
-static int reply_error(kvs_stream_t *s, const char *msg) {
-    return kvs_stream_enqueue_bytes(s, "-ERR ", 5) || kvs_stream_enqueue_bytes(s, msg, strlen(msg)) || kvs_stream_enqueue_bytes(s, "\r\n", 2);
-}
-
-static int reply_integer(kvs_stream_t *s, long long v) { return kvs_stream_enqueue_format(s, ":%lld\r\n", v); }
-static int reply_null(kvs_stream_t *s) { return kvs_stream_enqueue_bytes(s, "$-1\r\n", 5); }
-
-static int reply_bulk(kvs_stream_t *s, const kvs_blob_t *b) {
-    return kvs_stream_enqueue_format(s, "$%lld\r\n", (long long)b->len) || kvs_stream_enqueue_bytes(s, b->data, b->len) || kvs_stream_enqueue_bytes(s, "\r\n", 2);
-}
-
-static int view_eq_cstr(const kvs_blob_t *b, const char *s) {
-    size_t n = strlen(s);
-    return b->len == n && memcmp(b->data, s, n) == 0;
-}
-
-static int engine_exist(int engine, const kvs_blob_view_t *key) {
+static int engine_exist(int engine, char *key) {
     switch (engine) {
 #if ENABLE_ARRAY
         case KVS_ENGINE_ARRAY: return kvs_array_exist(&global_array, key);
@@ -165,7 +113,52 @@ static int engine_exist(int engine, const kvs_blob_view_t *key) {
     }
 }
 
-static int engine_del(int engine, const kvs_blob_view_t *key) {
+static char *engine_get(int engine, char *key) {
+    switch (engine) {
+#if ENABLE_ARRAY
+        case KVS_ENGINE_ARRAY: return kvs_array_get(&global_array, key);
+#endif
+#if ENABLE_RBTREE
+        case KVS_ENGINE_RBTREE: return kvs_rbtree_get(&global_rbtree, key);
+#endif
+#if ENABLE_HASH
+        case KVS_ENGINE_HASH: return kvs_hash_get(&global_hash, key);
+#endif
+        default: return NULL;
+    }
+}
+
+static int engine_set(int engine, char *key, char *val) {
+    switch (engine) {
+#if ENABLE_ARRAY
+        case KVS_ENGINE_ARRAY: return kvs_array_set(&global_array, key, val);
+#endif
+#if ENABLE_RBTREE
+        case KVS_ENGINE_RBTREE: return kvs_rbtree_set(&global_rbtree, key, val);
+#endif
+#if ENABLE_HASH
+        case KVS_ENGINE_HASH: return kvs_hash_set(&global_hash, key, val);
+#endif
+        default: return -1;
+    }
+}
+
+static int engine_mod(int engine, char *key, char *val) {
+    switch (engine) {
+#if ENABLE_ARRAY
+        case KVS_ENGINE_ARRAY: return kvs_array_mod(&global_array, key, val);
+#endif
+#if ENABLE_RBTREE
+        case KVS_ENGINE_RBTREE: return kvs_rbtree_mod(&global_rbtree, key, val);
+#endif
+#if ENABLE_HASH
+        case KVS_ENGINE_HASH: return kvs_hash_mod(&global_hash, key, val);
+#endif
+        default: return -1;
+    }
+}
+
+static int engine_del(int engine, char *key) {
     switch (engine) {
 #if ENABLE_ARRAY
         case KVS_ENGINE_ARRAY: return kvs_array_del(&global_array, key);
@@ -176,303 +169,242 @@ static int engine_del(int engine, const kvs_blob_view_t *key) {
 #if ENABLE_HASH
         case KVS_ENGINE_HASH: return kvs_hash_del(&global_hash, key);
 #endif
-        default: return 1;
+        default: return -1;
     }
 }
 
-static int lazy_expire_key(int engine, const kvs_blob_view_t *key) {
+static int try_expire_key(int engine, char *key) {
     if (kvs_expire_is_expired(&global_expire, engine, key)) {
         engine_del(engine, key);
         kvs_expire_del(&global_expire, engine, key);
+        kvs_dataset_del(engine, key);
         return 1;
     }
     return 0;
 }
 
-static int delete_with_expire(int engine, const kvs_blob_view_t *key) {
-    int ret = engine_del(engine, key);
-    kvs_expire_del(&global_expire, engine, key);
-    return ret;
+static int cmd_to_engine(const char *cmd, const char **base) {
+    if (cmd[0] == 'R') { *base = cmd + 1; return KVS_ENGINE_RBTREE; }
+    if (cmd[0] == 'H') { *base = cmd + 1; return KVS_ENGINE_HASH; }
+    *base = cmd; return KVS_ENGINE_ARRAY;
 }
 
-static int handle_expire_cmd(kvs_stream_t *s, int engine, const kvs_blob_view_t *key, long long sec) {
-    lazy_expire_key(engine, key);
-    if (engine_exist(engine, key) != 0) return reply_integer(s, 0);
-    if (sec <= 0) {
-        delete_with_expire(engine, key);
-        return reply_integer(s, 1);
-    }
-    return kvs_expire_set(&global_expire, engine, key, sec * 1000) == 0 ? reply_integer(s, 1) : reply_error(s, "expire failed");
+static int is_write_command(const char *base) {
+    return str_eq_nocase(base, "SET") || str_eq_nocase(base, "DEL") || str_eq_nocase(base, "MOD") ||
+           str_eq_nocase(base, "EXPIRE") || str_eq_nocase(base, "PERSIST") || str_eq_nocase(base, "SAVE");
 }
 
-static int handle_ttl_cmd(kvs_stream_t *s, int engine, const kvs_blob_view_t *key) {
-    long long ttl;
-    lazy_expire_key(engine, key);
-    if (engine_exist(engine, key) != 0) return reply_integer(s, -2);
-    ttl = kvs_expire_ttl(&global_expire, engine, key);
-    if (ttl == -1) return reply_integer(s, -1);
-    if (ttl == -2) return reply_integer(s, -2);
-    return reply_integer(s, ttl);
-}
-
-static int handle_persist_cmd(kvs_stream_t *s, int engine, const kvs_blob_view_t *key) {
-    lazy_expire_key(engine, key);
-    if (engine_exist(engine, key) != 0) return reply_integer(s, 0);
-    return reply_integer(s, kvs_expire_persist(&global_expire, engine, key) == 0 ? 1 : 0);
-}
-
-static int parse_seconds_arg(const kvs_blob_t *arg, long long *sec) {
-    char tmp[64];
-    if (!arg || !sec || arg->len == 0 || arg->len >= sizeof(tmp)) return -1;
-    memcpy(tmp, arg->data, arg->len);
-    tmp[arg->len] = '\0';
-    char *end = NULL;
-    long long v = strtoll(tmp, &end, 10);
-    if (!end || *end != '\0') return -1;
-    *sec = v;
+static int handle_set_like(int engine, char *key, char *value, unsigned char *out, size_t outcap, size_t *outlen, int mode) {
+    int ret = mode == 0 ? engine_set(engine, key, value) : engine_mod(engine, key, value);
+    if (ret < 0) { *outlen = encode_error(out, outcap, "write failed"); return 0; }
+    if (mode == 0 && ret > 0) { *outlen = encode_error(out, outcap, "key exists"); return 0; }
+    if (mode == 1 && ret > 0) { *outlen = encode_null(out, outcap); return 0; }
+    kvs_dataset_set(engine, key, value);
+    *outlen = encode_simple(out, outcap, "OK");
     return 0;
 }
 
-static int dispatch_request(kvs_stream_t *s, const kvs_resp_request_t *req) {
-    const kvs_blob_t *cmd;
-    kvs_blob_view_t key, value;
-    long long sec;
-    if (req->argc < 1) return reply_error(s, "wrong number of arguments");
-    cmd = &req->argv[0];
-    key.data = req->argc >= 2 ? req->argv[1].data : NULL;
-    key.len = req->argc >= 2 ? req->argv[1].len : 0;
-    value.data = req->argc >= 3 ? req->argv[2].data : NULL;
-    value.len = req->argc >= 3 ? req->argv[2].len : 0;
+static int execute_request(const kvs_resp_request_t *req, unsigned char *out, size_t outcap, size_t *outlen, int internal_replay) {
+    if (req->argc <= 0) { *outlen = encode_error(out, outcap, "invalid request"); return -1; }
+    char *cmd = dup_arg(&req->argv[0]);
+    if (!cmd) { *outlen = encode_error(out, outcap, "oom"); return -1; }
+    const char *base = NULL;
+    int engine = cmd_to_engine(cmd, &base);
 
-#if ENABLE_ARRAY
-    if (view_eq_cstr(cmd, "SET")) return req->argc == 3 ? (kvs_array_set(&global_array, &key, &value) == 0 ? reply_simple(s, "OK") : reply_error(s, "set failed")) : reply_error(s, "wrong argc for SET");
-    if (view_eq_cstr(cmd, "GET")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); kvs_blob_t *v = kvs_array_get(&global_array, &key); return v ? reply_bulk(s, v) : reply_null(s); }
-    if (view_eq_cstr(cmd, "DEL")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); return reply_integer(s, delete_with_expire(KVS_ENGINE_ARRAY, &key) == 0 ? 1 : 0); }
-    if (view_eq_cstr(cmd, "MOD")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); return req->argc == 3 ? reply_integer(s, kvs_array_mod(&global_array, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for MOD"); }
-    if (view_eq_cstr(cmd, "EXIST")) { lazy_expire_key(KVS_ENGINE_ARRAY, &key); return reply_integer(s, kvs_array_exist(&global_array, &key) == 0 ? 1 : 0); }
-    if (view_eq_cstr(cmd, "EXPIRE")) { if (req->argc != 3) return reply_error(s, "wrong argc for EXPIRE"); if (parse_seconds_arg(&req->argv[2], &sec) != 0) return reply_error(s, "invalid seconds"); return handle_expire_cmd(s, KVS_ENGINE_ARRAY, &key, sec); }
-    if (view_eq_cstr(cmd, "TTL")) { if (req->argc != 2) return reply_error(s, "wrong argc for TTL"); return handle_ttl_cmd(s, KVS_ENGINE_ARRAY, &key); }
-    if (view_eq_cstr(cmd, "PERSIST")) { if (req->argc != 2) return reply_error(s, "wrong argc for PERSIST"); return handle_persist_cmd(s, KVS_ENGINE_ARRAY, &key); }
-#endif
-#if ENABLE_RBTREE
-    if (view_eq_cstr(cmd, "RSET")) return req->argc == 3 ? (kvs_rbtree_set(&global_rbtree, &key, &value) == 0 ? reply_simple(s, "OK") : reply_error(s, "rset failed")) : reply_error(s, "wrong argc for RSET");
-    if (view_eq_cstr(cmd, "RGET")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); kvs_blob_t *v = kvs_rbtree_get(&global_rbtree, &key); return v ? reply_bulk(s, v) : reply_null(s); }
-    if (view_eq_cstr(cmd, "RDEL")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); return reply_integer(s, delete_with_expire(KVS_ENGINE_RBTREE, &key) == 0 ? 1 : 0); }
-    if (view_eq_cstr(cmd, "RMOD")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); return req->argc == 3 ? reply_integer(s, kvs_rbtree_mod(&global_rbtree, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for RMOD"); }
-    if (view_eq_cstr(cmd, "REXIST")) { lazy_expire_key(KVS_ENGINE_RBTREE, &key); return reply_integer(s, kvs_rbtree_exist(&global_rbtree, &key) == 0 ? 1 : 0); }
-    if (view_eq_cstr(cmd, "REXPIRE")) { if (req->argc != 3) return reply_error(s, "wrong argc for REXPIRE"); if (parse_seconds_arg(&req->argv[2], &sec) != 0) return reply_error(s, "invalid seconds"); return handle_expire_cmd(s, KVS_ENGINE_RBTREE, &key, sec); }
-    if (view_eq_cstr(cmd, "RTTL")) { if (req->argc != 2) return reply_error(s, "wrong argc for RTTL"); return handle_ttl_cmd(s, KVS_ENGINE_RBTREE, &key); }
-    if (view_eq_cstr(cmd, "RPERSIST")) { if (req->argc != 2) return reply_error(s, "wrong argc for RPERSIST"); return handle_persist_cmd(s, KVS_ENGINE_RBTREE, &key); }
-#endif
-#if ENABLE_HASH
-    if (view_eq_cstr(cmd, "HSET")) return req->argc == 3 ? (kvs_hash_set(&global_hash, &key, &value) == 0 ? reply_simple(s, "OK") : reply_error(s, "hset failed")) : reply_error(s, "wrong argc for HSET");
-    if (view_eq_cstr(cmd, "HGET")) { lazy_expire_key(KVS_ENGINE_HASH, &key); kvs_blob_t *v = kvs_hash_get(&global_hash, &key); return v ? reply_bulk(s, v) : reply_null(s); }
-    if (view_eq_cstr(cmd, "HDEL")) { lazy_expire_key(KVS_ENGINE_HASH, &key); return reply_integer(s, delete_with_expire(KVS_ENGINE_HASH, &key) == 0 ? 1 : 0); }
-    if (view_eq_cstr(cmd, "HMOD")) { lazy_expire_key(KVS_ENGINE_HASH, &key); return req->argc == 3 ? reply_integer(s, kvs_hash_mod(&global_hash, &key, &value) == 0 ? 1 : 0) : reply_error(s, "wrong argc for HMOD"); }
-    if (view_eq_cstr(cmd, "HEXIST")) { lazy_expire_key(KVS_ENGINE_HASH, &key); return reply_integer(s, kvs_hash_exist(&global_hash, &key) == 0 ? 1 : 0); }
-    if (view_eq_cstr(cmd, "HEXPIRE")) { if (req->argc != 3) return reply_error(s, "wrong argc for HEXPIRE"); if (parse_seconds_arg(&req->argv[2], &sec) != 0) return reply_error(s, "invalid seconds"); return handle_expire_cmd(s, KVS_ENGINE_HASH, &key, sec); }
-    if (view_eq_cstr(cmd, "HTTL")) { if (req->argc != 2) return reply_error(s, "wrong argc for HTTL"); return handle_ttl_cmd(s, KVS_ENGINE_HASH, &key); }
-    if (view_eq_cstr(cmd, "HPERSIST")) { if (req->argc != 2) return reply_error(s, "wrong argc for HPERSIST"); return handle_persist_cmd(s, KVS_ENGINE_HASH, &key); }
-#endif
-    return reply_error(s, "unknown command");
-}
+    char *key = req->argc > 1 ? dup_arg(&req->argv[1]) : NULL;
+    char *value = req->argc > 2 ? dup_arg(&req->argv[2]) : NULL;
+    long long ttl = value ? atoll(value) : 0;
 
-static void kvs_stream_resync_input(kvs_stream_t *s, size_t start) {
-    size_t i;
-    if (start >= s->in_len) { s->in_len = 0; s->parse_pos = 0; return; }
-    for (i = start; i < s->in_len; ++i) {
-        if (s->inbuf[i] == '*') {
-            if (i > 0 && s->inbuf[i - 1] != '\n') continue;
-            memmove(s->inbuf, s->inbuf + i, s->in_len - i);
-            s->in_len -= i;
-            s->parse_pos = 0;
-            return;
+    if (str_eq_nocase(base, "SET")) {
+        if (req->argc != 3) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else handle_set_like(engine, key, value, out, outcap, outlen, 0);
+    } else if (str_eq_nocase(base, "GET")) {
+        if (req->argc != 2) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else { try_expire_key(engine, key); *outlen = encode_bulk(out, outcap, engine_get(engine, key)); }
+    } else if (str_eq_nocase(base, "DEL")) {
+        if (req->argc != 2) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else {
+            try_expire_key(engine, key);
+            int ret = engine_del(engine, key);
+            kvs_expire_del(&global_expire, engine, key);
+            kvs_dataset_del(engine, key);
+            *outlen = ret == 0 ? encode_simple(out, outcap, "OK") : encode_null(out, outcap);
         }
+    } else if (str_eq_nocase(base, "MOD")) {
+        if (req->argc != 3) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else { try_expire_key(engine, key); handle_set_like(engine, key, value, out, outcap, outlen, 1); }
+    } else if (str_eq_nocase(base, "EXIST")) {
+        if (req->argc != 2) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else { try_expire_key(engine, key); *outlen = encode_integer(out, outcap, engine_exist(engine, key) == 0 ? 1 : 0); }
+    } else if (str_eq_nocase(base, "EXPIRE")) {
+        if (req->argc != 3) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else {
+            try_expire_key(engine, key);
+            if (engine_exist(engine, key) != 0) *outlen = encode_integer(out, outcap, 0);
+            else {
+                kvs_expire_set(&global_expire, engine, key, ttl * 1000);
+                kvs_dataset_expire(engine, key, kvs_now_ms() + ttl * 1000);
+                *outlen = encode_simple(out, outcap, "OK");
+            }
+        }
+    } else if (str_eq_nocase(base, "TTL")) {
+        if (req->argc != 2) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else {
+            try_expire_key(engine, key);
+            if (engine_exist(engine, key) != 0) *outlen = encode_integer(out, outcap, -2);
+            else *outlen = encode_integer(out, outcap, kvs_expire_ttl(&global_expire, engine, key));
+        }
+    } else if (str_eq_nocase(base, "PERSIST")) {
+        if (req->argc != 2) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else {
+            try_expire_key(engine, key);
+            if (engine_exist(engine, key) != 0) *outlen = encode_integer(out, outcap, 0);
+            else {
+                kvs_expire_persist(&global_expire, engine, key);
+                kvs_dataset_persist(engine, key);
+                *outlen = encode_simple(out, outcap, "OK");
+            }
+        }
+    } else if (str_eq_nocase(base, "SAVE")) {
+        if (req->argc != 1) *outlen = encode_error(out, outcap, "wrong number of arguments");
+        else *outlen = kvs_persist_save_snapshot() == 0 ? encode_simple(out, outcap, "OK") : encode_error(out, outcap, "save failed");
+    } else {
+        *outlen = encode_error(out, outcap, "unknown command");
     }
-    s->in_len = 0;
-    s->parse_pos = 0;
+
+    if (!internal_replay && req->argc > 0 && is_write_command(base)) kvs_persist_append_command(req);
+    kvs_free(cmd); kvs_free(key); kvs_free(value);
+    return 0;
 }
 
-static int kvs_stream_protocol_error(kvs_stream_t *s, const char *msg) {
-    size_t resume_from = s->parse_pos + 1;
-    if (reply_error(s, msg) != 0) return -1;
-    kvs_stream_reset_request(s);
-    kvs_stream_resync_input(s, resume_from);
+int kvs_dispatch_request(const kvs_resp_request_t *req, unsigned char *out, size_t outcap, size_t *outlen, int internal_replay) {
+    return execute_request(req, out, outcap, outlen, internal_replay);
+}
+
+void kvs_stream_init(kvs_stream_t *s) { memset(s, 0, sizeof(*s)); }
+
+void kvs_stream_free(kvs_stream_t *s) {
+    kvs_out_node_t *n = s->out_head;
+    while (n) { kvs_out_node_t *next = n->next; kvs_free(n->data); kvs_free(n); n = next; }
+    memset(s, 0, sizeof(*s));
+}
+
+int kvs_stream_enqueue(kvs_stream_t *s, const unsigned char *data, size_t len) {
+    kvs_out_node_t *n = kvs_malloc(sizeof(*n));
+    if (!n) return -1;
+    memset(n, 0, sizeof(*n));
+    n->data = kvs_malloc(len);
+    if (!n->data) { kvs_free(n); return -1; }
+    memcpy(n->data, data, len); n->len = len;
+    if (!s->out_tail) s->out_head = s->out_tail = n;
+    else { s->out_tail->next = n; s->out_tail = n; }
+    s->out_queued_bytes += len;
     return 0;
+}
+
+static size_t find_next_star(const unsigned char *buf, size_t len, size_t start) {
+    for (size_t i = start; i < len; ++i) if (buf[i] == '*') return i;
+    return len;
 }
 
 int kvs_stream_feed(kvs_stream_t *s, const unsigned char *data, size_t len) {
-    if (len > 0) {
-        if (s->in_len + len > KVS_STREAM_IN_CAP) return kvs_stream_protocol_error(s, "input buffer overflow");
-        memcpy(s->inbuf + s->in_len, data, len);
-        s->in_len += len;
-    }
-
-    while (1) {
-        if (s->state == KVS_RESP_STATE_ARRAY) {
-            size_t consumed = 0;
-            long long argc = 0;
-            int pr;
-            if (s->parse_pos >= s->in_len) break;
-            if (s->inbuf[s->parse_pos] != '*') {
-                if (kvs_stream_protocol_error(s, "expected array") != 0) return -1;
-                continue;
-            }
-            pr = parse_crlf_number(s->inbuf + s->parse_pos + 1, s->in_len - s->parse_pos - 1, &consumed, &argc);
-            if (pr == 0) break;
-            if (pr < 0) {
-                if (kvs_stream_protocol_error(s, "invalid array length") != 0) return -1;
-                continue;
-            }
-            if (argc <= 0 || argc > KVS_MAX_ARGC) {
-                if (kvs_stream_protocol_error(s, "invalid argc") != 0) return -1;
-                continue;
-            }
-            s->parse_pos += 1 + consumed;
-            s->argc_expected = (int)argc;
-            s->argc_read = 0;
-            s->req.argc = (int)argc;
-            s->state = KVS_RESP_STATE_BULK_LEN;
-        } else if (s->state == KVS_RESP_STATE_BULK_LEN) {
-            size_t consumed = 0;
-            long long bulk = 0;
-            int pr;
-            if (s->parse_pos >= s->in_len) break;
-            if (s->inbuf[s->parse_pos] != '$') {
-                if (kvs_stream_protocol_error(s, "expected bulk string") != 0) return -1;
-                continue;
-            }
-            pr = parse_crlf_number(s->inbuf + s->parse_pos + 1, s->in_len - s->parse_pos - 1, &consumed, &bulk);
-            if (pr == 0) break;
-            if (pr < 0) {
-                if (kvs_stream_protocol_error(s, "invalid bulk length") != 0) return -1;
-                continue;
-            }
-            if (bulk < 0) {
-                if (kvs_stream_protocol_error(s, "negative bulk not supported") != 0) return -1;
-                continue;
-            }
-            s->parse_pos += 1 + consumed;
-            s->bulk_len = (ssize_t)bulk;
-            s->state = KVS_RESP_STATE_BULK_DATA;
-        } else {
-            if (s->in_len - s->parse_pos < (size_t)s->bulk_len + 2) break;
-            if (kvs_blob_dup(&s->req.argv[s->argc_read], s->inbuf + s->parse_pos, (size_t)s->bulk_len) != 0) return -1;
-            s->parse_pos += (size_t)s->bulk_len;
-            if (s->inbuf[s->parse_pos] != '\r' || s->inbuf[s->parse_pos + 1] != '\n') {
-                if (kvs_stream_protocol_error(s, "bulk missing CRLF") != 0) return -1;
-                continue;
-            }
-            s->parse_pos += 2;
-            s->argc_read++;
-            if (s->argc_read == s->argc_expected) {
-                if (dispatch_request(s, &s->req) != 0) return -1;
-                kvs_stream_reset_request(s);
-                kvs_stream_compact_input(s);
-            } else {
-                s->state = KVS_RESP_STATE_BULK_LEN;
-            }
+    if (s->in_len + len > sizeof(s->inbuf)) return -1;
+    memcpy(s->inbuf + s->in_len, data, len);
+    s->in_len += len;
+    while (s->in_len > 0) {
+        kvs_resp_request_t req; char err[128] = {0}; size_t used = 0;
+        int rc = kvs_resp_parse_one(s->inbuf, s->in_len, &used, &req, err, sizeof(err));
+        if (rc == 0) break;
+        if (rc < 0) {
+            unsigned char out[256];
+            size_t outlen = encode_error(out, sizeof(out), err[0] ? err : "protocol error");
+            kvs_stream_enqueue(s, out, outlen);
+            size_t next = find_next_star(s->inbuf, s->in_len, 1);
+            if (next >= s->in_len) s->in_len = 0;
+            else { memmove(s->inbuf, s->inbuf + next, s->in_len - next); s->in_len -= next; }
+            continue;
         }
-    }
-
-    if (s->parse_pos > 0 && s->parse_pos == s->in_len) {
-        s->in_len = 0;
-        s->parse_pos = 0;
+        unsigned char out[BUFFER_LENGTH]; size_t outlen = 0;
+        kvs_dispatch_request(&req, out, sizeof(out), &outlen, 0);
+        kvs_stream_enqueue(s, out, outlen);
+        kvs_resp_request_reset(&req);
+        memmove(s->inbuf, s->inbuf + used, s->in_len - used);
+        s->in_len -= used;
     }
     return 0;
-}
-
-int kvs_stream_has_output(const kvs_stream_t *s) { return s->out_head != NULL; }
-const unsigned char *kvs_stream_output_ptr(const kvs_stream_t *s) { return s->out_head ? s->out_head->data + s->out_head->sent : NULL; }
-size_t kvs_stream_output_len(const kvs_stream_t *s) { return s->out_head ? (s->out_head->len - s->out_head->sent) : 0; }
-
-void kvs_stream_consume_output(kvs_stream_t *s, size_t n) {
-    while (n > 0 && s->out_head) {
-        kvs_out_node_t *node = s->out_head;
-        size_t left = node->len - node->sent;
-        if (n < left) {
-            node->sent += n;
-            s->out_queued_bytes -= n;
-            return;
-        }
-        n -= left;
-        s->out_queued_bytes -= left;
-        s->out_head = node->next;
-        if (!s->out_head) s->out_tail = NULL;
-        free(node->data);
-        free(node);
-    }
 }
 
 int kvs_active_expire_cycle(int budget) {
     int removed = 0;
     long long now = kvs_now_ms();
-    if (budget <= 0 || !global_expire.buckets) return 0;
     for (int i = 0; i < global_expire.size && removed < budget; ++i) {
-        kvs_expire_item_t *cur = global_expire.buckets[i];
-        kvs_expire_item_t *prev = NULL;
+        kvs_expire_item_t *cur = global_expire.buckets[i], *prev = NULL;
         while (cur && removed < budget) {
             if (now >= cur->expire_at_ms) {
-                kvs_expire_item_t *dead = cur;
-                kvs_blob_view_t key = { dead->key.data, dead->key.len };
-                engine_del(dead->engine, &key);
+                engine_del(cur->engine, cur->key);
+                kvs_dataset_del(cur->engine, cur->key);
                 if (prev) prev->next = cur->next; else global_expire.buckets[i] = cur->next;
+                kvs_expire_item_t *dead = cur;
                 cur = cur->next;
-                kvs_blob_free(&dead->key);
-                free(dead);
+                kvs_free(dead->key); kvs_free(dead);
                 removed++;
                 continue;
             }
-            prev = cur;
-            cur = cur->next;
+            prev = cur; cur = cur->next;
         }
     }
     return removed;
 }
 
-int init_kvengine(void) {
+static int init_kvengine(void) {
 #if ENABLE_ARRAY
+    extern kvs_array_t global_array;
     memset(&global_array, 0, sizeof(global_array));
-    if (kvs_array_create(&global_array) != 0) return -1;
+    kvs_array_create(&global_array);
 #endif
 #if ENABLE_RBTREE
+    extern kvs_rbtree_t global_rbtree;
     memset(&global_rbtree, 0, sizeof(global_rbtree));
-    if (kvs_rbtree_create(&global_rbtree) != 0) return -1;
+    kvs_rbtree_create(&global_rbtree);
 #endif
 #if ENABLE_HASH
+    extern kvs_hash_t global_hash;
     memset(&global_hash, 0, sizeof(global_hash));
-    if (kvs_hash_create(&global_hash) != 0) return -1;
+    kvs_hash_create(&global_hash);
 #endif
-    memset(&global_expire, 0, sizeof(global_expire));
-    if (kvs_expire_create(&global_expire) != 0) return -1;
+    kvs_expire_create(&global_expire);
+    kvs_persist_init("kvstore.dump", "kvstore.aof");
+    kvs_persist_load_all();
     return 0;
 }
 
-void dest_kvengine(void) {
+static void dest_kvengine(void) {
+    kvs_persist_shutdown();
+    kvs_expire_destroy(&global_expire);
 #if ENABLE_ARRAY
+    extern kvs_array_t global_array;
     kvs_array_destory(&global_array);
 #endif
 #if ENABLE_RBTREE
+    extern kvs_rbtree_t global_rbtree;
     kvs_rbtree_destory(&global_rbtree);
 #endif
 #if ENABLE_HASH
+    extern kvs_hash_t global_hash;
     kvs_hash_destory(&global_hash);
 #endif
-    kvs_expire_destroy(&global_expire);
 }
 
+int proactor_start(unsigned short port, msg_handler handler) { (void)port; (void)handler; return -1; }
+int ntyco_start(unsigned short port, msg_handler handler) { (void)port; (void)handler; return -1; }
+
+int kvs_protocol(char *msg, int length, char *response) { (void)msg; (void)length; (void)response; return -1; }
+
 int main(int argc, char *argv[]) {
-    int port;
     if (argc != 2) return -1;
-    port = atoi(argv[1]);
-    if (init_kvengine() != 0) return -1;
-#if (NETWORK_SELECT == NETWORK_REACTOR)
-    reactor_start((unsigned short)port, NULL);
-#elif (NETWORK_SELECT == NETWORK_PROACTOR)
-    proactor_start((unsigned short)port, NULL);
-#else
-    ntyco_start((unsigned short)port, NULL);
-#endif
+    int port = atoi(argv[1]);
+    init_kvengine();
+    int rc = reactor_start((unsigned short)port, kvs_protocol);
     dest_kvengine();
-    return 0;
+    return rc;
 }

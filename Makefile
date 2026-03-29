@@ -1,33 +1,14 @@
+CC=gcc
+CFLAGS=-Wall -Wextra -O2
+OBJS=kvstore.o reactor.o kvs_expire.o kvs_persist.o kvs_array.o kvs_hash.o kvs_rbtree.o
 
-CC = gcc
-FLAGS = -I ./NtyCo/core/ -L ./NtyCo/ -lntyco -lpthread -luring -ldl
-SRCS = kvstore.c ntyco.c reactor.c kvs_expire.c proactor.c kvs_array.c kvs_rbtree.c kvs_hash.c
-TESTCASE_SRCS = testcase.c
-TARGET = kvstore
-SUBDIR = ./NtyCo/
-TESTCASE = testcase
+all: kvstore
 
-OBJS = $(SRCS:.c=.o)
+kvstore: $(OBJS)
+	$(CC) -o $@ $(OBJS)
 
+%.o: %.c kvstore.h server.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
-all: $(SUBDIR) $(TARGET) $(TESTCASE)
-
-$(SUBDIR): ECHO
-	make -C $@
-
-ECHO:
-	@echo $(SUBDIR)
-
-$(TARGET): $(OBJS) 
-	$(CC) -o $@ $^ $(FLAGS)
-
-$(TESTCASE): $(TESTCASE_SRCS)
-	$(CC) -o $@ $^
-
-%.o: %.c
-	$(CC) $(FLAGS) -c $^ -o $@
-
-clean: 
-	rm -rf $(OBJS) $(TARGET) $(TESTCASE)
-
-
+clean:
+	rm -f *.o kvstore kvstore.dump kvstore.aof

@@ -457,7 +457,7 @@ void kvs_rbtree_destory(kvs_rbtree_t *inst) {
 
 	rbtree_node *node = NULL;
 
-	while (!(node = inst->root)) {
+	while ((node = inst->root) != inst->nil) {
 		
 		rbtree_node *mini = rbtree_mini(inst, node);
 		
@@ -511,11 +511,11 @@ int kvs_rbtree_del(kvs_rbtree_t *inst, char *key) {
 	if (!inst || !key) return -1;
 
 	rbtree_node *node = rbtree_search(inst, key);
-	if (!node) return 1; // no exist
-	
+	if (!node || node == inst->nil) return 1;
 	rbtree_node *cur = rbtree_delete(inst, node);
-	free(cur);
-
+	kvs_free(cur->key);
+	kvs_free(cur->value);
+	kvs_free(cur);
 	return 0;
 }
 

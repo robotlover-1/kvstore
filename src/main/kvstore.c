@@ -1,4 +1,5 @@
 #include "kvstore/kvstore.h"
+#include <ctype.h>
 
 kv_config_t g_cfg = { .role = ROLE_MASTER, .port = 5000, .master_host = "127.0.0.1", .master_port = 5000, .dump_path = "kvstore.dump", .aof_path = "kvstore.aof", .mem_backend = "libc" };
 conn_t *g_replicas = NULL;
@@ -233,14 +234,92 @@ static int build_memstat_text(char *buf, size_t cap) {
     }
     return (int)pos;
 }
+static void kvs_ascii_upper(char *s) {
+    if (!s) return;
+    for (; *s; ++s) *s = (char)toupper((unsigned char)*s);
+}
+
+static int resp_array_header(char *out, size_t cap, int count) {
+    return snprintf(out, cap, "*%d\r\n", count);
+}
+
+static int resp_empty_array(char *out, size_t cap) {
+    return snprintf(out, cap, "*0\r\n");
+}
+
+static int resp_array_two_bulk(char *out, size_t cap, const char *a, const char *b) {
+    size_t pos = 0;
+    int n = resp_array_header(out + pos, cap - pos, 2);
+    if (n < 0 || (size_t)n >= cap - pos) return -1;
+    pos += (size_t)n;
+    n = resp_bulk(out + pos, cap - pos, a, strlen(a));
+    if (n < 0 || (size_t)n >= cap - pos) return -1;
+    pos += (size_t)n;
+    n = resp_bulk(out + pos, cap - pos, b, strlen(b));
+    if (n < 0 || (size_t)n >= cap - pos) return -1;
+    pos += (size_t)n;
+    return (int)pos;
+}
+
+static int split_inline_argv(char *line, char **argv, int maxargc) {
+    int argc = 0;
+    char *p = line;
+    while (*p && argc < maxargc) {
+        while (*p && isspace((unsigned char)*p)) ++p;
+        if (!*p) break;
+        argv[argc++] = p;
+        while (*p && !isspace((unsigned char)*p)) ++p;
+        if (!*p) break;
+        *p++ = '\0';
+    }
+    return argc;
+}
+
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication) {
     (void)argl;
     char resp[BUFFER_CAP]; int n = 0;
     if (argc <= 0) return -1;
+    kvs_ascii_upper(argv[0]);
     const char *cmd = argv[0];
 
     if (g_cfg.role == ROLE_SLAVE && !from_replication && is_readonly_slave_blocked(cmd)) {
         n = resp_error(resp, sizeof(resp), "read only slave");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "PING")) {
+        if (argc >= 2) n = resp_bulk(resp, sizeof(resp), argv[1], strlen(argv[1]));
+        else n = resp_simple_string(resp, sizeof(resp), "PONG");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "ECHO") && argc == 2) {
+        n = resp_bulk(resp, sizeof(resp), argv[1], strlen(argv[1]));
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "QUIT")) {
+        n = resp_simple_string(resp, sizeof(resp), "OK");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "COMMAND")) {
+        n = resp_empty_array(resp, sizeof(resp));
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "CLIENT")) {
+        if (argc >= 2 && !strcmp(argv[1], "SETINFO")) {
+            n = resp_simple_string(resp, sizeof(resp), "OK");
+        } else {
+            n = resp_array_two_bulk(resp, sizeof(resp), "id", "1");
+            if (n < 0) n = resp_error(resp, sizeof(resp), "client subcommand failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "HELLO")) {
+        n = resp_error(resp, sizeof(resp), "NOPROTO unsupported RESP version");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
     }
@@ -328,12 +407,47 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
         if (buf[pos] == '+') {
             while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
             if (pos + 1 >= *len) break;
-            pos += 2; continue;
+            pos += 2;
+            continue;
         }
+
         if (buf[pos] != '*') {
-            if (c) { char r[64]; int n = resp_error(r, sizeof(r), "invalid resp type"); queue_bytes(c, (unsigned char *)r, (size_t)n); }
-            pos++; continue;
+            size_t line_end = pos;
+            while (line_end < *len && buf[line_end] != '\n') line_end++;
+            if (line_end >= *len) break;
+
+            size_t line_len = line_end - pos;
+            if (line_len > 0 && buf[pos + line_len - 1] == '\r') line_len--;
+            if (line_len == 0) {
+                pos = line_end + 1;
+                continue;
+            }
+
+            char *line = (char *)kvs_malloc(line_len + 1);
+            if (!line) {
+                if (c) {
+                    char r[64];
+                    int n = resp_error(r, sizeof(r), "oom");
+                    queue_bytes(c, (unsigned char *)r, (size_t)n);
+                }
+                pos = line_end + 1;
+                continue;
+            }
+            memcpy(line, buf + pos, line_len);
+            line[line_len] = '\0';
+
+            char *argv[32] = {0};
+            size_t argl[32] = {0};
+            int argc = split_inline_argv(line, argv, 32);
+            if (argc > 0) {
+                for (int i = 0; i < argc; ++i) argl[i] = strlen(argv[i]);
+                handle_parsed_command(c, argc, argv, argl, buf + pos, line_end + 1 - pos, from_replication);
+            }
+            kvs_free(line);
+            pos = line_end + 1;
+            continue;
         }
+
         size_t start = pos, p = pos + 1;
         while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
         if (p + 1 >= *len) break;
@@ -341,11 +455,18 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
         memcpy(nbuf, buf + pos + 1, p - (pos + 1));
         int argc = atoi(nbuf);
         if (argc <= 0 || argc > 32) {
-            if (c) { char r[64]; int n = resp_error(r, sizeof(r), "invalid argc"); queue_bytes(c, (unsigned char *)r, (size_t)n); }
-            pos = p + 2; continue;
+            if (c) {
+                char r[64];
+                int n = resp_error(r, sizeof(r), "invalid argc");
+                queue_bytes(c, (unsigned char *)r, (size_t)n);
+            }
+            pos = p + 2;
+            continue;
         }
         p += 2;
-        char *argv[32] = {0}; size_t argl[32] = {0}; int ok = 1;
+        char *argv[32] = {0};
+        size_t argl[32] = {0};
+        int ok = 1;
         for (int i = 0; i < argc; ++i) {
             if (p >= *len || buf[p] != '$') { ok = 0; break; }
             size_t lp = p + 1;
@@ -357,12 +478,17 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             long blen = strtol(lbuf, &endp, 10);
             if (!endp || *endp != '\0' || blen < 0) {
                 ok = 0;
-                if (c) { char r[128]; int n = resp_error(r, sizeof(r), "invalid bulk length"); queue_bytes(c, (unsigned char *)r, (size_t)n); }
+                if (c) {
+                    char r[128];
+                    int n = resp_error(r, sizeof(r), "invalid bulk length");
+                    queue_bytes(c, (unsigned char *)r, (size_t)n);
+                }
                 break;
             }
             p = lp + 2;
             if (p + (size_t)blen + 2 > *len) { ok = 0; break; }
             argv[i] = (char *)kvs_malloc((size_t)blen + 1);
+            if (!argv[i]) { ok = 0; break; }
             memcpy(argv[i], buf + p, (size_t)blen);
             argv[i][blen] = 0;
             argl[i] = (size_t)blen;
@@ -379,10 +505,15 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
         for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
         pos = p;
     }
-    if (pos > 0 && pos < *len) { memmove(buf, buf + pos, *len - pos); *len -= pos; }
-    else if (pos >= *len) *len = 0;
+    if (pos > 0 && pos < *len) {
+        memmove(buf, buf + pos, *len - pos);
+        *len -= pos;
+    } else if (pos >= *len) {
+        *len = 0;
+    }
     return 0;
 }
+
 
 static int emit_cmd3_fp(FILE *fp, const char *cmd, const char *a1, const char *a2) {
     unsigned char buf[BUFFER_CAP];

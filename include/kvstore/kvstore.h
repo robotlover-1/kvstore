@@ -42,7 +42,6 @@
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
-/* storage engines */
 #if ENABLE_ARRAY
 typedef struct kvs_array_item_s {
     char *key;
@@ -126,7 +125,6 @@ int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
 #endif
 
-/* expire */
 #define KVS_EXPIRE_BUCKETS 1024
 typedef struct kvs_expire_item_s {
     char *key;
@@ -141,7 +139,6 @@ typedef struct kvs_expire_table_s {
 } kvs_expire_table_t;
 extern kvs_expire_table_t global_expire;
 
-/* replication/network */
 typedef struct out_node_s {
     unsigned char *data;
     size_t len;
@@ -176,11 +173,6 @@ typedef struct {
     int initialized;
     size_t small_max_size;
     size_t class_count;
-    size_t class_sizes[16];
-    size_t class_free_chunks[16];
-    size_t class_total_chunks[16];
-    size_t class_page_count[16];
-    size_t class_bytes_in_pages[16];
     unsigned long long alloc_calls;
     unsigned long long free_calls;
     unsigned long long calloc_calls;
@@ -207,6 +199,11 @@ typedef struct {
     unsigned long long small_page_used_bytes;
     unsigned int internal_fragment_ppm;
     unsigned int page_utilization_ppm;
+    size_t class_sizes[16];
+    size_t class_total_chunks[16];
+    size_t class_free_chunks[16];
+    size_t class_page_count[16];
+    size_t class_bytes_in_pages[16];
 } kvs_mem_stats_t;
 
 extern kv_config_t g_cfg;
@@ -215,17 +212,16 @@ extern conn_t *g_replicas;
 extern pthread_mutex_t g_repl_lock;
 extern FILE *g_aof_fp;
 
-int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv);
-int kvs_mem_init(const char *backend_name);
-const char *kvs_mem_backend_name(void);
-int kvs_mem_get_stats(kvs_mem_stats_t *stats);
 void *kvs_malloc(size_t size);
 void *kvs_calloc(size_t n, size_t size);
 void *kvs_realloc(void *ptr, size_t size);
 void kvs_free(void *ptr);
 long long kvs_now_ms(void);
+int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv);
+int kvs_mem_init(const char *backend_name);
+const char *kvs_mem_backend_name(void);
+int kvs_mem_get_stats(kvs_mem_stats_t *stats);
 
-/* expire */
 int kvs_expire_create(kvs_expire_table_t *tab);
 void kvs_expire_destroy(kvs_expire_table_t *tab);
 int kvs_expire_set(kvs_expire_table_t *tab, int engine, const char *key, long long ttl_ms);
@@ -235,20 +231,17 @@ int kvs_expire_is_expired(kvs_expire_table_t *tab, int engine, const char *key);
 long long kvs_expire_ttl(kvs_expire_table_t *tab, int engine, const char *key);
 int kvs_active_expire_cycle(int budget);
 
-/* server / protocol */
 int reactor_start(void);
 int queue_bytes(conn_t *c, const unsigned char *buf, size_t len);
 void close_conn(conn_t *c);
 int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication);
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication);
 
-/* replication */
 void repl_add_slave(conn_t *c);
 void repl_remove_slave(conn_t *c);
 void repl_broadcast(const unsigned char *raw, size_t rawlen);
 int start_slave_thread(void);
 
-/* persistence */
 int persist_init(void);
 void persist_close(void);
 int persist_append_raw(const unsigned char *buf, size_t len);
@@ -256,7 +249,6 @@ int persist_save_dump(void);
 int persist_recover(void);
 int kvs_snapshot_to_fp(FILE *fp);
 
-/* helpers */
 int resp_simple_string(char *out, size_t cap, const char *s);
 int resp_error(char *out, size_t cap, const char *s);
 int resp_integer(char *out, size_t cap, long long v);

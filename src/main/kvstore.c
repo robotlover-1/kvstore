@@ -128,11 +128,11 @@ static int queue_snapshot(conn_t *c) {
 }
 
 static int is_readonly_slave_blocked(const char *cmd) {
-    return strcmp(cmd, "GET") && strcmp(cmd, "TTL") && strcmp(cmd, "EXIST") && strcmp(cmd, "RGET") && strcmp(cmd, "RTTL") && strcmp(cmd, "REXIST") && strcmp(cmd, "HGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST") && strcmp(cmd, "TGET") && strcmp(cmd, "TTTL") && strcmp(cmd, "TEXIST") && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT");
+    return strcmp(cmd, "GET") && strcmp(cmd, "MGET") && strcmp(cmd, "TTL") && strcmp(cmd, "EXIST") && strcmp(cmd, "RGET") && strcmp(cmd, "RMGET") && strcmp(cmd, "RTTL") && strcmp(cmd, "REXIST") && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST") && strcmp(cmd, "TGET") && strcmp(cmd, "TMGET") && strcmp(cmd, "TTTL") && strcmp(cmd, "TEXIST") && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT");
 }
 
 static int is_write_cmd(const char *cmd) {
-    const char *writes[] = {"SET","MOD","DEL","EXPIRE","PERSIST","RSET","RMOD","RDEL","REXPIRE","RPERSIST","HSET","HMOD","HDEL","HEXPIRE","HPERSIST","TSET","TMOD","TDEL","TEXPIRE","TPERSIST",NULL};
+    const char *writes[] = {"SET","MSET","MOD","DEL","EXPIRE","PERSIST","RSET","RMSET","RMOD","RDEL","REXPIRE","RPERSIST","HSET","HMSET","HMOD","HDEL","HEXPIRE","HPERSIST","TSET","TMSET","TMOD","TDEL","TEXPIRE","TPERSIST",NULL};
     for (int i = 0; writes[i]; ++i) if (!strcmp(cmd, writes[i])) return 1;
     return 0;
 }
@@ -201,6 +201,42 @@ static int try_expire(int engine, char *key) {
         return 1;
     }
     return 0;
+}
+
+static int resp_array_from_values(char *out, size_t cap, int count, char **values);
+
+static int engine_upsert(int engine, char *key, char *value) {
+    int exists;
+    if (!key || !value) return -1;
+    try_expire(engine, key);
+    exists = engine_exist(engine, key) == 0;
+    if (exists) {
+        if (engine_mod(engine, key, value) != 0) return -1;
+        kvs_expire_persist(&global_expire, engine, key);
+        return 0;
+    }
+    return engine_set(engine, key, value);
+}
+
+static int handle_multi_set(int engine, int argc, char **argv) {
+    if (argc < 3 || (argc % 2) == 0) return -1;
+    for (int i = 1; i < argc; i += 2) {
+        if (!argv[i] || !argv[i + 1]) return -1;
+    }
+    for (int i = 1; i < argc; i += 2) {
+        if (engine_upsert(engine, argv[i], argv[i + 1]) != 0) return -1;
+    }
+    return 0;
+}
+
+static int handle_multi_get(int engine, int argc, char **argv, char *resp, size_t cap) {
+    char *values[32] = {0};
+    if (argc < 2 || argc > 32) return -1;
+    for (int i = 1; i < argc; ++i) {
+        try_expire(engine, argv[i]);
+        values[i - 1] = engine_get(engine, argv[i]);
+    }
+    return resp_array_from_values(resp, cap, argc - 1, values);
 }
 
 static int build_memstat_text(char *buf, size_t cap) {
@@ -299,6 +335,27 @@ static int resp_array_header(char *out, size_t cap, int count) {
 
 static int resp_empty_array(char *out, size_t cap) {
     return snprintf(out, cap, "*0\r\n");
+}
+
+static int resp_array_append_bulk_or_null(char *out, size_t cap, size_t *pos, const char *s) {
+    int n;
+    if (!out || !pos || *pos >= cap) return -1;
+    if (s) n = resp_bulk(out + *pos, cap - *pos, s, strlen(s));
+    else n = resp_null_bulk(out + *pos, cap - *pos);
+    if (n < 0 || (size_t)n > cap - *pos) return -1;
+    *pos += (size_t)n;
+    return 0;
+}
+
+static int resp_array_from_values(char *out, size_t cap, int count, char **values) {
+    size_t pos = 0;
+    int n = resp_array_header(out + pos, cap - pos, count);
+    if (n < 0 || (size_t)n >= cap - pos) return -1;
+    pos += (size_t)n;
+    for (int i = 0; i < count; ++i) {
+        if (resp_array_append_bulk_or_null(out, cap, &pos, values[i]) != 0) return -1;
+    }
+    return (int)pos;
 }
 
 static int resp_array_two_bulk(char *out, size_t cap, const char *a, const char *b) {
@@ -474,12 +531,18 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     int rc = -1;
 
     if (!strcmp(op, "SET") && argc == 3) rc = engine_set(engine, argv[1], argv[2]);
+    else if (!strcmp(op, "MSET")) rc = handle_multi_set(engine, argc, argv);
     else if (!strcmp(op, "MOD") && argc == 3) { try_expire(engine, argv[1]); rc = engine_mod(engine, argv[1], argv[2]); }
     else if (!strcmp(op, "DEL") && argc == 2) { try_expire(engine, argv[1]); rc = engine_del(engine, argv[1]); kvs_expire_del(&global_expire, engine, argv[1]); }
     else if (!strcmp(op, "GET") && argc == 2) {
         try_expire(engine, argv[1]);
         char *v = engine_get(engine, argv[1]);
         n = v ? resp_bulk(resp, sizeof(resp), v, strlen(v)) : resp_null_bulk(resp, sizeof(resp));
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    } else if (!strcmp(op, "MGET")) {
+        n = handle_multi_get(engine, argc, argv, resp, sizeof(resp));
+        if (n < 0) n = resp_error(resp, sizeof(resp), "mget failed");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
     } else if (!strcmp(op, "EXIST") && argc == 2) {

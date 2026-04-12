@@ -1,3 +1,4 @@
+
 #include "kvstore/kvstore.h"
 #include <ctype.h>
 #include <strings.h>
@@ -128,11 +129,22 @@ static int queue_snapshot(conn_t *c) {
 }
 
 static int is_readonly_slave_blocked(const char *cmd) {
-    return strcmp(cmd, "GET") && strcmp(cmd, "MGET") && strcmp(cmd, "TTL") && strcmp(cmd, "EXIST") && strcmp(cmd, "RGET") && strcmp(cmd, "RMGET") && strcmp(cmd, "RTTL") && strcmp(cmd, "REXIST") && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST") && strcmp(cmd, "TGET") && strcmp(cmd, "TMGET") && strcmp(cmd, "TTTL") && strcmp(cmd, "TEXIST") && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT");
+    return strcmp(cmd, "GET") && strcmp(cmd, "MGET") && strcmp(cmd, "TTL") && strcmp(cmd, "EXIST") && strcmp(cmd, "OWNER")
+        && strcmp(cmd, "RGET") && strcmp(cmd, "RMGET") && strcmp(cmd, "RTTL") && strcmp(cmd, "REXIST")
+        && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST")
+        && strcmp(cmd, "TGET") && strcmp(cmd, "TMGET") && strcmp(cmd, "TTTL") && strcmp(cmd, "TEXIST")
+        && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT");
 }
 
 static int is_write_cmd(const char *cmd) {
-    const char *writes[] = {"SET","MSET","MOD","DEL","EXPIRE","PERSIST","RSET","RMSET","RMOD","RDEL","REXPIRE","RPERSIST","HSET","HMSET","HMOD","HDEL","HEXPIRE","HPERSIST","TSET","TMSET","TMOD","TDEL","TEXPIRE","TPERSIST",NULL};
+    const char *writes[] = {
+        "SET","MSET","MOD","DEL","EXPIRE","PERSIST",
+        "RSET","RMSET","RMOD","RDEL","REXPIRE","RPERSIST",
+        "HSET","HMSET","HMOD","HDEL","HEXPIRE","HPERSIST",
+        "TSET","TMSET","TMOD","TDEL","TEXPIRE","TPERSIST",
+        "LOCK","UNLOCK","RENEW",
+        NULL
+    };
     for (int i = 0; writes[i]; ++i) if (!strcmp(cmd, writes[i])) return 1;
     return 0;
 }
@@ -237,6 +249,41 @@ static int handle_multi_get(int engine, int argc, char **argv, char *resp, size_
         values[i - 1] = engine_get(engine, argv[i]);
     }
     return resp_array_from_values(resp, cap, argc - 1, values);
+}
+
+static int lock_acquire(int engine, char *key, char *token, long long ttl_ms) {
+    if (!key || !token || ttl_ms <= 0) return -1;
+    try_expire(engine, key);
+    if (engine_exist(engine, key) == 0) return 1;
+    if (engine_set(engine, key, token) != 0) return -1;
+    if (kvs_expire_set(&global_expire, engine, key, ttl_ms) != 0) {
+        engine_del(engine, key);
+        kvs_expire_del(&global_expire, engine, key);
+        return -1;
+    }
+    return 0;
+}
+
+static int lock_release(int engine, char *key, char *token) {
+    char *cur;
+    if (!key || !token) return -1;
+    try_expire(engine, key);
+    cur = engine_get(engine, key);
+    if (!cur) return 1;
+    if (strcmp(cur, token) != 0) return 1;
+    if (engine_del(engine, key) != 0) return -1;
+    kvs_expire_del(&global_expire, engine, key);
+    return 0;
+}
+
+static int lock_renew(int engine, char *key, char *token, long long ttl_ms) {
+    char *cur;
+    if (!key || !token || ttl_ms <= 0) return -1;
+    try_expire(engine, key);
+    cur = engine_get(engine, key);
+    if (!cur) return 1;
+    if (strcmp(cur, token) != 0) return 1;
+    return kvs_expire_set(&global_expire, engine, key, ttl_ms);
 }
 
 static int build_memstat_text(char *buf, size_t cap) {
@@ -522,6 +569,65 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "SNAPRULECLEAR")) {
         persist_clear_autosnap_rules();
         n = resp_simple_string(resp, sizeof(resp), "OK");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+
+    if (!strcmp(cmd, "LOCK") && argc == 4) {
+        int lrc = lock_acquire(KVS_ENGINE_ARRAY, argv[1], argv[2], atoll(argv[3]));
+        if (lrc == 0) {
+            n = resp_integer(resp, sizeof(resp), 1);
+            if (!from_replication) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            }
+        } else if (lrc == 1) {
+            n = resp_integer(resp, sizeof(resp), 0);
+        } else {
+            n = resp_error(resp, sizeof(resp), "lock failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "UNLOCK") && argc == 3) {
+        int lrc = lock_release(KVS_ENGINE_ARRAY, argv[1], argv[2]);
+        if (lrc == 0) {
+            n = resp_integer(resp, sizeof(resp), 1);
+            if (!from_replication) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            }
+        } else if (lrc == 1) {
+            n = resp_integer(resp, sizeof(resp), 0);
+        } else {
+            n = resp_error(resp, sizeof(resp), "unlock failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "RENEW") && argc == 4) {
+        int lrc = lock_renew(KVS_ENGINE_ARRAY, argv[1], argv[2], atoll(argv[3]));
+        if (lrc == 0) {
+            n = resp_integer(resp, sizeof(resp), 1);
+            if (!from_replication) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            }
+        } else if (lrc == 1) {
+            n = resp_integer(resp, sizeof(resp), 0);
+        } else {
+            n = resp_error(resp, sizeof(resp), "renew failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "OWNER") && argc == 2) {
+        try_expire(KVS_ENGINE_ARRAY, argv[1]);
+        char *v = engine_get(KVS_ENGINE_ARRAY, argv[1]);
+        n = v ? resp_bulk(resp, sizeof(resp), v, strlen(v)) : resp_null_bulk(resp, sizeof(resp));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
     }

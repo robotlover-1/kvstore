@@ -10,6 +10,7 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/storage/kvs_array.c \
      $(SRC_DIR)/storage/kvs_hash.c \
      $(SRC_DIR)/storage/kvs_rbtree.c \
+     $(SRC_DIR)/storage/kvs_skiptable.c \
      $(SRC_DIR)/memory/kvs_mem.c \
      $(SRC_DIR)/expire/kvs_expire.c \
      $(SRC_DIR)/persistence/kvs_persist.c \

@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -25,13 +26,15 @@
 #define ROLE_MASTER 1
 #define ROLE_SLAVE 2
 
-#define KVS_ENGINE_ARRAY   1
-#define KVS_ENGINE_RBTREE  2
-#define KVS_ENGINE_HASH    3
+#define KVS_ENGINE_ARRAY      1
+#define KVS_ENGINE_RBTREE     2
+#define KVS_ENGINE_HASH       3
+#define KVS_ENGINE_SKIPTABLE  4
 
 #define ENABLE_ARRAY 1
 #define ENABLE_RBTREE 1
 #define ENABLE_HASH 1
+#define ENABLE_SKIPTABLE 1
 
 #define KVS_ARRAY_SIZE 1024
 #define MAX_TABLE_SIZE 1024
@@ -39,6 +42,15 @@
 #define RED 1
 #define BLACK 2
 #define ENABLE_KEY_CHAR 1
+
+#define BGSAVE_IDLE 0
+#define BGSAVE_RUNNING 1
+#define BGSAVE_OK 2
+#define BGSAVE_ERR 3
+
+#define REPL_STATE_NONE 0
+#define REPL_STATE_WAIT_BGSAVE 1
+#define REPL_STATE_ONLINE 2
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
@@ -125,6 +137,20 @@ int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
 #endif
 
+#if ENABLE_SKIPTABLE
+typedef struct kvs_skiptable_s kvs_skiptable_t;
+typedef int (*kvs_skip_visit_cb)(const char *key, const char *value, void *arg);
+extern kvs_skiptable_t global_skiptable;
+int kvs_skiptable_create(kvs_skiptable_t *inst);
+void kvs_skiptable_destory(kvs_skiptable_t *inst);
+int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value);
+char *kvs_skiptable_get(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
+int kvs_skiptable_del(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_foreach(kvs_skiptable_t *inst, kvs_skip_visit_cb cb, void *arg);
+#endif
+
 #define KVS_EXPIRE_BUCKETS 1024
 typedef struct kvs_expire_item_s {
     char *key;
@@ -150,10 +176,14 @@ typedef struct conn_s {
     int fd;
     int is_listener;
     int is_replica;
+    int replica_state;
+    unsigned long long wait_bgsave_seq;
     unsigned char inbuf[BUFFER_CAP];
     size_t in_len;
     out_node_t *out_head;
     out_node_t *out_tail;
+    out_node_t *repl_backlog_head;
+    out_node_t *repl_backlog_tail;
     struct conn_s *next_replica;
 } conn_t;
 
@@ -211,6 +241,12 @@ extern int g_epfd;
 extern conn_t *g_replicas;
 extern pthread_mutex_t g_repl_lock;
 extern FILE *g_aof_fp;
+extern pid_t g_bgsave_pid;
+extern int g_bgsave_state;
+extern long long g_bgsave_last_start_ms;
+extern long long g_bgsave_last_end_ms;
+extern unsigned long long g_bgsave_seq;
+extern unsigned long long g_bgsave_done_seq;
 
 void *kvs_malloc(size_t size);
 void *kvs_calloc(size_t n, size_t size);
@@ -240,6 +276,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
 void repl_add_slave(conn_t *c);
 void repl_remove_slave(conn_t *c);
 void repl_broadcast(const unsigned char *raw, size_t rawlen);
+void repl_fullsync_cron(void);
 int start_slave_thread(void);
 
 int persist_init(void);
@@ -248,6 +285,10 @@ int persist_append_raw(const unsigned char *buf, size_t len);
 int persist_save_dump(void);
 int persist_recover(void);
 int kvs_snapshot_to_fp(FILE *fp);
+int persist_bgsave_start(void);
+void persist_bgsave_poll(void);
+int persist_bgsave_in_progress(void);
+const char *persist_bgsave_state_name(void);
 
 int resp_simple_string(char *out, size_t cap, const char *s);
 int resp_error(char *out, size_t cap, const char *s);

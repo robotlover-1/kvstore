@@ -1,0 +1,13 @@
+trigger_reply=OK
+save_wall_time_ms=50
+mode=save
+engine=hash
+port=6399
+dataset_size=100000
+clients=50
+requests=100000
+dump_file=./tmp_save_bgsave_perf/save_hash_20260412_014012/kvstore.dump
+dump_size_bytes=5476791
+server_log=./tmp_save_bgsave_perf/save_hash_20260412_014012/server.log
+baseline_output=./tmp_save_bgsave_perf/save_hash_20260412_014012/baseline.txt
+during_output=./tmp_save_bgsave_perf/save_hash_20260412_014012/during.txt

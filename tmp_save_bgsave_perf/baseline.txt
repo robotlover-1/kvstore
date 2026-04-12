@@ -1,0 +1,3 @@
+SET: 0.00SET: 92592.59 requests per second
+GET: 89285.71 requests per second
+

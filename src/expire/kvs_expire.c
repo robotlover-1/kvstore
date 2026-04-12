@@ -130,6 +130,7 @@ static int engine_del(int engine, const char *key) {
         case KVS_ENGINE_ARRAY: return kvs_array_del(&global_array, (char *)key);
         case KVS_ENGINE_RBTREE: return kvs_rbtree_del(&global_rbtree, (char *)key);
         case KVS_ENGINE_HASH: return kvs_hash_del(&global_hash, (char *)key);
+        case KVS_ENGINE_SKIPTABLE: return kvs_skiptable_del(&global_skiptable, (char *)key);
         default: return -1;
     }
 }

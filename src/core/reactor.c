@@ -70,6 +70,14 @@ void close_conn(conn_t *c) {
         n = next;
     }
 
+    n = c->repl_backlog_head;
+    while (n) {
+        out_node_t *next = n->next;
+        kvs_free(n->data);
+        kvs_free(n);
+        n = next;
+    }
+
     kvs_free(c);
 }
 
@@ -267,6 +275,8 @@ int reactor_start(void) {
         int n = epoll_wait(g_epfd, events, MAX_EVENTS, 100);
 
         long long now = kvs_now_ms();
+        persist_bgsave_poll();
+        repl_fullsync_cron();
         if (now - g_last_expire >= 100) {
             kvs_active_expire_cycle(32);
             g_last_expire = now;

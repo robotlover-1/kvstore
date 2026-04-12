@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -43,6 +44,11 @@
 #define ENABLE_KEY_CHAR 1
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
+
+typedef enum {
+    KVS_AOF_FSYNC_ALWAYS = 0,
+    KVS_AOF_FSYNC_EVERYSEC = 1,
+} kvs_aof_fsync_policy_t;
 
 #if ENABLE_ARRAY
 typedef struct kvs_array_item_s {
@@ -188,6 +194,7 @@ typedef struct {
     char dump_path[256];
     char aof_path[256];
     char mem_backend[32];
+    kvs_aof_fsync_policy_t aof_fsync;
     int autosnap_rule_count;
     kvs_autosnap_rule_t autosnap_rules[KVS_AUTOSNAP_RULES_MAX];
 } kv_config_t;
@@ -277,6 +284,14 @@ int persist_bgsave_start(void);
 int persist_bgsave_poll(void);
 int persist_bgsave_in_progress(void);
 const char *persist_bgsave_state_name(void);
+int persist_bgrewriteaof_start(void);
+int persist_bgrewriteaof_poll(void);
+int persist_bgrewriteaof_in_progress(void);
+const char *persist_bgrewriteaof_state_name(void);
+int persist_set_aof_policy(kvs_aof_fsync_policy_t policy);
+kvs_aof_fsync_policy_t persist_get_aof_policy(void);
+const char *persist_aof_policy_name(void);
+int persist_force_aof_flush(void);
 void persist_note_write(void);
 unsigned long long persist_dirty_count(void);
 long long persist_last_snapshot_ms(void);

@@ -1,7 +1,17 @@
 #include "kvstore/kvstore.h"
 #include <ctype.h>
+#include <strings.h>
 
-kv_config_t g_cfg = { .role = ROLE_MASTER, .port = 5000, .master_host = "127.0.0.1", .master_port = 5000, .dump_path = "kvstore.dump", .aof_path = "kvstore.aof", .mem_backend = "libc" };
+kv_config_t g_cfg = {
+    .role = ROLE_MASTER,
+    .port = 5000,
+    .master_host = "127.0.0.1",
+    .master_port = 5000,
+    .dump_path = "kvstore.dump",
+    .aof_path = "kvstore.aof",
+    .mem_backend = "libc",
+    .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
+};
 conn_t *g_replicas = NULL;
 pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -24,6 +34,18 @@ size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const ch
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
 
 static int parse_autosnap_rules(const char *spec);
+static int parse_appendfsync_policy(const char *s, kvs_aof_fsync_policy_t *out) {
+    if (!s || !out) return -1;
+    if (!strcasecmp(s, "always")) {
+        *out = KVS_AOF_FSYNC_ALWAYS;
+        return 0;
+    }
+    if (!strcasecmp(s, "everysec")) {
+        *out = KVS_AOF_FSYNC_EVERYSEC;
+        return 0;
+    }
+    return -1;
+}
 
 static int parse_args(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
@@ -34,6 +56,11 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--aof") && i + 1 < argc) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--mem") && i + 1 < argc) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--appendfsync") && i + 1 < argc) {
+            kvs_aof_fsync_policy_t policy;
+            if (parse_appendfsync_policy(argv[++i], &policy) != 0) return -1;
+            g_cfg.aof_fsync = policy;
+        }
         else if (!strcmp(argv[i], "--autosnap") && i + 1 < argc) {
             if (parse_autosnap_rules(argv[++i]) != 0) return -1;
         }
@@ -57,7 +84,6 @@ static int parse_autosnap_rules(const char *spec) {
     }
     return 0;
 }
-
 
 void repl_add_slave(conn_t *c) {
     pthread_mutex_lock(&g_repl_lock);
@@ -354,16 +380,19 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "REPLSYNC")) { repl_add_slave(c); queue_snapshot(c); return 0; }
     if (!strcmp(cmd, "REPLDONE")) return 0;
     if (!strcmp(cmd, "INFO")) {
-        char info[1024];
+        char info[2048];
         snprintf(info, sizeof(info),
-            "role:%s\nmem:%s\ndirty:%llu\nlast_snapshot_ms:%lld\nautosnap_rules:%d\nbgsave:%s\nbgsave_pid:%ld",
+            "role:%s\nmem:%s\ndirty:%llu\nlast_snapshot_ms:%lld\nautosnap_rules:%d\nbgsave:%s\nbgsave_pid:%ld\naof_fsync:%s\naof_rewrite:%s\naof_rewrite_pid:%ld",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
             (unsigned long long)persist_dirty_count(),
             persist_last_snapshot_ms(),
             g_cfg.autosnap_rule_count,
             persist_bgsave_state_name(),
-            (long)g_bgsave_pid);
+            (long)g_bgsave_pid,
+            persist_aof_policy_name(),
+            persist_bgrewriteaof_state_name(),
+            (long)(persist_bgrewriteaof_in_progress() ? 1 : -1));
         n = resp_bulk(resp, sizeof(resp), info, strlen(info));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
@@ -386,6 +415,36 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (brc == 0) n = resp_simple_string(resp, sizeof(resp), "Background saving started");
         else if (brc == 1) n = resp_error(resp, sizeof(resp), "background saving already in progress");
         else n = resp_error(resp, sizeof(resp), "bgsave failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "BGREWRITEAOF")) {
+        int rrc = persist_bgrewriteaof_start();
+        if (rrc == 0) n = resp_simple_string(resp, sizeof(resp), "Background append only file rewriting started");
+        else if (rrc == 1) n = resp_error(resp, sizeof(resp), "aof rewrite already in progress");
+        else n = resp_error(resp, sizeof(resp), "bgrewriteaof failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "APPENDFSYNC") && argc == 2) {
+        kvs_aof_fsync_policy_t policy;
+        if (parse_appendfsync_policy(argv[1], &policy) != 0 || persist_set_aof_policy(policy) != 0)
+            n = resp_error(resp, sizeof(resp), "invalid fsync policy");
+        else
+            n = resp_simple_string(resp, sizeof(resp), "OK");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "CONFIG") && argc == 3) {
+        if (!strcasecmp(argv[1], "APPENDFSYNC")) {
+            kvs_aof_fsync_policy_t policy;
+            if (parse_appendfsync_policy(argv[2], &policy) != 0 || persist_set_aof_policy(policy) != 0)
+                n = resp_error(resp, sizeof(resp), "invalid fsync policy");
+            else
+                n = resp_simple_string(resp, sizeof(resp), "OK");
+        } else {
+            n = resp_error(resp, sizeof(resp), "unsupported config option");
+        }
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
     }
@@ -580,7 +639,6 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
     return 0;
 }
 
-
 static int emit_cmd3_fp(FILE *fp, const char *cmd, const char *a1, const char *a2) {
     unsigned char buf[BUFFER_CAP];
     size_t n = resp_build_cmd3(buf, sizeof(buf), cmd, a1, a2);
@@ -650,7 +708,7 @@ int kvs_snapshot_to_fp(FILE *fp) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

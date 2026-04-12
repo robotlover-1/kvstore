@@ -23,6 +23,8 @@ size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const ch
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*2\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); return pos; }
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
 
+static int parse_autosnap_rules(const char *spec);
+
 static int parse_args(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) g_cfg.port = atoi(argv[++i]);
@@ -32,81 +34,34 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--aof") && i + 1 < argc) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--mem") && i + 1 < argc) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--autosnap") && i + 1 < argc) {
+            if (parse_autosnap_rules(argv[++i]) != 0) return -1;
+        }
         else return -1;
     }
     return 0;
 }
 
-static int queue_snapshot_file(conn_t *c, const char *path) {
-    char hdr[64];
-    int n = resp_simple_string(hdr, sizeof(hdr), "FULLRESYNC");
-    if (queue_bytes(c, (unsigned char *)hdr, (size_t)n) != 0) return -1;
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return -1;
-
-    unsigned char buf[8192];
-    size_t r;
-    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        if (queue_bytes(c, buf, r) != 0) {
-            fclose(fp);
-            return -1;
-        }
+static int parse_autosnap_rules(const char *spec) {
+    if (!spec || !*spec) return 0;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", spec);
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(tmp, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+        char *sep = strchr(tok, ':');
+        if (!sep) return -1;
+        *sep = '\0';
+        long long sec = atoll(tok);
+        long long changes = atoll(sep + 1);
+        if (persist_register_autosnap_rule(sec, changes) != 0) return -1;
     }
-    fclose(fp);
-
-    size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
-    if (queue_bytes(c, buf, done) != 0) return -1;
     return 0;
 }
 
-static int repl_backlog_append(conn_t *c, const unsigned char *raw, size_t rawlen) {
-    out_node_t *n = (out_node_t *)kvs_malloc(sizeof(*n));
-    if (!n) return -1;
-    n->data = (unsigned char *)kvs_malloc(rawlen);
-    if (!n->data) {
-        kvs_free(n);
-        return -1;
-    }
-    memcpy(n->data, raw, rawlen);
-    n->len = rawlen;
-    n->sent = 0;
-    n->next = NULL;
-    if (c->repl_backlog_tail) c->repl_backlog_tail->next = n;
-    else c->repl_backlog_head = n;
-    c->repl_backlog_tail = n;
-    return 0;
-}
-
-static void repl_backlog_flush_to_outq(conn_t *c) {
-    out_node_t *n = c->repl_backlog_head;
-    while (n) {
-        out_node_t *next = n->next;
-        n->next = NULL;
-        n->sent = 0;
-        if (c->out_tail) c->out_tail->next = n;
-        else c->out_head = n;
-        c->out_tail = n;
-        n = next;
-    }
-    c->repl_backlog_head = NULL;
-    c->repl_backlog_tail = NULL;
-}
-
-static int repl_activate_slave(conn_t *c) {
-    if (!c || c->replica_state != REPL_STATE_WAIT_BGSAVE) return -1;
-    if (queue_snapshot_file(c, g_cfg.dump_path) != 0) return -1;
-    repl_backlog_flush_to_outq(c);
-    c->replica_state = REPL_STATE_ONLINE;
-    c->wait_bgsave_seq = 0;
-    return 0;
-}
 
 void repl_add_slave(conn_t *c) {
     pthread_mutex_lock(&g_repl_lock);
     c->is_replica = 1;
-    c->replica_state = REPL_STATE_WAIT_BGSAVE;
-    c->wait_bgsave_seq = persist_bgsave_in_progress() ? (g_bgsave_seq + 1) : (g_bgsave_seq + 1);
     c->next_replica = g_replicas;
     g_replicas = c;
     pthread_mutex_unlock(&g_repl_lock);
@@ -124,35 +79,26 @@ void repl_remove_slave(conn_t *c) {
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     pthread_mutex_lock(&g_repl_lock);
-    for (conn_t *c = g_replicas; c; c = c->next_replica) {
-        if (c->replica_state == REPL_STATE_ONLINE) queue_bytes(c, raw, rawlen);
-        else if (c->replica_state == REPL_STATE_WAIT_BGSAVE) repl_backlog_append(c, raw, rawlen);
-    }
+    for (conn_t *c = g_replicas; c; c = c->next_replica) queue_bytes(c, raw, rawlen);
     pthread_mutex_unlock(&g_repl_lock);
 }
 
-void repl_fullsync_cron(void) {
-    pthread_mutex_lock(&g_repl_lock);
-
-    int has_waiting = 0;
-    int has_ready = 0;
-    for (conn_t *c = g_replicas; c; c = c->next_replica) {
-        if (c->replica_state != REPL_STATE_WAIT_BGSAVE) continue;
-        has_waiting = 1;
-        if (c->wait_bgsave_seq <= g_bgsave_done_seq) has_ready = 1;
-    }
-
-    if (!persist_bgsave_in_progress() && has_waiting && !has_ready) {
-        persist_bgsave_start();
-    }
-
-    for (conn_t *c = g_replicas; c; c = c->next_replica) {
-        if (c->replica_state == REPL_STATE_WAIT_BGSAVE && c->wait_bgsave_seq <= g_bgsave_done_seq) {
-            repl_activate_slave(c);
-        }
-    }
-
-    pthread_mutex_unlock(&g_repl_lock);
+static int queue_snapshot(conn_t *c) {
+    char hdr[64];
+    int n = resp_simple_string(hdr, sizeof(hdr), "FULLRESYNC");
+    queue_bytes(c, (unsigned char *)hdr, (size_t)n);
+    FILE *fp = fopen(g_cfg.dump_path, "wb");
+    if (!fp) return -1;
+    if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); return -1; }
+    fclose(fp);
+    fp = fopen(g_cfg.dump_path, "rb");
+    if (!fp) return -1;
+    unsigned char buf[8192]; size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) queue_bytes(c, buf, r);
+    fclose(fp);
+    size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
+    queue_bytes(c, buf, done);
+    return 0;
 }
 
 static int is_readonly_slave_blocked(const char *cmd) {
@@ -405,24 +351,19 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
     }
-    if (!strcmp(cmd, "REPLSYNC")) {
-        repl_add_slave(c);
-        repl_fullsync_cron();
-        n = resp_simple_string(resp, sizeof(resp), "FULLRESYNC scheduled");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-        return 0;
-    }
+    if (!strcmp(cmd, "REPLSYNC")) { repl_add_slave(c); queue_snapshot(c); return 0; }
     if (!strcmp(cmd, "REPLDONE")) return 0;
     if (!strcmp(cmd, "INFO")) {
-        char info[512];
+        char info[1024];
         snprintf(info, sizeof(info),
-                 "role:%s mem:%s bgsave:%s bgsave_pid:%ld bgsave_start_ms:%lld bgsave_end_ms:%lld",
-                 g_cfg.role == ROLE_MASTER ? "master" : "slave",
-                 kvs_mem_backend_name(),
-                 persist_bgsave_state_name(),
-                 (long)g_bgsave_pid,
-                 g_bgsave_last_start_ms,
-                 g_bgsave_last_end_ms);
+            "role:%s\nmem:%s\ndirty:%llu\nlast_snapshot_ms:%lld\nautosnap_rules:%d\nbgsave:%s\nbgsave_pid:%ld",
+            g_cfg.role == ROLE_MASTER ? "master" : "slave",
+            kvs_mem_backend_name(),
+            (unsigned long long)persist_dirty_count(),
+            persist_last_snapshot_ms(),
+            g_cfg.autosnap_rule_count,
+            persist_bgsave_state_name(),
+            (long)g_bgsave_pid);
         n = resp_bulk(resp, sizeof(resp), info, strlen(info));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
@@ -443,8 +384,28 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "BGSAVE")) {
         int brc = persist_bgsave_start();
         if (brc == 0) n = resp_simple_string(resp, sizeof(resp), "Background saving started");
-        else if (brc == 1) n = resp_error(resp, sizeof(resp), "background save already in progress");
-        else n = resp_error(resp, sizeof(resp), "background save failed to start");
+        else if (brc == 1) n = resp_error(resp, sizeof(resp), "background saving already in progress");
+        else n = resp_error(resp, sizeof(resp), "bgsave failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "SNAPRULE") && argc == 3) {
+        int arc = persist_register_autosnap_rule(atoll(argv[1]), atoll(argv[2]));
+        n = (arc == 0) ? resp_simple_string(resp, sizeof(resp), "OK") : resp_error(resp, sizeof(resp), "snaprule failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "SNAPRULES")) {
+        char info[BUFFER_CAP];
+        n = persist_build_autosnap_text(info, sizeof(info));
+        if (n < 0) n = resp_error(resp, sizeof(resp), "snaprules build failed");
+        else n = resp_bulk(resp, sizeof(resp), info, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        return 0;
+    }
+    if (!strcmp(cmd, "SNAPRULECLEAR")) {
+        persist_clear_autosnap_rules();
+        n = resp_simple_string(resp, sizeof(resp), "OK");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         return 0;
     }
@@ -493,6 +454,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (rc == 0) {
         n = resp_simple_string(resp, sizeof(resp), "OK");
         if (!from_replication && is_write_cmd(cmd)) {
+            persist_note_write();
             persist_append_raw(raw, rawlen);
             if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
         }
@@ -688,7 +650,7 @@ int kvs_snapshot_to_fp(FILE *fp) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

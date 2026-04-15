@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 BACKENDS = ("libc", "jemalloc", "custom")
+ENGINE_CMDS = ("SET", "RSET", "HSET", "XSET")
 
 
 def build_resp(*parts: str) -> bytes:
@@ -128,7 +129,13 @@ def launch_server(binary: Path, backend: str, port: int, dump_path: Path, aof_pa
         jem = "/lib/x86_64-linux-gnu/libjemalloc.so.2"
         if os.path.exists(jem):
             env["LD_PRELOAD"] = jem
-    return subprocess.Popen(cmd, cwd=binary.parent, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    return subprocess.Popen(
+        cmd,
+        cwd=binary.parent,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env
+    )
 
 
 def run_one_backend(binary: Path, backend: str, port: int, n: int, value_size: int, warmup: int,
@@ -137,10 +144,12 @@ def run_one_backend(binary: Path, backend: str, port: int, n: int, value_size: i
     dump_path = binary.parent / f"bench_{run_tag}.dump"
     aof_path = binary.parent / f"bench_{run_tag}.aof"
     cleanup_files(dump_path, aof_path)
+
     proc = launch_server(binary, backend, port, dump_path, aof_path)
     try:
         wait_ready(port)
         payload = "x" * value_size
+
         with socket.create_connection(("127.0.0.1", port), timeout=10.0) as sock:
             for i in range(warmup):
                 resp = send_cmd(sock, cmd_name, f"warm:{run_tag}:{i}", payload)
@@ -154,6 +163,7 @@ def run_one_backend(binary: Path, backend: str, port: int, n: int, value_size: i
                     raise RuntimeError(f"unexpected {cmd_name} response for {backend}: {resp!r}")
             elapsed = time.perf_counter() - t0
             qps = n / elapsed if elapsed > 0 else 0.0
+
             time.sleep(settle)
             memstat_raw = send_cmd(sock, "MEMSTAT")
             info_raw = send_cmd(sock, "INFO")
@@ -161,6 +171,7 @@ def run_one_backend(binary: Path, backend: str, port: int, n: int, value_size: i
         status = parse_proc_status(proc.pid)
         memstat = parse_memstat(memstat_raw.decode() if isinstance(memstat_raw, bytes) else "")
         info_text = info_raw.decode() if isinstance(info_raw, bytes) else str(info_raw)
+
         row = {
             "run_label": run_label,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -198,7 +209,9 @@ def run_one_backend(binary: Path, backend: str, port: int, n: int, value_size: i
             "small_page_used_bytes": memstat.get("small_page_used_bytes", "0"),
             "page_utilization": memstat.get("page_utilization", "0"),
         }
+
         append_csv(csv_path, row)
+
         print(
             f"{backend}: cmd={row['cmd']} qps={row['qps']} "
             f"vmrss_kb={row['vmrss_kb']} vmsize_kb={row['vmsize_kb']} mem_gap_kb={row['mem_gap_kb']} "
@@ -217,14 +230,21 @@ def run_one_backend(binary: Path, backend: str, port: int, n: int, value_size: i
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark kvstore memory backends and optionally append to a CSV.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark kvstore memory backends and optionally append to a CSV."
+    )
     parser.add_argument("--binary", default="./kvstore", help="kvstore binary path")
     parser.add_argument("--csv", default="../data/bench_results_all.csv", help="cumulative csv path")
-    parser.add_argument("--ops", type=int, default=50000)
-    parser.add_argument("--value-size", type=int, default=128)
-    parser.add_argument("--warmup", type=int, default=200)
-    parser.add_argument("--settle", type=float, default=0.5)
-    parser.add_argument("--cmd", default="HSET", choices=["SET", "RSET", "HSET"])
+    parser.add_argument("--ops", type=int, default=50000, help="number of write ops per backend")
+    parser.add_argument("--value-size", type=int, default=128, help="value payload size")
+    parser.add_argument("--warmup", type=int, default=200, help="warmup ops before measuring")
+    parser.add_argument("--settle", type=float, default=0.5, help="sleep before collecting MEMSTAT/INFO")
+    parser.add_argument(
+        "--cmd",
+        default="HSET",
+        choices=ENGINE_CMDS,
+        help="write command to benchmark: SET(array), RSET(rbtree), HSET(hash), XSET(skiptable)"
+    )
     parser.add_argument("--base-port", type=int, default=6500)
     parser.add_argument("--backends", default=",".join(BACKENDS), help="comma separated backends")
     parser.add_argument("--run-label", default="", help="label for this multi-backend run")
@@ -239,18 +259,36 @@ def main():
         return 1
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
+    if not backends:
+        print("no backends specified", file=sys.stderr)
+        return 1
+
     run_label = args.run_label or f"{args.cmd.lower()}_ops{args.ops}_val{args.value_size}"
     csv_path = Path(args.csv).resolve()
+
     if csv_path.exists() and not args.append:
         csv_path.unlink()
 
     for idx, backend in enumerate(backends):
-        run_one_backend(binary, backend, args.base_port + idx, args.ops, args.value_size, args.warmup, args.settle, args.cmd, csv_path, run_label)
+        run_one_backend(
+            binary=binary,
+            backend=backend,
+            port=args.base_port + idx,
+            n=args.ops,
+            value_size=args.value_size,
+            warmup=args.warmup,
+            settle=args.settle,
+            cmd_name=args.cmd,
+            csv_path=csv_path,
+            run_label=run_label,
+        )
 
     print(f"wrote results to {csv_path}")
+
     if args.plot:
         plot_cmd = [sys.executable, args.plot_script, "--csv", str(csv_path), "--cmd", args.cmd]
         subprocess.run(plot_cmd, check=False)
+
     return 0
 
 

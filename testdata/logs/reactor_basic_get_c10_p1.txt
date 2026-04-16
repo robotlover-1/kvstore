@@ -1,0 +1,11 @@
+GET: -nan====== GET ======
+  10000 requests completed in 0.11 seconds
+  10 parallel clients
+  3 bytes payload
+  keep alive: 1
+
+99.97% <= 1 milliseconds
+100.00% <= 1 milliseconds
+89285.71 requests per second
+
+

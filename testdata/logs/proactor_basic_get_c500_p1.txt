@@ -1,0 +1,35 @@
+GET: 0.00====== GET ======
+  10000 requests completed in 0.09 seconds
+  500 parallel clients
+  3 bytes payload
+  keep alive: 1
+
+0.01% <= 2 milliseconds
+52.73% <= 3 milliseconds
+89.38% <= 4 milliseconds
+98.51% <= 5 milliseconds
+99.79% <= 7 milliseconds
+99.80% <= 10 milliseconds
+99.81% <= 11 milliseconds
+99.82% <= 13 milliseconds
+99.83% <= 15 milliseconds
+99.84% <= 17 milliseconds
+99.85% <= 19 milliseconds
+99.86% <= 20 milliseconds
+99.87% <= 23 milliseconds
+99.88% <= 26 milliseconds
+99.89% <= 28 milliseconds
+99.90% <= 29 milliseconds
+99.91% <= 31 milliseconds
+99.92% <= 33 milliseconds
+99.93% <= 34 milliseconds
+99.94% <= 36 milliseconds
+99.95% <= 38 milliseconds
+99.96% <= 40 milliseconds
+99.97% <= 42 milliseconds
+99.98% <= 44 milliseconds
+99.99% <= 46 milliseconds
+100.00% <= 48 milliseconds
+109890.11 requests per second
+
+

@@ -1,0 +1,17 @@
+SET: 0.00====== SET ======
+  10000 requests completed in 0.10 seconds
+  500 parallel clients
+  16 bytes payload
+  keep alive: 1
+
+0.01% <= 2 milliseconds
+1.62% <= 3 milliseconds
+30.32% <= 4 milliseconds
+73.21% <= 5 milliseconds
+88.04% <= 6 milliseconds
+97.39% <= 7 milliseconds
+99.27% <= 8 milliseconds
+100.00% <= 8 milliseconds
+98039.22 requests per second
+
+

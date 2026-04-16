@@ -7,6 +7,8 @@ INC_DIR=include/kvstore
 
 SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/core/reactor.c \
+     $(SRC_DIR)/core/proactor.c \
+     $(SRC_DIR)/core/ntyco.c \
      $(SRC_DIR)/storage/kvs_array.c \
      $(SRC_DIR)/storage/kvs_hash.c \
      $(SRC_DIR)/storage/kvs_rbtree.c \
@@ -15,6 +17,7 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/expire/kvs_expire.c \
      $(SRC_DIR)/persistence/kvs_persist.c \
      $(SRC_DIR)/replication/kvs_repl.c \
+     $(SRC_DIR)/replication/kvs_sentinel.c \
      $(SRC_DIR)/utils/hash.c
 
 OBJS=$(patsubst $(SRC_DIR)/%.c, build/%.o, $(SRCS))

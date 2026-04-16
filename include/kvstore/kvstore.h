@@ -194,9 +194,19 @@ typedef struct {
     char dump_path[256];
     char aof_path[256];
     char mem_backend[32];
+    char net_backend[32];
     kvs_aof_fsync_policy_t aof_fsync;
     int autosnap_rule_count;
     kvs_autosnap_rule_t autosnap_rules[KVS_AUTOSNAP_RULES_MAX];
+
+    int is_sentinel;
+    char sentinel_master_name[64];
+    char sentinel_monitor_host[128];
+    int sentinel_monitor_port;
+    char sentinel_known_slaves[512];
+    int sentinel_down_after_ms;
+    int sentinel_failover_timeout_ms;
+    int sentinel_quorum;
 } kv_config_t;
 
 typedef struct {
@@ -264,6 +274,9 @@ long long kvs_expire_ttl(kvs_expire_table_t *tab, int engine, const char *key);
 int kvs_active_expire_cycle(int budget);
 
 int reactor_start(void);
+int proactor_start(unsigned short port);
+int ntyco_start(unsigned short port);
+
 int queue_bytes(conn_t *c, const unsigned char *buf, size_t len);
 void close_conn(conn_t *c);
 int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication);
@@ -273,6 +286,8 @@ void repl_add_slave(conn_t *c);
 void repl_remove_slave(conn_t *c);
 void repl_broadcast(const unsigned char *raw, size_t rawlen);
 int start_slave_thread(void);
+int repl_slaveof(const char *host, int port);
+int repl_slaveof_noone(void);
 
 int persist_init(void);
 void persist_close(void);
@@ -299,6 +314,7 @@ int persist_register_autosnap_rule(long long seconds, long long changes);
 void persist_clear_autosnap_rules(void);
 int persist_build_autosnap_text(char *buf, size_t cap);
 int persist_autosnap_cron(void);
+int sentinel_start(void);
 
 extern pid_t g_bgsave_pid;
 extern long long g_bgsave_last_start_ms;
@@ -313,5 +329,7 @@ int resp_null_bulk(char *out, size_t cap);
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);
+
+const char *repl_master_link_state_name(void);
 
 #endif

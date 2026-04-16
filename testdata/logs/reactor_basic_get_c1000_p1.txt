@@ -1,0 +1,21 @@
+GET: 0.00====== GET ======
+  10000 requests completed in 0.11 seconds
+  1000 parallel clients
+  3 bytes payload
+  keep alive: 1
+
+0.01% <= 4 milliseconds
+4.84% <= 5 milliseconds
+12.54% <= 6 milliseconds
+32.07% <= 7 milliseconds
+52.20% <= 8 milliseconds
+73.55% <= 9 milliseconds
+82.84% <= 10 milliseconds
+90.46% <= 11 milliseconds
+92.78% <= 12 milliseconds
+95.29% <= 13 milliseconds
+98.87% <= 14 milliseconds
+100.00% <= 14 milliseconds
+94339.62 requests per second
+
+

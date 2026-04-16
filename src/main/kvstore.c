@@ -11,7 +11,16 @@ kv_config_t g_cfg = {
     .dump_path = "kvstore.dump",
     .aof_path = "kvstore.aof",
     .mem_backend = "libc",
+    .net_backend = "reactor",
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
+    .is_sentinel = 0,
+    .sentinel_master_name = "mymaster",
+    .sentinel_monitor_host = "127.0.0.1",
+    .sentinel_monitor_port = 5000,
+    .sentinel_known_slaves = "",
+    .sentinel_down_after_ms = 5000,
+    .sentinel_failover_timeout_ms = 10000,
+    .sentinel_quorum = 1,
 };
 conn_t *g_replicas = NULL;
 pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -57,6 +66,9 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--aof") && i + 1 < argc) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--mem") && i + 1 < argc) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--net") && i + 1 < argc) {
+            snprintf(g_cfg.net_backend, sizeof(g_cfg.net_backend), "%s", argv[++i]);
+        }
         else if (!strcmp(argv[i], "--appendfsync") && i + 1 < argc) {
             kvs_aof_fsync_policy_t policy;
             if (parse_appendfsync_policy(argv[++i], &policy) != 0) return -1;
@@ -64,6 +76,30 @@ static int parse_args(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--autosnap") && i + 1 < argc) {
             if (parse_autosnap_rules(argv[++i]) != 0) return -1;
+        }
+        else if (!strcmp(argv[i], "--sentinel")) {
+            g_cfg.is_sentinel = 1;
+        }
+        else if (!strcmp(argv[i], "--sentinel-master-name") && i + 1 < argc) {
+            snprintf(g_cfg.sentinel_master_name, sizeof(g_cfg.sentinel_master_name), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--sentinel-monitor-host") && i + 1 < argc) {
+            snprintf(g_cfg.sentinel_monitor_host, sizeof(g_cfg.sentinel_monitor_host), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--sentinel-monitor-port") && i + 1 < argc) {
+            g_cfg.sentinel_monitor_port = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--sentinel-known-slaves") && i + 1 < argc) {
+            snprintf(g_cfg.sentinel_known_slaves, sizeof(g_cfg.sentinel_known_slaves), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--sentinel-down-after") && i + 1 < argc) {
+            g_cfg.sentinel_down_after_ms = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--sentinel-failover-timeout") && i + 1 < argc) {
+            g_cfg.sentinel_failover_timeout_ms = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--sentinel-quorum") && i + 1 < argc) {
+            g_cfg.sentinel_quorum = atoi(argv[++i]);
         }
         else return -1;
     }
@@ -133,7 +169,8 @@ static int is_readonly_slave_blocked(const char *cmd) {
         && strcmp(cmd, "RGET") && strcmp(cmd, "RMGET") && strcmp(cmd, "RTTL") && strcmp(cmd, "REXIST")
         && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST")
         && strcmp(cmd, "TGET") && strcmp(cmd, "TMGET") && strcmp(cmd, "TTTL") && strcmp(cmd, "TEXIST")
-        && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT");
+        && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT")
+        && strcmp(cmd, "SLAVEOF") && strcmp(cmd, "ROLE");
 }
 
 static int is_write_cmd(const char *cmd) {
@@ -141,7 +178,7 @@ static int is_write_cmd(const char *cmd) {
         "SET","MSET","MOD","DEL","EXPIRE","PERSIST",
         "RSET","RMSET","RMOD","RDEL","REXPIRE","RPERSIST",
         "HSET","HMSET","HMOD","HDEL","HEXPIRE","HPERSIST",
-        "TSET","TMSET","TMOD","TDEL","TEXPIRE","TPERSIST",
+        "XSET","XMSET","XMOD","XDEL","XEXPIRE","XPERSIST",
         "LOCK","UNLOCK","RENEW",
         NULL
     };
@@ -152,12 +189,13 @@ static int is_write_cmd(const char *cmd) {
 static int cmd_engine(const char *cmd) {
     if (cmd[0] == 'R') return KVS_ENGINE_RBTREE;
     if (cmd[0] == 'H') return KVS_ENGINE_HASH;
-    if (cmd[0] == 'T') return KVS_ENGINE_SKIPTABLE;
+    if (cmd[0] == 'X') return KVS_ENGINE_SKIPTABLE;
     return KVS_ENGINE_ARRAY;
 }
 
 static const char *strip_prefix(const char *cmd) {
-    if (cmd[0] == 'R' || cmd[0] == 'H' || cmd[0] == 'T') return cmd + 1;
+    if (cmd[0] == 'R' || cmd[0] == 'H' || cmd[0] == 'X')
+        return cmd + 1;
     return cmd;
 }
 
@@ -434,59 +472,87 @@ static int split_inline_argv(char *line, char **argv, int maxargc) {
 }
 
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication) {
+
+    int rc_ret = 0;
+    int n = 0;
+    char *resp = (char *)kvs_malloc(BUFFER_CAP);
+    if (!resp) return -1;
+
     (void)argl;
-    char resp[BUFFER_CAP]; int n = 0;
-    if (argc <= 0) return -1;
+    if (argc <= 0) {
+        rc_ret = -1;
+        goto out;
+    }
+
     kvs_ascii_upper(argv[0]);
     const char *cmd = argv[0];
 
     if (g_cfg.role == ROLE_SLAVE && !from_replication && is_readonly_slave_blocked(cmd)) {
-        n = resp_error(resp, sizeof(resp), "read only slave");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_error(resp, BUFFER_CAP, "read only slave");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "PING")) {
-        if (argc >= 2) n = resp_bulk(resp, sizeof(resp), argv[1], strlen(argv[1]));
-        else n = resp_simple_string(resp, sizeof(resp), "PONG");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (argc >= 2) n = resp_bulk(resp, BUFFER_CAP, argv[1], strlen(argv[1]));
+        else n = resp_simple_string(resp, BUFFER_CAP, "PONG");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "ECHO") && argc == 2) {
-        n = resp_bulk(resp, sizeof(resp), argv[1], strlen(argv[1]));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_bulk(resp, BUFFER_CAP, argv[1], strlen(argv[1]));
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "QUIT")) {
-        n = resp_simple_string(resp, sizeof(resp), "OK");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "COMMAND")) {
-        n = resp_empty_array(resp, sizeof(resp));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_empty_array(resp, BUFFER_CAP);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "CLIENT")) {
         if (argc >= 2 && !strcmp(argv[1], "SETINFO")) {
-            n = resp_simple_string(resp, sizeof(resp), "OK");
+            n = resp_simple_string(resp, BUFFER_CAP, "OK");
         } else {
-            n = resp_array_two_bulk(resp, sizeof(resp), "id", "1");
-            if (n < 0) n = resp_error(resp, sizeof(resp), "client subcommand failed");
+            n = resp_array_two_bulk(resp, BUFFER_CAP, "id", "1");
+            if (n < 0) n = resp_error(resp, BUFFER_CAP, "client subcommand failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "HELLO")) {
-        n = resp_error(resp, sizeof(resp), "NOPROTO unsupported RESP version");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_error(resp, BUFFER_CAP, "NOPROTO unsupported RESP version");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "REPLSYNC")) { repl_add_slave(c); queue_snapshot(c); return 0; }
     if (!strcmp(cmd, "REPLDONE")) return 0;
     if (!strcmp(cmd, "INFO")) {
         char info[2048];
+
+        int replicas = 0;
+        pthread_mutex_lock(&g_repl_lock);
+        for (conn_t *rc = g_replicas; rc; rc = rc->next_replica) replicas++;
+        pthread_mutex_unlock(&g_repl_lock);
+
         snprintf(info, sizeof(info),
-            "role:%s\nmem:%s\ndirty:%llu\nlast_snapshot_ms:%lld\nautosnap_rules:%d\nbgsave:%s\nbgsave_pid:%ld\naof_fsync:%s\naof_rewrite:%s\naof_rewrite_pid:%ld",
+            "role:%s\n"
+            "mem:%s\n"
+            "dirty:%llu\n"
+            "last_snapshot_ms:%lld\n"
+            "autosnap_rules:%d\n"
+            "bgsave:%s\n"
+            "bgsave_pid:%ld\n"
+            "aof_fsync:%s\n"
+            "aof_rewrite:%s\n"
+            "aof_rewrite_pid:%ld\n"
+            "master_host:%s\n"
+            "master_port:%d\n"
+            "master_link:%s\n"
+            "replicas:%d",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
             (unsigned long long)persist_dirty_count(),
@@ -496,139 +562,182 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             (long)g_bgsave_pid,
             persist_aof_policy_name(),
             persist_bgrewriteaof_state_name(),
-            (long)(persist_bgrewriteaof_in_progress() ? 1 : -1));
-        n = resp_bulk(resp, sizeof(resp), info, strlen(info));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+            (long)(persist_bgrewriteaof_in_progress() ? 1 : -1),
+            g_cfg.master_host[0] ? g_cfg.master_host : "",
+            g_cfg.master_port,
+            repl_master_link_state_name(),
+            replicas);
+
+        n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "MEMSTAT")) {
-        char info[BUFFER_CAP];
+        char *info = (char *)kvs_malloc(BUFFER_CAP);
         n = build_memstat_text(info, sizeof(info));
-        if (n < 0) n = resp_error(resp, sizeof(resp), "memstat build failed");
-        else n = resp_bulk(resp, sizeof(resp), info, (size_t)n);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (n < 0) n = resp_error(resp, BUFFER_CAP, "memstat build failed");
+        else n = resp_bulk(resp, BUFFER_CAP, info, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "SAVE")) {
-        n = (persist_save_dump() == 0) ? resp_simple_string(resp, sizeof(resp), "OK") : resp_error(resp, sizeof(resp), "save failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = (persist_save_dump() == 0) ? resp_simple_string(resp, BUFFER_CAP, "OK") : resp_error(resp, BUFFER_CAP, "save failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "BGSAVE")) {
         int brc = persist_bgsave_start();
-        if (brc == 0) n = resp_simple_string(resp, sizeof(resp), "Background saving started");
-        else if (brc == 1) n = resp_error(resp, sizeof(resp), "background saving already in progress");
-        else n = resp_error(resp, sizeof(resp), "bgsave failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (brc == 0) n = resp_simple_string(resp, BUFFER_CAP, "Background saving started");
+        else if (brc == 1) n = resp_error(resp, BUFFER_CAP, "background saving already in progress");
+        else n = resp_error(resp, BUFFER_CAP, "bgsave failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "BGREWRITEAOF")) {
         int rrc = persist_bgrewriteaof_start();
-        if (rrc == 0) n = resp_simple_string(resp, sizeof(resp), "Background append only file rewriting started");
-        else if (rrc == 1) n = resp_error(resp, sizeof(resp), "aof rewrite already in progress");
-        else n = resp_error(resp, sizeof(resp), "bgrewriteaof failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (rrc == 0) n = resp_simple_string(resp, BUFFER_CAP, "Background append only file rewriting started");
+        else if (rrc == 1) n = resp_error(resp, BUFFER_CAP, "aof rewrite already in progress");
+        else n = resp_error(resp, BUFFER_CAP, "bgrewriteaof failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "APPENDFSYNC") && argc == 2) {
         kvs_aof_fsync_policy_t policy;
         if (parse_appendfsync_policy(argv[1], &policy) != 0 || persist_set_aof_policy(policy) != 0)
-            n = resp_error(resp, sizeof(resp), "invalid fsync policy");
+            n = resp_error(resp, BUFFER_CAP, "invalid fsync policy");
         else
-            n = resp_simple_string(resp, sizeof(resp), "OK");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+            n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "CONFIG") && argc == 3) {
         if (!strcasecmp(argv[1], "APPENDFSYNC")) {
             kvs_aof_fsync_policy_t policy;
             if (parse_appendfsync_policy(argv[2], &policy) != 0 || persist_set_aof_policy(policy) != 0)
-                n = resp_error(resp, sizeof(resp), "invalid fsync policy");
+                n = resp_error(resp, BUFFER_CAP, "invalid fsync policy");
             else
-                n = resp_simple_string(resp, sizeof(resp), "OK");
+                n = resp_simple_string(resp, BUFFER_CAP, "OK");
         } else {
-            n = resp_error(resp, sizeof(resp), "unsupported config option");
+            n = resp_error(resp, BUFFER_CAP, "unsupported config option");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULE") && argc == 3) {
         int arc = persist_register_autosnap_rule(atoll(argv[1]), atoll(argv[2]));
-        n = (arc == 0) ? resp_simple_string(resp, sizeof(resp), "OK") : resp_error(resp, sizeof(resp), "snaprule failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = (arc == 0) ? resp_simple_string(resp, BUFFER_CAP, "OK") : resp_error(resp, BUFFER_CAP, "snaprule failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULES")) {
-        char info[BUFFER_CAP];
-        n = persist_build_autosnap_text(info, sizeof(info));
-        if (n < 0) n = resp_error(resp, sizeof(resp), "snaprules build failed");
-        else n = resp_bulk(resp, sizeof(resp), info, (size_t)n);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        char *info = (char *)kvs_malloc(BUFFER_CAP);
+        n = persist_build_autosnap_text(info, BUFFER_CAP);
+        if (n < 0) n = resp_error(resp, BUFFER_CAP, "snaprules build failed");
+        else n = resp_bulk(resp, BUFFER_CAP, info, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULECLEAR")) {
         persist_clear_autosnap_rules();
-        n = resp_simple_string(resp, sizeof(resp), "OK");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
 
     if (!strcmp(cmd, "LOCK") && argc == 4) {
         int lrc = lock_acquire(KVS_ENGINE_ARRAY, argv[1], argv[2], atoll(argv[3]));
         if (lrc == 0) {
-            n = resp_integer(resp, sizeof(resp), 1);
+            n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (lrc == 1) {
-            n = resp_integer(resp, sizeof(resp), 0);
+            n = resp_integer(resp, BUFFER_CAP, 0);
         } else {
-            n = resp_error(resp, sizeof(resp), "lock failed");
+            n = resp_error(resp, BUFFER_CAP, "lock failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "UNLOCK") && argc == 3) {
         int lrc = lock_release(KVS_ENGINE_ARRAY, argv[1], argv[2]);
         if (lrc == 0) {
-            n = resp_integer(resp, sizeof(resp), 1);
+            n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (lrc == 1) {
-            n = resp_integer(resp, sizeof(resp), 0);
+            n = resp_integer(resp, BUFFER_CAP, 0);
         } else {
-            n = resp_error(resp, sizeof(resp), "unlock failed");
+            n = resp_error(resp, BUFFER_CAP, "unlock failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "RENEW") && argc == 4) {
         int lrc = lock_renew(KVS_ENGINE_ARRAY, argv[1], argv[2], atoll(argv[3]));
         if (lrc == 0) {
-            n = resp_integer(resp, sizeof(resp), 1);
+            n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (lrc == 1) {
-            n = resp_integer(resp, sizeof(resp), 0);
+            n = resp_integer(resp, BUFFER_CAP, 0);
         } else {
-            n = resp_error(resp, sizeof(resp), "renew failed");
+            n = resp_error(resp, BUFFER_CAP, "renew failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
     if (!strcmp(cmd, "OWNER") && argc == 2) {
         try_expire(KVS_ENGINE_ARRAY, argv[1]);
         char *v = engine_get(KVS_ENGINE_ARRAY, argv[1]);
-        n = v ? resp_bulk(resp, sizeof(resp), v, strlen(v)) : resp_null_bulk(resp, sizeof(resp));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        return 0;
+    }
+    if (!strcmp(cmd, "SLAVEOF")) {
+        if (argc == 3 && !strcasecmp(argv[1], "NO") && !strcasecmp(argv[2], "ONE")) {
+            if (repl_slaveof_noone() != 0)
+                n = resp_error(resp, BUFFER_CAP, "slaveof no one failed");
+            else
+                n = resp_simple_string(resp, BUFFER_CAP, "OK");
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+            return 0;
+        }
+
+        if (argc == 3) {
+            int port = atoi(argv[2]);
+            if (port <= 0 || repl_slaveof(argv[1], port) != 0)
+                n = resp_error(resp, BUFFER_CAP, "slaveof failed");
+            else
+                n = resp_simple_string(resp, BUFFER_CAP, "OK");
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+            return 0;
+        }
+
+        n = resp_error(resp, BUFFER_CAP, "wrong args for SLAVEOF");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        return 0;
+    }
+    if (!strcmp(cmd, "ROLE")) {
+        if (g_cfg.role == ROLE_MASTER) {
+            n = resp_array_two_bulk(resp, BUFFER_CAP, "master", "0");
+        } else {
+            char mp[32];
+            snprintf(mp, sizeof(mp), "%d", g_cfg.master_port);
+            n = snprintf(resp, BUFFER_CAP,
+                "*3\r\n$5\r\nslave\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                strlen(g_cfg.master_host), g_cfg.master_host,
+                strlen(mp), mp);
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
 
@@ -643,18 +752,18 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     else if (!strcmp(op, "GET") && argc == 2) {
         try_expire(engine, argv[1]);
         char *v = engine_get(engine, argv[1]);
-        n = v ? resp_bulk(resp, sizeof(resp), v, strlen(v)) : resp_null_bulk(resp, sizeof(resp));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     } else if (!strcmp(op, "MGET")) {
-        n = handle_multi_get(engine, argc, argv, resp, sizeof(resp));
-        if (n < 0) n = resp_error(resp, sizeof(resp), "mget failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
+        if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     } else if (!strcmp(op, "EXIST") && argc == 2) {
         try_expire(engine, argv[1]);
-        n = resp_integer(resp, sizeof(resp), engine_exist(engine, argv[1]) == 0 ? 1 : 0);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_integer(resp, BUFFER_CAP, engine_exist(engine, argv[1]) == 0 ? 1 : 0);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     } else if (!strcmp(op, "EXPIRE") && argc == 3) {
         try_expire(engine, argv[1]);
@@ -662,37 +771,39 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
     } else if (!strcmp(op, "TTL") && argc == 2) {
         try_expire(engine, argv[1]);
-        if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, sizeof(resp), -2);
+        if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, BUFFER_CAP, -2);
         else {
             long long ttl = kvs_expire_ttl(&global_expire, engine, argv[1]);
-            n = resp_integer(resp, sizeof(resp), ttl);
+            n = resp_integer(resp, BUFFER_CAP, ttl);
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     } else if (!strcmp(op, "PERSIST") && argc == 2) {
         try_expire(engine, argv[1]);
         if (engine_exist(engine, argv[1]) != 0) rc = 1;
         else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
     } else {
-        n = resp_error(resp, sizeof(resp), "unknown command or wrong args");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
         return 0;
     }
 
     if (rc == 0) {
-        n = resp_simple_string(resp, sizeof(resp), "OK");
+        n = resp_simple_string(resp, BUFFER_CAP, "OK");
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
             persist_append_raw(raw, rawlen);
             if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
         }
     } else if (rc == 1) {
-        n = resp_error(resp, sizeof(resp), "not found or exists");
+        n = resp_error(resp, BUFFER_CAP, "not found or exists");
     } else {
-        n = resp_error(resp, sizeof(resp), "operation failed");
+        n = resp_error(resp, BUFFER_CAP, "operation failed");
     }
-    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-    return 0;
+    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+    out:
+    kvs_free(resp);
+    return rc_ret;
 }
 
 int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
@@ -877,7 +988,7 @@ int kvs_snapshot_to_fp(FILE *fp) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {
@@ -895,7 +1006,21 @@ int main(int argc, char **argv) {
     kvs_hash_create(&global_hash);
     kvs_skiptable_create(&global_skiptable);
     kvs_expire_create(&global_expire);
+   
+    if (g_cfg.is_sentinel) {
+        return sentinel_start();
+    }
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
-    return reactor_start();
+
+    if (!strcmp(g_cfg.net_backend, "reactor")) {
+        return reactor_start();
+    } else if (!strcmp(g_cfg.net_backend, "proactor")) {
+        return proactor_start((unsigned short)g_cfg.port);
+    } else if (!strcmp(g_cfg.net_backend, "ntyco")) {
+        return ntyco_start((unsigned short)g_cfg.port);
+    } else {
+        fprintf(stderr, "unknown net backend: %s\n", g_cfg.net_backend);
+        return 1;
+    }
 }

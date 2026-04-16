@@ -1,190 +1,256 @@
-
-
-
-#include <stdio.h>
+#include "kvstore/kvstore.h"
 #include <liburing.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <unistd.h>
 
+#define KVS_URING_ENTRIES 1024
+#define KVS_EVENT_ACCEPT  1
+#define KVS_EVENT_READ    2
+#define KVS_EVENT_WRITE   3
 
-#define EVENT_ACCEPT   	0
-#define EVENT_READ		1
-#define EVENT_WRITE		2
+typedef struct uring_req_s {
+    int event;
+    conn_t *conn;
+    int fd;
+    struct sockaddr_in client_addr;
+    socklen_t client_len;
+} uring_req_t;
 
-extern int kvs_protocol(char *msg, int length, char *response);
+static long long g_last_cron_ms = 0;
 
-
-
-struct conn_info {
-	int fd;
-	int event;
-};
-
-
-int p_init_server(unsigned short port) {	
-
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);	
-	struct sockaddr_in serveraddr;	
-	memset(&serveraddr, 0, sizeof(struct sockaddr_in));	
-	serveraddr.sin_family = AF_INET;	
-	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);	
-	serveraddr.sin_port = htons(port);	
-
-	if (-1 == bind(sockfd, (struct sockaddr*)&serveraddr, sizeof(struct sockaddr))) {		
-		perror("bind");		
-		return -1;	
-	}	
-
-	listen(sockfd, 10);
-	
-	return sockfd;
+static int set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-
-
-#define ENTRIES_LENGTH		1024
-#define BUFFER_LENGTH		1024
-
-int set_event_recv(struct io_uring *ring, int sockfd,
-				      void *buf, size_t len, int flags) {
-
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-
-	struct conn_info accept_info = {
-		.fd = sockfd,
-		.event = EVENT_READ,
-	};
-	
-	io_uring_prep_recv(sqe, sockfd, buf, len, flags);
-	memcpy(&sqe->user_data, &accept_info, sizeof(struct conn_info));
-
+static void free_req(uring_req_t *req) {
+    if (req) kvs_free(req);
 }
 
+static void close_conn_uring(conn_t *c) {
+    if (!c) return;
 
-int set_event_send(struct io_uring *ring, int sockfd,
-				      void *buf, size_t len, int flags) {
+    if (c->is_replica) repl_remove_slave(c);
 
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    close(c->fd);
 
-	struct conn_info accept_info = {
-		.fd = sockfd,
-		.event = EVENT_WRITE,
-	};
-	
-	io_uring_prep_send(sqe, sockfd, buf, len, flags);
-	memcpy(&sqe->user_data, &accept_info, sizeof(struct conn_info));
-
+    out_node_t *n = c->out_head;
+    while (n) {
+        out_node_t *next = n->next;
+        kvs_free(n->data);
+        kvs_free(n);
+        n = next;
+    }
+    kvs_free(c);
 }
 
+static void run_cron_once(void) {
+    long long now = kvs_now_ms();
+    if (now - g_last_cron_ms < 100) return;
 
-
-int set_event_accept(struct io_uring *ring, int sockfd, struct sockaddr *addr,
-					socklen_t *addrlen, int flags) {
-
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-
-	struct conn_info accept_info = {
-		.fd = sockfd,
-		.event = EVENT_ACCEPT,
-	};
-	
-	io_uring_prep_accept(sqe, sockfd, (struct sockaddr*)addr, addrlen, flags);
-	memcpy(&sqe->user_data, &accept_info, sizeof(struct conn_info));
-
+    kvs_active_expire_cycle(32);
+    persist_autosnap_cron();
+    persist_bgsave_poll();
+    persist_bgrewriteaof_poll();
+    g_last_cron_ms = now;
 }
 
+static int submit_accept(struct io_uring *ring, int lfd) {
+    uring_req_t *req = (uring_req_t *)kvs_calloc(1, sizeof(*req));
+    if (!req) return -1;
 
-typedef int (*msg_handler)(char *msg, int length, char *response);
-static msg_handler kvs_handler;
+    req->event = KVS_EVENT_ACCEPT;
+    req->fd = lfd;
+    req->client_len = sizeof(req->client_addr);
 
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        free_req(req);
+        return -1;
+    }
 
-
-
-int proactor_start(unsigned short port, msg_handler handler) {
-
-	int sockfd = p_init_server(port);
-	kvs_handler = handler;
-
-	struct io_uring_params params;
-	memset(&params, 0, sizeof(params));
-
-	struct io_uring ring;
-	io_uring_queue_init_params(ENTRIES_LENGTH, &ring, &params);
-
-	
-#if 0
-	struct sockaddr_in clientaddr;	
-	socklen_t len = sizeof(clientaddr);
-	accept(sockfd, (struct sockaddr*)&clientaddr, &len);
-#else
-
-	struct sockaddr_in clientaddr;	
-	socklen_t len = sizeof(clientaddr);
-	set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
-	
-#endif
-
-	char buffer[BUFFER_LENGTH] = {0};
-	char response[BUFFER_LENGTH] = {0};
-
-
-	while (1) {
-
-		io_uring_submit(&ring);
-
-
-		struct io_uring_cqe *cqe;
-		io_uring_wait_cqe(&ring, &cqe);
-
-		struct io_uring_cqe *cqes[128];
-		int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);  // epoll_wait
-
-		int i = 0;
-		for (i = 0;i < nready;i ++) {
-
-			struct io_uring_cqe *entries = cqes[i];
-			struct conn_info result;
-			memcpy(&result, &entries->user_data, sizeof(struct conn_info));
-
-			if (result.event == EVENT_ACCEPT) {
-
-				set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
-				//printf("set_event_accept\n"); //
-
-				int connfd = entries->res;
-
-				set_event_recv(&ring, connfd, buffer, BUFFER_LENGTH, 0);
-
-				
-			} else if (result.event == EVENT_READ) {  //
-
-				int ret = entries->res;
-
-				if (ret == 0) {
-					close(result.fd);
-				} else if (ret > 0) {
-					
-					//int kvs_protocol(char *msg, int length, char *response);
-					ret = kvs_handler(buffer, ret, response);
-					
-					set_event_send(&ring, result.fd, response, ret, 0);
-				}
-			}  else if (result.event == EVENT_WRITE) {
-  //
-
-				int ret = entries->res;
-				//printf("set_event_send ret: %d, %s\n", ret, buffer);
-
-				set_event_recv(&ring, result.fd, buffer, BUFFER_LENGTH, 0);
-				
-			}
-			
-		}
-
-		io_uring_cq_advance(&ring, nready);
-	}
-
+    io_uring_prep_accept(sqe, lfd, (struct sockaddr *)&req->client_addr, &req->client_len, 0);
+    io_uring_sqe_set_data(sqe, req);
+    return 0;
 }
 
+static int submit_read(struct io_uring *ring, conn_t *c) {
+    if (!c) return -1;
+    if (c->in_len >= sizeof(c->inbuf)) return -1;
 
+    uring_req_t *req = (uring_req_t *)kvs_calloc(1, sizeof(*req));
+    if (!req) return -1;
+
+    req->event = KVS_EVENT_READ;
+    req->conn = c;
+    req->fd = c->fd;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        free_req(req);
+        return -1;
+    }
+
+    io_uring_prep_recv(sqe, c->fd, c->inbuf + c->in_len, sizeof(c->inbuf) - c->in_len, 0);
+    io_uring_sqe_set_data(sqe, req);
+    return 0;
+}
+
+static int submit_write(struct io_uring *ring, conn_t *c) {
+    if (!c || !c->out_head) return -1;
+
+    out_node_t *n = c->out_head;
+
+    uring_req_t *req = (uring_req_t *)kvs_calloc(1, sizeof(*req));
+    if (!req) return -1;
+
+    req->event = KVS_EVENT_WRITE;
+    req->conn = c;
+    req->fd = c->fd;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        free_req(req);
+        return -1;
+    }
+
+    io_uring_prep_send(sqe, c->fd, n->data + n->sent, n->len - n->sent, 0);
+    io_uring_sqe_set_data(sqe, req);
+    return 0;
+}
+
+static int create_listener(unsigned short port) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) return -1;
+
+    int yes = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    if (set_nonblock(lfd) != 0) {
+        close(lfd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(lfd);
+        return -1;
+    }
+    if (listen(lfd, LISTEN_BACKLOG) != 0) {
+        close(lfd);
+        return -1;
+    }
+    return lfd;
+}
+
+int proactor_start(unsigned short port) {
+    int lfd = create_listener(port);
+    if (lfd < 0) return -1;
+
+    if (g_cfg.role == ROLE_SLAVE) start_slave_thread();
+
+    struct io_uring ring;
+    if (io_uring_queue_init(KVS_URING_ENTRIES, &ring, 0) != 0) {
+        close(lfd);
+        return -1;
+    }
+
+    g_last_cron_ms = kvs_now_ms();
+
+    if (submit_accept(&ring, lfd) != 0) {
+        io_uring_queue_exit(&ring);
+        close(lfd);
+        return -1;
+    }
+    io_uring_submit(&ring);
+
+    while (1) {
+        struct io_uring_cqe *cqe = NULL;
+        int rc = io_uring_wait_cqe_timeout(&ring, &cqe, NULL);
+        run_cron_once();
+
+        if (rc == -ETIME || rc == -EINTR) continue;
+        if (rc < 0) break;
+        if (!cqe) continue;
+
+        uring_req_t *req = (uring_req_t *)io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
+
+        if (!req) {
+            io_uring_cqe_seen(&ring, cqe);
+            continue;
+        }
+
+        if (req->event == KVS_EVENT_ACCEPT) {
+            int cfd = res;
+            submit_accept(&ring, lfd);
+
+            if (cfd >= 0) {
+                conn_t *c = (conn_t *)kvs_calloc(1, sizeof(*c));
+                if (!c) {
+                    close(cfd);
+                } else {
+                    c->fd = cfd;
+                    set_nonblock(cfd);
+                    if (submit_read(&ring, c) != 0) {
+                        close_conn_uring(c);
+                    }
+                }
+            }
+        } else if (req->event == KVS_EVENT_READ) {
+            conn_t *c = req->conn;
+            if (!c) {
+                /* ignore */
+            } else if (res <= 0) {
+                if (c->out_head) {
+                    if (submit_write(&ring, c) != 0) close_conn_uring(c);
+                } else {
+                    close_conn_uring(c);
+                }
+            } else {
+                c->in_len += (size_t)res;
+                parse_resp_stream(c, c->inbuf, &c->in_len, 0);
+
+                if (c->out_head) {
+                    if (submit_write(&ring, c) != 0) close_conn_uring(c);
+                } else {
+                    if (submit_read(&ring, c) != 0) close_conn_uring(c);
+                }
+            }
+        } else if (req->event == KVS_EVENT_WRITE) {
+            conn_t *c = req->conn;
+            if (!c || !c->out_head) {
+                /* ignore */
+            } else if (res <= 0) {
+                close_conn_uring(c);
+            } else {
+                out_node_t *n = c->out_head;
+                n->sent += (size_t)res;
+
+                if (n->sent >= n->len) {
+                    c->out_head = n->next;
+                    if (!c->out_head) c->out_tail = NULL;
+                    kvs_free(n->data);
+                    kvs_free(n);
+                }
+
+                if (c->out_head) {
+                    if (submit_write(&ring, c) != 0) close_conn_uring(c);
+                } else {
+                    if (submit_read(&ring, c) != 0) close_conn_uring(c);
+                }
+            }
+        }
+
+        free_req(req);
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_submit(&ring);
+    }
+
+    io_uring_queue_exit(&ring);
+    close(lfd);
+    return -1;
+}

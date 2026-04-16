@@ -1,0 +1,10 @@
+GET: 16000.00GET: 19541.83GET: 19706.59====== GET ======
+  10000 requests completed in 0.51 seconds
+  1 parallel clients
+  3 bytes payload
+  keep alive: 1
+
+100.00% <= 0 milliseconds
+19685.04 requests per second
+
+

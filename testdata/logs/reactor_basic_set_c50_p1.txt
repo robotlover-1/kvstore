@@ -1,0 +1,11 @@
+SET: -nan====== SET ======
+  10000 requests completed in 0.10 seconds
+  50 parallel clients
+  16 bytes payload
+  keep alive: 1
+
+98.99% <= 1 milliseconds
+100.00% <= 1 milliseconds
+100000.00 requests per second
+
+

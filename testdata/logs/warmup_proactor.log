@@ -1,0 +1,17 @@
+GET: -nanGET: 9800.00GET: 9668.00GET: 9133.33GET: 9250.00GET: 9230.40GET: 9100.00GET: 9120.57GET: 9137.00====== GET ======
+  20000 requests completed in 2.20 seconds
+  50 parallel clients
+  3 bytes payload
+  keep alive: 1
+
+85.79% <= 1 milliseconds
+98.17% <= 2 milliseconds
+99.29% <= 3 milliseconds
+99.36% <= 4 milliseconds
+99.44% <= 5 milliseconds
+99.64% <= 6 milliseconds
+99.89% <= 7 milliseconds
+100.00% <= 7 milliseconds
+9099.18 requests per second
+
+

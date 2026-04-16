@@ -1,0 +1,16 @@
+model,concurrency,status,qps,avg_ms,p50_ms,p95_ms,p99_ms,errors,logfile
+reactor,100,fail,NA,NA,NA,NA,NA,0,./testdata//logs/reactor_maxconn_c100.txt
+reactor,500,fail,NA,NA,NA,NA,NA,0,./testdata//logs/reactor_maxconn_c500.txt
+reactor,1000,fail,NA,NA,NA,NA,NA,0,./testdata//logs/reactor_maxconn_c1000.txt
+reactor,2000,fail,NA,NA,NA,NA,NA,0,./testdata//logs/reactor_maxconn_c2000.txt
+reactor,5000,fail,NA,NA,NA,NA,NA,0,./testdata//logs/reactor_maxconn_c5000.txt
+proactor,100,ok,117647.05,inf,1,1,1,0,./testdata//logs/proactor_maxconn_c100.txt
+proactor,500,ok,90090.09,inf,4,5,5,0,./testdata//logs/proactor_maxconn_c500.txt
+proactor,1000,ok,75187.97,inf,7,8,10,0,./testdata//logs/proactor_maxconn_c1000.txt
+proactor,2000,ok,66225.17,inf,15,19,19,0,./testdata//logs/proactor_maxconn_c2000.txt
+proactor,5000,ok,46728.97,inf,54,67,69,0,./testdata//logs/proactor_maxconn_c5000.txt
+ntyco,100,fail,NA,NA,NA,NA,NA,0,./testdata//logs/ntyco_maxconn_c100.txt
+ntyco,500,fail,NA,NA,NA,NA,NA,0,./testdata//logs/ntyco_maxconn_c500.txt
+ntyco,1000,fail,NA,NA,NA,NA,NA,0,./testdata//logs/ntyco_maxconn_c1000.txt
+ntyco,2000,fail,NA,NA,NA,NA,NA,0,./testdata//logs/ntyco_maxconn_c2000.txt
+ntyco,5000,fail,NA,NA,NA,NA,NA,0,./testdata//logs/ntyco_maxconn_c5000.txt

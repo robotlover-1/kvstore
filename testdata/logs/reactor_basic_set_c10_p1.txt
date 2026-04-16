@@ -1,0 +1,10 @@
+SET: 5000.00====== SET ======
+  10000 requests completed in 0.12 seconds
+  10 parallel clients
+  16 bytes payload
+  keep alive: 1
+
+100.00% <= 0 milliseconds
+84033.61 requests per second
+
+

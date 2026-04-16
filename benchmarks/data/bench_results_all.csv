@@ -1,7 +1,43 @@
 run_label,timestamp,backend,cmd,port,ops,value_size,warmup,elapsed_sec,qps,vmrss_kb,vmsize_kb,vmdata_kb,mem_gap_kb,info,memstat_backend,current_small_inuse,peak_small_inuse,total_small_page_bytes,current_large_inuse_bytes,peak_large_inuse_bytes,active_large_map_bytes,peak_active_large_map_bytes,fallback_alloc_calls,fallback_free_calls,current_fallback_inuse_bytes,peak_fallback_inuse_bytes,large_alloc_calls,small_alloc_calls,current_requested_bytes,current_allocated_bytes,internal_fragment_bytes,internal_fragment_rate,small_page_used_bytes,page_utilization
-set_ops5_val128,2026-03-31 00:09:59,libc,SET,6500,5,128,0,0.001875,2666.09,1832,3424,884,1592,role:master mem:libc,libc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.000000,0,0.000000
-set_ops5_val128,2026-03-31 00:09:59,jemalloc,SET,6501,5,128,0,0.001995,2505.8,4288,17648,11036,13360,role:master mem:jemalloc,jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.000000,0,0.000000
-set_ops5_val128,2026-03-31 00:09:59,custom,SET,6502,5,128,0,0.002569,1946.12,2340,3572,1028,1232,role:master mem:custom,custom,1696,2080,196512,163936,163936,184320,184320,0,0,0,0,6,40,164897,185896,20999,0.112961,1696,0.008630
-val128,2026-03-31 00:12:23,libc,HSET,6500,50000,128,200,22.958256,2177.87,13808,15168,12632,1360,role:master mem:libc,libc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.000000,0,0.000000
-val128,2026-03-31 00:12:47,jemalloc,HSET,6501,50000,128,200,22.650693,2207.44,16836,30960,24348,14124,role:master mem:jemalloc,jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.000000,0,0.000000
-val128,2026-03-31 00:13:11,custom,HSET,6502,50000,128,200,23.734103,2106.67,23012,24236,21700,1224,role:master mem:custom,custom,17670496,17670880,21356256,163936,163936,184320,184320,0,0,0,0,6,401605,10192572,17854696,7662124,0.429137,17670496,0.827415
+tset_300k_v128_1,2026-04-15 07:49:51,libc,XSET,6800,300000,128,2000,189.96517,1579.24,87740,89112,86552,1372,"role:master
+mem:libc
+dirty:302000
+last_snapshot_ms:1776264398688
+autosnap_rules:0
+bgsave:idle
+bgsave_pid:-1
+aof_fsync:always
+aof_rewrite:idle
+aof_rewrite_pid:-1
+master_host:127.0.0.1
+master_port:5000
+master_link:down
+replicas:0",libc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.000000,0,0.000000
+tset_300k_v128_1,2026-04-15 07:53:11,jemalloc,XSET,6801,300000,128,2000,196.977437,1523.02,86328,110856,104220,24528,"role:master
+mem:jemalloc
+dirty:302000
+last_snapshot_ms:1776264591430
+autosnap_rules:0
+bgsave:idle
+bgsave_pid:-1
+aof_fsync:always
+aof_rewrite:idle
+aof_rewrite_pid:-1
+master_host:127.0.0.1
+master_port:5000
+master_link:down
+replicas:0",jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.000000,0,0.000000
+tset_300k_v128_1,2026-04-15 07:56:29,custom,XSET,6802,300000,128,2000,195.2663,1536.36,144580,145804,143236,1224,"role:master
+mem:custom
+dirty:302000
+last_snapshot_ms:1776264791182
+autosnap_rules:0
+bgsave:idle
+bgsave_pid:-1
+aof_fsync:always
+aof_rewrite:idle
+aof_rewrite_pid:-1
+master_host:127.0.0.1
+master_port:5000
+master_link:down
+replicas:0",custom,116637024,116637408,145761336,163936,163936,184320,184320,0,0,0,0,6,2718007,71017052,116821224,45804172,0.392087,116637024,0.800191

@@ -1,20 +1,5 @@
-val32 | HSET ops=50,000 | value=32B
-  libc: qps=2010.03, vmrss_kb=13452.00, vmsize_kb=14860.00, mem_gap_kb=1408.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  jemalloc: qps=1921.33, vmrss_kb=10332.00, vmsize_kb=23256.00, mem_gap_kb=12924.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  custom: qps=2008.25, vmrss_kb=13496.00, vmsize_kb=14716.00, mem_gap_kb=1220.00, internal_fragment_rate=0.352120, page_utilization=0.689090, fallback_alloc_calls=0.00
-
-val128 | HSET ops=50,000 | value=128B
-  libc: qps=2251.40, vmrss_kb=13788.00, vmsize_kb=15124.00, mem_gap_kb=1336.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  jemalloc: qps=2144.64, vmrss_kb=16644.00, vmsize_kb=30932.00, mem_gap_kb=14288.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  custom: qps=1982.71, vmrss_kb=22912.00, vmsize_kb=24192.00, mem_gap_kb=1280.00, internal_fragment_rate=0.429137, page_utilization=0.827415, fallback_alloc_calls=0.00
-
-val4096 | HSET ops=50,000 | value=4096B
-  libc: qps=2030.31, vmrss_kb=208060.00, vmsize_kb=209584.00, mem_gap_kb=1524.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  jemalloc: qps=1964.98, vmrss_kb=261956.00, vmsize_kb=313564.00, mem_gap_kb=51608.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  custom: qps=1680.87, vmrss_kb=410696.00, vmsize_kb=412036.00, mem_gap_kb=1340.00, internal_fragment_rate=0.495379, page_utilization=0.662951, fallback_alloc_calls=0.00
-
-val128_ops100k | HSET ops=100,000 | value=128B
-  libc: qps=1941.25, vmrss_kb=25484.00, vmsize_kb=26740.00, mem_gap_kb=1256.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  jemalloc: qps=1934.92, vmrss_kb=29440.00, vmsize_kb=42200.00, mem_gap_kb=12760.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  custom: qps=2125.87, vmrss_kb=43828.00, vmsize_kb=44996.00, mem_gap_kb=1168.00, internal_fragment_rate=0.407859, page_utilization=0.828305, fallback_alloc_calls=0.00
+skiptable_100k_val256 | XSET ops=100,000 | value=256B
+  libc: qps=1603.64, vmrss_kb=44452.00, vmsize_kb=45948.00, mem_gap_kb=1496.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
+  jemalloc: qps=1587.41, vmrss_kb=47288.00, vmsize_kb=67844.00, mem_gap_kb=20556.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
+  custom: qps=1590.74, vmrss_kb=62160.00, vmsize_kb=63432.00, mem_gap_kb=1272.00, internal_fragment_rate=0.285953, page_utilization=0.840580, fallback_alloc_calls=0.00
 

@@ -1,0 +1,19 @@
+SET: -nanSET: 9800.00SET: 9700.00SET: 9133.33SET: 9250.00SET: 9265.39SET: 9104.60SET: 8974.30SET: 9028.49SET: 8938.69SET: 8986.01SET: 8921.85SET: 8963.01SET: 9001.85SET: 8939.73SET: 8983.21SET: 8932.27SET: 8962.13SET: 8984.00SET: 8948.22SET: 8966.61SET: 8942.49SET: 8951.46SET: 8974.96SET: 8946.68SET: 8961.29SET: 8939.10SET: 8956.46SET: 8969.01SET: 8948.98SET: 8961.08SET: 8940.40SET: 8954.01SET: 8961.83SET: 8945.90SET: 8960.92SET: 8937.79SET: 8952.23SET: 8948.22SET: 8945.24SET: 8925.62SET: 8940.50SET: 8936.39SET: 8933.97SET: 8934.56====== SET ======
+  100000 requests completed in 11.19 seconds
+  50 parallel clients
+  32 bytes payload
+  keep alive: 1
+
+67.72% <= 1 milliseconds
+93.10% <= 2 milliseconds
+98.94% <= 3 milliseconds
+99.76% <= 4 milliseconds
+99.82% <= 5 milliseconds
+99.86% <= 6 milliseconds
+99.90% <= 7 milliseconds
+99.94% <= 8 milliseconds
+99.99% <= 9 milliseconds
+100.00% <= 9 milliseconds
+8932.56 requests per second
+
+

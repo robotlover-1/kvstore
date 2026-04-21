@@ -178,7 +178,7 @@ blue "preloading $PRELOAD_COUNT keys into master"
   printf 'EXPIRE preload:00002 300\n'
   printf 'HEXPIRE h:base 300\n'
   printf 'REXPIRE r:base 300\n'
-  printf 'TEXPIRE t:base 300\n'
+  printf 'XEXPIRE t:base 300\n'
 } | redis-cli -p "$MASTER_PORT" --pipe >/dev/null
 
 green "preload done"

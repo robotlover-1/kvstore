@@ -168,7 +168,7 @@ static int is_readonly_slave_blocked(const char *cmd) {
     return strcmp(cmd, "GET") && strcmp(cmd, "MGET") && strcmp(cmd, "TTL") && strcmp(cmd, "EXIST") && strcmp(cmd, "OWNER")
         && strcmp(cmd, "RGET") && strcmp(cmd, "RMGET") && strcmp(cmd, "RTTL") && strcmp(cmd, "REXIST")
         && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST")
-        && strcmp(cmd, "TGET") && strcmp(cmd, "TMGET") && strcmp(cmd, "TTTL") && strcmp(cmd, "TEXIST")
+        && strcmp(cmd, "XGET") && strcmp(cmd, "XMGET") && strcmp(cmd, "XTTL") && strcmp(cmd, "XEXIST")
         && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT")
         && strcmp(cmd, "SLAVEOF") && strcmp(cmd, "ROLE");
 }

@@ -134,9 +134,9 @@ sample_compare_rbtree_key() {
 sample_compare_skip_key() {
   local key="$1"
   local vm vs
-  vm="$(redis_raw "$MASTER_PORT" TGET "$key" 2>/dev/null || true)"
-  vs="$(redis_raw "$SLAVE_PORT" TGET "$key" 2>/dev/null || true)"
-  assert_eq "TGET $key" "$vm" "$vs"
+  vm="$(redis_raw "$MASTER_PORT" XGET "$key" 2>/dev/null || true)"
+  vs="$(redis_raw "$SLAVE_PORT" XGET "$key" 2>/dev/null || true)"
+  assert_eq "XGET $key" "$vm" "$vs"
 }
 
 if [[ ! -x "$BIN" ]]; then
@@ -173,7 +173,7 @@ blue "preloading $PRELOAD_COUNT keys into master"
   done
   printf 'HSET h:base hv:base\n'
   printf 'RSET r:base rv:base\n'
-  printf 'TSET t:base tv:base\n'
+  printf 'XSET t:base tv:base\n'
   printf 'EXPIRE preload:00001 300\n'
   printf 'EXPIRE preload:00002 300\n'
   printf 'HEXPIRE h:base 300\n'
@@ -208,7 +208,7 @@ sleep "$INJECT_DELAY"
   done
   printf 'HSET after_h hv_after\n'
   printf 'RSET after_r rv_after\n'
-  printf 'TSET after_t tv_after\n'
+  printf 'XSET after_t tv_after\n'
   printf 'SET special:key during-sync\n'
 } | redis-cli -p "$MASTER_PORT" --pipe >/dev/null
 

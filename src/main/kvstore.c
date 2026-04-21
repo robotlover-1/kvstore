@@ -574,7 +574,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     }
     if (!strcmp(cmd, "MEMSTAT")) {
         char *info = (char *)kvs_malloc(BUFFER_CAP);
-        n = build_memstat_text(info, sizeof(info));
+        n = build_memstat_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "memstat build failed");
         else n = resp_bulk(resp, BUFFER_CAP, info, (size_t)n);
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
@@ -932,7 +932,7 @@ static int maybe_emit_expire(FILE *fp, int engine, const char *key) {
     const char *cmd =
         engine == KVS_ENGINE_ARRAY ? "EXPIRE" :
         engine == KVS_ENGINE_RBTREE ? "REXPIRE" :
-        engine == KVS_ENGINE_HASH ? "HEXPIRE" : "TEXPIRE";
+        engine == KVS_ENGINE_HASH ? "HEXPIRE" : "XEXPIRE";
     return emit_cmd3_fp(fp, cmd, key, sec);
 }
 

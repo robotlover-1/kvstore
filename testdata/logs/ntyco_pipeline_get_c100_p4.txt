@@ -1,16 +1,0 @@
-GET: -nanGET: 10000.00GET: 9096.00GET: 9236.00GET: 9224.00====== GET ======
-  10000 requests completed in 1.08 seconds
-  100 parallel clients
-  3 bytes payload
-  keep alive: 1
-
-62.60% <= 1 milliseconds
-86.45% <= 2 milliseconds
-95.89% <= 3 milliseconds
-99.37% <= 4 milliseconds
-99.73% <= 5 milliseconds
-99.85% <= 6 milliseconds
-100.00% <= 6 milliseconds
-9242.14 requests per second
-
-

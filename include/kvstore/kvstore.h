@@ -212,6 +212,45 @@ typedef struct {
     int sentinel_quorum;
 } kv_config_t;
 
+typedef struct {
+    const char *backend_name;
+    int backend_id;
+    int initialized;
+    size_t small_max_size;
+    size_t class_count;
+    unsigned long long alloc_calls;
+    unsigned long long free_calls;
+    unsigned long long calloc_calls;
+    unsigned long long realloc_calls;
+    unsigned long long small_alloc_calls;
+    unsigned long long small_free_calls;
+    unsigned long long large_alloc_calls;
+    unsigned long long large_free_calls;
+    unsigned long long fallback_alloc_calls;
+    unsigned long long fallback_free_calls;
+    unsigned long long current_small_inuse;
+    unsigned long long peak_small_inuse;
+    unsigned long long current_large_inuse_bytes;
+    unsigned long long peak_large_inuse_bytes;
+    unsigned long long current_fallback_inuse_bytes;
+    unsigned long long peak_fallback_inuse_bytes;
+    unsigned long long total_small_page_bytes;
+    unsigned long long total_large_map_bytes;
+    unsigned long long active_large_map_bytes;
+    unsigned long long peak_active_large_map_bytes;
+    unsigned long long current_requested_bytes;
+    unsigned long long current_allocated_bytes;
+    unsigned long long internal_fragment_bytes;
+    unsigned long long small_page_used_bytes;
+    unsigned int internal_fragment_ppm;
+    unsigned int page_utilization_ppm;
+    size_t class_sizes[16];
+    size_t class_total_chunks[16];
+    size_t class_free_chunks[16];
+    size_t class_page_count[16];
+    size_t class_bytes_in_pages[16];
+} kvs_mem_stats_t;
+
 extern kv_config_t g_cfg;
 extern int g_epfd;
 extern conn_t *g_replicas;
@@ -229,5 +268,76 @@ int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv);
 int kvs_mem_init(const char *backend_name);
 const char *kvs_mem_backend_name(void);
 int kvs_mem_get_stats(kvs_mem_stats_t *stats);
+
+int kvs_expire_create(kvs_expire_table_t *tab);
+void kvs_expire_destroy(kvs_expire_table_t *tab);
+int kvs_expire_set(kvs_expire_table_t *tab, int engine, const char *key, long long ttl_ms);
+int kvs_expire_del(kvs_expire_table_t *tab, int engine, const char *key);
+int kvs_expire_persist(kvs_expire_table_t *tab, int engine, const char *key);
+int kvs_expire_is_expired(kvs_expire_table_t *tab, int engine, const char *key);
+long long kvs_expire_ttl(kvs_expire_table_t *tab, int engine, const char *key);
+int kvs_active_expire_cycle(int budget);
+
+int reactor_start(void);
+int proactor_start(unsigned short port);
+int ntyco_start(unsigned short port);
+
+int queue_bytes(conn_t *c, const unsigned char *buf, size_t len);
+void close_conn(conn_t *c);
+int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication);
+int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication);
+
+void repl_add_slave(conn_t *c);
+void repl_remove_slave(conn_t *c);
+void repl_broadcast(const unsigned char *raw, size_t rawlen);
+int start_slave_thread(void);
+int repl_slaveof(const char *host, int port);
+int repl_slaveof_noone(void);
+
+int persist_init(void);
+void persist_close(void);
+int persist_append_raw(const unsigned char *buf, size_t len);
+int persist_save_dump(void);
+int persist_recover(void);
+int kvs_snapshot_to_fp(FILE *fp);
+int persist_bgsave_start(void);
+int persist_bgsave_poll(void);
+int persist_bgsave_in_progress(void);
+const char *persist_bgsave_state_name(void);
+int persist_bgrewriteaof_start(void);
+int persist_bgrewriteaof_poll(void);
+int persist_bgrewriteaof_in_progress(void);
+const char *persist_bgrewriteaof_state_name(void);
+int persist_set_aof_policy(kvs_aof_fsync_policy_t policy);
+kvs_aof_fsync_policy_t persist_get_aof_policy(void);
+const char *persist_aof_policy_name(void);
+int persist_force_aof_flush(void);
+const char *persist_mode_name(void);
+int persist_mode_snapshot_enabled(void);
+int persist_mode_aof_enabled(void);
+void persist_note_write(void);
+unsigned long long persist_dirty_count(void);
+long long persist_last_snapshot_ms(void);
+int persist_register_autosnap_rule(long long seconds, long long changes);
+void persist_clear_autosnap_rules(void);
+int persist_build_autosnap_text(char *buf, size_t cap);
+int persist_autosnap_cron(void);
+int sentinel_start(void);
+
+extern pid_t g_bgsave_pid;
+extern long long g_bgsave_last_start_ms;
+extern long long g_bgsave_last_end_ms;
+extern unsigned long long g_dirty_counter;
+
+int resp_simple_string(char *out, size_t cap, const char *s);
+int resp_error(char *out, size_t cap, const char *s);
+int resp_integer(char *out, size_t cap, long long v);
+int resp_bulk(char *out, size_t cap, const char *s, size_t len);
+int resp_null_bulk(char *out, size_t cap);
+size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
+size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
+size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);
+
+const char *repl_master_link_state_name(void);
 
 #endif

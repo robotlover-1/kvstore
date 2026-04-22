@@ -187,6 +187,7 @@ typedef struct {
 } kvs_autosnap_rule_t;
 
 typedef struct {
+    char bind_ip[64];
     int role;
     int port;
     char master_host[128];
@@ -195,6 +196,8 @@ typedef struct {
     char aof_path[256];
     char mem_backend[32];
     char net_backend[32];
+    char log_mode[32];
+    char persist_mode[32];
     kvs_aof_fsync_policy_t aof_fsync;
     int autosnap_rule_count;
     kvs_autosnap_rule_t autosnap_rules[KVS_AUTOSNAP_RULES_MAX];

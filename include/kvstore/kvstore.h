@@ -50,7 +50,167 @@ typedef enum {
     KVS_AOF_FSYNC_EVERYSEC = 1,
 } kvs_aof_fsync_policy_t;
 
-/* ... existing content unchanged ... */
+#if ENABLE_ARRAY
+typedef struct kvs_array_item_s {
+    char *key;
+    char *value;
+} kvs_array_item_t;
+
+typedef struct kvs_array_s {
+    kvs_array_item_t *table;
+    int idx;
+    int total;
+} kvs_array_t;
+
+extern kvs_array_t global_array;
+int kvs_array_create(kvs_array_t *inst);
+void kvs_array_destory(kvs_array_t *inst);
+int kvs_array_set(kvs_array_t *inst, char *key, char *value);
+char* kvs_array_get(kvs_array_t *inst, char *key);
+int kvs_array_del(kvs_array_t *inst, char *key);
+int kvs_array_mod(kvs_array_t *inst, char *key, char *value);
+int kvs_array_exist(kvs_array_t *inst, char *key);
+#endif
+
+#if ENABLE_RBTREE
+#if ENABLE_KEY_CHAR
+typedef char* KEY_TYPE;
+#else
+typedef int KEY_TYPE;
+#endif
+
+typedef struct _rbtree_node {
+    unsigned char color;
+    struct _rbtree_node *right;
+    struct _rbtree_node *left;
+    struct _rbtree_node *parent;
+    KEY_TYPE key;
+    void *value;
+} rbtree_node;
+
+typedef struct _rbtree {
+    rbtree_node *root;
+    rbtree_node *nil;
+} rbtree;
+
+typedef struct _rbtree kvs_rbtree_t;
+extern kvs_rbtree_t global_rbtree;
+int kvs_rbtree_create(kvs_rbtree_t *inst);
+void kvs_rbtree_destory(kvs_rbtree_t *inst);
+int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value);
+char* kvs_rbtree_get(kvs_rbtree_t *inst, char *key);
+int kvs_rbtree_del(kvs_rbtree_t *inst, char *key);
+int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value);
+int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
+#endif
+
+#if ENABLE_HASH
+typedef struct hashnode_s {
+#if ENABLE_KEY_POINTER
+    char *key;
+    char *value;
+#else
+    char key[128];
+    char value[512];
+#endif
+    struct hashnode_s *next;
+} hashnode_t;
+
+typedef struct hashtable_s {
+    hashnode_t **nodes;
+    int max_slots;
+    int count;
+} hashtable_t;
+
+typedef struct hashtable_s kvs_hash_t;
+extern kvs_hash_t global_hash;
+int kvs_hash_create(kvs_hash_t *hash);
+void kvs_hash_destory(kvs_hash_t *hash);
+int kvs_hash_set(hashtable_t *hash, char *key, char *value);
+char *kvs_hash_get(kvs_hash_t *hash, char *key);
+int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
+int kvs_hash_del(kvs_hash_t *hash, char *key);
+int kvs_hash_exist(kvs_hash_t *hash, char *key);
+#endif
+
+#if ENABLE_SKIPTABLE
+typedef struct kvs_skiptable_s kvs_skiptable_t;
+typedef int (*kvs_skip_visit_cb)(const char *key, const char *value, void *arg);
+extern kvs_skiptable_t global_skiptable;
+int kvs_skiptable_create(kvs_skiptable_t *inst);
+void kvs_skiptable_destory(kvs_skiptable_t *inst);
+int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value);
+char *kvs_skiptable_get(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
+int kvs_skiptable_del(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_foreach(kvs_skiptable_t *inst, kvs_skip_visit_cb cb, void *arg);
+#endif
+
+#define KVS_EXPIRE_BUCKETS 1024
+typedef struct kvs_expire_item_s {
+    char *key;
+    int engine;
+    long long expire_at_ms;
+    struct kvs_expire_item_s *next;
+} kvs_expire_item_t;
+
+typedef struct kvs_expire_table_s {
+    kvs_expire_item_t **buckets;
+    int size;
+} kvs_expire_table_t;
+extern kvs_expire_table_t global_expire;
+
+typedef struct out_node_s {
+    unsigned char *data;
+    size_t len;
+    size_t sent;
+    struct out_node_s *next;
+} out_node_t;
+
+typedef struct conn_s {
+    int fd;
+    int is_listener;
+    int is_replica;
+    unsigned char inbuf[BUFFER_CAP];
+    size_t in_len;
+    out_node_t *out_head;
+    out_node_t *out_tail;
+    struct conn_s *next_replica;
+} conn_t;
+
+#define KVS_AUTOSNAP_RULES_MAX 8
+
+typedef struct {
+    long long seconds;
+    long long changes;
+} kvs_autosnap_rule_t;
+
+typedef struct {
+    char bind_ip[64];
+    int role;
+    int port;
+    char master_host[128];
+    int master_port;
+    char dump_path[256];
+    char aof_path[256];
+    char mem_backend[32];
+    char net_backend[32];
+    char log_mode[32];
+    char persist_mode[32];
+    kvs_aof_fsync_policy_t aof_fsync;
+    int autosnap_rule_count;
+    kvs_autosnap_rule_t autosnap_rules[KVS_AUTOSNAP_RULES_MAX];
+
+    int is_sentinel;
+    char sentinel_master_name[64];
+    char sentinel_monitor_host[128];
+    int sentinel_monitor_port;
+    char sentinel_known_slaves[512];
+    int sentinel_down_after_ms;
+    int sentinel_failover_timeout_ms;
+    int sentinel_quorum;
+} kv_config_t;
 
 extern kv_config_t g_cfg;
 extern int g_epfd;
@@ -69,7 +229,5 @@ int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv);
 int kvs_mem_init(const char *backend_name);
 const char *kvs_mem_backend_name(void);
 int kvs_mem_get_stats(kvs_mem_stats_t *stats);
-
-/* rest unchanged */
 
 #endif

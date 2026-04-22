@@ -147,17 +147,67 @@ int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
 int kvs_skiptable_foreach(kvs_skiptable_t *inst, kvs_skip_visit_cb cb, void *arg);
 #endif
 
-#define KVS_EXPIRE_BUCKETS 1024
+#define ENABLE_DOC 1
+
+#if ENABLE_DOC
+#define KVS_DOC_BUCKETS 1024
+#define KVS_DOC_FIELD_BUCKETS 16
+
+typedef struct kvs_doc_field_s {
+    char *name;
+    char *value;
+    struct kvs_doc_field_s *next;
+} kvs_doc_field_t;
+
+typedef struct kvs_doc_s {
+    char *key;
+    kvs_doc_field_t **fields;
+    int field_count;
+    int bucket_count;
+    struct kvs_doc_s *next;
+} kvs_doc_t;
+
+typedef struct kvs_doc_table_s {
+    kvs_doc_t **buckets;
+    int size;
+    int count;
+} kvs_doc_table_t;
+
+extern kvs_doc_table_t global_doc;
+int kvs_doc_create(kvs_doc_table_t *tab);
+void kvs_doc_destroy(kvs_doc_table_t *tab);
+int kvs_doc_set(kvs_doc_table_t *tab, const char *key, const char *field, const char *value);
+char *kvs_doc_get(kvs_doc_table_t *tab, const char *key, const char *field);
+int kvs_doc_del_field(kvs_doc_table_t *tab, const char *key, const char *field);
+int kvs_doc_del(kvs_doc_table_t *tab, const char *key);
+int kvs_doc_exist(kvs_doc_table_t *tab, const char *key);
+int kvs_doc_field_exist(kvs_doc_table_t *tab, const char *key, const char *field);
+int kvs_doc_field_count(kvs_doc_table_t *tab, const char *key);
+
+typedef int (*kvs_doc_field_visit_cb)(const char *name, const char *value, void *arg);
+int kvs_doc_foreach_field(kvs_doc_table_t *tab, const char *key, kvs_doc_field_visit_cb cb, void *arg);
+
+typedef int (*kvs_doc_visit_cb)(const char *key, kvs_doc_t *doc, void *arg);
+int kvs_doc_foreach(kvs_doc_table_t *tab, kvs_doc_visit_cb cb, void *arg);
+#endif
+
+#define KVS_EXPIRE_BUCKETS 8192
+#define KVS_EXPIRE_HEAP_INIT_CAP 1024
 typedef struct kvs_expire_item_s {
     char *key;
     int engine;
     long long expire_at_ms;
+    size_t heap_index;
     struct kvs_expire_item_s *next;
 } kvs_expire_item_t;
 
 typedef struct kvs_expire_table_s {
     kvs_expire_item_t **buckets;
-    int size;
+    size_t size;
+    size_t count;
+    kvs_expire_item_t **heap;
+    size_t heap_size;
+    size_t heap_cap;
 } kvs_expire_table_t;
 extern kvs_expire_table_t global_expire;
 
@@ -326,6 +376,7 @@ int resp_error(char *out, size_t cap, const char *s);
 int resp_integer(char *out, size_t cap, long long v);
 int resp_bulk(char *out, size_t cap, const char *s, size_t len);
 int resp_null_bulk(char *out, size_t cap);
+size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3);
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);

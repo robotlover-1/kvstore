@@ -4,6 +4,17 @@ int g_epfd = -1;
 static conn_t *fdmap[65536];
 static long long g_last_expire = 0;
 
+static int expire_cycle_budget(void) {
+    size_t count = global_expire.count;
+    if (count >= 1000000) return 4096;
+    if (count >= 300000) return 2048;
+    if (count >= 100000) return 1024;
+    if (count >= 30000) return 512;
+    if (count >= 10000) return 256;
+    if (count >= 1000) return 128;
+    return 32;
+}
+
 static int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
@@ -221,7 +232,8 @@ int reactor_start(void) {
 
         long long now = kvs_now_ms();
         if (now - g_last_expire >= 100) {
-            kvs_active_expire_cycle(32);
+            int budget = expire_cycle_budget();
+            kvs_active_expire_cycle(budget);
             persist_autosnap_cron();
             g_last_expire = now;
         }

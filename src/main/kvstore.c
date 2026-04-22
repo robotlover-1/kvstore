@@ -39,6 +39,7 @@ static size_t append_bulk(unsigned char *out, size_t pos, size_t cap, const char
     out[pos++] = '\r'; out[pos++] = '\n';
     return pos;
 }
+size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*4\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); return pos; }
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*3\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); return pos; }
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*2\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); return pos; }
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
@@ -170,7 +171,8 @@ static int is_readonly_slave_blocked(const char *cmd) {
         && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST")
         && strcmp(cmd, "XGET") && strcmp(cmd, "XMGET") && strcmp(cmd, "XTTL") && strcmp(cmd, "XEXIST")
         && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT")
-        && strcmp(cmd, "SLAVEOF") && strcmp(cmd, "ROLE");
+        && strcmp(cmd, "SLAVEOF") && strcmp(cmd, "ROLE")
+        && strcmp(cmd, "DOCGET") && strcmp(cmd, "DOCGETALL") && strcmp(cmd, "DOCEXIST") && strcmp(cmd, "DOCCOUNT");
 }
 
 static int is_write_cmd(const char *cmd) {
@@ -180,6 +182,7 @@ static int is_write_cmd(const char *cmd) {
         "HSET","HMSET","HMOD","HDEL","HEXPIRE","HPERSIST",
         "XSET","XMSET","XMOD","XDEL","XEXPIRE","XPERSIST",
         "LOCK","UNLOCK","RENEW",
+        "DOCSET","DOCDEL","DOCDROP",
         NULL
     };
     for (int i = 0; writes[i]; ++i) if (!strcmp(cmd, writes[i])) return 1;
@@ -766,14 +769,136 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
 
+    if (!strcmp(cmd, "DOCSET") && argc == 4) {
+        int drc = kvs_doc_set(&global_doc, argv[1], argv[2], argv[3]);
+        if (drc == 0) {
+            n = resp_simple_string(resp, BUFFER_CAP, "OK");
+            if (!from_replication) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            }
+        } else {
+            n = resp_error(resp, BUFFER_CAP, "docset failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+    if (!strcmp(cmd, "DOCGET") && argc == 3) {
+        char *v = kvs_doc_get(&global_doc, argv[1], argv[2]);
+        n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+    if (!strcmp(cmd, "DOCDEL") && argc == 3) {
+        int drc = kvs_doc_del_field(&global_doc, argv[1], argv[2]);
+        if (drc == 0) {
+            n = resp_simple_string(resp, BUFFER_CAP, "OK");
+            if (!from_replication) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            }
+        } else if (drc == 1) {
+            n = resp_error(resp, BUFFER_CAP, "doc or field not found");
+        } else {
+            n = resp_error(resp, BUFFER_CAP, "docdel failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+    if (!strcmp(cmd, "DOCDROP") && argc == 2) {
+        int drc = kvs_doc_del(&global_doc, argv[1]);
+        if (drc == 0) {
+            n = resp_simple_string(resp, BUFFER_CAP, "OK");
+            if (!from_replication) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            }
+        } else if (drc == 1) {
+            n = resp_error(resp, BUFFER_CAP, "doc not found");
+        } else {
+            n = resp_error(resp, BUFFER_CAP, "docdrop failed");
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+    if (!strcmp(cmd, "DOCEXIST") && argc == 2) {
+        n = resp_integer(resp, BUFFER_CAP, kvs_doc_exist(&global_doc, argv[1]) == 0 ? 1 : 0);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+    if (!strcmp(cmd, "DOCCOUNT") && argc == 2) {
+        int cnt = kvs_doc_field_count(&global_doc, argv[1]);
+        n = resp_integer(resp, BUFFER_CAP, cnt);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+    if (!strcmp(cmd, "DOCGETALL") && argc == 2) {
+        int cnt = kvs_doc_field_count(&global_doc, argv[1]);
+        if (cnt <= 0) {
+            n = resp_empty_array(resp, BUFFER_CAP);
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+            goto out;
+        }
+        size_t pos = 0;
+        int hn = resp_array_header(resp, BUFFER_CAP, cnt * 2);
+        if (hn < 0) { n = resp_error(resp, BUFFER_CAP, "docgetall failed"); if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n); goto out; }
+        pos += (size_t)hn;
+        kvs_doc_t *d = NULL;
+        if (global_doc.buckets) {
+            unsigned int didx;
+            for (didx = 0; didx < (unsigned int)global_doc.size; ++didx) {
+                for (kvs_doc_t *dd = global_doc.buckets[didx]; dd; dd = dd->next) {
+                    if (strcmp(dd->key, argv[1]) == 0) { d = dd; break; }
+                }
+                if (d) break;
+            }
+        }
+        if (d) {
+            for (int bi = 0; bi < d->bucket_count; ++bi) {
+                for (kvs_doc_field_t *f = d->fields[bi]; f; f = f->next) {
+                    if (resp_array_append_bulk_or_null(resp, BUFFER_CAP, &pos, f->name) != 0) break;
+                    if (resp_array_append_bulk_or_null(resp, BUFFER_CAP, &pos, f->value) != 0) break;
+                }
+            }
+        }
+        n = (int)pos;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+    }
+
     int engine = cmd_engine(cmd);
     const char *op = strip_prefix(cmd);
     int rc = -1;
+    int should_reply_ok = 0;
+    int should_reply_missing = 0;
 
-    if (!strcmp(op, "SET") && argc == 3) {rc = try_expire(engine, argv[1]); rc = engine_set(engine, argv[1], argv[2]);}
-    else if (!strcmp(op, "MSET")) {rc = try_expire(engine, argv[1]); rc = handle_multi_set(engine, argc, argv);}
-    else if (!strcmp(op, "MOD") && argc == 3) { try_expire(engine, argv[1]); rc = engine_mod(engine, argv[1], argv[2]); }
-    else if (!strcmp(op, "DEL") && argc == 2) { try_expire(engine, argv[1]); rc = engine_del(engine, argv[1]); kvs_expire_del(&global_expire, engine, argv[1]); }
+    if (!strcmp(op, "SET") && argc == 3) {
+        try_expire(engine, argv[1]);
+        rc = engine_set(engine, argv[1], argv[2]);
+        should_reply_ok = 1;
+        should_reply_missing = 1;
+    }
+    else if (!strcmp(op, "MSET")) {
+        try_expire(engine, argv[1]);
+        rc = handle_multi_set(engine, argc, argv);
+        should_reply_ok = 1;
+    }
+    else if (!strcmp(op, "MOD") && argc == 3) {
+        try_expire(engine, argv[1]);
+        rc = engine_mod(engine, argv[1], argv[2]);
+        should_reply_ok = 1;
+        should_reply_missing = 1;
+    }
+    else if (!strcmp(op, "DEL") && argc == 2) {
+        try_expire(engine, argv[1]);
+        rc = engine_del(engine, argv[1]);
+        kvs_expire_del(&global_expire, engine, argv[1]);
+        should_reply_ok = 1;
+        should_reply_missing = 1;
+    }
     else if (!strcmp(op, "GET") && argc == 2) {
         try_expire(engine, argv[1]);
         char *v = engine_get(engine, argv[1]);
@@ -797,6 +922,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         try_expire(engine, argv[1]);
         if (engine_exist(engine, argv[1]) != 0) rc = 1;
         else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
+        should_reply_ok = 1;
+        should_reply_missing = 1;
     } else if (!strcmp(op, "TTL") && argc == 2) {
         try_expire(engine, argv[1]);
         if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, BUFFER_CAP, -2);
@@ -811,8 +938,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         try_expire(engine, argv[1]);
         if (engine_exist(engine, argv[1]) != 0) rc = 1;
         else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
+        should_reply_ok = 1;
+        should_reply_missing = 1;
     } else {
-        n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
+        int expected_argc = 0;
+        if (!strcmp(op, "SET") || !strcmp(op, "MOD") || !strcmp(op, "EXPIRE")) expected_argc = 3;
+        else if (!strcmp(op, "GET") || !strcmp(op, "DEL") || !strcmp(op, "EXIST") || !strcmp(op, "TTL") || !strcmp(op, "PERSIST")) expected_argc = 2;
+        if (expected_argc > 0 && argc != expected_argc)
+            n = resp_error(resp, BUFFER_CAP, "wrong number of arguments");
+        else
+            n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;
@@ -825,8 +960,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             persist_append_raw(raw, rawlen);
             if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
         }
-    } else if (rc == 1) {
-        n = resp_error(resp, BUFFER_CAP, "not found or exists");
+    } else if (rc == 1 && should_reply_missing) {
+        if (!strcmp(op, "SET")) n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        else n = resp_error(resp, BUFFER_CAP, "not found or exists");
     } else {
         n = resp_error(resp, BUFFER_CAP, "operation failed");
     }
@@ -885,6 +1021,9 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
         }
 
         size_t start = pos, p = pos + 1;
+        int incomplete = 0;
+        int malformed = 0;
+
         while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
         if (p + 1 >= *len) break;
         char nbuf[32] = {0};
@@ -902,18 +1041,27 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
         p += 2;
         char *argv[32] = {0};
         size_t argl[32] = {0};
-        int ok = 1;
         for (int i = 0; i < argc; ++i) {
-            if (p >= *len || buf[p] != '$') { ok = 0; break; }
+            if (p >= *len) {
+                incomplete = 1;
+                break;
+            }
+            if (buf[p] != '$') {
+                malformed = 1;
+                break;
+            }
             size_t lp = p + 1;
             while (lp + 1 < *len && !(buf[lp] == '\r' && buf[lp + 1] == '\n')) lp++;
-            if (lp + 1 >= *len) { ok = 0; break; }
+            if (lp + 1 >= *len) {
+                incomplete = 1;
+                break;
+            }
             char lbuf[32] = {0};
             memcpy(lbuf, buf + p + 1, lp - (p + 1));
             char *endp = NULL;
             long blen = strtol(lbuf, &endp, 10);
             if (!endp || *endp != '\0' || blen < 0) {
-                ok = 0;
+                malformed = 1;
                 if (c) {
                     char r[128];
                     int n = resp_error(r, sizeof(r), "invalid bulk length");
@@ -922,19 +1070,33 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                 break;
             }
             p = lp + 2;
-            if (p + (size_t)blen + 2 > *len) { ok = 0; break; }
+            if (p + (size_t)blen + 2 > *len) {
+                incomplete = 1;
+                break;
+            }
             argv[i] = (char *)kvs_malloc((size_t)blen + 1);
-            if (!argv[i]) { ok = 0; break; }
+            if (!argv[i]) {
+                malformed = 1;
+                break;
+            }
             memcpy(argv[i], buf + p, (size_t)blen);
             argv[i][blen] = 0;
             argl[i] = (size_t)blen;
             p += (size_t)blen;
-            if (!(buf[p] == '\r' && buf[p + 1] == '\n')) { ok = 0; break; }
+            if (!(buf[p] == '\r' && buf[p + 1] == '\n')) {
+                malformed = 1;
+                break;
+            }
             p += 2;
         }
-        if (!ok) {
+        if (incomplete) {
             for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
-            if (p > pos) pos = p; else break;
+            break;
+        }
+        if (malformed) {
+            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+            if (p > start) pos = p;
+            else break;
             continue;
         }
         handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
@@ -953,6 +1115,12 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
 static int emit_cmd3_fp(FILE *fp, const char *cmd, const char *a1, const char *a2) {
     unsigned char buf[BUFFER_CAP];
     size_t n = resp_build_cmd3(buf, sizeof(buf), cmd, a1, a2);
+    return fwrite(buf, 1, n, fp) == n ? 0 : -1;
+}
+
+static int emit_cmd4_fp(FILE *fp, const char *cmd, const char *a1, const char *a2, const char *a3) {
+    unsigned char buf[BUFFER_CAP];
+    size_t n = resp_build_cmd4(buf, sizeof(buf), cmd, a1, a2, a3);
     return fwrite(buf, 1, n, fp) == n ? 0 : -1;
 }
 
@@ -1008,12 +1176,31 @@ static int snapshot_skiptable(FILE *fp) {
     return kvs_skiptable_foreach(&global_skiptable, snapshot_skiptable_cb, fp);
 }
 
+static int snapshot_doc_field_cb(const char *name, const char *value, void *arg) {
+    void **ctx = (void **)arg;
+    FILE *fp = (FILE *)ctx[0];
+    const char *key = (const char *)ctx[1];
+    return emit_cmd4_fp(fp, "DOCSET", key, name, value);
+}
+
+static int snapshot_doc_cb(const char *key, kvs_doc_t *doc, void *arg) {
+    FILE *fp = (FILE *)arg;
+    (void)doc;
+    void *ctx[2] = { fp, (void *)key };
+    return kvs_doc_foreach_field(&global_doc, key, snapshot_doc_field_cb, ctx);
+}
+
+static int snapshot_doc(FILE *fp) {
+    return kvs_doc_foreach(&global_doc, snapshot_doc_cb, fp);
+}
+
 int kvs_snapshot_to_fp(FILE *fp) {
     if (!fp) return -1;
     if (snapshot_array(fp) != 0) return -1;
     if (snapshot_rbtree_node(fp, global_rbtree.root, global_rbtree.nil) != 0) return -1;
     if (snapshot_hash(fp) != 0) return -1;
     if (snapshot_skiptable(fp) != 0) return -1;
+    if (snapshot_doc(fp) != 0) return -1;
     return 0;
 }
 
@@ -1037,6 +1224,7 @@ int main(int argc, char **argv) {
     kvs_hash_create(&global_hash);
     kvs_skiptable_create(&global_skiptable);
     kvs_expire_create(&global_expire);
+    kvs_doc_create(&global_doc);
    
     if (g_cfg.is_sentinel) {
         return sentinel_start();

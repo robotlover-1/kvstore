@@ -1,36 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================
-# KVStore replication test
-# =========================
-# What it verifies:
-# 1) slave auto-connects and sends REPLSYNC
-# 2) master performs or reuses BGSAVE for full sync
-# 3) writes during full sync are delivered via backlog
-# 4) master/slave final data match on sampled keys
-#
-# Requirements:
-# - bash
-# - redis-cli
-# - your kvstore binary already built, or BUILD_CMD available
-#
-# Usage:
-#   chmod +x ./run_repl_fullsync_test.sh
-#   ./run_repl_fullsync_test.sh
-#
-# Optional env vars:
-#   BIN=./kvstore
-#   BUILD_CMD='make -j'
-#   MASTER_PORT=6379
-#   SLAVE_PORT=6380
-#   BASE_DIR=./tmp_repl_test
-#   PRELOAD_COUNT=5000
-#   DURING_SYNC_WRITES=200
-#   STARTUP_WAIT=1
-#   SYNC_WAIT=8
-#   INJECT_DELAY=0.2
-
 BIN="${BIN:-./kvstore}"
 BUILD_CMD="${BUILD_CMD:-}"
 MASTER_PORT="${MASTER_PORT:-6379}"
@@ -41,6 +11,8 @@ DURING_SYNC_WRITES="${DURING_SYNC_WRITES:-200}"
 STARTUP_WAIT="${STARTUP_WAIT:-1}"
 SYNC_WAIT="${SYNC_WAIT:-8}"
 INJECT_DELAY="${INJECT_DELAY:-0.2}"
+NC_BIN="${NC_BIN:-nc}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
 
 MASTER_DIR="$BASE_DIR/master"
 SLAVE_DIR="$BASE_DIR/slave"
@@ -76,23 +48,69 @@ cleanup() {
 }
 trap cleanup EXIT
 
+run_cmd() {
+  local host="$1"
+  local port="$2"
+  local cmd="$3"
+  if command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
+    printf '%s\r\n' "$cmd" | "$TIMEOUT_BIN" 2 "$NC_BIN" "$host" "$port" 2>/dev/null || true
+  else
+    printf '%s\r\n' "$cmd" | "$NC_BIN" "$host" "$port" 2>/dev/null || true
+  fi
+}
+
+send_expect_ok() {
+  local port="$1"
+  local cmd="$2"
+  local out
+  out="$(run_cmd 127.0.0.1 "$port" "$cmd")"
+  if [[ "$out" != "+OK"$'\r\n' && "$out" != ":1"$'\r\n' ]]; then
+    red "unexpected response on port $port for command: $cmd"
+    printf '%s\n' "$out"
+    exit 1
+  fi
+}
+
+cmd_get_value() {
+  local port="$1"
+  local cmd="$2"
+  local out len value
+  out="$(run_cmd 127.0.0.1 "$port" "$cmd")"
+  out="${out//$'\r'/}"
+  if [[ "$out" == '$-1'$'\n' ]]; then
+    printf ''
+    return 0
+  fi
+  if [[ "$out" =~ ^\$([0-9]+)$'\n'(.*)$'\n'$ ]]; then
+    len="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    printf '%s' "$value"
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
+resp_info() {
+  local port="$1"
+  run_cmd 127.0.0.1 "$port" 'INFO'
+}
+
+resp_ping() {
+  local port="$1"
+  run_cmd 127.0.0.1 "$port" 'PING'
+}
+
 wait_port() {
   local port="$1"
   local retries="${2:-100}"
   local i
   for ((i=0; i<retries; i++)); do
-    if redis-cli -p "$port" PING >/dev/null 2>&1; then
+    if [[ "$(resp_ping "$port")" == "+PONG"$'\r\n' ]]; then
       return 0
     fi
     sleep 0.1
   done
   return 1
-}
-
-redis_raw() {
-  local port="$1"
-  shift
-  redis-cli --raw -p "$port" "$@"
 }
 
 assert_eq() {
@@ -110,32 +128,32 @@ assert_eq() {
 sample_compare_string_key() {
   local key="$1"
   local vm vs
-  vm="$(redis_raw "$MASTER_PORT" GET "$key" 2>/dev/null || true)"
-  vs="$(redis_raw "$SLAVE_PORT" GET "$key" 2>/dev/null || true)"
+  vm="$(cmd_get_value "$MASTER_PORT" "GET $key")"
+  vs="$(cmd_get_value "$SLAVE_PORT" "GET $key")"
   assert_eq "GET $key" "$vm" "$vs"
 }
 
 sample_compare_hash_key() {
   local key="$1"
   local vm vs
-  vm="$(redis_raw "$MASTER_PORT" HGET "$key" 2>/dev/null || true)"
-  vs="$(redis_raw "$SLAVE_PORT" HGET "$key" 2>/dev/null || true)"
+  vm="$(cmd_get_value "$MASTER_PORT" "HGET $key")"
+  vs="$(cmd_get_value "$SLAVE_PORT" "HGET $key")"
   assert_eq "HGET $key" "$vm" "$vs"
 }
 
 sample_compare_rbtree_key() {
   local key="$1"
   local vm vs
-  vm="$(redis_raw "$MASTER_PORT" RGET "$key" 2>/dev/null || true)"
-  vs="$(redis_raw "$SLAVE_PORT" RGET "$key" 2>/dev/null || true)"
+  vm="$(cmd_get_value "$MASTER_PORT" "RGET $key")"
+  vs="$(cmd_get_value "$SLAVE_PORT" "RGET $key")"
   assert_eq "RGET $key" "$vm" "$vs"
 }
 
 sample_compare_skip_key() {
   local key="$1"
   local vm vs
-  vm="$(redis_raw "$MASTER_PORT" XGET "$key" 2>/dev/null || true)"
-  vs="$(redis_raw "$SLAVE_PORT" XGET "$key" 2>/dev/null || true)"
+  vm="$(cmd_get_value "$MASTER_PORT" "XGET $key")"
+  vs="$(cmd_get_value "$SLAVE_PORT" "XGET $key")"
   assert_eq "XGET $key" "$vm" "$vs"
 }
 
@@ -148,7 +166,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 [[ -x "$BIN" ]] || { red "kvstore binary not found: $BIN"; exit 1; }
-need_cmd redis-cli
+need_cmd "$NC_BIN"
 
 rm -rf "$BASE_DIR"
 mkdir -p "$MASTER_DIR" "$SLAVE_DIR"
@@ -167,23 +185,23 @@ sleep "$STARTUP_WAIT"
 green "master ready pid=$MASTER_PID"
 
 blue "preloading $PRELOAD_COUNT keys into master"
-{
-  for i in $(seq 1 "$PRELOAD_COUNT"); do
-    printf 'SET preload:%05d value:%05d\n' "$i" "$i"
-  done
-  printf 'HSET h:base hv:base\n'
-  printf 'RSET r:base rv:base\n'
-  printf 'XSET t:base tv:base\n'
-  printf 'EXPIRE preload:00001 300\n'
-  printf 'EXPIRE preload:00002 300\n'
-  printf 'HEXPIRE h:base 300\n'
-  printf 'REXPIRE r:base 300\n'
-  printf 'XEXPIRE t:base 300\n'
-} | redis-cli -p "$MASTER_PORT" --pipe >/dev/null
+for i in $(seq 1 "$PRELOAD_COUNT"); do
+  key=$(printf 'preload:%05d' "$i")
+  val=$(printf 'value:%05d' "$i")
+  send_expect_ok "$MASTER_PORT" "SET $key $val"
+done
+send_expect_ok "$MASTER_PORT" 'HSET h:base hv:base'
+send_expect_ok "$MASTER_PORT" 'RSET r:base rv:base'
+send_expect_ok "$MASTER_PORT" 'XSET t:base tv:base'
+send_expect_ok "$MASTER_PORT" 'EXPIRE preload:00001 300'
+send_expect_ok "$MASTER_PORT" 'EXPIRE preload:00002 300'
+send_expect_ok "$MASTER_PORT" 'HEXPIRE h:base 300'
+send_expect_ok "$MASTER_PORT" 'REXPIRE r:base 300'
+send_expect_ok "$MASTER_PORT" 'XEXPIRE t:base 300'
 
 green "preload done"
 blue "master INFO before slave start:"
-redis-cli -p "$MASTER_PORT" INFO || true
+resp_info "$MASTER_PORT" || true
 
 blue "starting slave on :$SLAVE_PORT"
 "$BIN" \
@@ -202,27 +220,27 @@ green "slave ready pid=$SLAVE_PID"
 
 blue "injecting writes during full sync after ${INJECT_DELAY}s"
 sleep "$INJECT_DELAY"
-{
-  for i in $(seq 1 "$DURING_SYNC_WRITES"); do
-    printf 'SET after_sync:%05d v:%05d\n' "$i" "$i"
-  done
-  printf 'HSET after_h hv_after\n'
-  printf 'RSET after_r rv_after\n'
-  printf 'XSET after_t tv_after\n'
-  printf 'SET special:key during-sync\n'
-} | redis-cli -p "$MASTER_PORT" --pipe >/dev/null
+for i in $(seq 1 "$DURING_SYNC_WRITES"); do
+  key=$(printf 'after_sync:%05d' "$i")
+  val=$(printf 'v:%05d' "$i")
+  send_expect_ok "$MASTER_PORT" "SET $key $val"
+done
+send_expect_ok "$MASTER_PORT" 'HSET after_h hv_after'
+send_expect_ok "$MASTER_PORT" 'RSET after_r rv_after'
+send_expect_ok "$MASTER_PORT" 'XSET after_t tv_after'
+send_expect_ok "$MASTER_PORT" 'SET special:key during-sync'
 
 green "during-sync writes injected"
 blue "waiting $SYNC_WAIT seconds for full sync + backlog replay"
 sleep "$SYNC_WAIT"
 
 blue "master INFO after sync window:"
-redis-cli -p "$MASTER_PORT" INFO || true
+resp_info "$MASTER_PORT" || true
 blue "slave INFO after sync window:"
-redis-cli -p "$SLAVE_PORT" INFO || true
+resp_info "$SLAVE_PORT" || true
 
 blue "verifying slave read-only"
-slave_set_out="$(redis-cli --raw -p "$SLAVE_PORT" SET should_fail x 2>&1 || true)"
+slave_set_out="$(run_cmd 127.0.0.1 "$SLAVE_PORT" 'SET should_fail x')"
 echo "$slave_set_out"
 if echo "$slave_set_out" | grep -qi 'read only slave'; then
   green "[OK] slave is read-only"
@@ -249,8 +267,8 @@ sample_compare_skip_key t:base || fail=1
 sample_compare_skip_key after_t || fail=1
 
 blue "checking TTL presence on a sample key"
-master_ttl="$(redis_raw "$MASTER_PORT" TTL preload:00001 2>/dev/null || true)"
-slave_ttl="$(redis_raw "$SLAVE_PORT" TTL preload:00001 2>/dev/null || true)"
+master_ttl="$(run_cmd 127.0.0.1 "$MASTER_PORT" 'TTL preload:00001' | perl -0pe 's/\r//g')"
+slave_ttl="$(run_cmd 127.0.0.1 "$SLAVE_PORT" 'TTL preload:00001' | perl -0pe 's/\r//g')"
 echo "master TTL preload:00001 => $master_ttl"
 echo "slave  TTL preload:00001 => $slave_ttl"
 
@@ -258,6 +276,13 @@ blue "showing recent master log lines"
 tail -n 40 "$MASTER_LOG" || true
 blue "showing recent slave log lines"
 tail -n 40 "$SLAVE_LOG" || true
+
+if [[ "$fail" -ne 0 ]]; then
+  red "replication check failed"
+  exit 1
+fi
+
+green "replication check passed"
 
 blue "artifacts saved under: $BASE_DIR"
 echo "master log: $MASTER_LOG"

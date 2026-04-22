@@ -263,7 +263,7 @@ strict_expect_one_of "pipeline GET then EXIST" \
 '$4\r\npval\r\nEXIST\r\n'
 
 strict_expect_one_of "pipeline SET GET DEL" \
-'*3\r\n$3\r\nSET\r\n$3\r\nk3\r\n$2\r\nv3\r\n*2\r\n$3\r\nGET\r\n$3\r\nk3\r\n*2\r\n$3\r\nDEL\r\n$3\r\nk3\r\n' \
+'*3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n*2\r\n$3\r\nGET\r\n$2\r\nk3\r\n*2\r\n$3\r\nDEL\r\n$2\r\nk3\r\n' \
 '+OK\r\n$2\r\nv3\r\n+OK\r\n' \
 '+OK\r\n$2\r\nv3\r\nOK\r\n'
 

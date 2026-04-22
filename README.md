@@ -4,33 +4,47 @@ kvstore是一个用C语言实现的高性能、可扩展的键值存储系统，
 
 ## 主要特性
 
-### 存储引擎
+> 注意：下面分为“当前代码已实现并可验证的能力”和“后续规划能力”。本轮开始会按阶段推进实现，并在每一步提供对应验证方法。
 
-- **数组(Array)**：简单数组存储，适合小规模数据
-- **红黑树(RBTREE)**：自平衡二叉搜索树，支持有序数据
-- **哈希表(Hash)**：链式哈希表，快速查找
-- **跳表(Skiptable)**：多级索引结构，支持范围查询
+### 当前代码已实现并可验证的能力
 
-### 内存管理
+#### 存储引擎
 
-- **libc**：标准C库内存分配器
-- **jemalloc**：高性能内存分配器，减少内存碎片
-- **custom**：自定义内存分配器，支持slab分配和mmap大块内存
+- **数组(Array)**：基础键值存储
+- **红黑树(RBTREE)**：前缀 `R*` 命令
+- **哈希表(Hash)**：前缀 `H*` 命令
+- **跳表(Skiptable)**：前缀 `X*` 命令
 
-### 网络模型
+#### 内存管理
 
-- **Reactor**：基于epoll的事件驱动模型
-- **Proactor**：基于io_uring的异步I/O模型
-- **NtyCo**：协程模型，支持高并发连接
+- **libc**：标准 C 库内存分配器
+- **jemalloc**：高性能内存分配器
+- **custom**：自定义内存分配器，支持 slab 与大块映射统计
 
-### 核心功能
+#### 网络模型
 
-- **RESP协议**：兼容Redis序列化协议
-- **数据持久化**：支持AOF和RDB两种持久化方式
-- **主从复制**：支持一主多从架构
-- **哨兵模式**：支持高可用和自动故障转移
-- **键过期**：支持TTL和过期自动清理
-- **分布式锁**：支持锁获取、释放和续期
+- **Reactor**：基于 epoll
+- **Proactor**：基于 io_uring
+- **NtyCo**：协程模型
+
+#### 核心功能
+
+- **RESP 协议解析与响应**
+- **AOF + dump 恢复链路**：启动时可回放 `dump` 和 `aof`
+- **SAVE / BGSAVE / BGREWRITEAOF**
+- **主从复制基础能力**：支持 `SLAVEOF`、`ROLE`、`REPLSYNC` 全量同步与增量广播
+- **TTL / 过期清理**：支持 `EXPIRE`、`TTL`、`PERSIST`
+- **分布式锁基础命令**：`LOCK`、`UNLOCK`、`RENEW`、`OWNER`
+- **文档型 value（最小对象模型）**：支持 `DOCSET`、`DOCGET`、`DOCDEL`、`DOCDROP`、`DOCEXIST`、`DOCCOUNT`、`DOCGETALL`
+- **INFO / MEMSTAT / 自动快照规则**
+
+### 当前尚未完成或需要继续增强的能力
+
+- 更严格的“10w/100w 数据级”持久化回归测试与性能结果整理
+- 更完整的主从异常恢复与断点续传机制
+- RDMA / eBPF 同步优化
+- mmap 加载优化
+- README 中部分历史描述与实际实现的进一步对齐
 
 ## 快速开始
 
@@ -128,6 +142,15 @@ printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 - **TTL key**：获取键剩余生存时间
 - **PERSIST key**：移除键的过期时间
 
+当前 TTL 系统已从“固定桶 + 全表扫描”优化为“哈希索引 + 最小堆调度 + 自适应主动清理预算”：
+
+- 过期项可通过哈希索引按 `engine + key` 快速定位
+- 主动过期优先处理最早到期的 key，不再每轮扫描整张过期表
+- 当过期 key 数量增大时，事件循环会自动提升每轮清理预算
+- 更适合大量 key 同时设置 TTL 的场景
+
+对于海量 TTL 压测，建议优先使用 `HSET/HGET/HEXPIRE/HTTL` 对应的哈希引擎命令，而不是默认数组引擎。默认数组引擎容量较小，更适合基础功能验证。
+
 ### 服务器管理
 
 - **INFO**：获取服务器信息
@@ -152,6 +175,23 @@ printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 - **UNLOCK key owner**：释放锁
 - **RENEW key owner seconds**：续期锁
 - **OWNER key**：查看锁的所有者
+
+### 文档型对象操作
+
+- **DOCSET key field value**：设置文档字段；若文档不存在则自动创建
+- **DOCGET key field**：获取文档字段值
+- **DOCDEL key field**：删除文档中的单个字段
+- **DOCDROP key**：删除整个文档
+- **DOCEXIST key**：检查文档是否存在
+- **DOCCOUNT key**：返回文档字段数量
+- **DOCGETALL key**：返回文档全部字段和值（RESP array）
+
+第一版文档模型是“扁平对象模型”：
+
+- 只支持 `key -> field -> string value`
+- 适合作为 plan 第四阶段的最小可用实现
+- 已接入 dump/AOF 恢复链路
+- 已接入主从复制广播链路
 
 ### 复制和集群
 
@@ -283,28 +323,134 @@ print(response)
 
 ## 测试方法
 
-### 单元测试
+### 当前推荐的基线验证顺序
+
+在继续做后续功能改造前，建议先固定使用下面这套基线验证：
 
 ```bash
-# 编译测试程序
-cd tests
-make
+# 1. 编译
+make clean && make
 
-# 运行测试
-./test
+# 2. 启动服务
+./kvstore
+
+# 3. 运行基线验证
+make check
+
+# 4. 单独验证主从复制
+make check-repl
 ```
+
+说明：
+
+- `make check-resp`：验证 RESP 基础读写、多包、精确返回格式
+- `make check-ttl`：验证 TTL / EXPIRE / PERSIST
+- `make check-persist`：验证基础持久化命令与文件落盘
+- `make check-doc`：验证文档型 value 的增删改查与保存
+- `make check-mass-ttl`：验证大量 TTL key 的写入、到期与回收行为
+- `make check-repl`：验证主从全量同步和增量复制
+
+如果服务端口不是默认 `5000`，可以这样运行：
+
+```bash
+make check TEST_PORT=6380
+```
+
+如果主从测试端口需要调整：
+
+```bash
+make check-repl REPL_MASTER_PORT=7000 REPL_SLAVE_PORT=7001
+```
+
+### 单元测试
+
+当前 `tests/test.c` 为空，项目现阶段以集成验证脚本为主。后续在做文档型 value、mmap、TTL 扩展时，再补充真正的单元测试。
 
 ### 集成测试
 
 ```bash
-# 运行Redis协议兼容性测试
-./scripts/test_resp_nc_strict.sh
+# RESP基础能力
+make check-resp
 
-# 运行队列恢复测试
-./scripts/test_resp_queue_recovery.sh
+# TTL能力
+make check-ttl
 
-# 运行TTL测试
-./scripts/test_resp_ttl_nc.sh
+# 持久化基础验证
+make check-persist
+
+# 文档型 value 验证
+make check-doc
+
+# 海量 TTL key 验证
+make check-mass-ttl
+
+# 主从复制验证
+make check-repl
+```
+
+### 海量 TTL key 验证
+
+```bash
+# 先启动服务
+./kvstore --port 5100
+
+# 小规模验证
+make check-mass-ttl TEST_PORT=5100 MASS_TTL_KEYS=200 MASS_TTL_SECONDS=2 MASS_TTL_BATCH=50 MASS_TTL_SAMPLE=10
+
+# 更大规模验证
+make check-mass-ttl TEST_PORT=5100 MASS_TTL_KEYS=5000 MASS_TTL_SECONDS=2 MASS_TTL_BATCH=500 MASS_TTL_SAMPLE=20
+```
+
+可调参数：
+
+- `MASS_TTL_KEYS`：写入 key 总数
+- `MASS_TTL_SECONDS`：每个 key 的 TTL 秒数
+- `MASS_TTL_BATCH`：批次大小
+- `MASS_TTL_SAMPLE`：过期前后抽样检查数量
+
+说明：
+
+- `check-mass-ttl` 默认使用哈希引擎命令进行验证，更适合大量 key 场景
+- 该脚本会验证“写入成功 / 过期前可读 / 过期后删除 / 服务仍可响应”四类行为
+- 如果要逐步扩大规模，建议从 `200 -> 5000 -> 20000` 逐步提升
+
+### 第四阶段（文档型 value）建议验证步骤
+
+```bash
+# 1. 编译
+make clean && make
+
+# 2. 启动服务
+./kvstore --port 5099
+
+# 3. 运行文档对象测试
+make check-doc TEST_PORT=5099
+```
+
+如果你想手工验证，可以执行：
+
+```bash
+# 写入文档字段
+printf '*4\r\n$6\r\nDOCSET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n$5\r\nalice\r\n' | nc 127.0.0.1 5099
+
+# 读取文档字段
+printf '*3\r\n$6\r\nDOCGET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n' | nc 127.0.0.1 5099
+
+# 查看字段数量
+printf '*2\r\n$8\r\nDOCCOUNT\r\n$6\r\nuser:1\r\n' | nc 127.0.0.1 5099
+
+# 获取整个文档
+printf '*2\r\n$9\r\nDOCGETALL\r\n$6\r\nuser:1\r\n' | nc 127.0.0.1 5099
+```
+
+验证持久化恢复：
+
+```bash
+# 保存
+printf '*1\r\n$4\r\nSAVE\r\n' | nc 127.0.0.1 5099
+
+# 重启服务后再次读取
+printf '*3\r\n$6\r\nDOCGET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n' | nc 127.0.0.1 5099
 ```
 
 ### 性能测试

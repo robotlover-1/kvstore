@@ -123,7 +123,10 @@ static void server_main(void *arg) {
     memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;
     local.sin_port = htons(port);
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (inet_pton(AF_INET, g_cfg.bind_ip, &local.sin_addr) != 1) {
+        close(lfd);
+        return;
+    }
 
     if (bind(lfd, (struct sockaddr *)&local, sizeof(local)) != 0) {
         perror("[ntyco] bind");

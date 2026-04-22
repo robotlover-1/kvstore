@@ -29,6 +29,14 @@ static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
 static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
 static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static int persist_mode_is_none(void) { return strcmp(g_cfg.persist_mode, "none") == 0; }
+static int persist_mode_has_snapshot(void) {
+    return strcmp(g_cfg.persist_mode, "snapshot") == 0 || strcmp(g_cfg.persist_mode, "hybrid") == 0;
+}
+static int persist_mode_has_aof(void) {
+    return strcmp(g_cfg.persist_mode, "aof") == 0 || strcmp(g_cfg.persist_mode, "hybrid") == 0;
+}
+
 static int replay_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
@@ -150,6 +158,11 @@ static int finalize_rewrite_parent(void) {
 }
 
 int persist_init(void) {
+    if (persist_mode_is_none() || !persist_mode_has_aof()) {
+        g_aof_fp = NULL;
+        g_aof_last_flush_ms = kvs_now_ms();
+        return 0;
+    }
     g_aof_fp = fopen(g_cfg.aof_path, "ab+");
     g_aof_last_flush_ms = kvs_now_ms();
     return g_aof_fp ? 0 : -1;
@@ -165,6 +178,7 @@ void persist_close(void) {
 
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy) {
     if (policy != KVS_AOF_FSYNC_ALWAYS && policy != KVS_AOF_FSYNC_EVERYSEC) return -1;
+    if (!persist_mode_has_aof()) return -1;
     g_cfg.aof_fsync = policy;
     return 0;
 }
@@ -177,7 +191,20 @@ const char *persist_aof_policy_name(void) {
     return g_cfg.aof_fsync == KVS_AOF_FSYNC_EVERYSEC ? "everysec" : "always";
 }
 
+const char *persist_mode_name(void) {
+    return g_cfg.persist_mode;
+}
+
+int persist_mode_snapshot_enabled(void) {
+    return persist_mode_has_snapshot();
+}
+
+int persist_mode_aof_enabled(void) {
+    return persist_mode_has_aof();
+}
+
 int persist_force_aof_flush(void) {
+    if (!persist_mode_has_aof()) return -1;
     if (!g_aof_fp) return -1;
     if (persist_flush_aof_fp(g_aof_fp) != 0) return -1;
     g_aof_dirty = 0;
@@ -186,6 +213,7 @@ int persist_force_aof_flush(void) {
 }
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
+    if (!persist_mode_has_aof()) return 0;
     if (!g_aof_fp) return -1;
     if (fwrite(buf, 1, len, g_aof_fp) != len) return -1;
     g_aof_dirty = 1;
@@ -199,14 +227,15 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 }
 
 int persist_save_dump(void) {
+    if (persist_mode_is_none() || !persist_mode_has_snapshot()) return -1;
     int rc = persist_save_dump_to(g_cfg.dump_path);
     if (rc == 0) persist_mark_snapshot_success(g_dirty_counter);
     return rc;
 }
 
 int persist_recover(void) {
-    replay_file(g_cfg.dump_path);
-    replay_file(g_cfg.aof_path);
+    if (persist_mode_has_snapshot()) replay_file(g_cfg.dump_path);
+    if (persist_mode_has_aof()) replay_file(g_cfg.aof_path);
     g_dirty_counter = 0;
     g_last_snapshot_ms = kvs_now_ms();
     g_bgsave_last_end_ms = g_last_snapshot_ms;
@@ -216,6 +245,7 @@ int persist_recover(void) {
 }
 
 int persist_bgsave_start(void) {
+    if (persist_mode_is_none() || !persist_mode_has_snapshot()) return -1;
     if (g_bgsave_pid > 0) return 1;
 
     unsigned long long snap_dirty = g_dirty_counter;
@@ -279,6 +309,7 @@ const char *persist_bgsave_state_name(void) {
 }
 
 int persist_bgrewriteaof_start(void) {
+    if (!persist_mode_has_aof()) return -1;
     if (g_bgrewrite_pid > 0) return 1;
 
     if (persist_force_aof_flush() != 0 && g_aof_fp) return -1;

@@ -6,6 +6,7 @@ SRC_DIR=src
 INC_DIR=include/kvstore
 
 SRCS=$(SRC_DIR)/main/kvstore.c \
+     $(SRC_DIR)/main/config_validate.c \
      $(SRC_DIR)/core/reactor.c \
      $(SRC_DIR)/core/proactor.c \
      $(SRC_DIR)/core/ntyco.c \

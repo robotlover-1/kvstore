@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <strings.h>
 
+#define KVS_DEFAULT_CONFIG_PATH "kvstore.conf"
+
 kv_config_t g_cfg = {
     .role = ROLE_MASTER,
     .port = 5000,
@@ -45,6 +47,8 @@ size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const ch
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
 
 static int parse_autosnap_rules(const char *spec);
+static int parse_config_file(const char *path);
+static void trim_inplace(char *s);
 static int parse_appendfsync_policy(const char *s, kvs_aof_fsync_policy_t *out) {
     if (!s || !out) return -1;
     if (!strcasecmp(s, "always")) {
@@ -59,8 +63,29 @@ static int parse_appendfsync_policy(const char *s, kvs_aof_fsync_policy_t *out) 
 }
 
 static int parse_args(int argc, char **argv) {
+    const char *config_path = NULL;
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) g_cfg.port = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--config") && i + 1 < argc) {
+            config_path = argv[i + 1];
+            break;
+        }
+    }
+
+    if (!config_path) {
+        FILE *fp = fopen(KVS_DEFAULT_CONFIG_PATH, "r");
+        if (fp) {
+            fclose(fp);
+            config_path = KVS_DEFAULT_CONFIG_PATH;
+        }
+    }
+
+    if (config_path && parse_config_file(config_path) != 0) return -1;
+
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--config") && i + 1 < argc) {
+            ++i;
+        }
+        else if (!strcmp(argv[i], "--port") && i + 1 < argc) g_cfg.port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) g_cfg.role = !strcmp(argv[++i], "slave") ? ROLE_SLAVE : ROLE_MASTER;
         else if (!strcmp(argv[i], "--master-host") && i + 1 < argc) snprintf(g_cfg.master_host, sizeof(g_cfg.master_host), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--master-port") && i + 1 < argc) g_cfg.master_port = atoi(argv[++i]);
@@ -76,6 +101,7 @@ static int parse_args(int argc, char **argv) {
             g_cfg.aof_fsync = policy;
         }
         else if (!strcmp(argv[i], "--autosnap") && i + 1 < argc) {
+            persist_clear_autosnap_rules();
             if (parse_autosnap_rules(argv[++i]) != 0) return -1;
         }
         else if (!strcmp(argv[i], "--sentinel")) {
@@ -120,6 +146,87 @@ static int parse_autosnap_rules(const char *spec) {
         long long changes = atoll(sep + 1);
         if (persist_register_autosnap_rule(sec, changes) != 0) return -1;
     }
+    return 0;
+}
+
+static void trim_inplace(char *s) {
+    char *start;
+    char *end;
+    size_t len;
+    if (!s) return;
+    start = s;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != s) memmove(s, start, strlen(start) + 1);
+    len = strlen(s);
+    if (len == 0) return;
+    end = s + len - 1;
+    while (end >= s && isspace((unsigned char)*end)) {
+        *end = '\0';
+        --end;
+    }
+}
+
+static int apply_config_kv(const char *key, const char *value) {
+    kvs_aof_fsync_policy_t policy;
+    if (!key || !value) return -1;
+    if (!strcmp(key, "port")) g_cfg.port = atoi(value);
+    else if (!strcmp(key, "role")) g_cfg.role = !strcasecmp(value, "slave") ? ROLE_SLAVE : ROLE_MASTER;
+    else if (!strcmp(key, "master_host")) snprintf(g_cfg.master_host, sizeof(g_cfg.master_host), "%s", value);
+    else if (!strcmp(key, "master_port")) g_cfg.master_port = atoi(value);
+    else if (!strcmp(key, "dump_path")) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", value);
+    else if (!strcmp(key, "aof_path")) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", value);
+    else if (!strcmp(key, "mem_backend")) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", value);
+    else if (!strcmp(key, "net_backend")) snprintf(g_cfg.net_backend, sizeof(g_cfg.net_backend), "%s", value);
+    else if (!strcmp(key, "appendfsync")) {
+        if (parse_appendfsync_policy(value, &policy) != 0) return -1;
+        g_cfg.aof_fsync = policy;
+    }
+    else if (!strcmp(key, "autosnap")) {
+        persist_clear_autosnap_rules();
+        if (parse_autosnap_rules(value) != 0) return -1;
+    }
+    else if (!strcmp(key, "sentinel")) g_cfg.is_sentinel = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
+    else if (!strcmp(key, "sentinel_master_name")) snprintf(g_cfg.sentinel_master_name, sizeof(g_cfg.sentinel_master_name), "%s", value);
+    else if (!strcmp(key, "sentinel_monitor_host")) snprintf(g_cfg.sentinel_monitor_host, sizeof(g_cfg.sentinel_monitor_host), "%s", value);
+    else if (!strcmp(key, "sentinel_monitor_port")) g_cfg.sentinel_monitor_port = atoi(value);
+    else if (!strcmp(key, "sentinel_known_slaves")) snprintf(g_cfg.sentinel_known_slaves, sizeof(g_cfg.sentinel_known_slaves), "%s", value);
+    else if (!strcmp(key, "sentinel_down_after_ms")) g_cfg.sentinel_down_after_ms = atoi(value);
+    else if (!strcmp(key, "sentinel_failover_timeout_ms")) g_cfg.sentinel_failover_timeout_ms = atoi(value);
+    else if (!strcmp(key, "sentinel_quorum")) g_cfg.sentinel_quorum = atoi(value);
+    else return -1;
+    return 0;
+}
+
+static int parse_config_file(const char *path) {
+    FILE *fp;
+    char line[1024];
+    int lineno = 0;
+    if (!path || !*path) return -1;
+    fp = fopen(path, "r");
+    if (!fp) return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        char *eq;
+        char *key;
+        char *value;
+        lineno++;
+        trim_inplace(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+        eq = strchr(line, '=');
+        if (!eq) {
+            fclose(fp);
+            return -1;
+        }
+        *eq = '\0';
+        key = line;
+        value = eq + 1;
+        trim_inplace(key);
+        trim_inplace(value);
+        if (apply_config_kv(key, value) != 0) {
+            fclose(fp);
+            return -1;
+        }
+    }
+    fclose(fp);
     return 0;
 }
 
@@ -1206,7 +1313,7 @@ int kvs_snapshot_to_fp(FILE *fp) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

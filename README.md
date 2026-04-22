@@ -60,21 +60,61 @@ make clean && make
 ### 启动服务
 
 ```bash
-# 使用默认配置启动（端口5000，libc内存后端，reactor网络模型）
+# 使用默认配置启动（若当前目录存在 kvstore.conf，会自动加载该配置文件）
 ./kvstore
 
-# 指定端口和内存后端
-./kvstore --port 6380 --mem jemalloc
+# 显式指定配置文件启动
+./kvstore --config kvstore.conf
+
+# 指定端口和内存后端（命令行参数会覆盖配置文件同名项）
+./kvstore --config kvstore.conf --port 6380 --mem jemalloc
 
 # 指定网络模型
-./kvstore --net proactor --port 5000
+./kvstore --config kvstore.conf --net proactor --port 5000
 
 # 启动从节点
-./kvstore --role slave --master-host 127.0.0.1 --master-port 5000
+./kvstore --config kvstore.conf --role slave --master-host 127.0.0.1 --master-port 5000
 
 # 启动哨兵模式
-./kvstore --sentinel --sentinel-master-name mymaster --sentinel-monitor-host 127.0.0.1 --sentinel-monitor-port 5000
+./kvstore --config kvstore.conf --sentinel --sentinel-master-name mymaster --sentinel-monitor-host 127.0.0.1 --sentinel-monitor-port 5000
 ```
+
+### 配置文件
+
+项目根目录已提供示例配置文件：`kvstore.conf`
+
+配置文件格式为 `key=value`，支持空行和 `#` 注释。例如：
+
+```ini
+port=5000
+role=master
+master_host=127.0.0.1
+master_port=5000
+
+dump_path=kvstore.dump
+aof_path=kvstore.aof
+mem_backend=libc
+net_backend=reactor
+appendfsync=always
+
+autosnap=60:1000,300:10
+
+sentinel=0
+sentinel_master_name=mymaster
+sentinel_monitor_host=127.0.0.1
+sentinel_monitor_port=5000
+sentinel_known_slaves=
+sentinel_down_after_ms=5000
+sentinel_failover_timeout_ms=10000
+sentinel_quorum=1
+```
+
+说明：
+
+- 如果当前目录存在 `kvstore.conf`，`./kvstore` 会自动加载它
+- 也可以通过 `--config <path>` 显式指定配置文件
+- 命令行参数优先级高于配置文件
+- 当前配置文件已覆盖现有主要启动配置项，包括 `port`、`dump_path`、`aof_path`、`mem_backend`、`net_backend`、`appendfsync`、`autosnap`、主从配置和哨兵配置
 
 ### 基本使用
 
@@ -96,6 +136,7 @@ printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 
 | 参数                          | 说明                                | 默认值       |
 | ----------------------------- | ----------------------------------- | ------------ |
+| `--config`                    | 配置文件路径                        | `kvstore.conf` |
 | `--port`                      | 监听端口                            | 5000         |
 | `--role`                      | 角色（master/slave）                | master       |
 | `--master-host`               | 主节点地址（从节点使用）            | 127.0.0.1    |

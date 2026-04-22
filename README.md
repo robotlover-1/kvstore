@@ -30,8 +30,8 @@ kvstore是一个用C语言实现的高性能、可扩展的键值存储系统，
 #### 核心功能
 
 - **RESP 协议解析与响应**
-- **AOF + dump 恢复链路**：启动时可回放 `dump` 和 `aof`
-- **SAVE / BGSAVE / BGREWRITEAOF**
+- **AOF + dump 恢复链路**：启动时可回放 `dump` 和 `aof`，恢复路径优先使用 `mmap` 加载文件内容，大文件或映射失败时回退到普通流式读取
+- **SAVE / BGSAVE / BGREWRITEAOF**：持久化落盘优先尝试 `io_uring` 文件写/`fsync`，失败时回退到传统同步文件 IO；AOF 主路径已切到 `fd-first`，不再依赖 `FILE*` 的 `fflush`，只有仍经过 stdio 的路径才需要先 `fflush`
 - **主从复制基础能力**：支持 `SLAVEOF`、`ROLE`、`REPLSYNC` 全量同步与增量广播
 - **TTL / 过期清理**：支持 `EXPIRE`、`TTL`、`PERSIST`
 - **分布式锁基础命令**：`LOCK`、`UNLOCK`、`RENEW`、`OWNER`
@@ -43,7 +43,6 @@ kvstore是一个用C语言实现的高性能、可扩展的键值存储系统，
 - 更严格的“10w/100w 数据级”持久化回归测试与性能结果整理
 - 更完整的主从异常恢复与断点续传机制
 - RDMA / eBPF 同步优化
-- mmap 加载优化
 - README 中部分历史描述与实际实现的进一步对齐
 
 ## 快速开始
@@ -287,6 +286,14 @@ kvstore/
 
 ## 性能基准测试
 
+当前持久化链路说明：
+
+- AOF 主路径已切换为 `fd-first`，优先尝试 `io_uring` 文件写
+- dump / rewrite 快照序列化已支持直接写入目标 `fd`，不再必须经过 `FILE*`
+- AOF / dump / rewrite 的落盘同步优先尝试 `io_uring fsync`
+- 若运行环境、队列初始化或提交失败，则自动回退到 `pwrite/fsync`
+- 恢复加载路径优先使用 `mmap`，失败时回退到普通流式读取
+
 项目提供完整的基准测试套件：
 
 ### 运行基准测试
@@ -425,9 +432,49 @@ make check-doc
 # 海量 TTL key 验证
 make check-mass-ttl
 
+# io_uring 持久化正确性/性能 smoke 验证
+make check-uring-persist
+
 # 主从复制验证
 make check-repl
 ```
+
+### io_uring 持久化基准/正确性验证
+
+```bash
+# 默认 smoke 验证
+make check-uring-persist
+
+# 指定写入条数与 fsync 策略
+make check-uring-persist URING_PERSIST_COUNT=500 URING_PERSIST_APPEND_FSYNC=always
+```
+
+说明：
+
+- 该脚本会启动一个临时 kvstore 实例
+- 批量写入 key 后执行 `SAVE`
+- 输出写入耗时、SAVE 耗时、重启恢复校验耗时
+- 同时校验 `aof`/`dump` 文件存在且恢复后的 key 可读
+
+### mmap 恢复性能增强版验证
+
+```bash
+# 默认 mmap 恢复验证（默认使用 hash 引擎，适合较大 key 数）
+make check-mmap-recover
+
+# 指定恢复数据规模
+make check-mmap-recover MMAP_RECOVER_COUNT=5000 MMAP_RECOVER_APPEND_FSYNC=everysec
+
+# 指定底层引擎（array/hash/rbtree/skiptable）
+make check-mmap-recover MMAP_RECOVER_ENGINE=hash MMAP_RECOVER_COUNT=5000
+```
+
+说明：
+
+- 启动临时实例写入数据并生成 `dump` / `aof`
+- 重启后统计恢复 wall time
+- 通过 `INFO` 输出恢复阶段统计信息
+- 重点观测 `recover_mmap_attempts`、`recover_mmap_success`、`recover_mmap_fallbacks`、`recover_mmap_bytes`
 
 ### 海量 TTL key 验证
 

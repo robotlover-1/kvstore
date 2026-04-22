@@ -648,7 +648,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "REPLSYNC")) { repl_add_slave(c); queue_snapshot(c); return 0; }
     if (!strcmp(cmd, "REPLDONE")) return 0;
     if (!strcmp(cmd, "INFO")) {
-        char info[2048];
+        char info[4096];
+        char recover[1024] = {0};
+        int recover_n = persist_build_recover_text(recover, sizeof(recover));
 
         int replicas = 0;
         pthread_mutex_lock(&g_repl_lock);
@@ -669,7 +671,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "master_host:%s\n"
             "master_port:%d\n"
             "master_link:%s\n"
-            "replicas:%d",
+            "replicas:%d\n"
+            "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
             (unsigned long long)persist_dirty_count(),
@@ -683,7 +686,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             g_cfg.master_host[0] ? g_cfg.master_host : "",
             g_cfg.master_port,
             repl_master_link_state_name(),
-            replicas);
+            replicas,
+            recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1219,19 +1223,40 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
     return 0;
 }
 
-static int emit_cmd3_fp(FILE *fp, const char *cmd, const char *a1, const char *a2) {
+typedef int (*snapshot_emit_fn)(void *ctx, const unsigned char *buf, size_t len);
+
+typedef struct snapshot_sink_s {
+    snapshot_emit_fn emit;
+    void *ctx;
+} snapshot_sink_t;
+
+static int emit_cmd3_sink(snapshot_sink_t *sink, const char *cmd, const char *a1, const char *a2) {
     unsigned char buf[BUFFER_CAP];
     size_t n = resp_build_cmd3(buf, sizeof(buf), cmd, a1, a2);
-    return fwrite(buf, 1, n, fp) == n ? 0 : -1;
+    return sink->emit(sink->ctx, buf, n);
 }
 
-static int emit_cmd4_fp(FILE *fp, const char *cmd, const char *a1, const char *a2, const char *a3) {
+static int emit_cmd4_sink(snapshot_sink_t *sink, const char *cmd, const char *a1, const char *a2, const char *a3) {
     unsigned char buf[BUFFER_CAP];
     size_t n = resp_build_cmd4(buf, sizeof(buf), cmd, a1, a2, a3);
-    return fwrite(buf, 1, n, fp) == n ? 0 : -1;
+    return sink->emit(sink->ctx, buf, n);
 }
 
-static int maybe_emit_expire(FILE *fp, int engine, const char *key) {
+static int snapshot_emit_fp(void *ctx, const unsigned char *buf, size_t len) {
+    FILE *fp = (FILE *)ctx;
+    return fwrite(buf, 1, len, fp) == len ? 0 : -1;
+}
+
+static int snapshot_emit_fd(void *ctx, const unsigned char *buf, size_t len) {
+    long long *state = (long long *)ctx;
+    int fd = (int)state[0];
+    long long off = state[1];
+    if (persist_write_raw_fd(fd, buf, len, &off) != 0) return -1;
+    state[1] = off;
+    return 0;
+}
+
+static int maybe_emit_expire_sink(snapshot_sink_t *sink, int engine, const char *key) {
     long long ttl = kvs_expire_ttl(&global_expire, engine, key);
     if (ttl < 0) return 0;
     char sec[32]; snprintf(sec, sizeof(sec), "%lld", ttl);
@@ -1239,76 +1264,95 @@ static int maybe_emit_expire(FILE *fp, int engine, const char *key) {
         engine == KVS_ENGINE_ARRAY ? "EXPIRE" :
         engine == KVS_ENGINE_RBTREE ? "REXPIRE" :
         engine == KVS_ENGINE_HASH ? "HEXPIRE" : "XEXPIRE";
-    return emit_cmd3_fp(fp, cmd, key, sec);
+    return emit_cmd3_sink(sink, cmd, key, sec);
 }
 
-static int snapshot_array(FILE *fp) {
+static int snapshot_array_sink(snapshot_sink_t *sink) {
     for (int i = 0; i < KVS_ARRAY_SIZE; ++i) {
         if (global_array.table && global_array.table[i].key) {
-            if (emit_cmd3_fp(fp, "SET", global_array.table[i].key, global_array.table[i].value) != 0) return -1;
-            if (maybe_emit_expire(fp, KVS_ENGINE_ARRAY, global_array.table[i].key) != 0) return -1;
+            if (emit_cmd3_sink(sink, "SET", global_array.table[i].key, global_array.table[i].value) != 0) return -1;
+            if (maybe_emit_expire_sink(sink, KVS_ENGINE_ARRAY, global_array.table[i].key) != 0) return -1;
         }
     }
     return 0;
 }
 
-static int snapshot_hash(FILE *fp) {
+static int snapshot_hash_sink(snapshot_sink_t *sink) {
     if (!global_hash.nodes) return 0;
     for (int i = 0; i < global_hash.max_slots; ++i) {
         for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
-            if (emit_cmd3_fp(fp, "HSET", node->key, node->value) != 0) return -1;
-            if (maybe_emit_expire(fp, KVS_ENGINE_HASH, node->key) != 0) return -1;
+            if (emit_cmd3_sink(sink, "HSET", node->key, node->value) != 0) return -1;
+            if (maybe_emit_expire_sink(sink, KVS_ENGINE_HASH, node->key) != 0) return -1;
         }
     }
     return 0;
 }
 
-static int snapshot_rbtree_node(FILE *fp, rbtree_node *node, rbtree_node *nil) {
+static int snapshot_rbtree_node_sink(snapshot_sink_t *sink, rbtree_node *node, rbtree_node *nil) {
     if (node == nil) return 0;
-    if (snapshot_rbtree_node(fp, node->left, nil) != 0) return -1;
-    if (emit_cmd3_fp(fp, "RSET", node->key, (char *)node->value) != 0) return -1;
-    if (maybe_emit_expire(fp, KVS_ENGINE_RBTREE, node->key) != 0) return -1;
-    if (snapshot_rbtree_node(fp, node->right, nil) != 0) return -1;
+    if (snapshot_rbtree_node_sink(sink, node->left, nil) != 0) return -1;
+    if (emit_cmd3_sink(sink, "RSET", node->key, (char *)node->value) != 0) return -1;
+    if (maybe_emit_expire_sink(sink, KVS_ENGINE_RBTREE, node->key) != 0) return -1;
+    if (snapshot_rbtree_node_sink(sink, node->right, nil) != 0) return -1;
     return 0;
 }
 
-static int snapshot_skiptable_cb(const char *key, const char *value, void *arg) {
-    FILE *fp = (FILE *)arg;
-    if (emit_cmd3_fp(fp, "XSET", key, value) != 0) return -1;
-    if (maybe_emit_expire(fp, KVS_ENGINE_SKIPTABLE, key) != 0) return -1;
+static int snapshot_skiptable_cb_sink(const char *key, const char *value, void *arg) {
+    snapshot_sink_t *sink = (snapshot_sink_t *)arg;
+    if (emit_cmd3_sink(sink, "XSET", key, value) != 0) return -1;
+    if (maybe_emit_expire_sink(sink, KVS_ENGINE_SKIPTABLE, key) != 0) return -1;
     return 0;
 }
 
-static int snapshot_skiptable(FILE *fp) {
-    return kvs_skiptable_foreach(&global_skiptable, snapshot_skiptable_cb, fp);
+static int snapshot_skiptable_sink(snapshot_sink_t *sink) {
+    return kvs_skiptable_foreach(&global_skiptable, snapshot_skiptable_cb_sink, sink);
 }
 
-static int snapshot_doc_field_cb(const char *name, const char *value, void *arg) {
+static int snapshot_doc_field_cb_sink(const char *name, const char *value, void *arg) {
     void **ctx = (void **)arg;
-    FILE *fp = (FILE *)ctx[0];
+    snapshot_sink_t *sink = (snapshot_sink_t *)ctx[0];
     const char *key = (const char *)ctx[1];
-    return emit_cmd4_fp(fp, "DOCSET", key, name, value);
+    return emit_cmd4_sink(sink, "DOCSET", key, name, value);
 }
 
-static int snapshot_doc_cb(const char *key, kvs_doc_t *doc, void *arg) {
-    FILE *fp = (FILE *)arg;
+static int snapshot_doc_cb_sink(const char *key, kvs_doc_t *doc, void *arg) {
+    snapshot_sink_t *sink = (snapshot_sink_t *)arg;
     (void)doc;
-    void *ctx[2] = { fp, (void *)key };
-    return kvs_doc_foreach_field(&global_doc, key, snapshot_doc_field_cb, ctx);
+    void *ctx[2] = { sink, (void *)key };
+    return kvs_doc_foreach_field(&global_doc, key, snapshot_doc_field_cb_sink, ctx);
 }
 
-static int snapshot_doc(FILE *fp) {
-    return kvs_doc_foreach(&global_doc, snapshot_doc_cb, fp);
+static int snapshot_doc_sink(snapshot_sink_t *sink) {
+    return kvs_doc_foreach(&global_doc, snapshot_doc_cb_sink, sink);
+}
+
+static int snapshot_all_sink(snapshot_sink_t *sink) {
+    if (!sink || !sink->emit) return -1;
+    if (snapshot_array_sink(sink) != 0) return -1;
+    if (snapshot_rbtree_node_sink(sink, global_rbtree.root, global_rbtree.nil) != 0) return -1;
+    if (snapshot_hash_sink(sink) != 0) return -1;
+    if (snapshot_skiptable_sink(sink) != 0) return -1;
+    if (snapshot_doc_sink(sink) != 0) return -1;
+    return 0;
 }
 
 int kvs_snapshot_to_fp(FILE *fp) {
+    snapshot_sink_t sink;
     if (!fp) return -1;
-    if (snapshot_array(fp) != 0) return -1;
-    if (snapshot_rbtree_node(fp, global_rbtree.root, global_rbtree.nil) != 0) return -1;
-    if (snapshot_hash(fp) != 0) return -1;
-    if (snapshot_skiptable(fp) != 0) return -1;
-    if (snapshot_doc(fp) != 0) return -1;
-    return 0;
+    sink.emit = snapshot_emit_fp;
+    sink.ctx = fp;
+    return snapshot_all_sink(&sink);
+}
+
+int kvs_snapshot_to_fd(int fd) {
+    snapshot_sink_t sink;
+    long long fd_state[2];
+    if (fd < 0) return -1;
+    fd_state[0] = fd;
+    fd_state[1] = 0;
+    sink.emit = snapshot_emit_fd;
+    sink.ctx = fd_state;
+    return snapshot_all_sink(&sink);
 }
 
 int main(int argc, char **argv) {

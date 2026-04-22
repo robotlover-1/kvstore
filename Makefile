@@ -12,6 +12,13 @@ MASS_TTL_KEYS?=10000
 MASS_TTL_SECONDS?=2
 MASS_TTL_BATCH?=1000
 MASS_TTL_SAMPLE?=20
+URING_PERSIST_COUNT?=1000
+URING_PERSIST_PORT?=5140
+URING_PERSIST_APPEND_FSYNC?=always
+MMAP_RECOVER_COUNT?=2000
+MMAP_RECOVER_PORT?=5142
+MMAP_RECOVER_ENGINE?=hash
+MMAP_RECOVER_APPEND_FSYNC?=everysec
 
 SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/core/reactor.c \
@@ -61,9 +68,15 @@ check-doc:
 check-mass-ttl:
 	python3 ./scripts/run_mass_ttl_validation.py --host $(TEST_HOST) --port $(TEST_PORT) --keys $(MASS_TTL_KEYS) --ttl $(MASS_TTL_SECONDS) --batch $(MASS_TTL_BATCH) --sample $(MASS_TTL_SAMPLE)
 
+check-uring-persist:
+	python3 ./scripts/run_uring_persist_bench.py --bin ./kvstore --host $(TEST_HOST) --port $(URING_PERSIST_PORT) --count $(URING_PERSIST_COUNT) --appendfsync $(URING_PERSIST_APPEND_FSYNC)
+
+check-mmap-recover:
+	python3 ./scripts/run_mmap_recover_bench.py --bin ./kvstore --host $(TEST_HOST) --port $(MMAP_RECOVER_PORT) --count $(MMAP_RECOVER_COUNT) --engine $(MMAP_RECOVER_ENGINE) --appendfsync $(MMAP_RECOVER_APPEND_FSYNC)
+
 check-repl:
 	MASTER_PORT=$(REPL_MASTER_PORT) SLAVE_PORT=$(REPL_SLAVE_PORT) bash ./scripts/run_repl_fullsync_test.sh
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-mass-ttl check-repl
+.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-mass-ttl check-uring-persist check-mmap-recover check-repl

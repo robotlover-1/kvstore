@@ -46,20 +46,14 @@ make clean && make
 ### 启动服务
 
 ```bash
-# 使用默认配置启动（端口5000，libc内存后端，reactor网络模型）
+# 使用默认配置文件启动（kvstore.conf）
 ./kvstore
 
-# 指定端口和内存后端
-./kvstore --port 6380 --mem jemalloc
+# 指定配置文件启动（推荐）
+./kvstore --config kvstore.conf
 
-# 指定网络模型
-./kvstore --net proactor --port 5000
-
-# 启动从节点
-./kvstore --role slave --master-host 127.0.0.1 --master-port 5000
-
-# 启动哨兵模式
-./kvstore --sentinel --sentinel-master-name mymaster --sentinel-monitor-host 127.0.0.1 --sentinel-monitor-port 5000
+# 仍支持命令行参数覆盖（兼容模式，建议迁移到配置文件）
+./kvstore --config kvstore.conf --port 6380 --mem jemalloc
 ```
 
 ### 基本使用
@@ -77,11 +71,38 @@ printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 ```
 
-## 命令行参数
+## 配置文件（推荐）
 
+默认读取仓库根目录 `kvstore.conf`，也可通过 `--config <path>` 指定。
+
+配置示例：
+
+```ini
+port = 5000
+role = master
+master_host = 127.0.0.1
+master_port = 5000
+dump_path = kvstore.dump
+aof_path = kvstore.aof
+appendfsync = always
+autosnap =
+mem_backend = libc
+net_backend = reactor
+sentinel = false
+sentinel_master_name = mymaster
+sentinel_monitor_host = 127.0.0.1
+sentinel_monitor_port = 5000
+sentinel_known_slaves =
+sentinel_down_after_ms = 5000
+sentinel_failover_timeout_ms = 10000
+sentinel_quorum = 1
+```
+
+## 命令行参数（兼容模式）
 
 | 参数                          | 说明                                | 默认值       |
 | ----------------------------- | ----------------------------------- | ------------ |
+| `--config`                    | 配置文件路径                        | kvstore.conf |
 | `--port`                      | 监听端口                            | 5000         |
 | `--role`                      | 角色（master/slave）                | master       |
 | `--master-host`               | 主节点地址（从节点使用）            | 127.0.0.1    |

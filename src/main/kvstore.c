@@ -57,8 +57,111 @@ static int parse_appendfsync_policy(const char *s, kvs_aof_fsync_policy_t *out) 
     return -1;
 }
 
+static char *trim_inplace(char *s) {
+    char *end;
+    if (!s) return s;
+    while (*s && isspace((unsigned char)*s)) ++s;
+    if (*s == '\0') return s;
+    end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) --end;
+    end[1] = '\0';
+    return s;
+}
+
+static int parse_bool_text(const char *s, int *out) {
+    if (!s || !out) return -1;
+    if (!strcasecmp(s, "1") || !strcasecmp(s, "true") || !strcasecmp(s, "yes") || !strcasecmp(s, "on")) {
+        *out = 1;
+        return 0;
+    }
+    if (!strcasecmp(s, "0") || !strcasecmp(s, "false") || !strcasecmp(s, "no") || !strcasecmp(s, "off")) {
+        *out = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static int apply_config_kv(const char *key, const char *val) {
+    int bool_value;
+    if (!strcmp(key, "port")) g_cfg.port = atoi(val);
+    else if (!strcmp(key, "role")) g_cfg.role = !strcasecmp(val, "slave") ? ROLE_SLAVE : ROLE_MASTER;
+    else if (!strcmp(key, "master_host")) snprintf(g_cfg.master_host, sizeof(g_cfg.master_host), "%s", val);
+    else if (!strcmp(key, "master_port")) g_cfg.master_port = atoi(val);
+    else if (!strcmp(key, "dump_path")) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", val);
+    else if (!strcmp(key, "aof_path")) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", val);
+    else if (!strcmp(key, "mem_backend")) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", val);
+    else if (!strcmp(key, "net_backend")) snprintf(g_cfg.net_backend, sizeof(g_cfg.net_backend), "%s", val);
+    else if (!strcmp(key, "appendfsync")) {
+        kvs_aof_fsync_policy_t policy;
+        if (parse_appendfsync_policy(val, &policy) != 0) return -1;
+        g_cfg.aof_fsync = policy;
+    }
+    else if (!strcmp(key, "autosnap")) {
+        if (parse_autosnap_rules(val) != 0) return -1;
+    }
+    else if (!strcmp(key, "sentinel")) {
+        if (parse_bool_text(val, &bool_value) != 0) return -1;
+        g_cfg.is_sentinel = bool_value;
+    }
+    else if (!strcmp(key, "sentinel_master_name")) snprintf(g_cfg.sentinel_master_name, sizeof(g_cfg.sentinel_master_name), "%s", val);
+    else if (!strcmp(key, "sentinel_monitor_host")) snprintf(g_cfg.sentinel_monitor_host, sizeof(g_cfg.sentinel_monitor_host), "%s", val);
+    else if (!strcmp(key, "sentinel_monitor_port")) g_cfg.sentinel_monitor_port = atoi(val);
+    else if (!strcmp(key, "sentinel_known_slaves")) snprintf(g_cfg.sentinel_known_slaves, sizeof(g_cfg.sentinel_known_slaves), "%s", val);
+    else if (!strcmp(key, "sentinel_down_after_ms")) g_cfg.sentinel_down_after_ms = atoi(val);
+    else if (!strcmp(key, "sentinel_failover_timeout_ms")) g_cfg.sentinel_failover_timeout_ms = atoi(val);
+    else if (!strcmp(key, "sentinel_quorum")) g_cfg.sentinel_quorum = atoi(val);
+    else return -1;
+    return 0;
+}
+
+static int load_config_file(const char *path) {
+    char line[1024];
+    int lineno = 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *eq;
+        char *key;
+        char *val;
+        lineno++;
+        key = trim_inplace(line);
+        if (*key == '\0' || *key == '#') continue;
+        eq = strchr(key, '=');
+        if (!eq) {
+            fprintf(stderr, "invalid config line %d: %s\n", lineno, key);
+            fclose(fp);
+            return -1;
+        }
+        *eq = '\0';
+        val = trim_inplace(eq + 1);
+        key = trim_inplace(key);
+        if (apply_config_kv(key, val) != 0) {
+            fprintf(stderr, "invalid config key/value at line %d: %s=%s\n", lineno, key, val);
+            fclose(fp);
+            return -1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
 static int parse_args(int argc, char **argv) {
+    const char *config_path = "kvstore.conf";
     for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--config") && i + 1 < argc) {
+            config_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(argv[i], "--config")) return -1;
+    }
+    if (load_config_file(config_path) != 0) {
+        fprintf(stderr, "failed to load config file: %s\n", config_path);
+        return -1;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--config") && i + 1 < argc) { ++i; continue; }
         if (!strcmp(argv[i], "--port") && i + 1 < argc) g_cfg.port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) g_cfg.role = !strcmp(argv[++i], "slave") ? ROLE_SLAVE : ROLE_MASTER;
         else if (!strcmp(argv[i], "--master-host") && i + 1 < argc) snprintf(g_cfg.master_host, sizeof(g_cfg.master_host), "%s", argv[++i]);
@@ -1019,7 +1122,7 @@ int kvs_snapshot_to_fp(FILE *fp) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s --port 5000 [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [legacy args...]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

@@ -489,28 +489,33 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
 
     if (g_cfg.role == ROLE_SLAVE && !from_replication && is_readonly_slave_blocked(cmd)) {
         n = resp_error(resp, BUFFER_CAP, "read only slave");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "PING")) {
         if (argc >= 2) n = resp_bulk(resp, BUFFER_CAP, argv[1], strlen(argv[1]));
         else n = resp_simple_string(resp, BUFFER_CAP, "PONG");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "ECHO") && argc == 2) {
         n = resp_bulk(resp, BUFFER_CAP, argv[1], strlen(argv[1]));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "QUIT")) {
         n = resp_simple_string(resp, BUFFER_CAP, "OK");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "COMMAND")) {
         n = resp_empty_array(resp, BUFFER_CAP);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "CLIENT")) {
@@ -520,12 +525,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_array_two_bulk(resp, BUFFER_CAP, "id", "1");
             if (n < 0) n = resp_error(resp, BUFFER_CAP, "client subcommand failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "HELLO")) {
         n = resp_error(resp, BUFFER_CAP, "NOPROTO unsupported RESP version");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "REPLSYNC")) { repl_add_slave(c); queue_snapshot(c); return 0; }
@@ -569,7 +576,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             replicas);
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "MEMSTAT")) {
@@ -577,12 +585,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         n = build_memstat_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "memstat build failed");
         else n = resp_bulk(resp, BUFFER_CAP, info, (size_t)n);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "SAVE")) {
         n = (persist_save_dump() == 0) ? resp_simple_string(resp, BUFFER_CAP, "OK") : resp_error(resp, BUFFER_CAP, "save failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "BGSAVE")) {
@@ -590,7 +600,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (brc == 0) n = resp_simple_string(resp, BUFFER_CAP, "Background saving started");
         else if (brc == 1) n = resp_error(resp, BUFFER_CAP, "background saving already in progress");
         else n = resp_error(resp, BUFFER_CAP, "bgsave failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "BGREWRITEAOF")) {
@@ -598,7 +609,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (rrc == 0) n = resp_simple_string(resp, BUFFER_CAP, "Background append only file rewriting started");
         else if (rrc == 1) n = resp_error(resp, BUFFER_CAP, "aof rewrite already in progress");
         else n = resp_error(resp, BUFFER_CAP, "bgrewriteaof failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "APPENDFSYNC") && argc == 2) {
@@ -607,7 +619,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_error(resp, BUFFER_CAP, "invalid fsync policy");
         else
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "CONFIG") && argc == 3) {
@@ -620,13 +633,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         } else {
             n = resp_error(resp, BUFFER_CAP, "unsupported config option");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULE") && argc == 3) {
         int arc = persist_register_autosnap_rule(atoll(argv[1]), atoll(argv[2]));
         n = (arc == 0) ? resp_simple_string(resp, BUFFER_CAP, "OK") : resp_error(resp, BUFFER_CAP, "snaprule failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULES")) {
@@ -634,13 +649,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         n = persist_build_autosnap_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "snaprules build failed");
         else n = resp_bulk(resp, BUFFER_CAP, info, (size_t)n);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULECLEAR")) {
         persist_clear_autosnap_rules();
         n = resp_simple_string(resp, BUFFER_CAP, "OK");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
 
@@ -658,7 +675,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         } else {
             n = resp_error(resp, BUFFER_CAP, "lock failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "UNLOCK") && argc == 3) {
@@ -675,7 +693,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         } else {
             n = resp_error(resp, BUFFER_CAP, "unlock failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "RENEW") && argc == 4) {
@@ -692,14 +711,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         } else {
             n = resp_error(resp, BUFFER_CAP, "renew failed");
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "OWNER") && argc == 2) {
         try_expire(KVS_ENGINE_ARRAY, argv[1]);
         char *v = engine_get(KVS_ENGINE_ARRAY, argv[1]);
         n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "SLAVEOF")) {
@@ -708,7 +729,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 n = resp_error(resp, BUFFER_CAP, "slaveof no one failed");
             else
                 n = resp_simple_string(resp, BUFFER_CAP, "OK");
-            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
             return 0;
         }
 
@@ -718,12 +740,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 n = resp_error(resp, BUFFER_CAP, "slaveof failed");
             else
                 n = resp_simple_string(resp, BUFFER_CAP, "OK");
-            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
             return 0;
         }
 
         n = resp_error(resp, BUFFER_CAP, "wrong args for SLAVEOF");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
     if (!strcmp(cmd, "ROLE")) {
@@ -737,7 +761,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 strlen(g_cfg.master_host), g_cfg.master_host,
                 strlen(mp), mp);
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
 
@@ -753,17 +778,20 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         try_expire(engine, argv[1]);
         char *v = engine_get(engine, argv[1]);
         n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     } else if (!strcmp(op, "MGET")) {
         n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     } else if (!strcmp(op, "EXIST") && argc == 2) {
         try_expire(engine, argv[1]);
         n = resp_integer(resp, BUFFER_CAP, engine_exist(engine, argv[1]) == 0 ? 1 : 0);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     } else if (!strcmp(op, "EXPIRE") && argc == 3) {
         try_expire(engine, argv[1]);
@@ -776,7 +804,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             long long ttl = kvs_expire_ttl(&global_expire, engine, argv[1]);
             n = resp_integer(resp, BUFFER_CAP, ttl);
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     } else if (!strcmp(op, "PERSIST") && argc == 2) {
         try_expire(engine, argv[1]);
@@ -784,7 +813,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
     } else {
         n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
         return 0;
     }
 
@@ -800,7 +830,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     } else {
         n = resp_error(resp, BUFFER_CAP, "operation failed");
     }
-    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);goto out;
+    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
     out:
     kvs_free(resp);
     return rc_ret;

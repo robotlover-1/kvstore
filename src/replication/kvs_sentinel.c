@@ -251,10 +251,15 @@ static int issue_slaveof_no_one(const char *host, int port) {
 }
 
 static int issue_slaveof(const char *host, int port, const char *master_host, int master_port) {
-    char cmd[256];
+    char cmd[1024];
     char reply[512];
+    int n;
 
-    snprintf(cmd, sizeof(cmd), "SLAVEOF %s %d\r\n", master_host, master_port);
+    n = snprintf(cmd, sizeof(cmd), "SLAVEOF %s %d\r\n", master_host, master_port);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        /* 截断或错误，但缓冲区足够大（1024），不应发生 */
+        return -1;
+    }
     if (send_inline_cmd_simple(host, port, cmd, reply, sizeof(reply), 1500) != 0) return -1;
     return (reply[0] == '+' || reply[0] == ':') ? 0 : -1;
 }
@@ -430,7 +435,8 @@ int sentinel_start(void) {
                                       nodes[idx].host, nodes[idx].port,
                                       failed_host, failed_port);
 
-                snprintf(g_cfg.sentinel_monitor_host, sizeof(g_cfg.sentinel_monitor_host), "%s", nodes[idx].host);
+                strncpy(g_cfg.sentinel_monitor_host, nodes[idx].host, sizeof(g_cfg.sentinel_monitor_host) - 1);
+                g_cfg.sentinel_monitor_host[sizeof(g_cfg.sentinel_monitor_host) - 1] = '\0';
                 g_cfg.sentinel_monitor_port = nodes[idx].port;
                 last_failover_ms = now;
                 sdown = 0;

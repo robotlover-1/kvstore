@@ -62,7 +62,9 @@ hashnode_t *_create_node(char *key, char *value) {
 	if (!node) return NULL;
 	
 	strncpy(node->key, key, MAX_KEY_LEN);
+	node->key[MAX_KEY_LEN - 1] = '\0';
 	strncpy(node->value, value, MAX_VALUE_LEN);
+	node->value[MAX_VALUE_LEN - 1] = '\0';
 	node->next = NULL;
 
 	return node;

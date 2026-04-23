@@ -8,6 +8,8 @@ TEST_HOST?=127.0.0.1
 TEST_PORT?=5000
 REPL_MASTER_PORT?=6379
 REPL_SLAVE_PORT?=6380
+REPL_RECONNECT_WAIT?=3
+REPL_RESTART_WAIT?=4
 MASS_TTL_KEYS?=10000
 MASS_TTL_SECONDS?=2
 MASS_TTL_BATCH?=1000
@@ -75,7 +77,7 @@ check-mmap-recover:
 	python3 ./scripts/run_mmap_recover_bench.py --bin ./kvstore --host $(TEST_HOST) --port $(MMAP_RECOVER_PORT) --count $(MMAP_RECOVER_COUNT) --engine $(MMAP_RECOVER_ENGINE) --appendfsync $(MMAP_RECOVER_APPEND_FSYNC)
 
 check-repl:
-	MASTER_PORT=$(REPL_MASTER_PORT) SLAVE_PORT=$(REPL_SLAVE_PORT) bash ./scripts/run_repl_fullsync_test.sh
+	MASTER_PORT=$(REPL_MASTER_PORT) SLAVE_PORT=$(REPL_SLAVE_PORT) RECONNECT_WAIT=$(REPL_RECONNECT_WAIT) RESTART_WAIT=$(REPL_RESTART_WAIT) bash ./scripts/run_repl_fullsync_test.sh
 
 check: check-resp check-ttl check-persist check-doc
 

@@ -398,6 +398,37 @@ make check-repl
 - `make check-mass-ttl`：验证大量 TTL key 的写入、到期与回收行为
 - `make check-repl`：验证主从全量同步和增量复制
 
+### 阶段 9 复制链路基线指标
+
+`INFO` 已输出第一批复制链路指标，可作为后续 backlog / partial resync / eBPF 优化的基线：
+
+- `master_replid`
+- `master_repl_offset`
+- `connected_slaves`
+- `repl_fullsync_count`
+- `repl_partialsync_ok_count`
+- `repl_partialsync_err_count`
+- `repl_broadcast_bytes`
+- `repl_snapshot_bytes`
+- `repl_backlog_size`
+- `repl_backlog_histlen`
+- `repl_backlog_start_offset`
+- `repl_backlog_end_offset`
+
+当前这些指标主要用于观测：
+
+- 主节点复制流累计偏移
+- 当前已连接从节点数量
+- 全量同步次数
+- 后续部分重同步成功/失败次数
+- 增量广播字节量与全量快照发送字节量
+- 当前 backlog 容量、历史窗口长度以及可服务的 offset 范围
+
+当前已实现第一版 partial resync：
+
+- slave 在同一进程内通过 `SLAVEOF NO ONE` 再次执行 `SLAVEOF <host> <port>` 重连时，可基于 `replid + offset + backlog` 走 `CONTINUE`
+- 如果 slave 是跨进程重启，由于本地 `replid/offset` 尚未持久化，当前仍会退回 `FULLRESYNC`
+
 如果服务端口不是默认 `5000`，可以这样运行：
 
 ```bash

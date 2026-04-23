@@ -249,14 +249,20 @@ void repl_remove_slave(conn_t *c) {
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
+    repl_backlog_feed(raw, rawlen);
+    repl_note_broadcast(rawlen);
     pthread_mutex_lock(&g_repl_lock);
-    for (conn_t *c = g_replicas; c; c = c->next_replica) queue_bytes(c, raw, rawlen);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        queue_bytes(c, raw, rawlen);
+        c->repl_offset_sent = repl_master_offset();
+        c->repl_last_send_ms = kvs_now_ms();
+    }
     pthread_mutex_unlock(&g_repl_lock);
 }
 
 static int queue_snapshot(conn_t *c) {
-    char hdr[64];
-    int n = resp_simple_string(hdr, sizeof(hdr), "FULLRESYNC");
+    char hdr[128];
+    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu\r\n", repl_master_id(), repl_master_offset());
     queue_bytes(c, (unsigned char *)hdr, (size_t)n);
     FILE *fp = fopen(g_cfg.dump_path, "wb");
     if (!fp) return -1;
@@ -264,9 +270,15 @@ static int queue_snapshot(conn_t *c) {
     fclose(fp);
     fp = fopen(g_cfg.dump_path, "rb");
     if (!fp) return -1;
-    unsigned char buf[8192]; size_t r;
-    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) queue_bytes(c, buf, r);
+    unsigned char buf[8192]; size_t r; size_t total = 0;
+    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        total += r;
+        queue_bytes(c, buf, r);
+    }
     fclose(fp);
+    repl_note_fullsync(total);
+    c->repl_offset_sent = repl_master_offset();
+    c->repl_last_send_ms = kvs_now_ms();
     size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
     queue_bytes(c, buf, done);
     return 0;
@@ -645,8 +657,26 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         goto out;
         return 0;
     }
-    if (!strcmp(cmd, "REPLSYNC")) { repl_add_slave(c); queue_snapshot(c); return 0; }
-    if (!strcmp(cmd, "REPLDONE")) return 0;
+    if (!strcmp(cmd, "REPLSYNC")) {
+        const char *req_replid = argc >= 2 ? argv[1] : "?";
+        unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
+        repl_add_slave(c);
+        if (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)) {
+            char hdr[128];
+            int hn = snprintf(hdr, sizeof(hdr), "+CONTINUE %s %llu\r\n", repl_master_id(), req_offset);
+            queue_bytes(c, (unsigned char *)hdr, (size_t)hn);
+            repl_note_partialsync_result(1);
+            repl_backlog_write_range(c, req_offset);
+        } else {
+            repl_note_partialsync_result(argc >= 3 ? 0 : 1);
+            queue_snapshot(c);
+        }
+        return 0;
+    }
+    if (!strcmp(cmd, "REPLDONE")) {
+        repl_slave_finish_fullsync();
+        return 0;
+    }
     if (!strcmp(cmd, "INFO")) {
         char info[4096];
         char recover[1024] = {0};
@@ -672,6 +702,20 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "master_port:%d\n"
             "master_link:%s\n"
             "replicas:%d\n"
+            "master_replid:%s\n"
+            "master_repl_offset:%llu\n"
+            "connected_slaves:%llu\n"
+            "repl_fullsync_count:%llu\n"
+            "repl_partialsync_ok_count:%llu\n"
+            "repl_partialsync_err_count:%llu\n"
+            "repl_broadcast_bytes:%llu\n"
+            "repl_snapshot_bytes:%llu\n"
+            "repl_backlog_size:%llu\n"
+            "repl_backlog_histlen:%llu\n"
+            "repl_backlog_start_offset:%llu\n"
+            "repl_backlog_end_offset:%llu\n"
+            "slave_master_replid:%s\n"
+            "slave_repl_offset:%llu\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -687,6 +731,20 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             g_cfg.master_port,
             repl_master_link_state_name(),
             replicas,
+            repl_master_id(),
+            repl_master_offset(),
+            repl_connected_slaves(),
+            repl_fullsync_count(),
+            repl_partialsync_ok_count(),
+            repl_partialsync_err_count(),
+            repl_broadcast_bytes(),
+            repl_snapshot_bytes(),
+            repl_backlog_size(),
+            repl_backlog_histlen(),
+            repl_backlog_start_offset(),
+            repl_backlog_end_offset(),
+            repl_slave_master_id(),
+            repl_slave_offset(),
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
@@ -1066,6 +1124,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
 
     if (rc == 0) {
         n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        if (from_replication && is_write_cmd(cmd)) {
+            repl_slave_note_applied(rawlen);
+        }
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
             persist_append_raw(raw, rawlen);
@@ -1088,8 +1149,25 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
     size_t pos = 0;
     while (pos < *len) {
         if (buf[pos] == '+') {
+            size_t line_start = pos + 1;
             while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
             if (pos + 1 >= *len) break;
+            if (from_replication && pos > line_start) {
+                size_t line_len = pos - line_start;
+                char *line = (char *)kvs_malloc(line_len + 1);
+                if (line) {
+                    memcpy(line, buf + line_start, line_len);
+                    line[line_len] = '\0';
+                    char *argv[8] = {0};
+                    int argc = split_inline_argv(line, argv, 8);
+                    if (argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
+                        repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), 1);
+                    } else if (argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
+                        repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), 0);
+                    }
+                    kvs_free(line);
+                }
+            }
             pos += 2;
             continue;
         }
@@ -1382,6 +1460,7 @@ int main(int argc, char **argv) {
     }
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
+    if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
 
     if (!strcmp(g_cfg.net_backend, "reactor")) {
         return reactor_start();

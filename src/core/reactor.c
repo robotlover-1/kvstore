@@ -105,6 +105,7 @@ static void on_accept(conn_t *lc) {
         }
 
         c->fd = cfd;
+        c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
         fdmap[cfd] = c;
 
         struct epoll_event ev;

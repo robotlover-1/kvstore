@@ -55,14 +55,19 @@ def parse_info(raw: bytes):
 
 
 def wait_ready(host: str, port: int, retries: int = 60) -> None:
+    last_resp = b""
+    last_err = None
     for _ in range(retries):
         try:
             resp = req(host, port, "ROLE")
+            last_resp = resp
             if b"master" in resp or b"slave" in resp:
                 return
-        except Exception:
-            time.sleep(0.2)
-    raise RuntimeError("server not ready")
+        except Exception as exc:
+            last_err = exc
+        time.sleep(0.2)
+    detail = last_resp.decode(errors="ignore") if last_resp else repr(last_err)
+    raise RuntimeError(f"server not ready: {detail}")
 
 
 def wait_fullsync_done(host: str, port: int, retries: int = 80):
@@ -233,6 +238,7 @@ def main() -> int:
     ap.add_argument("--rdma-qp-wr-depth", type=int, default=0)
     ap.add_argument("--allow-soak-failure", action="store_true")
     ap.add_argument("--ebpf", action="store_true")
+    ap.add_argument("--force-fallback", action="store_true")
     args = ap.parse_args()
 
     root = Path(args.work_dir).resolve()
@@ -355,6 +361,20 @@ def main() -> int:
         wait_ready(args.host, args.slave_port)
         time.sleep(args.wait)
         last_info = wait_fullsync_done(args.host, args.slave_port)
+        if args.force_fallback:
+            stop_proc(slave)
+            slave = None
+            time.sleep(1.0)
+            slave = subprocess.Popen(
+                [args.bin, "--port", str(args.slave_port), "--role", "slave", "--master-host", args.host, "--master-port", str(args.master_port), "--dump", str(slave_dump), "--aof", str(slave_aof), "--repl-transport", "tcp"],
+                stdout=slog,
+                stderr=slog,
+                cwd=str(cwd),
+                preexec_fn=os.setsid,
+            )
+            wait_ready(args.host, args.slave_port)
+            time.sleep(args.wait)
+            last_info = wait_fullsync_done(args.host, args.slave_port)
         fullsync_done = last_info.get("slave_fullsync_loading") == "0" and last_info.get("master_link") == "up"
 
         for i in range(args.tail_writes):
@@ -481,6 +501,10 @@ def main() -> int:
 
         log_text = slave_log.read_text(errors="ignore") if slave_log.exists() else ""
         master_log_text = master_log.read_text(errors="ignore") if master_log.exists() else ""
+        slave_async_disconnect_seen = 'cm_event_async - RDMA_CM_EVENT_DISCONNECTED' in log_text
+        master_async_disconnect_seen = 'cm_event_async - RDMA_CM_EVENT_DISCONNECTED' in master_log_text
+        slave_async_disconnect_impactful = slave_async_disconnect_seen and (final_info.get('master_link') != 'up' or not final_resume_ok)
+        master_async_disconnect_impactful = master_async_disconnect_seen and (not fullsync_done or not postsync_ok or not rounds_ok or not final_resume_ok or final_info.get('master_link') != 'up')
         print("REPL_RDMA_STRESS_RESULT")
         print(f"build_log={build_log}")
         print(f"master_log={master_log}")
@@ -509,6 +533,7 @@ def main() -> int:
         print(f"failure_master_tail={failure_master_tail}")
         print(f"failure_slave_tail={failure_slave_tail}")
         print(f"partial_resync_continue_rounds={resumed_continue_rounds}")
+        print(f"force_fallback={'yes' if args.force_fallback else 'no'}")
         print(f"final_resume_ok={'yes' if final_resume_ok else 'no'}")
         print(f"failure_slave_repl_transport={last_info.get('repl_transport', 'missing')}")
         print(f"failure_slave_master_link={last_info.get('master_link', 'missing')}")
@@ -516,8 +541,10 @@ def main() -> int:
         print(f"final_slave_repl_transport={final_info.get('repl_transport', 'missing')}")
         print(f"final_slave_master_link={final_info.get('master_link', 'missing')}")
         print(f"final_slave_repl_offset={final_info.get('slave_repl_offset', 'missing')}")
-        print(f"rdma_slave_async_disconnect_seen={'yes' if 'cm_event_async - RDMA_CM_EVENT_DISCONNECTED' in log_text else 'no'}")
-        print(f"rdma_master_async_disconnect_seen={'yes' if 'cm_event_async - RDMA_CM_EVENT_DISCONNECTED' in master_log_text else 'no'}")
+        print(f"rdma_slave_async_disconnect_seen={'yes' if slave_async_disconnect_seen else 'no'}")
+        print(f"rdma_slave_async_disconnect_impactful={'yes' if slave_async_disconnect_impactful else 'no'}")
+        print(f"rdma_master_async_disconnect_seen={'yes' if master_async_disconnect_seen else 'no'}")
+        print(f"rdma_master_async_disconnect_impactful={'yes' if master_async_disconnect_impactful else 'no'}")
         print(f"rdma_continue_seen={'yes' if 'slave_parse - CONTINUE' in log_text else 'no'}")
         print(f"soak_failure_allowed={'yes' if args.allow_soak_failure else 'no'}")
         print(f"rdma_ebpf_enabled={'yes' if args.ebpf else 'no'}")

@@ -414,6 +414,15 @@ TTL 持久化与复制支持
 
 当前验证结论
 - RDMA stress / soak 已通过：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`soak_ok=yes`、`soak_availability_ok=yes`、`soak_recovery_ok=yes`、`final_resume_ok=yes`
+- 新一轮 RDMA 稳定性收敛已完成：
+  - 通过 defer ACK during fullsync、修复 stale replica 清理、`pending_recv` 队列化、master 持续接收 `REPLACK`、去掉重复 ACK、串行化 CQ 轮询，已将“中等负载复制失败”收敛为“中等负载通过”
+  - 小一档回归（`64 / 16 / 1`）通过：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`final_resume_ok=yes`
+  - 中等负载回归（`128 / 32 / 2`）通过：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`final_resume_ok=yes`
+  - 剩余现象是 master 侧仍可能出现 `RDMA_CM_EVENT_DISCONNECTED`，但在当前验证中属于 `seen=yes` 且 `impactful=no`，不再影响复制正确性
+- 后续如果继续收敛 RDMA 生命周期，优先方向不是再修复数据一致性，而是：
+  - 进一步区分良性 disconnect 与真正故障 disconnect
+  - 缩小 master async disconnect 的触发窗口
+  - 视需要补充更长期 soak 和更大负载验证
 - eBPF 已命中真实 RDMA 路径：`rdma_connect`、`rdma_accept`、`rdma_get_cm_event`、`repl_transport_send`、`repl_handle_replica_send_failure`
 - 当前剩余工作以工程化收尾为主：压缩调试日志、沉淀最终 README/plan 命令、补充阶段性限制与结论
 

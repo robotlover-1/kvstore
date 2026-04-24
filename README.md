@@ -720,6 +720,16 @@ printf '*3\r\n$6\r\nDOCGET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n' | nc 127.0.0.1 509
 | 复制指标基线 | `make check-repl-metrics` | `tools/repl/run_repl_metrics_bench.py` | `artifacts/repl/metrics/` |
 | 复制 profile | `make check-repl-profile` | `tools/repl/run_repl_profile.py` | `artifacts/repl/profile/` |
 | 复制 eBPF 观测 | `make check-repl-ebpf` | `tools/repl/run_repl_profile.py --ebpf` | `artifacts/repl/profile/` |
+| RDMA fallback 验证 | `make check-repl-rdma-fallback` | `tools/repl/run_repl_rdma_stress.py --force-fallback` | `artifacts/repl/rdma-stress/` |
+| RDMA 长时 soak | `make check-repl-rdma-long-soak` | `tools/repl/run_repl_rdma_stress.py` | `artifacts/repl/rdma-stress/` |
+
+当前稳定化语义补充：
+
+- slave 通过 `REPLACK` 上报 `applied_offset` 与 `durable_offset`
+- partial resync 不仅检查 backlog，还要求 slave 上报的 durable 位点不落后于请求位点
+- `INFO` 可观测：`repl_transport_configured`、`repl_transport_active`、`repl_transport_fallback_reason`、`repl_transport_fallback_count`
+- RDMA 失败时系统允许回退到 TCP，以优先保证复制服务连续性
+
 | eBPF 环境探测 | `make check-repl-ebpf-env` | `tools/repl/run_repl_ebpf_env_probe.py` | 终端输出为主 |
 | RDMA unsupported 验证 | `make check-repl-rdma-unsupported` | `tools/repl/run_repl_rdma_unsupported.py` | `artifacts/repl/rdma-unsupported/` |
 | RDMA smoke | `make check-repl-rdma-smoke` | `tools/repl/run_repl_rdma_smoke.py` | `artifacts/repl/rdma-smoke/` |

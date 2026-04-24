@@ -194,6 +194,7 @@ int proactor_start(unsigned short port) {
                     close(cfd);
                 } else {
                     c->fd = cfd;
+                    c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
                     set_nonblock(cfd);
                     if (submit_read(&ring, c) != 0) {
                         close_conn_uring(c);

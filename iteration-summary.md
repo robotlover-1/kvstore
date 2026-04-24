@@ -214,7 +214,93 @@ RDMA 相关问题很难只靠普通日志定位。特别是：
 
 ## 4. RDMA 复制实验路径迭代
 
-这一部分是本项目后期最复杂、迭代次数最多的工作。
+### 4.1 本轮稳定性收敛：从“中负载失败”到“中负载通过”
+
+这一轮的核心目标，不再是单纯让 RDMA 路径“能建链”，而是把此前在中等负载下稳定复现的复制失败收敛到可通过的状态。
+
+#### 本轮确认并修复的问题
+
+1. **fullsync 期间 slave ACK 干扰数据通道**
+   - 现象：slave 在 fullsync snapshot 加载期间仍发送 `REPLACK`，与 snapshot 数据流共享同一 RDMA 通道与 CQ，容易导致状态紊乱。
+   - 修复：在 fullsync 加载期间 defer ACK，仅在 fullsync 完成后再恢复 ACK。
+
+2. **RDMA 发送失败后的 replica 清理不完整**
+   - 现象：master 在 RDMA replica 发送失败时，只做浅层上下文清理，没有真正从全局 replica 链表移除 stale 节点。
+   - 修复：发送失败路径补上真正的 `repl_remove_slave()`，避免后续 resync / reconnect 状态被污染。
+
+3. **pending recv 单槽导致 postsync 增量漏消息**
+   - 现象：send completion 等待过程中，多个 `RECV completion` 会被单槽缓存覆盖，导致 slave 在 postsync 阶段间歇性丢 key。
+   - 修复：把 `pending_recv` 从单槽改为环形队列，完整保留在 send wait 期间到达的多个 recv completion。
+
+4. **master 只处理初始 RDMA payload，不持续消费后续 REPLACK**
+   - 现象：master 只在 listener 建链后处理一次初始 `REPLSYNC`，之后不再持续读取 slave 发来的 `REPLACK`。
+   - 修复：把 master listener 改为持续 recv 循环，反复 `wait_cq_recv_completion -> repost recv -> parse_resp_stream`。
+
+5. **slave 在复制写入路径里重复发送 ACK**
+   - 现象：复制命令应用完成后，既通过 durable 路径发 ACK，又在复制写入尾部再次显式发 ACK。
+   - 修复：去掉重复 ACK，只保留 durable / fullsync 完成路径上的 ACK。
+
+6. **send / recv completion 并发轮询同一 CQ**
+   - 现象：broadcast 发送线程和 listener 接收线程会并发 `ibv_poll_cq()` 同一个 CQ，容易造成 completion 竞争。
+   - 修复：增加 CQ 轮询互斥，串行化对同一 CQ 的 poll。
+
+#### 验证过程与结果
+
+这一轮没有只依赖大脚本重跑，而是先做了更窄的半手工验证，再回到 stress：
+
+- 半手工验证：
+  - 单独拉起 master/slave
+  - 先验证 fullsync 是否完成
+  - 再注入连续 `tail:0..15`，逐个检查 slave 上的 key
+  - 修复前可稳定观察到部分 key 缺失；修复 `pending_recv` 队列后，`0..15` 全量到达
+
+- 小一档 stress 回归：
+  - `preload 64`
+  - `tail-writes 16`
+  - `restart-rounds 1`
+  - 结果：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`final_resume_ok=yes`
+
+- 中等负载 stress 回归：
+  - `preload 128`
+  - `tail-writes 32`
+  - `restart-rounds 2`
+  - 结果：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`final_resume_ok=yes`
+
+#### 当前状态判断
+
+这一轮之后，可以明确认为：
+
+- RDMA 复制的**主功能正确性问题已解决**
+- 中等负载下此前的 fullsync / postsync / restart 失败已经收敛并通过验证
+- 剩余现象主要是 master 侧仍可能观察到 `RDMA_CM_EVENT_DISCONNECTED`，但在当前验证中它表现为 **seen but not impactful**：
+  - 事件被观测到
+  - 但不会破坏 `fullsync_done / postsync_tail_ok / restart_rounds_ok / final_resume_ok`
+  - 最终 slave 仍保持 `repl_transport=rdma` 且 `master_link=up`
+
+这意味着后续工作重点不再是“修复复制正确性”，而是进一步区分并收敛 RDMA 生命周期中的良性 disconnect 与真正故障 disconnect。
+
+### 4.2 结果解释与后续收口方向
+
+为了避免把所有 async disconnect 都当成失败信号，本轮还增强了 `tools/repl/run_repl_rdma_stress.py`：
+
+- `wait_ready()` 在失败时输出最后一次响应或异常，而不是仅报 `server not ready`
+- 将 async disconnect 判定拆分为：
+  - `rdma_master_async_disconnect_seen`
+  - `rdma_master_async_disconnect_impactful`
+  - `rdma_slave_async_disconnect_seen`
+  - `rdma_slave_async_disconnect_impactful`
+
+这样可以把“观察到 disconnect 事件”和“disconnect 影响最终正确性”这两件事区分开。
+
+当前脚本输出已经能准确表达现状：
+
+- 可能仍看到 `rdma_master_async_disconnect_seen=yes`
+- 但在回归通过的场景中，对应 `rdma_master_async_disconnect_impactful=no`
+
+因此，这一轮迭代的结论不是“RDMA 已经零抖动”，而是：
+
+- **RDMA 复制正确性已经稳定通过**
+- **剩余问题已收敛为生命周期层的 disconnect 观察项，而非数据一致性错误**
 
 目标不是“让 RDMA 看起来能编译”，而是逐步把它从：
 

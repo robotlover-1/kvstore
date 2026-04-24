@@ -28,12 +28,14 @@ REPL_RDMA_STRESS_PRELOAD?=128
 REPL_RDMA_STRESS_TAIL_WRITES?=64
 REPL_RDMA_STRESS_RESTART_ROUNDS?=3
 REPL_RDMA_SOAK_SECONDS?=60
+REPL_RDMA_LONG_SOAK_SECONDS?=1800
 REPL_RDMA_SOAK_ALLOW_FAILURE?=0
 REPL_RDMA_SOAK_RECONNECT_INTERVAL?=10
 REPL_RDMA_SOAK_WRITE_INTERVAL_MS?=200
 REPL_RDMA_TUNABLE_RECV_SLOTS?=0
 REPL_RDMA_TUNABLE_CHUNK_SIZE?=0
 REPL_RDMA_TUNABLE_QP_WR_DEPTH?=0
+REPL_RDMA_FORCE_FALLBACK?=0
 RDMA_PINGPONG_HOST?=$(REPL_RDMA_SMOKE_HOST)
 RDMA_PINGPONG_PORT?=18515
 RDMA_PINGPONG_DEV?=rxe0
@@ -130,7 +132,13 @@ check-repl-rdma-stress:
 	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds $(REPL_RDMA_STRESS_RESTART_ROUNDS) --rdma-recv-slots $(REPL_RDMA_TUNABLE_RECV_SLOTS) --rdma-chunk-size $(REPL_RDMA_TUNABLE_CHUNK_SIZE) --rdma-qp-wr-depth $(REPL_RDMA_TUNABLE_QP_WR_DEPTH)
 
 check-repl-rdma-soak:
-	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds $(REPL_RDMA_STRESS_RESTART_ROUNDS) --soak-seconds $(REPL_RDMA_SOAK_SECONDS) --soak-reconnect-interval $(REPL_RDMA_SOAK_RECONNECT_INTERVAL) --soak-write-interval-ms $(REPL_RDMA_SOAK_WRITE_INTERVAL_MS) --rdma-recv-slots $(REPL_RDMA_TUNABLE_RECV_SLOTS) --rdma-chunk-size $(REPL_RDMA_TUNABLE_CHUNK_SIZE) --rdma-qp-wr-depth $(REPL_RDMA_TUNABLE_QP_WR_DEPTH) $(if $(filter 1,$(REPL_RDMA_SOAK_ALLOW_FAILURE)),--allow-soak-failure,)
+	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds $(REPL_RDMA_STRESS_RESTART_ROUNDS) --soak-seconds $(REPL_RDMA_SOAK_SECONDS) --soak-reconnect-interval $(REPL_RDMA_SOAK_RECONNECT_INTERVAL) --soak-write-interval-ms $(REPL_RDMA_SOAK_WRITE_INTERVAL_MS) --rdma-recv-slots $(REPL_RDMA_TUNABLE_RECV_SLOTS) --rdma-chunk-size $(REPL_RDMA_TUNABLE_CHUNK_SIZE) --rdma-qp-wr-depth $(REPL_RDMA_TUNABLE_QP_WR_DEPTH) $(if $(filter 1,$(REPL_RDMA_SOAK_ALLOW_FAILURE)),--allow-soak-failure,) $(if $(filter 1,$(REPL_RDMA_FORCE_FALLBACK)),--force-fallback,)
+
+check-repl-rdma-long-soak:
+	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds $(REPL_RDMA_STRESS_RESTART_ROUNDS) --soak-seconds $(REPL_RDMA_LONG_SOAK_SECONDS) --soak-reconnect-interval $(REPL_RDMA_SOAK_RECONNECT_INTERVAL) --soak-write-interval-ms $(REPL_RDMA_SOAK_WRITE_INTERVAL_MS) --rdma-recv-slots $(REPL_RDMA_TUNABLE_RECV_SLOTS) --rdma-chunk-size $(REPL_RDMA_TUNABLE_CHUNK_SIZE) --rdma-qp-wr-depth $(REPL_RDMA_TUNABLE_QP_WR_DEPTH)
+
+check-repl-rdma-fallback:
+	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds 1 --force-fallback
 
 check-repl-rdma-soak-skip:
 	@echo "Skipping RDMA soak check"

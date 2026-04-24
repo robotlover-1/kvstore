@@ -337,12 +337,14 @@ void repl_add_slave(conn_t *c) {
         if (it == c) {
             c->is_replica = 1;
             c->repl_draining = 0;
+            c->repl_fullsync_pending = 0;
             pthread_mutex_unlock(&g_repl_lock);
             return;
         }
     }
     c->is_replica = 1;
     c->repl_draining = 0;
+    c->repl_fullsync_pending = 0;
     c->next_replica = g_replicas;
     g_replicas = c;
     pthread_mutex_unlock(&g_repl_lock);
@@ -358,6 +360,7 @@ void repl_remove_slave(conn_t *c) {
     c->next_replica = NULL;
     c->is_replica = 0;
     c->repl_draining = 0;
+    c->repl_fullsync_pending = 0;
     pthread_mutex_unlock(&g_repl_lock);
 }
 
@@ -373,6 +376,10 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             *pp = c->next_replica;
             c->next_replica = NULL;
             c->is_replica = 0;
+            continue;
+        }
+        if (c->repl_fullsync_pending) {
+            pp = &c->next_replica;
             continue;
         }
         if (repl_transport_send(c, raw, rawlen) != 0) {
@@ -406,25 +413,45 @@ int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
 
 static int queue_snapshot(conn_t *c) {
     char hdr[128];
-    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu\r\n", repl_master_id(), repl_master_offset());
     FILE *fp;
     unsigned char buf[8192];
     size_t r;
     size_t total = 0;
+    size_t total_bytes = 0;
 
+#if KVS_ENABLE_RDMA
+    fprintf(stderr, "repl rdma: queue_snapshot - begin replid=%s offset=%llu\n", repl_master_id(), repl_master_offset());
+#endif
     fp = fopen(g_cfg.dump_path, "wb");
     if (!fp) return -1;
     if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); return -1; }
     fclose(fp);
+    fp = fopen(g_cfg.dump_path, "rb");
+    if (!fp) return -1;
+    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) total_bytes += r;
+    fclose(fp);
+
+    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu\r\n", repl_master_id(), repl_master_offset(), total_bytes);
 
     repl_note_send_context("fullsync-header", (size_t)n, repl_master_offset(), (unsigned char *)hdr);
-    if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)n) != 0) return -1;
+    if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)n) != 0) {
+#if KVS_ENABLE_RDMA
+        fprintf(stderr, "repl rdma: queue_snapshot - header send failed\n");
+#endif
+        return -1;
+    }
     fp = fopen(g_cfg.dump_path, "rb");
     if (!fp) return -1;
     while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) {
         total += r;
         repl_note_send_context("fullsync-snapshot", r, repl_master_offset(), buf);
-        if (repl_send_chunked(c, buf, r) != 0) { fclose(fp); return -1; }
+        if (repl_send_chunked(c, buf, r) != 0) {
+#if KVS_ENABLE_RDMA
+            fprintf(stderr, "repl rdma: queue_snapshot - snapshot chunk send failed total=%zu chunk=%zu\n", total, r);
+#endif
+            fclose(fp);
+            return -1;
+        }
     }
     fclose(fp);
     repl_note_fullsync(total);
@@ -433,8 +460,17 @@ static int queue_snapshot(conn_t *c) {
     {
         size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
         repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
-        if (repl_send_chunked(c, buf, done) != 0) return -1;
+        if (repl_send_chunked(c, buf, done) != 0) {
+#if KVS_ENABLE_RDMA
+            fprintf(stderr, "repl rdma: queue_snapshot - REPLDONE send failed\n");
+#endif
+            return -1;
+        }
     }
+    c->repl_fullsync_pending = 0;
+#if KVS_ENABLE_RDMA
+    fprintf(stderr, "repl rdma: queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu\n", total, repl_master_offset());
+#endif
     return 0;
 }
 
@@ -737,6 +773,26 @@ static void kvs_ascii_upper(char *s) {
     for (; *s; ++s) *s = (char)toupper((unsigned char)*s);
 }
 
+static void repl_collect_replica_ack_stats(unsigned long long *max_applied, unsigned long long *max_durable, long long *min_ack_age_ms, int *replicas) {
+    unsigned long long applied = 0;
+    unsigned long long durable = 0;
+    long long min_age = -1;
+    int count = 0;
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *rc = g_replicas; rc; rc = rc->next_replica) {
+        long long ack_age = (rc->repl_last_ack_ms > 0) ? (kvs_now_ms() - rc->repl_last_ack_ms) : -1;
+        count++;
+        if (rc->repl_applied_offset_ack > applied) applied = rc->repl_applied_offset_ack;
+        if (rc->repl_durable_offset_ack > durable) durable = rc->repl_durable_offset_ack;
+        if (ack_age >= 0 && (min_age < 0 || ack_age < min_age)) min_age = ack_age;
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+    if (max_applied) *max_applied = applied;
+    if (max_durable) *max_durable = durable;
+    if (min_ack_age_ms) *min_ack_age_ms = min_age;
+    if (replicas) *replicas = count;
+}
+
 static int resp_array_header(char *out, size_t cap, int count) {
     return snprintf(out, cap, "*%d\r\n", count);
 }
@@ -861,19 +917,34 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "REPLSYNC")) {
         const char *req_replid = argc >= 2 ? argv[1] : "?";
         unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
+        unsigned long long req_durable = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : req_offset;
+        int can_continue = (argc >= 3 && req_durable >= req_offset && repl_backlog_can_continue(req_replid, req_offset));
 #if KVS_ENABLE_RDMA
-        fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
-            req_replid, req_offset, repl_backlog_start_offset(), repl_backlog_end_offset(),
-            (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)) ? 1 : 0);
+        fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
+            req_replid, req_offset, req_durable, repl_backlog_start_offset(), repl_backlog_end_offset(), can_continue ? 1 : 0);
 #endif
         repl_add_slave(c);
-        if (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)) {
+        repl_replica_update_ack(c, req_offset, req_durable);
+        c->repl_fullsync_pending = can_continue ? 0 : 1;
+        if (can_continue) {
             repl_note_partialsync_result(1);
             repl_backlog_send_continue(c, req_offset);
         } else {
             repl_note_partialsync_result(argc >= 3 ? 0 : 1);
-            queue_snapshot(c);
+            if (queue_snapshot(c) != 0) {
+#if KVS_ENABLE_RDMA
+                fprintf(stderr, "repl rdma: master_replsync - queue_snapshot failed\n");
+#endif
+                c->repl_draining = 1;
+                c->repl_fullsync_pending = 0;
+            }
         }
+        return 0;
+    }
+    if (!strcmp(cmd, "REPLACK")) {
+        unsigned long long applied_offset = argc >= 2 ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
+        unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
+        repl_replica_update_ack(c, applied_offset, durable_offset);
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {
@@ -888,10 +959,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char recover[1024] = {0};
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
 
+        unsigned long long max_replica_applied = 0;
+        unsigned long long max_replica_durable = 0;
+        long long min_replica_ack_age_ms = -1;
         int replicas = 0;
-        pthread_mutex_lock(&g_repl_lock);
-        for (conn_t *rc = g_replicas; rc; rc = rc->next_replica) replicas++;
-        pthread_mutex_unlock(&g_repl_lock);
+        repl_collect_replica_ack_stats(&max_replica_applied, &max_replica_durable, &min_replica_ack_age_ms, &replicas);
 
         snprintf(info, sizeof(info),
             "role:%s\n"
@@ -908,6 +980,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "master_port:%d\n"
             "master_link:%s\n"
             "repl_transport:%s\n"
+            "repl_transport_configured:%s\n"
+            "repl_transport_active:%s\n"
+            "repl_transport_fallback_reason:%s\n"
+            "repl_transport_fallback_count:%llu\n"
+            "repl_transport_fallback_until_ms:%lld\n"
             "replicas:%d\n"
             "master_replid:%s\n"
             "master_repl_offset:%llu\n"
@@ -923,7 +1000,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_backlog_end_offset:%llu\n"
             "slave_master_replid:%s\n"
             "slave_repl_offset:%llu\n"
+            "slave_repl_applied_offset:%llu\n"
+            "slave_repl_durable_offset:%llu\n"
             "slave_fullsync_loading:%d\n"
+            "replica_max_applied_offset_ack:%llu\n"
+            "replica_max_durable_offset_ack:%llu\n"
+            "replica_min_ack_age_ms:%lld\n"
             "rdma_recv_slots:%d\n"
             "rdma_chunk_size:%d\n"
             "rdma_qp_wr_depth:%d\n"
@@ -947,6 +1029,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             g_cfg.master_port,
             repl_master_link_state_name(),
             repl_transport_name(),
+            repl_transport_configured_name(),
+            repl_transport_active_name(),
+            repl_transport_fallback_reason()[0] ? repl_transport_fallback_reason() : "none",
+            repl_transport_fallback_count(),
+            repl_transport_fallback_until_ms(),
             replicas,
             repl_master_id(),
             repl_master_offset(),
@@ -962,7 +1049,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_backlog_end_offset(),
             repl_slave_master_id(),
             repl_slave_offset(),
+            repl_slave_applied_offset(),
+            repl_slave_durable_offset(),
             repl_slave_loading_fullsync(),
+            max_replica_applied,
+            max_replica_durable,
+            min_replica_ack_age_ms,
             repl_rdma_effective_recv_slots(),
             repl_rdma_effective_chunk_size(),
             repl_rdma_effective_qp_wr_depth(),
@@ -1149,8 +1241,17 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "ROLE")) {
+        unsigned long long role_max_replica_applied = 0;
+        unsigned long long role_max_replica_durable = 0;
+        long long role_min_replica_ack_age_ms = -1;
+        int role_replicas = 0;
+        repl_collect_replica_ack_stats(&role_max_replica_applied, &role_max_replica_durable, &role_min_replica_ack_age_ms, &role_replicas);
         if (g_cfg.role == ROLE_MASTER) {
-            n = resp_array_two_bulk(resp, BUFFER_CAP, "master", "0");
+            char durable[32];
+            snprintf(durable, sizeof(durable), "%llu", role_max_replica_durable);
+            n = snprintf(resp, BUFFER_CAP,
+                "*3\r\n$6\r\nmaster\r\n$1\r\n0\r\n$%zu\r\n%s\r\n",
+                strlen(durable), durable);
         } else {
             char mp[32];
             snprintf(mp, sizeof(mp), "%d", g_cfg.master_port);
@@ -1375,6 +1476,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (g_cfg.role == ROLE_SLAVE && !persist_recover_in_progress()) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
+                repl_slave_note_durable(rawlen);
             }
             repl_slave_note_applied(rawlen);
         }
@@ -1412,17 +1514,19 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                     char *argv[8] = {0};
                     int argc = split_inline_argv(line, argv, 8);
                     if (argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
-                        repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), 1);
+                        unsigned long long fullsync_target = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : 0;
+                        repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), (unsigned long long)strtoull(argv[2], NULL, 10), 1, fullsync_target);
 #if KVS_ENABLE_RDMA
-                        fprintf(stderr, "repl rdma: slave_parse - FULLRESYNC replid=%s offset=%s\n", argv[1], argv[2]);
+                        fprintf(stderr, "repl rdma: slave_parse - FULLRESYNC replid=%s offset=%s target=%s\n", argv[1], argv[2], argc >= 4 ? argv[3] : "0");
 #endif
                     } else if (argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
                         unsigned long long continue_end = (unsigned long long)strtoull(argv[2], NULL, 10);
                         unsigned long long continue_start = repl_slave_offset();
+                        unsigned long long durable_start = repl_slave_durable_offset();
                         if (continue_end < continue_start) continue_end = continue_start;
-                        repl_slave_set_sync_state(argv[1], continue_start, 0);
+                        repl_slave_set_sync_state(argv[1], continue_start, durable_start, 0, 0);
 #if KVS_ENABLE_RDMA
-                        fprintf(stderr, "repl rdma: slave_parse - CONTINUE replid=%s start_offset=%llu end_offset=%llu\n", argv[1], continue_start, continue_end);
+                        fprintf(stderr, "repl rdma: slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu\n", argv[1], continue_start, durable_start, continue_end);
 #endif
                     }
                     kvs_free(line);

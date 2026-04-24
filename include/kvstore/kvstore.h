@@ -18,6 +18,8 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 #ifndef KVS_ENABLE_RDMA
 #define KVS_ENABLE_RDMA 0
@@ -29,6 +31,9 @@
 
 #define ROLE_MASTER 1
 #define ROLE_SLAVE 2
+
+#define KVS_REPL_TRANSPORT_TCP 1
+#define KVS_REPL_TRANSPORT_RDMA 2
 
 #define KVS_ENGINE_ARRAY      1
 #define KVS_ENGINE_RBTREE     2
@@ -227,7 +232,12 @@ typedef struct conn_s {
     int is_listener;
     int is_replica;
     int repl_draining;
+    int repl_fullsync_pending;
+    int repl_transport_kind;
     unsigned long long repl_offset_sent;
+    unsigned long long repl_applied_offset_ack;
+    unsigned long long repl_durable_offset_ack;
+    long long repl_last_ack_ms;
     long long repl_last_send_ms;
     unsigned char inbuf[BUFFER_CAP];
     size_t in_len;
@@ -347,6 +357,11 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication);
 
 const char *repl_transport_name(void);
+const char *repl_transport_configured_name(void);
+const char *repl_transport_active_name(void);
+const char *repl_transport_fallback_reason(void);
+unsigned long long repl_transport_fallback_count(void);
+long long repl_transport_fallback_until_ms(void);
 int repl_transport_send(conn_t *c, const unsigned char *buf, size_t len);
 int repl_transport_send_many(conn_t *c, const unsigned char *buf1, size_t len1, const unsigned char *buf2, size_t len2);
 int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len);
@@ -389,11 +404,16 @@ int repl_backlog_can_continue(const char *replid, unsigned long long offset);
 int repl_backlog_write_range(conn_t *c, unsigned long long offset);
 int repl_backlog_send_continue(conn_t *c, unsigned long long offset);
 void repl_note_partialsync_result(int ok);
-void repl_slave_set_sync_state(const char *replid, unsigned long long offset, int fullsync_loading);
+void repl_slave_set_sync_state(const char *replid, unsigned long long applied_offset, unsigned long long durable_offset, int fullsync_loading, unsigned long long fullsync_target_bytes);
 void repl_slave_finish_fullsync(void);
 void repl_slave_note_applied(size_t rawlen);
+void repl_slave_note_durable(size_t rawlen);
+int repl_slave_send_ack(void);
+void repl_replica_update_ack(conn_t *c, unsigned long long applied_offset, unsigned long long durable_offset);
 const char *repl_slave_master_id(void);
 unsigned long long repl_slave_offset(void);
+unsigned long long repl_slave_applied_offset(void);
+unsigned long long repl_slave_durable_offset(void);
 int repl_slave_loading_fullsync(void);
 int repl_slave_state_load(void);
 int repl_slave_state_save(void);

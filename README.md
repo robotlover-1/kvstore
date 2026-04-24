@@ -95,6 +95,7 @@ aof_path=kvstore.aof
 mem_backend=libc
 net_backend=reactor
 appendfsync=always
+repl_transport_backend=tcp
 
 autosnap=60:1000,300:10
 
@@ -114,6 +115,8 @@ sentinel_quorum=1
 - 也可以通过 `--config <path>` 显式指定配置文件
 - 命令行参数优先级高于配置文件
 - 当前配置文件已覆盖现有主要启动配置项，包括 `port`、`dump_path`、`aof_path`、`mem_backend`、`net_backend`、`appendfsync`、`autosnap`、主从配置和哨兵配置
+- 复制 transport 当前支持配置为 `tcp` 或 `rdma`
+- 默认复制 transport 为 `tcp`；`rdma` 已具备实验性真实实现，可用于 smoke / stress / soak 验证，但仍建议视为高性能实验路径而非默认稳定主路径
 
 ### 基本使用
 
@@ -144,6 +147,7 @@ printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 | `--aof`                       | AOF文件路径                         | kvstore.aof  |
 | `--mem`                       | 内存后端（libc/jemalloc/custom）    | libc         |
 | `--net`                       | 网络模型（reactor/proactor/ntyco）  | reactor      |
+| `--repl-transport`            | 复制传输层（tcp/rdma）              | tcp          |
 | `--appendfsync`               | AOF同步策略（always/everysec）      | always       |
 | `--autosnap`                  | 自动快照规则（秒:变化数,秒:变化数） | 无           |
 | `--sentinel`                  | 启用哨兵模式                        | 关闭         |
@@ -239,7 +243,102 @@ printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 - **SLAVEOF NO ONE**：停止复制，变为主节点
 - **ROLE**：查看服务器角色和复制状态
 
-## 架构设计
+当前复制链路已支持：
+
+- `FULLRESYNC` 全量同步
+- `CONTINUE` partial resync
+- replication backlog
+- slave 复制位点持久化
+- 进程内重连 partial resync
+- 跨进程重启 partial resync
+- `INFO` 中复制指标与 `repl_transport`
+
+## 测试与分析入口
+
+### 基础功能测试
+
+```bash
+make check
+```
+
+### 主从复制验证
+
+```bash
+make check-repl
+```
+
+覆盖内容：
+
+- 首次全量同步
+- 进程内断线重连 partial resync
+- 跨进程重启 partial resync
+
+### 复制指标基线
+
+```bash
+make check-repl-metrics
+```
+
+输出内容包括：
+
+- full sync / tail / restart 三阶段 `INFO` 指标
+- `repl_fullsync_count`
+- `repl_partialsync_ok_count`
+- `repl_partialsync_err_count`
+- `repl_backlog_histlen`
+- `repl_broadcast_bytes`
+- `repl_snapshot_bytes`
+- 进程 CPU / RSS / socket 摘要
+
+### 复制 profiling helper
+
+```bash
+make check-repl-profile
+```
+
+说明：
+
+- 默认先运行复制指标基线，并把结果保存到 `artifacts/repl/profile/`
+- 若环境存在 `perf`，可直接运行：
+
+```bash
+python3 ./scripts/run_repl_profile.py --perf
+```
+
+### perf / eBPF 环境探测
+
+```bash
+make check-repl-ebpf-env
+```
+
+该命令用于判断当前环境是否具备后续性能观测能力，例如：
+
+- `perf`
+- `bpftrace`
+- `bpftool`
+- `clang`
+- tracing/debugfs 可见性
+- `perf_event_paranoid`
+- `unprivileged_bpf_disabled`
+
+若输出为 `profiling_readiness=minimal`，表示当前环境仅适合保留基线和脚本入口，不适合继续做真实 eBPF/perf 实验。
+
+### RDMA / eBPF 环境前提与限制
+
+使用 RDMA / eBPF 实验路径前，建议明确以下前提：
+
+- 默认稳定复制路径仍是 `tcp`
+- `rdma` 当前定位为实验性高性能 transport，用于学习、验证和观测
+- 需要可用 RDMA 环境；在本项目验证中使用的是 Soft-RoCE (`rxe0`)
+- eBPF 观测通常需要 `root` 或足够的 capability
+- `tools/repl/run_repl_rdma_stress.py --ebpf` 会额外在对应 `artifacts/repl/rdma-stress/` 目录下生成 `rdma_ebpf.out`、`rdma_ebpf.err`、`rdma_ebpf_summary.txt`
+- 若 RDMA 不可用，应优先回退到 TCP 路径，而不是把 RDMA 视为默认必选项
+
+当前 RDMA / eBPF 路径的工程化结论：
+
+- fullsync、tail 增量、跨进程 restart partial resync、soak reconnect 恢复均已通过脚本验证
+- slave 复制写已接入本地持久化，避免重启后数据集落后于 `repl_offset`
+- 当前更适合作为实验性高性能扩展与观测入口，而不是 README 中宣称的默认稳定主链路
 
 ### 代码结构
 
@@ -576,14 +675,58 @@ printf '*3\r\n$6\r\nDOCGET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n' | nc 127.0.0.1 509
 
 ```bash
 # 运行完整性能测试套件
-./scripts/run_benchmark.sh
+./tools/bench/run_benchmark.sh
 
 # 运行复制全同步测试
-./scripts/run_repl_fullsync_test.sh
+./tools/repl/run_repl_fullsync_test.sh
 
 # 运行持久化性能测试
-./scripts/run_save_bgsave_perf_test.sh
+./tools/persist/run_save_bgsave_perf_test.sh
 ```
+
+## 目录规划
+
+项目现在按工程化方式约定目录职责：
+
+- `src/`：核心源码
+- `include/`：头文件
+- `tests/`：集成测试脚本与测试源码
+- `tools/`：辅助脚本，按领域拆分
+  - `tools/repl/`
+  - `tools/rdma/`
+  - `tools/persist/`
+  - `tools/bench/`
+  - `tools/tests/`
+- `artifacts/`：统一存放脚本生成物
+  - `artifacts/repl/`
+  - `artifacts/rdma/`
+  - `artifacts/persist/`
+  - `artifacts/bench/`
+  - `artifacts/legacy/`
+- `testdata/`：测试样例配置、样例 AOF / dump 等静态测试数据
+- `assets/diagrams/`：设计草图、流程图、架构图等工程图示资源
+
+约定：新的验证脚本、压力脚本、性能脚本默认都应把日志、AOF、dump、profile、summary 等输出写入 `artifacts/` 子目录，而不是继续散落在项目根目录。
+
+### 脚本入口与产物落点速查表
+
+| 场景 | 命令入口 | 实际脚本 | 默认产物目录 |
+| --- | --- | --- | --- |
+| 持久化基础验证 | `make check-persist` | `tools/persist/test_resp_persist_nc.sh` | 无固定产物目录 |
+| 海量 TTL 验证 | `make check-mass-ttl` | `tools/persist/run_mass_ttl_validation.py` | 无固定产物目录 |
+| io_uring 持久化 smoke | `make check-uring-persist` | `tools/persist/run_uring_persist_bench.py` | `artifacts/persist/uring-bench/` |
+| mmap 恢复验证 | `make check-mmap-recover` | `tools/persist/run_mmap_recover_bench.py` | `artifacts/persist/mmap-recover/` |
+| 主从全同步验证 | `make check-repl` | `tools/repl/run_repl_fullsync_test.sh` | 脚本运行时工作目录下指定路径 |
+| 复制指标基线 | `make check-repl-metrics` | `tools/repl/run_repl_metrics_bench.py` | `artifacts/repl/metrics/` |
+| 复制 profile | `make check-repl-profile` | `tools/repl/run_repl_profile.py` | `artifacts/repl/profile/` |
+| 复制 eBPF 观测 | `make check-repl-ebpf` | `tools/repl/run_repl_profile.py --ebpf` | `artifacts/repl/profile/` |
+| eBPF 环境探测 | `make check-repl-ebpf-env` | `tools/repl/run_repl_ebpf_env_probe.py` | 终端输出为主 |
+| RDMA unsupported 验证 | `make check-repl-rdma-unsupported` | `tools/repl/run_repl_rdma_unsupported.py` | `artifacts/repl/rdma-unsupported/` |
+| RDMA smoke | `make check-repl-rdma-smoke` | `tools/repl/run_repl_rdma_smoke.py` | `artifacts/repl/rdma-smoke/` |
+| RDMA stress / soak | `make check-repl-rdma-stress` / `make check-repl-rdma-soak` | `tools/repl/run_repl_rdma_stress.py` | `artifacts/repl/rdma-stress/` |
+| RDMA 环境探测 | `make check-rdma-standalone-probe` | `tools/rdma/run_rdma_standalone_probe.py` | `artifacts/rdma/probe/` |
+| RDMA pingpong smoke | `make check-rdma-pingpong-smoke` | `tools/rdma/run_rdma_pingpong_smoke.py` | `artifacts/rdma/pingpong/` |
+| 基准测试套件 | 手工运行 | `tools/bench/run_benchmark.sh` | 脚本参数指定输出目录 |
 
 ## 开发指南
 

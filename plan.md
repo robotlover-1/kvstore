@@ -367,6 +367,66 @@ TTL 持久化与复制支持
 目标
 完成你需求中的高级优化部分，但这应该是后置增强项，不应阻塞主线交付。
 
+9.1：TCP 复制增强与 partial resync（已完成）
+完成项
+- replication backlog
+- replid / offset 复制位点
+- FULLRESYNC / CONTINUE 协议分支
+- in-process partial resync
+- slave 复制位点持久化
+- cross-process restart partial resync
+验收结果
+- `make check-repl` 已覆盖全量同步、进程内重连 partial resync、跨进程重启 partial resync
+- 当前验收通过
+
+9.2：高性能优化前的观测与基线（已完成）
+目标
+- 在不引入 RDMA / eBPF 依赖的前提下，先固化复制链路性能基线
+- 为后续 RDMA 传输实验和 eBPF 观测提供可对比数据
+
+完成项
+- `check-repl-metrics`：复制链路指标基线采集
+- `check-repl-profile`：profiling 外层入口
+- `check-repl-ebpf-env`：perf/eBPF 环境能力探测
+- 复制 `INFO` 指标补充 `repl_transport`
+- 复制 transport 抽象前置层
+- `repl_transport_backend` 配置项，默认 `tcp`
+
+验收结果
+- `make check-repl-metrics` 通过，已输出 full sync / tail / restart 三阶段复制指标
+- `make check-repl-profile` 通过，profiling helper 可生成 artifacts
+- `make check-repl-ebpf-env` 通过，当前环境结论为 `profiling_readiness=minimal`
+
+9.3：实验性 RDMA / eBPF（已完成阶段性闭环验证，当前处于工程化收尾）
+当前状态
+- `rdma` transport backend 已从 skeleton 演进为实验性可运行实现
+- 本地环境已具备 Soft-RoCE (`rxe0`) 与 `bpftrace`，可执行真实 RDMA / eBPF 验证
+- 已完成 RDMA smoke、RDMA stress、可选 eBPF 联动观测；当前主链路已完成 soak 验证并进入日志/文档收尾
+
+当前完成项
+- `rdma` transport backend 真实握手、收发、disconnect / reconnect 基础路径
+- `check-repl-rdma-unsupported`：非 RDMA 构建场景下明确 unsupported 且行为可测试
+- `run_repl_rdma_smoke.py`：验证 RDMA fullsync 与基础数据正确性
+- `run_repl_rdma_stress.py`：验证 fullsync、tail 增量、restart partial resync，并支持 soak / eBPF artifacts
+- RDMA stress 已验证：fullsync、tail 增量、跨进程 restart partial resync、soak reconnect 恢复全部通过
+- slave 复制写本地持久化已补齐，消除“重启后 offset 前进但数据集回退”的一致性缺口
+- eBPF 已验证：syscall/sched tracepoints + kvstore/rdmacm/ibverbs uprobes 可采集，且可输出结构化 summary
+
+当前验证结论
+- RDMA stress / soak 已通过：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`soak_ok=yes`、`soak_availability_ok=yes`、`soak_recovery_ok=yes`、`final_resume_ok=yes`
+- eBPF 已命中真实 RDMA 路径：`rdma_connect`、`rdma_accept`、`rdma_get_cm_event`、`repl_transport_send`、`repl_handle_replica_send_failure`
+- 当前剩余工作以工程化收尾为主：压缩调试日志、沉淀最终 README/plan 命令、补充阶段性限制与结论
+
+剩余工作
+- 收敛并保留高信号 RDMA 观测点，移除高频成功噪声日志
+- 在 README / plan 中沉淀最终验证命令、环境前提与限制条件
+- 根据需要补充更长时长 soak 或参数矩阵验证
+
+后续进入“基本完成”的条件
+- README / plan / 验证命令完成收口
+- RDMA 不可用时保持 TCP 降级不受影响
+- eBPF 观测路径在 root / capability 前提下可重复执行
+
 任务
 明确范围 你的需求写的是：
 

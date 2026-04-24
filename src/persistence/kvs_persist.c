@@ -12,6 +12,7 @@ unsigned long long g_dirty_counter = 0;
 
 static long long g_aof_write_offset = 0;
 
+static int g_persist_recovering = 0;
 static long long g_recover_last_total_ms = 0;
 static long long g_recover_last_dump_ms = 0;
 static long long g_recover_last_aof_ms = 0;
@@ -363,11 +364,16 @@ int persist_save_dump(void) {
     return rc;
 }
 
+int persist_recover_in_progress(void) {
+    return g_persist_recovering;
+}
+
 int persist_recover(void) {
     long long begin_ms = kvs_now_ms();
     long long dump_begin_ms;
     long long aof_begin_ms;
 
+    g_persist_recovering = 1;
     g_recover_last_total_ms = 0;
     g_recover_last_dump_ms = 0;
     g_recover_last_aof_ms = 0;
@@ -392,6 +398,7 @@ int persist_recover(void) {
     g_bgsave_last_end_ms = g_last_snapshot_ms;
     g_aof_last_flush_ms = g_last_snapshot_ms;
     g_aof_dirty = 0;
+    g_persist_recovering = 0;
     return 0;
 }
 

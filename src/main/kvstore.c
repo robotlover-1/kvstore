@@ -14,6 +14,13 @@ kv_config_t g_cfg = {
     .aof_path = "kvstore.aof",
     .mem_backend = "libc",
     .net_backend = "reactor",
+    .repl_transport_backend = "tcp",
+    .rdma_dev = "rxe0",
+    .rdma_ib_port = 1,
+    .rdma_gid_idx = 1,
+    .rdma_recv_slots = 32,
+    .rdma_chunk_size = BUFFER_CAP / 4,
+    .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
     .is_sentinel = 0,
     .sentinel_master_name = "mymaster",
@@ -26,6 +33,11 @@ kv_config_t g_cfg = {
 };
 conn_t *g_replicas = NULL;
 pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_repl_last_send_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_repl_last_send_stage[64] = "none";
+static unsigned long long g_repl_last_send_len = 0;
+static unsigned long long g_repl_last_send_offset = 0;
+static char g_repl_last_send_preview[160] = "";
 
 int resp_simple_string(char *out, size_t cap, const char *s) { return snprintf(out, cap, "+%s\r\n", s); }
 int resp_error(char *out, size_t cap, const char *s) { return snprintf(out, cap, "-ERR %s\r\n", s); }
@@ -46,6 +58,56 @@ size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const ch
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*2\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); return pos; }
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
 
+static void repl_format_send_preview(char *out, size_t out_cap, const unsigned char *buf, size_t len) {
+    size_t in_cap;
+    size_t i;
+    size_t pos = 0;
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!buf || len == 0) return;
+    in_cap = len < 64 ? len : 64;
+    for (i = 0; i < in_cap && pos + 2 < out_cap; ++i) {
+        unsigned char ch = buf[i];
+        if (ch == '\r') {
+            if (pos + 2 >= out_cap) break;
+            out[pos++] = '\\';
+            out[pos++] = 'r';
+        } else if (ch == '\n') {
+            if (pos + 2 >= out_cap) break;
+            out[pos++] = '\\';
+            out[pos++] = 'n';
+        } else if (isprint(ch)) {
+            out[pos++] = (char)ch;
+        } else {
+            out[pos++] = '.';
+        }
+    }
+    if (in_cap < len && pos + 4 < out_cap) {
+        out[pos++] = '.';
+        out[pos++] = '.';
+        out[pos++] = '.';
+    }
+    out[pos] = '\0';
+}
+
+void repl_note_send_context(const char *stage, size_t len, unsigned long long offset, const unsigned char *buf) {
+    pthread_mutex_lock(&g_repl_last_send_lock);
+    snprintf(g_repl_last_send_stage, sizeof(g_repl_last_send_stage), "%s", (stage && *stage) ? stage : "unknown");
+    g_repl_last_send_len = (unsigned long long)len;
+    g_repl_last_send_offset = offset;
+    repl_format_send_preview(g_repl_last_send_preview, sizeof(g_repl_last_send_preview), buf, len);
+    pthread_mutex_unlock(&g_repl_last_send_lock);
+}
+
+void repl_get_last_send_context(char *stage, size_t stage_cap, unsigned long long *len, unsigned long long *offset, char *preview, size_t preview_cap) {
+    pthread_mutex_lock(&g_repl_last_send_lock);
+    if (stage && stage_cap > 0) snprintf(stage, stage_cap, "%s", g_repl_last_send_stage);
+    if (len) *len = g_repl_last_send_len;
+    if (offset) *offset = g_repl_last_send_offset;
+    if (preview && preview_cap > 0) snprintf(preview, preview_cap, "%s", g_repl_last_send_preview);
+    pthread_mutex_unlock(&g_repl_last_send_lock);
+}
+
 static int parse_autosnap_rules(const char *spec);
 static int parse_config_file(const char *path);
 static void trim_inplace(char *s);
@@ -59,6 +121,13 @@ static int parse_appendfsync_policy(const char *s, kvs_aof_fsync_policy_t *out) 
         *out = KVS_AOF_FSYNC_EVERYSEC;
         return 0;
     }
+    return -1;
+}
+
+static int parse_repl_transport_backend(const char *s) {
+    if (!s) return -1;
+    if (!strcasecmp(s, "tcp")) return 0;
+    if (!strcasecmp(s, "rdma")) return 0;
     return -1;
 }
 
@@ -94,6 +163,28 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mem") && i + 1 < argc) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--net") && i + 1 < argc) {
             snprintf(g_cfg.net_backend, sizeof(g_cfg.net_backend), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--repl-transport") && i + 1 < argc) {
+            if (parse_repl_transport_backend(argv[i + 1]) != 0) return -1;
+            snprintf(g_cfg.repl_transport_backend, sizeof(g_cfg.repl_transport_backend), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-dev") && i + 1 < argc) {
+            snprintf(g_cfg.rdma_dev, sizeof(g_cfg.rdma_dev), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-ib-port") && i + 1 < argc) {
+            g_cfg.rdma_ib_port = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-gid-idx") && i + 1 < argc) {
+            g_cfg.rdma_gid_idx = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-recv-slots") && i + 1 < argc) {
+            g_cfg.rdma_recv_slots = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-chunk-size") && i + 1 < argc) {
+            g_cfg.rdma_chunk_size = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-qp-wr-depth") && i + 1 < argc) {
+            g_cfg.rdma_qp_wr_depth = atoi(argv[++i]);
         }
         else if (!strcmp(argv[i], "--appendfsync") && i + 1 < argc) {
             kvs_aof_fsync_policy_t policy;
@@ -177,6 +268,16 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "aof_path")) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", value);
     else if (!strcmp(key, "mem_backend")) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", value);
     else if (!strcmp(key, "net_backend")) snprintf(g_cfg.net_backend, sizeof(g_cfg.net_backend), "%s", value);
+    else if (!strcmp(key, "repl_transport_backend")) {
+        if (parse_repl_transport_backend(value) != 0) return -1;
+        snprintf(g_cfg.repl_transport_backend, sizeof(g_cfg.repl_transport_backend), "%s", value);
+    }
+    else if (!strcmp(key, "rdma_dev")) snprintf(g_cfg.rdma_dev, sizeof(g_cfg.rdma_dev), "%s", value);
+    else if (!strcmp(key, "rdma_ib_port")) g_cfg.rdma_ib_port = atoi(value);
+    else if (!strcmp(key, "rdma_gid_idx")) g_cfg.rdma_gid_idx = atoi(value);
+    else if (!strcmp(key, "rdma_recv_slots")) g_cfg.rdma_recv_slots = atoi(value);
+    else if (!strcmp(key, "rdma_chunk_size")) g_cfg.rdma_chunk_size = atoi(value);
+    else if (!strcmp(key, "rdma_qp_wr_depth")) g_cfg.rdma_qp_wr_depth = atoi(value);
     else if (!strcmp(key, "appendfsync")) {
         if (parse_appendfsync_policy(value, &policy) != 0) return -1;
         g_cfg.aof_fsync = policy;
@@ -232,7 +333,16 @@ static int parse_config_file(const char *path) {
 
 void repl_add_slave(conn_t *c) {
     pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *it = g_replicas; it; it = it->next_replica) {
+        if (it == c) {
+            c->is_replica = 1;
+            c->repl_draining = 0;
+            pthread_mutex_unlock(&g_repl_lock);
+            return;
+        }
+    }
     c->is_replica = 1;
+    c->repl_draining = 0;
     c->next_replica = g_replicas;
     g_replicas = c;
     pthread_mutex_unlock(&g_repl_lock);
@@ -245,42 +355,86 @@ void repl_remove_slave(conn_t *c) {
         if (*pp == c) { *pp = c->next_replica; break; }
         pp = &(*pp)->next_replica;
     }
+    c->next_replica = NULL;
+    c->is_replica = 0;
+    c->repl_draining = 0;
     pthread_mutex_unlock(&g_repl_lock);
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
+    repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
     pthread_mutex_lock(&g_repl_lock);
-    for (conn_t *c = g_replicas; c; c = c->next_replica) {
-        queue_bytes(c, raw, rawlen);
+    conn_t **pp = &g_replicas;
+    while (*pp) {
+        conn_t *c = *pp;
+        if (c->repl_draining) {
+            *pp = c->next_replica;
+            c->next_replica = NULL;
+            c->is_replica = 0;
+            continue;
+        }
+        if (repl_transport_send(c, raw, rawlen) != 0) {
+            if (repl_handle_replica_send_failure(c, pp)) continue;
+            pp = &c->next_replica;
+            continue;
+        }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
+        pp = &c->next_replica;
     }
     pthread_mutex_unlock(&g_repl_lock);
+}
+
+int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
+    size_t off = 0;
+    size_t chunk_cap = !strcasecmp(repl_transport_name(), "rdma") ? (g_cfg.rdma_chunk_size > 0 ? (size_t)g_cfg.rdma_chunk_size : (BUFFER_CAP / 4)) : len;
+    if (!buf || len == 0) return 0;
+    repl_note_send_context("chunked", len, repl_master_offset(), buf);
+    if (chunk_cap < 1024) chunk_cap = 1024;
+    if (chunk_cap > BUFFER_CAP) chunk_cap = BUFFER_CAP;
+    if (chunk_cap == 0) chunk_cap = len;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > chunk_cap) chunk = chunk_cap;
+        if (repl_transport_send(c, buf + off, chunk) != 0) return -1;
+        off += chunk;
+    }
+    return 0;
 }
 
 static int queue_snapshot(conn_t *c) {
     char hdr[128];
     int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu\r\n", repl_master_id(), repl_master_offset());
-    queue_bytes(c, (unsigned char *)hdr, (size_t)n);
-    FILE *fp = fopen(g_cfg.dump_path, "wb");
+    FILE *fp;
+    unsigned char buf[8192];
+    size_t r;
+    size_t total = 0;
+
+    fp = fopen(g_cfg.dump_path, "wb");
     if (!fp) return -1;
     if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); return -1; }
     fclose(fp);
+
+    repl_note_send_context("fullsync-header", (size_t)n, repl_master_offset(), (unsigned char *)hdr);
+    if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)n) != 0) return -1;
     fp = fopen(g_cfg.dump_path, "rb");
     if (!fp) return -1;
-    unsigned char buf[8192]; size_t r; size_t total = 0;
     while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) {
         total += r;
-        queue_bytes(c, buf, r);
+        repl_note_send_context("fullsync-snapshot", r, repl_master_offset(), buf);
+        if (repl_send_chunked(c, buf, r) != 0) { fclose(fp); return -1; }
     }
     fclose(fp);
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
     c->repl_last_send_ms = kvs_now_ms();
-    size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
-    queue_bytes(c, buf, done);
+    {
+        size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
+        repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
+        if (repl_send_chunked(c, buf, done) != 0) return -1;
+    }
     return 0;
 }
 
@@ -376,6 +530,53 @@ static int try_expire(int engine, char *key) {
 }
 
 static int resp_array_from_values(char *out, size_t cap, int count, char **values);
+
+static void repl_log_applied_command(const char *cmd, int argc, char **argv, size_t rawlen) {
+#if KVS_ENABLE_RDMA
+    const char *key = (argc >= 2 && argv && argv[1]) ? argv[1] : "";
+    unsigned long long before = repl_slave_offset();
+    unsigned long long after = before + (unsigned long long)rawlen;
+    fprintf(stderr, "repl rdma: slave_apply_cmd - cmd=%s key=%s rawlen=%zu offset_before=%llu offset_after=%llu\n",
+        cmd ? cmd : "?", key, rawlen, before, after);
+#else
+    (void)cmd;
+    (void)argc;
+    (void)argv;
+    (void)rawlen;
+#endif
+}
+
+static int repl_is_soak_key(const char *key) {
+    return key && strstr(key, "rdma:soak:key:") == key;
+}
+
+static void repl_log_apply_verify(int engine, int argc, char **argv) {
+#if KVS_ENABLE_RDMA
+    char *readback;
+    if (argc < 3 || !argv || !argv[0] || !argv[1] || !argv[2]) return;
+    if (strcmp(argv[0], "SET") != 0) return;
+    if (!repl_is_soak_key(argv[1])) return;
+    readback = engine_get(engine, argv[1]);
+    fprintf(stderr, "repl rdma: slave_apply_verify - cmd=%s key=%s expected=%s readback=%s slave_offset=%llu\n",
+        argv[0], argv[1], argv[2], readback ? readback : "(null)", repl_slave_offset());
+#else
+    (void)engine;
+    (void)argc;
+    (void)argv;
+#endif
+}
+
+static void repl_log_slave_get_check(int engine, const char *key, const char *value) {
+#if KVS_ENABLE_RDMA
+    if (!repl_is_soak_key(key)) return;
+    fprintf(stderr, "repl rdma: slave_get_check - key=%s hit=%d value=%s slave_offset=%llu master_link=%s\n",
+        key ? key : "", value ? 1 : 0, value ? value : "(null)", repl_slave_offset(), repl_master_link_state_name());
+#else
+    (void)engine;
+    (void)key;
+    (void)value;
+#endif
+}
 
 static int engine_upsert(int engine, char *key, char *value) {
     int exists;
@@ -660,13 +861,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "REPLSYNC")) {
         const char *req_replid = argc >= 2 ? argv[1] : "?";
         unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
+#if KVS_ENABLE_RDMA
+        fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
+            req_replid, req_offset, repl_backlog_start_offset(), repl_backlog_end_offset(),
+            (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)) ? 1 : 0);
+#endif
         repl_add_slave(c);
         if (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)) {
-            char hdr[128];
-            int hn = snprintf(hdr, sizeof(hdr), "+CONTINUE %s %llu\r\n", repl_master_id(), req_offset);
-            queue_bytes(c, (unsigned char *)hdr, (size_t)hn);
             repl_note_partialsync_result(1);
-            repl_backlog_write_range(c, req_offset);
+            repl_backlog_send_continue(c, req_offset);
         } else {
             repl_note_partialsync_result(argc >= 3 ? 0 : 1);
             queue_snapshot(c);
@@ -674,6 +877,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {
+#if KVS_ENABLE_RDMA
+        fprintf(stderr, "repl rdma: slave_parse - REPLDONE\n");
+#endif
         repl_slave_finish_fullsync();
         return 0;
     }
@@ -701,6 +907,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "master_host:%s\n"
             "master_port:%d\n"
             "master_link:%s\n"
+            "repl_transport:%s\n"
             "replicas:%d\n"
             "master_replid:%s\n"
             "master_repl_offset:%llu\n"
@@ -716,6 +923,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_backlog_end_offset:%llu\n"
             "slave_master_replid:%s\n"
             "slave_repl_offset:%llu\n"
+            "slave_fullsync_loading:%d\n"
+            "rdma_recv_slots:%d\n"
+            "rdma_chunk_size:%d\n"
+            "rdma_qp_wr_depth:%d\n"
+            "rdma_connected:%d\n"
+            "rdma_disconnect_count:%llu\n"
+            "rdma_reject_count:%llu\n"
+            "rdma_send_cq_error_count:%llu\n"
+            "rdma_recv_cq_error_count:%llu\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -730,6 +946,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             g_cfg.master_host[0] ? g_cfg.master_host : "",
             g_cfg.master_port,
             repl_master_link_state_name(),
+            repl_transport_name(),
             replicas,
             repl_master_id(),
             repl_master_offset(),
@@ -745,6 +962,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_backlog_end_offset(),
             repl_slave_master_id(),
             repl_slave_offset(),
+            repl_slave_loading_fullsync(),
+            repl_rdma_effective_recv_slots(),
+            repl_rdma_effective_chunk_size(),
+            repl_rdma_effective_qp_wr_depth(),
+            repl_rdma_is_connected(),
+            repl_rdma_disconnect_count(),
+            repl_rdma_reject_count(),
+            repl_rdma_send_cq_error_count(),
+            repl_rdma_recv_cq_error_count(),
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
@@ -1071,12 +1297,29 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     else if (!strcmp(op, "GET") && argc == 2) {
         try_expire(engine, argv[1]);
         char *v = engine_get(engine, argv[1]);
+#if KVS_ENABLE_RDMA
+        if (g_cfg.role == ROLE_SLAVE && !from_replication && repl_is_soak_key(argv[1])) {
+            fprintf(stderr, "repl rdma: slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s\n",
+                argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
+        }
+#endif
         n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;
     } else if (!strcmp(op, "MGET")) {
         n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
+#if KVS_ENABLE_RDMA
+        if (g_cfg.role == ROLE_SLAVE && !from_replication) {
+            for (int i = 1; i < argc; ++i) {
+                if (repl_is_soak_key(argv[i])) {
+                    char *mv = engine_get(engine, argv[i]);
+                    fprintf(stderr, "repl rdma: slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s\n",
+                        argv[i], mv ? 1 : 0, mv ? mv : "(null)", repl_slave_offset(), repl_master_link_state_name());
+                }
+            }
+        }
+#endif
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
@@ -1124,7 +1367,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
 
     if (rc == 0) {
         n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        if (!strcmp(op, "SET") || !strcmp(op, "MOD")) {
+            kvs_expire_persist(&global_expire, engine, argv[1]);
+        }
         if (from_replication && is_write_cmd(cmd)) {
+            repl_log_applied_command(cmd, argc, argv, rawlen);
+            if (g_cfg.role == ROLE_SLAVE && !persist_recover_in_progress()) {
+                persist_note_write();
+                persist_append_raw(raw, rawlen);
+            }
             repl_slave_note_applied(rawlen);
         }
         if (!from_replication && is_write_cmd(cmd)) {
@@ -1162,8 +1413,17 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                     int argc = split_inline_argv(line, argv, 8);
                     if (argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
                         repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), 1);
+#if KVS_ENABLE_RDMA
+                        fprintf(stderr, "repl rdma: slave_parse - FULLRESYNC replid=%s offset=%s\n", argv[1], argv[2]);
+#endif
                     } else if (argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
-                        repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), 0);
+                        unsigned long long continue_end = (unsigned long long)strtoull(argv[2], NULL, 10);
+                        unsigned long long continue_start = repl_slave_offset();
+                        if (continue_end < continue_start) continue_end = continue_start;
+                        repl_slave_set_sync_state(argv[1], continue_start, 0);
+#if KVS_ENABLE_RDMA
+                        fprintf(stderr, "repl rdma: slave_parse - CONTINUE replid=%s start_offset=%llu end_offset=%llu\n", argv[1], continue_start, continue_end);
+#endif
                     }
                     kvs_free(line);
                 }
@@ -1435,7 +1695,7 @@ int kvs_snapshot_to_fd(int fd) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma] [--rdma-dev rxe0] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {
@@ -1461,6 +1721,10 @@ int main(int argc, char **argv) {
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
+    if (start_rdma_master_listener() != 0) {
+        fprintf(stderr, "failed to start rdma master listener thread\n");
+        return 1;
+    }
 
     if (!strcmp(g_cfg.net_backend, "reactor")) {
         return reactor_start();

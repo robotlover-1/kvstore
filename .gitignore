@@ -1,0 +1,36 @@
+# Build outputs
+/build/
+/kvstore
+/kvs_hash
+
+# Generated artifacts
+/artifacts/**
+!/artifacts/.gitkeep
+!/artifacts/repl/
+!/artifacts/repl/.gitkeep
+!/artifacts/rdma/
+!/artifacts/rdma/.gitkeep
+!/artifacts/persist/
+!/artifacts/persist/.gitkeep
+!/artifacts/bench/
+!/artifacts/bench/.gitkeep
+!/artifacts/legacy/
+!/artifacts/legacy/.gitkeep
+
+# Python caches
+**/__pycache__/
+*.pyc
+
+# Local runtime files and logs
+*.log
+*.pid
+*.out
+*.err
+
+# Local data dumps / AOFs produced during manual tests
+*.aof
+*.dump
+*.aof.replstate
+
+# Editor / OS noise
+.DS_Store

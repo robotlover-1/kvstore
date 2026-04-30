@@ -414,6 +414,11 @@ TTL 持久化与复制支持
 
 当前验证结论
 - RDMA stress / soak 已通过：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`soak_ok=yes`、`soak_availability_ok=yes`、`soak_recovery_ok=yes`、`final_resume_ok=yes`
+- 对 `async disconnect` 的进一步收敛结论已经明确：
+  - `restart-rounds 0` 的 steady-state RDMA stress 下，`rdma_master_async_disconnect_seen=no`、`rdma_slave_async_disconnect_seen=no`
+  - 带 restart 的场景下，master 侧仍可能出现 `rdma_master_async_disconnect_seen=yes`，但脚本已能区分其为 `impactful=no`
+  - 这说明当前剩余 disconnect 现象主要与 restart/重连生命周期相关，而不是 steady-state 复制错误
+- 因此当前 RDMA 的工程判断是：已达到“正确性通过 + steady-state 干净 + restart 可恢复”的阶段；若要宣称严格意义上的成熟版本，仍建议继续补长时 soak、更高负载、以及更复杂网络扰动验证
 - 新一轮 RDMA 稳定性收敛已完成：
   - 通过 defer ACK during fullsync、修复 stale replica 清理、`pending_recv` 队列化、master 持续接收 `REPLACK`、去掉重复 ACK、串行化 CQ 轮询，已将“中等负载复制失败”收敛为“中等负载通过”
   - 小一档回归（`64 / 16 / 1`）通过：`fullsync_done=yes`、`postsync_tail_ok=yes`、`restart_rounds_ok=yes`、`final_resume_ok=yes`

@@ -296,6 +296,7 @@ RDMA 相关问题很难只靠普通日志定位。特别是：
 
 - 可能仍看到 `rdma_master_async_disconnect_seen=yes`
 - 但在回归通过的场景中，对应 `rdma_master_async_disconnect_impactful=no`
+- 并且在 `restart-rounds 0` 的 steady-state 验证下，`rdma_master_async_disconnect_seen=no`、`rdma_slave_async_disconnect_seen=no`
 
 因此，这一轮迭代的结论不是“RDMA 已经零抖动”，而是：
 

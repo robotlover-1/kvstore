@@ -332,6 +332,11 @@ make check-repl-ebpf-env
 - 需要可用 RDMA 环境；在本项目验证中使用的是 Soft-RoCE (`rxe0`)
 - eBPF 观测通常需要 `root` 或足够的 capability
 - `tools/repl/run_repl_rdma_stress.py --ebpf` 会额外在对应 `artifacts/repl/rdma-stress/` 目录下生成 `rdma_ebpf.out`、`rdma_ebpf.err`、`rdma_ebpf_summary.txt`
+- 当前 RDMA 复制状态：
+  - 最小场景、半手工 postsync、小一档 stress（含 restart）、中等负载 stress（含 restart）均已通过
+  - `restart-rounds 0` 的 steady-state 验证下，`rdma_master_async_disconnect_seen=no`、`rdma_slave_async_disconnect_seen=no`
+  - 带 restart 的场景下，master 侧仍可能看到 `rdma_master_async_disconnect_seen=yes`，但已验证为 `impactful=no`，不会破坏 `fullsync_done / postsync_tail_ok / restart_rounds_ok / final_resume_ok`
+  - 因此当前 RDMA 已达到“功能正确、steady-state 干净、restart 场景可恢复”的状态，但是否称为“成熟版本”仍取决于你对长期 soak、极端负载、生产环境抖动容忍度的要求
 - 若 RDMA 不可用，应优先回退到 TCP 路径，而不是把 RDMA 视为默认必选项
 
 当前 RDMA / eBPF 路径的工程化结论：

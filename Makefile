@@ -1,7 +1,10 @@
 CC=gcc
+CLANG?=clang
 ENABLE_RDMA?=1
-CFLAGS=-Wall -Wextra -O2 -I./include -I./NtyCo/core -I./liburing/src/include $(if $(filter 1,$(ENABLE_RDMA)),-DKVS_ENABLE_RDMA=1,-DKVS_ENABLE_RDMA=0)
-LDFLAGS=-lpthread -ldl -L./NtyCo -lntyco -L./liburing/src -luring -ldl $(if $(filter 1,$(ENABLE_RDMA)),-lrdmacm -libverbs,)
+ENABLE_EBPF?=0
+BPF_CFLAGS?=-O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu
+CFLAGS=-Wall -Wextra -O2 -I./include -I./NtyCo/core -I./liburing/src/include $(if $(filter 1,$(ENABLE_RDMA)),-DKVS_ENABLE_RDMA=1,-DKVS_ENABLE_RDMA=0) $(if $(filter 1,$(ENABLE_EBPF)),-DKVS_ENABLE_EBPF=1,-DKVS_ENABLE_EBPF=0)
+LDFLAGS=-lpthread -ldl -L./NtyCo -lntyco -L./liburing/src -luring -ldl $(if $(filter 1,$(ENABLE_RDMA)),-lrdmacm -libverbs,) $(if $(filter 1,$(ENABLE_EBPF)),-lbpf -lelf -lz,)
 
 SRC_DIR=src
 INC_DIR=include/kvstore
@@ -18,6 +21,9 @@ REPL_BENCH_PRELOAD?=5000
 REPL_BENCH_TAIL?=1000
 REPL_PROFILE_MASTER_PORT?=5200
 REPL_PROFILE_SLAVE_PORT?=5201
+REPL_EBPF_SYNC_MASTER_PORT?=5240
+REPL_EBPF_SYNC_SLAVE_PORT?=5241
+REPL_EBPF_SYNC_COUNT?=64
 REPL_RDMA_UNSUPPORTED_MASTER_PORT?=5210
 REPL_RDMA_UNSUPPORTED_SLAVE_PORT?=5211
 REPL_RDMA_SMOKE_MASTER_PORT?=5220
@@ -66,22 +72,34 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/expire/kvs_expire.c \
      $(SRC_DIR)/persistence/kvs_persist.c \
      $(SRC_DIR)/replication/kvs_repl.c \
+     $(SRC_DIR)/replication/kvs_repl_ebpf.c \
      $(SRC_DIR)/replication/kvs_sentinel.c \
      $(SRC_DIR)/utils/hash.c
 
 OBJS=$(patsubst $(SRC_DIR)/%.c, build/%.o, $(SRCS))
+BPF_SRCS=$(SRC_DIR)/replication/bpf/repl_sockmap.bpf.c
+BPF_OBJS=$(patsubst $(SRC_DIR)/%.bpf.c, build/%.bpf.o, $(BPF_SRCS))
+KVS_BPF_OBJS=$(if $(filter 1,$(ENABLE_EBPF)),$(BPF_OBJS),)
 
 all: build_dir kvstore
 
-kvstore: $(OBJS)
+kvstore: $(KVS_BPF_OBJS) $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LDFLAGS)
+
+build/replication/kvs_repl_ebpf.o: $(SRC_DIR)/replication/kvs_repl_ebpf.c $(INC_DIR)/kvstore.h
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -O2,$(CFLAGS)) -O0 -c $< -o $@
 
 build/%.o: $(SRC_DIR)/%.c $(INC_DIR)/kvstore.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+build/%.bpf.o: $(SRC_DIR)/%.bpf.c
+	@mkdir -p $(dir $@)
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
 build_dir:
-	@mkdir -p build/main build/core build/storage build/memory build/expire build/persistence build/replication build/utils
+	@mkdir -p build/main build/core build/storage build/memory build/expire build/persistence build/replication build/replication/bpf build/utils
 
 clean:
 	rm -rf build kvstore kvstore.dump kvstore.aof
@@ -122,6 +140,15 @@ check-repl-ebpf:
 check-repl-ebpf-env:
 	python3 ./tools/repl/run_repl_ebpf_env_probe.py
 
+check-repl-ebpf-sync:
+	python3 ./tools/repl/run_repl_ebpf_sync_test.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_EBPF_SYNC_MASTER_PORT) --slave-port $(REPL_EBPF_SYNC_SLAVE_PORT) --count $(REPL_EBPF_SYNC_COUNT) --cleanup-leftovers --timeout 60
+
+check-repl-ebpf-sync-required:
+	python3 ./tools/repl/run_repl_ebpf_sync_test.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_EBPF_SYNC_MASTER_PORT) --slave-port $(REPL_EBPF_SYNC_SLAVE_PORT) --count $(REPL_EBPF_SYNC_COUNT) --require-ebpf --cleanup-leftovers --timeout 60
+
+check-repl-ebpf-redirect:
+	python3 ./tools/repl/run_repl_ebpf_sync_test.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_EBPF_SYNC_MASTER_PORT) --slave-port $(REPL_EBPF_SYNC_SLAVE_PORT) --count $(REPL_EBPF_SYNC_COUNT) --require-ebpf --redirect --cleanup-leftovers --timeout 60
+
 check-repl-rdma-unsupported:
 	python3 ./tools/repl/run_repl_rdma_unsupported.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_RDMA_UNSUPPORTED_MASTER_PORT) --slave-port $(REPL_RDMA_UNSUPPORTED_SLAVE_PORT)
 
@@ -151,4 +178,4 @@ check-rdma-pingpong-smoke:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke
+.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke

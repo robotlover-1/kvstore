@@ -62,6 +62,7 @@ void close_conn(conn_t *c) {
         repl_remove_slave(c);
     }
 
+    repl_ebpf_unregister_fd(c->fd);
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
 

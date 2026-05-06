@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -20,9 +21,14 @@
 #include <pthread.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <sys/resource.h>
 
 #ifndef KVS_ENABLE_RDMA
 #define KVS_ENABLE_RDMA 0
+#endif
+
+#ifndef KVS_ENABLE_EBPF
+#define KVS_ENABLE_EBPF 0
 #endif
 
 #define BUFFER_CAP 65536
@@ -34,6 +40,7 @@
 
 #define KVS_REPL_TRANSPORT_TCP 1
 #define KVS_REPL_TRANSPORT_RDMA 2
+#define KVS_REPL_TRANSPORT_EBPF 3
 
 #define KVS_ENGINE_ARRAY      1
 #define KVS_ENGINE_RBTREE     2
@@ -263,6 +270,11 @@ typedef struct {
     char mem_backend[32];
     char net_backend[32];
     char repl_transport_backend[32];
+    char ebpf_obj_path[256];
+    char ebpf_pin_path[256];
+    int ebpf_redirect;
+    int ebpf_redirect_key;
+    int ebpf_forward;
     char rdma_dev[32];
     int rdma_ib_port;
     int rdma_gid_idx;
@@ -321,6 +333,27 @@ typedef struct {
     size_t class_page_count[16];
     size_t class_bytes_in_pages[16];
 } kvs_mem_stats_t;
+
+typedef struct {
+    unsigned long long initialized;
+    unsigned long long compiled;
+    unsigned long long register_attempts;
+    unsigned long long register_failures;
+    int last_errno;
+    char last_error[128];
+    unsigned long long sk_msg_count;
+    unsigned long long sk_msg_bytes;
+    unsigned long long sk_msg_pass;
+    unsigned long long sk_msg_drop;
+    unsigned long long redirect_enabled;
+    unsigned long long redirect_attempts;
+    unsigned long long redirect_success;
+    unsigned long long redirect_failures;
+    unsigned long long forward_enabled;
+    unsigned long long role_unknown;
+    unsigned long long role_master;
+    unsigned long long role_slave;
+} kvs_repl_ebpf_stats_t;
 
 extern kv_config_t g_cfg;
 extern int g_epfd;
@@ -417,6 +450,14 @@ unsigned long long repl_slave_durable_offset(void);
 int repl_slave_loading_fullsync(void);
 int repl_slave_state_load(void);
 int repl_slave_state_save(void);
+
+int repl_ebpf_init(void);
+void repl_ebpf_cleanup(void);
+int repl_ebpf_supported(void);
+int repl_ebpf_register_fd(int fd, int is_master_side);
+int repl_ebpf_register_forward_fd(int fd);
+int repl_ebpf_unregister_fd(int fd);
+int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats);
 
 int persist_init(void);
 void persist_close(void);

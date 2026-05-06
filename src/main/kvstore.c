@@ -15,6 +15,11 @@ kv_config_t g_cfg = {
     .mem_backend = "libc",
     .net_backend = "reactor",
     .repl_transport_backend = "tcp",
+    .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
+    .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
+    .ebpf_redirect = 0,
+    .ebpf_redirect_key = 0,
+    .ebpf_forward = 0,
     .rdma_dev = "rxe0",
     .rdma_ib_port = 1,
     .rdma_gid_idx = 1,
@@ -128,6 +133,8 @@ static int parse_repl_transport_backend(const char *s) {
     if (!s) return -1;
     if (!strcasecmp(s, "tcp")) return 0;
     if (!strcasecmp(s, "rdma")) return 0;
+    if (!strcasecmp(s, "ebpf")) return 0;
+    if (!strcasecmp(s, "sockmap")) return 0;
     return -1;
 }
 
@@ -167,6 +174,21 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--repl-transport") && i + 1 < argc) {
             if (parse_repl_transport_backend(argv[i + 1]) != 0) return -1;
             snprintf(g_cfg.repl_transport_backend, sizeof(g_cfg.repl_transport_backend), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--ebpf-obj") && i + 1 < argc) {
+            snprintf(g_cfg.ebpf_obj_path, sizeof(g_cfg.ebpf_obj_path), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--ebpf-pin") && i + 1 < argc) {
+            snprintf(g_cfg.ebpf_pin_path, sizeof(g_cfg.ebpf_pin_path), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--ebpf-redirect")) {
+            g_cfg.ebpf_redirect = 1;
+        }
+        else if (!strcmp(argv[i], "--ebpf-redirect-key") && i + 1 < argc) {
+            g_cfg.ebpf_redirect_key = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--ebpf-forward")) {
+            g_cfg.ebpf_forward = 1;
         }
         else if (!strcmp(argv[i], "--rdma-dev") && i + 1 < argc) {
             snprintf(g_cfg.rdma_dev, sizeof(g_cfg.rdma_dev), "%s", argv[++i]);
@@ -272,6 +294,11 @@ static int apply_config_kv(const char *key, const char *value) {
         if (parse_repl_transport_backend(value) != 0) return -1;
         snprintf(g_cfg.repl_transport_backend, sizeof(g_cfg.repl_transport_backend), "%s", value);
     }
+    else if (!strcmp(key, "ebpf_obj_path")) snprintf(g_cfg.ebpf_obj_path, sizeof(g_cfg.ebpf_obj_path), "%s", value);
+    else if (!strcmp(key, "ebpf_pin_path")) snprintf(g_cfg.ebpf_pin_path, sizeof(g_cfg.ebpf_pin_path), "%s", value);
+    else if (!strcmp(key, "ebpf_redirect")) g_cfg.ebpf_redirect = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
+    else if (!strcmp(key, "ebpf_redirect_key")) g_cfg.ebpf_redirect_key = atoi(value);
+    else if (!strcmp(key, "ebpf_forward")) g_cfg.ebpf_forward = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
     else if (!strcmp(key, "rdma_dev")) snprintf(g_cfg.rdma_dev, sizeof(g_cfg.rdma_dev), "%s", value);
     else if (!strcmp(key, "rdma_ib_port")) g_cfg.rdma_ib_port = atoi(value);
     else if (!strcmp(key, "rdma_gid_idx")) g_cfg.rdma_gid_idx = atoi(value);
@@ -923,6 +950,18 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
             req_replid, req_offset, req_durable, repl_backlog_start_offset(), repl_backlog_end_offset(), can_continue ? 1 : 0);
 #endif
+        if (c && (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
+            c->repl_transport_kind = KVS_REPL_TRANSPORT_EBPF;
+            if (repl_ebpf_register_fd(c->fd, 1) != 0) {
+                fprintf(stderr, "repl ebpf: fd registration failed on master replica link, using tcp-compatible path\n");
+            }
+            /* In cross-machine forward mode, register the same fd at the redirect key
+             * so the BPF program can redirect data to this socket's send queue,
+             * transmitting it over TCP to the remote slave. */
+            if (g_cfg.ebpf_forward && repl_ebpf_register_forward_fd(c->fd) != 0) {
+                fprintf(stderr, "repl ebpf: forward fd registration failed, cross-machine forwarding disabled\n");
+            }
+        }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
@@ -955,9 +994,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "INFO")) {
-        char info[4096];
+        char info[8192];
         char recover[1024] = {0};
+        kvs_repl_ebpf_stats_t ebpf_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
+        repl_ebpf_get_stats(&ebpf_stats);
 
         unsigned long long max_replica_applied = 0;
         unsigned long long max_replica_durable = 0;
@@ -1014,6 +1055,24 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "rdma_reject_count:%llu\n"
             "rdma_send_cq_error_count:%llu\n"
             "rdma_recv_cq_error_count:%llu\n"
+            "ebpf_compiled:%llu\n"
+            "ebpf_initialized:%llu\n"
+            "ebpf_register_attempts:%llu\n"
+            "ebpf_register_failures:%llu\n"
+            "ebpf_last_errno:%d\n"
+            "ebpf_last_error:%s\n"
+            "ebpf_sk_msg_count:%llu\n"
+            "ebpf_sk_msg_bytes:%llu\n"
+            "ebpf_sk_msg_pass:%llu\n"
+            "ebpf_sk_msg_drop:%llu\n"
+            "ebpf_redirect_enabled:%llu\n"
+            "ebpf_forward_enabled:%llu\n"
+            "ebpf_redirect_attempts:%llu\n"
+            "ebpf_redirect_success:%llu\n"
+            "ebpf_redirect_failures:%llu\n"
+            "ebpf_role_unknown:%llu\n"
+            "ebpf_role_master:%llu\n"
+            "ebpf_role_slave:%llu\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -1063,6 +1122,24 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_rdma_reject_count(),
             repl_rdma_send_cq_error_count(),
             repl_rdma_recv_cq_error_count(),
+            ebpf_stats.compiled,
+            ebpf_stats.initialized,
+            ebpf_stats.register_attempts,
+            ebpf_stats.register_failures,
+            ebpf_stats.last_errno,
+            ebpf_stats.last_error,
+            ebpf_stats.sk_msg_count,
+            ebpf_stats.sk_msg_bytes,
+            ebpf_stats.sk_msg_pass,
+            ebpf_stats.sk_msg_drop,
+            ebpf_stats.redirect_enabled,
+            ebpf_stats.forward_enabled,
+            ebpf_stats.redirect_attempts,
+            ebpf_stats.redirect_success,
+            ebpf_stats.redirect_failures,
+            ebpf_stats.role_unknown,
+            ebpf_stats.role_master,
+            ebpf_stats.role_slave,
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
@@ -1799,7 +1876,7 @@ int kvs_snapshot_to_fd(int fd) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma] [--rdma-dev rxe0] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore_repl_sockmap] [--ebpf-redirect --ebpf-redirect-key 0] [--rdma-dev rxe0] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {
@@ -1825,6 +1902,12 @@ int main(int argc, char **argv) {
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
+    if (g_cfg.role == ROLE_MASTER && (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
+        if (repl_ebpf_init() != 0) {
+            fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
+            /* Non-fatal: continue with TCP fallback, transport will auto-fallback at first send */
+        }
+    }
     if (start_rdma_master_listener() != 0) {
         fprintf(stderr, "failed to start rdma master listener thread\n");
         return 1;

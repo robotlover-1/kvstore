@@ -131,6 +131,10 @@ static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t l
     return queue_bytes(c, buf, len);
 }
 
+static int repl_transport_ebpf_send(conn_t *c, const unsigned char *buf, size_t len) {
+    return repl_transport_tcp_send(c, buf, len);
+}
+
 static int repl_transport_tcp_connect_slave(const char *host, int port) {
     int fd;
     struct timeval tv;
@@ -695,6 +699,20 @@ static void repl_transport_tcp_disconnect_slave(int fd) {
     if (fd >= 0) close(fd);
 }
 
+static int repl_transport_ebpf_connect_slave(const char *host, int port) {
+    int fd = repl_transport_tcp_connect_slave(host, port);
+    if (fd < 0) return -1;
+    if (repl_ebpf_register_fd(fd, 0) != 0) {
+        fprintf(stderr, "repl ebpf: fd registration failed on slave link, using tcp-compatible path\n");
+    }
+    return fd;
+}
+
+static void repl_transport_ebpf_disconnect_slave(int fd) {
+    repl_ebpf_unregister_fd(fd);
+    repl_transport_tcp_disconnect_slave(fd);
+}
+
 static int repl_transport_rdma_send(conn_t *c, const unsigned char *buf, size_t len) {
     (void)c;
     (void)buf;
@@ -831,6 +849,14 @@ static const repl_transport_ops_t g_repl_transport_tcp_ops = {
     .disconnect_slave = repl_transport_tcp_disconnect_slave,
 };
 
+static const repl_transport_ops_t g_repl_transport_ebpf_ops = {
+    .name = "ebpf",
+    .supported = 1,
+    .send = repl_transport_ebpf_send,
+    .connect_slave = repl_transport_ebpf_connect_slave,
+    .disconnect_slave = repl_transport_ebpf_disconnect_slave,
+};
+
 static const repl_transport_ops_t g_repl_transport_rdma_ops = {
     .name = "rdma",
     .supported = KVS_ENABLE_RDMA,
@@ -869,7 +895,7 @@ static void repl_transport_mark_active(const char *name) {
 
 static void repl_transport_trigger_fallback(const char *reason, int cooldown_ms) {
     g_repl_transport_fallback_count++;
-    snprintf(g_repl_transport_fallback_reason, sizeof(g_repl_transport_fallback_reason), "%s", reason ? reason : "rdma_failure");
+    snprintf(g_repl_transport_fallback_reason, sizeof(g_repl_transport_fallback_reason), "%s", reason ? reason : "transport_failure");
     g_repl_transport_fallback_until_ms = kvs_now_ms() + (cooldown_ms > 0 ? cooldown_ms : 5000);
     repl_transport_mark_active("tcp");
 #if KVS_ENABLE_RDMA
@@ -878,7 +904,9 @@ static void repl_transport_trigger_fallback(const char *reason, int cooldown_ms)
 }
 
 const char *repl_transport_configured_name(void) {
-    return !strcasecmp(g_cfg.repl_transport_backend, "rdma") ? "rdma" : "tcp";
+    if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
+    if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
+    return "tcp";
 }
 
 const char *repl_transport_active_name(void) {
@@ -900,9 +928,11 @@ long long repl_transport_fallback_until_ms(void) {
 static const repl_transport_ops_t *repl_transport_ops_for_conn(conn_t *c) {
     if (!c) {
         if (g_slave_transport_kind == KVS_REPL_TRANSPORT_RDMA) return &g_repl_transport_rdma_ops;
+        if (g_slave_transport_kind == KVS_REPL_TRANSPORT_EBPF) return &g_repl_transport_ebpf_ops;
         return &g_repl_transport_tcp_ops;
     }
     if (c->repl_transport_kind == KVS_REPL_TRANSPORT_RDMA) return &g_repl_transport_rdma_ops;
+    if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF) return &g_repl_transport_ebpf_ops;
     return &g_repl_transport_tcp_ops;
 }
 
@@ -913,13 +943,22 @@ static int repl_should_use_rdma_now(void) {
     return 1;
 }
 
+static int repl_should_use_ebpf_now(void) {
+    if (strcasecmp(g_cfg.repl_transport_backend, "ebpf") != 0 && strcasecmp(g_cfg.repl_transport_backend, "sockmap") != 0) return 0;
+    if (!g_repl_transport_ebpf_ops.supported || !repl_ebpf_supported()) return 0;
+    if (g_repl_transport_fallback_until_ms > kvs_now_ms()) return 0;
+    return 1;
+}
+
 static const repl_transport_ops_t *repl_transport_ops(void) {
     if (repl_should_use_rdma_now()) return &g_repl_transport_rdma_ops;
+    if (repl_should_use_ebpf_now()) return &g_repl_transport_ebpf_ops;
     return &g_repl_transport_tcp_ops;
 }
 
 static int repl_transport_supported(void) {
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return g_repl_transport_rdma_ops.supported;
+    if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return g_repl_transport_ebpf_ops.supported && repl_ebpf_supported();
     return 1;
 }
 
@@ -936,6 +975,8 @@ int repl_transport_send(conn_t *c, const unsigned char *buf, size_t len) {
     }
     if (ops == &g_repl_transport_rdma_ops) {
         repl_transport_trigger_fallback("rdma_send_failure", 5000);
+    } else if (ops == &g_repl_transport_ebpf_ops) {
+        repl_transport_trigger_fallback("ebpf_send_failure", 5000);
     }
     return rc;
 }
@@ -1579,8 +1620,13 @@ static void *slave_thread(void *arg) {
             continue;
         }
 
-        repl_transport_mark_active("tcp");
-        g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        if (repl_should_use_ebpf_now()) {
+            repl_transport_mark_active("ebpf");
+            g_slave_transport_kind = KVS_REPL_TRANSPORT_EBPF;
+        } else {
+            repl_transport_mark_active("tcp");
+            g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        }
         repl_set_link_state(1);
         unsigned char buf[BUFFER_CAP];
         size_t blen = 0;

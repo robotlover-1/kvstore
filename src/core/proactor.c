@@ -31,6 +31,7 @@ static void close_conn_uring(conn_t *c) {
 
     if (c->is_replica) repl_remove_slave(c);
 
+    repl_ebpf_unregister_fd(c->fd);
     close(c->fd);
 
     out_node_t *n = c->out_head;

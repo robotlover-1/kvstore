@@ -51,13 +51,25 @@ MASS_TTL_KEYS?=10000
 MASS_TTL_SECONDS?=2
 MASS_TTL_BATCH?=1000
 MASS_TTL_SAMPLE?=20
-URING_PERSIST_COUNT?=1000
+URING_PERSIST_COUNT?=10000
 URING_PERSIST_PORT?=5140
 URING_PERSIST_APPEND_FSYNC?=always
-MMAP_RECOVER_COUNT?=2000
+MMAP_RECOVER_COUNT?=10000
 MMAP_RECOVER_PORT?=5142
 MMAP_RECOVER_ENGINE?=hash
 MMAP_RECOVER_APPEND_FSYNC?=everysec
+FULL_DUMP_DEMO_COUNT?=100000
+FULL_DUMP_DEMO_PORT?=5150
+INCR_AOF_DEMO_COUNT?=100000
+INCR_AOF_DEMO_PORT?=5152
+REPL_SYNC_DEMO_MASTER_PORT?=5160
+REPL_SYNC_DEMO_SLAVE_PORT?=5161
+REPL_SYNC_DEMO_PRE?=50000
+REPL_SYNC_DEMO_POST?=50000
+REPL_SYNC_DEMO_FULLSYNC?=tcp
+REPL_SYNC_DEMO_REALTIME?=ebpf
+REPL_BENCH_PRELOAD?=50000
+REPL_BENCH_TAIL?=5000
 
 SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/core/reactor.c \
@@ -176,6 +188,16 @@ check-rdma-standalone-probe:
 check-rdma-pingpong-smoke:
 	python3 ./tools/rdma/run_rdma_pingpong_smoke.py --host $(RDMA_PINGPONG_HOST) --port $(RDMA_PINGPONG_PORT) --ib-dev $(RDMA_PINGPONG_DEV) --ib-port $(RDMA_PINGPONG_IB_PORT) --gid-idx $(RDMA_PINGPONG_GID_IDX)
 
+# ---- 10w-level demo targets ----
+check-demo-full-dump:
+	python3 ./tools/persist/run_full_dump_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --port $(FULL_DUMP_DEMO_PORT) --count $(FULL_DUMP_DEMO_COUNT)
+
+check-demo-incr-aof:
+	python3 ./tools/persist/run_incr_aof_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --port $(INCR_AOF_DEMO_PORT) --count $(INCR_AOF_DEMO_COUNT)
+
+check-demo-repl-sync:
+	python3 ./tools/repl/run_repl_sync_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_SYNC_DEMO_MASTER_PORT) --slave-port $(REPL_SYNC_DEMO_SLAVE_PORT) --pre-count $(REPL_SYNC_DEMO_PRE) --post-count $(REPL_SYNC_DEMO_POST) --fullsync-transport $(REPL_SYNC_DEMO_FULLSYNC) --realtime-transport $(REPL_SYNC_DEMO_REALTIME)
+
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke
+.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync

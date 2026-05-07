@@ -42,6 +42,10 @@
 #define KVS_REPL_TRANSPORT_RDMA 2
 #define KVS_REPL_TRANSPORT_EBPF 3
 
+/* Replication send context: which transport to use */
+#define KVS_REPL_SEND_FULLSYNC  1   /* bulk existing data: RDMA */
+#define KVS_REPL_SEND_REALTIME  2   /* incremental real-time: eBPF */
+
 #define KVS_ENGINE_ARRAY      1
 #define KVS_ENGINE_RBTREE     2
 #define KVS_ENGINE_HASH       3
@@ -270,6 +274,8 @@ typedef struct {
     char mem_backend[32];
     char net_backend[32];
     char repl_transport_backend[32];
+    char repl_fullsync_transport[32];   /* transport for fullsync/snapshot (RDMA) */
+    char repl_realtime_transport[32];   /* transport for realtime broadcast (eBPF) */
     char ebpf_obj_path[256];
     char ebpf_pin_path[256];
     int ebpf_redirect;
@@ -282,6 +288,7 @@ typedef struct {
     int rdma_chunk_size;
     int rdma_qp_wr_depth;
     kvs_aof_fsync_policy_t aof_fsync;
+    char log_mode[32];
     int autosnap_rule_count;
     kvs_autosnap_rule_t autosnap_rules[KVS_AUTOSNAP_RULES_MAX];
 
@@ -395,9 +402,14 @@ const char *repl_transport_active_name(void);
 const char *repl_transport_fallback_reason(void);
 unsigned long long repl_transport_fallback_count(void);
 long long repl_transport_fallback_until_ms(void);
+const char *repl_fullsync_transport_name(void);
+const char *repl_realtime_transport_name(void);
 int repl_transport_send(conn_t *c, const unsigned char *buf, size_t len);
 int repl_transport_send_many(conn_t *c, const unsigned char *buf1, size_t len1, const unsigned char *buf2, size_t len2);
+int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len);
+int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len);
 int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len);
+int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int send_ctx);
 
 void repl_add_slave(conn_t *c);
 void repl_remove_slave(conn_t *c);
@@ -469,6 +481,8 @@ int persist_recover(void);
 int persist_recover_in_progress(void);
 int kvs_snapshot_to_fp(FILE *fp);
 int kvs_snapshot_to_fd(int fd);
+int kvs_dump_to_fd(int fd);
+int kvs_load_dump_from_fd(int fd);
 int persist_bgsave_start(void);
 int persist_bgsave_poll(void);
 int persist_bgsave_in_progress(void);

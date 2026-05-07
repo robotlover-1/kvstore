@@ -27,6 +27,7 @@ static int g_slave_port = 0;
 static int g_slave_conf_gen = 0;
 static int g_master_link_up = 0;
 static int g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+static int g_slave_fd = -1;
 static long long g_master_last_io_ms = 0;
 static int g_slave_thread_started = 0;
 static int g_rdma_master_listener_started = 0;
@@ -730,6 +731,7 @@ static const repl_transport_ops_t *repl_transport_ops_for_conn(conn_t *c);
 static int repl_should_use_rdma_now(void);
 static void repl_transport_mark_active(const char *name);
 static void repl_transport_trigger_fallback(const char *reason, int cooldown_ms);
+static int repl_realtime_should_use_ebpf(void);
 
 static int repl_transport_rdma_connect_slave(const char *host, int port) {
     (void)host;
@@ -744,9 +746,17 @@ static int repl_transport_rdma_connect_slave(const char *host, int port) {
     }
     repl_rdma_log("prepare_addr", "ok");
     repl_rdma_reset_ctx();
-    g_repl_rdma_ctx.ec = rdma_create_event_channel();
+    /* Retry event channel creation: transient failures can occur under load */
+    for (int ec_retry = 0; ec_retry < 3; ec_retry++) {
+        g_repl_rdma_ctx.ec = rdma_create_event_channel();
+        if (g_repl_rdma_ctx.ec) break;
+        char ec_err[128];
+        snprintf(ec_err, sizeof(ec_err), "create failed errno=%d retry=%d", errno, ec_retry);
+        repl_rdma_log("event_channel", ec_err);
+        if (ec_retry < 2) usleep(200000);
+    }
     if (!g_repl_rdma_ctx.ec) {
-        repl_rdma_log("event_channel", "create failed");
+        repl_rdma_log("event_channel", "create failed after retries");
         return -1;
     }
     repl_rdma_log("event_channel", "created");
@@ -904,12 +914,18 @@ static void repl_transport_trigger_fallback(const char *reason, int cooldown_ms)
 }
 
 const char *repl_transport_configured_name(void) {
+    int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
     return "tcp";
 }
 
 const char *repl_transport_active_name(void) {
+    int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     return g_repl_transport_active[0] ? g_repl_transport_active : repl_transport_configured_name();
 }
 
@@ -937,20 +953,32 @@ static const repl_transport_ops_t *repl_transport_ops_for_conn(conn_t *c) {
 }
 
 static int repl_should_use_rdma_now(void) {
-    if (strcasecmp(g_cfg.repl_transport_backend, "rdma") != 0) return 0;
+    if (strcasecmp(repl_fullsync_transport_name(), "rdma") != 0 && strcasecmp(g_cfg.repl_transport_backend, "rdma") != 0) return 0;
     if (!g_repl_transport_rdma_ops.supported) return 0;
     if (g_repl_transport_fallback_until_ms > kvs_now_ms()) return 0;
     return 1;
 }
 
 static int repl_should_use_ebpf_now(void) {
-    if (strcasecmp(g_cfg.repl_transport_backend, "ebpf") != 0 && strcasecmp(g_cfg.repl_transport_backend, "sockmap") != 0) return 0;
+    const char *t = repl_realtime_transport_name();
+    if (strcasecmp(t, "ebpf") != 0 && strcasecmp(t, "sockmap") != 0
+        && strcasecmp(g_cfg.repl_transport_backend, "ebpf") != 0 && strcasecmp(g_cfg.repl_transport_backend, "sockmap") != 0) return 0;
     if (!g_repl_transport_ebpf_ops.supported || !repl_ebpf_supported()) return 0;
     if (g_repl_transport_fallback_until_ms > kvs_now_ms()) return 0;
     return 1;
 }
 
 static const repl_transport_ops_t *repl_transport_ops(void) {
+    /* In hybrid mode, the main ops are for realtime transport */
+    int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_ebpf_realtime) {
+        /* Hybrid: RDMA for fullsync, eBPF for realtime.
+         * The main transport is eBPF (over TCP) for realtime data. */
+        if (g_repl_transport_ebpf_ops.supported && repl_ebpf_supported())
+            return &g_repl_transport_ebpf_ops;
+        return &g_repl_transport_tcp_ops;
+    }
     if (repl_should_use_rdma_now()) return &g_repl_transport_rdma_ops;
     if (repl_should_use_ebpf_now()) return &g_repl_transport_ebpf_ops;
     return &g_repl_transport_tcp_ops;
@@ -963,6 +991,9 @@ static int repl_transport_supported(void) {
 }
 
 const char *repl_transport_name(void) {
+    int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     return repl_transport_active_name();
 }
 
@@ -985,6 +1016,63 @@ int repl_transport_send_many(conn_t *c, const unsigned char *buf1, size_t len1, 
     if (repl_transport_send(c, buf1, len1) != 0) return -1;
     if (repl_transport_send(c, buf2, len2) != 0) return -1;
     return 0;
+}
+
+/* ---- Dual-transport: fullsync vs realtime ---- */
+
+const char *repl_fullsync_transport_name(void) {
+    /* Use dedicated config if set, otherwise fall back to repl_transport_backend */
+    if (g_cfg.repl_fullsync_transport[0]) return g_cfg.repl_fullsync_transport;
+    if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
+    return "tcp";
+}
+
+const char *repl_realtime_transport_name(void) {
+    if (g_cfg.repl_realtime_transport[0]) return g_cfg.repl_realtime_transport;
+    if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
+    return "tcp";
+}
+
+static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) {
+    if (send_ctx == KVS_REPL_SEND_FULLSYNC) {
+        const char *t = repl_fullsync_transport_name();
+        if (!strcasecmp(t, "rdma") && g_repl_transport_rdma_ops.supported && g_repl_transport_fallback_until_ms <= kvs_now_ms())
+            return &g_repl_transport_rdma_ops;
+        return &g_repl_transport_tcp_ops;
+    }
+    /* KVS_REPL_SEND_REALTIME */
+    const char *t = repl_realtime_transport_name();
+    if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported())
+        return &g_repl_transport_ebpf_ops;
+    return &g_repl_transport_tcp_ops;
+}
+
+int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len) {
+    const repl_transport_ops_t *ops = repl_transport_ops_for_context(KVS_REPL_SEND_FULLSYNC);
+    int rc = ops->send(c, buf, len);
+    if (rc == 0) {
+        return 0;
+    }
+    /* Fallback: try TCP on failure */
+    rc = repl_transport_tcp_send(c, buf, len);
+    if (rc == 0) return 0;
+    return -1;
+}
+
+int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len) {
+    const repl_transport_ops_t *ops = repl_transport_ops_for_context(KVS_REPL_SEND_REALTIME);
+    int rc = ops->send(c, buf, len);
+    if (rc == 0) {
+        return 0;
+    }
+    /* Fallback: try TCP on failure */
+    rc = repl_transport_tcp_send(c, buf, len);
+    return rc;
+}
+
+static int repl_realtime_should_use_ebpf(void) {
+    const char *t = repl_realtime_transport_name();
+    return !strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap");
 }
 
 static void build_slave_state_path(void) {
@@ -1316,15 +1404,29 @@ int repl_slave_send_ack(void) {
     char applied[32];
     char durable[32];
     size_t n;
+    long long now;
     if (g_cfg.role != ROLE_SLAVE) return 0;
     if (!repl_is_master_link_up()) return 0;
+    /* Rate-limit: at most one REPLACK per second */
+    now = kvs_now_ms();
+    if (now - g_slave_last_ack_ms < 1000) return 0;
     snprintf(applied, sizeof(applied), "%llu", g_slave_repl_applied_offset);
     snprintf(durable, sizeof(durable), "%llu", g_slave_repl_durable_offset);
     n = resp_build_cmd3(cmd, sizeof(cmd), "REPLACK", applied, durable);
-    if (g_slave_transport_kind != KVS_REPL_TRANSPORT_RDMA) return 0;
-    if (repl_transport_send_on_slave_link(cmd, n) == 0) {
-        g_slave_last_ack_ms = kvs_now_ms();
-        return 0;
+    if (g_slave_transport_kind == KVS_REPL_TRANSPORT_RDMA) {
+        if (repl_transport_send_on_slave_link(cmd, n) == 0) {
+            g_slave_last_ack_ms = kvs_now_ms();
+            return 0;
+        }
+        return -1;
+    }
+    /* TCP / eBPF transport: send REPLACK over the slave fd */
+    if (g_slave_fd >= 0) {
+        ssize_t sent = send(g_slave_fd, cmd, n, 0);
+        if (sent == (ssize_t)n) {
+            g_slave_last_ack_ms = kvs_now_ms();
+            return 0;
+        }
     }
     return -1;
 }
@@ -1460,7 +1562,8 @@ static int slave_should_reconnect(int local_gen) {
 }
 
 static void repl_slave_retry_pause(int rdma_fail_streak) {
-    if (!strcasecmp(repl_transport_name(), "rdma")) {
+    const char *tname = repl_transport_name();
+    if (!strcasecmp(tname, "rdma") || !strcasecmp(tname, "rdma+ebpf")) {
         int delay_ms = 100 * (rdma_fail_streak > 0 ? rdma_fail_streak : 1);
         if (delay_ms < 100) delay_ms = 100;
         if (delay_ms > 1000) delay_ms = 1000;
@@ -1474,6 +1577,20 @@ static void repl_slave_ack_heartbeat(void) {
     if (now - g_slave_last_ack_ms < 1000) return;
     repl_slave_send_ack();
 }
+
+#if KVS_ENABLE_RDMA
+typedef struct repl_rdma_bg_connect_arg_s {
+    char host[128];
+    int port;
+} repl_rdma_bg_connect_arg_t;
+
+static void *repl_rdma_bg_connect_thread(void *arg) {
+    repl_rdma_bg_connect_arg_t *a = (repl_rdma_bg_connect_arg_t *)arg;
+    repl_transport_rdma_connect_slave(a->host, a->port);
+    kvs_free(a);
+    return NULL;
+}
+#endif
 
 static void *slave_thread(void *arg) {
     int rdma_fail_streak = 0;
@@ -1501,6 +1618,124 @@ static void *slave_thread(void *arg) {
             continue;
         }
 
+        /* ---- Hybrid dual-transport: RDMA for fullsync + eBPF for realtime ---- */
+        int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma") && KVS_ENABLE_RDMA;
+        int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+
+        /* If using dual transport, always establish TCP as the primary link.
+         * RDMA is established separately for fullsync bulk data. */
+        if (use_rdma_fullsync && use_ebpf_realtime) {
+            int tcp_fd = repl_transport_tcp_connect_slave(host, port);
+            if (tcp_fd < 0) {
+                repl_set_link_state(0);
+                rdma_fail_streak++;
+                repl_slave_retry_pause(rdma_fail_streak);
+                continue;
+            }
+            /* Send REPLSYNC immediately over TCP before attempting RDMA */
+            unsigned char cmd[256];
+            char offbuf[32], durablebuf[32];
+            snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
+            snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
+            size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+            if (send(tcp_fd, cmd, n, 0) < 0) {
+                repl_transport_tcp_disconnect_slave(tcp_fd);
+                repl_set_link_state(0);
+                sleep(1);
+                continue;
+            }
+
+            /* Kick off RDMA connection attempt in a background thread.
+             * This must not block: fullsync data flows over TCP immediately
+             * after REPLSYNC, and we need to read it without delay.
+             * RDMA connect is non-fatal if it fails. */
+#if KVS_ENABLE_RDMA
+            repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
+            if (rdma_arg) {
+                snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
+                rdma_arg->port = port;
+                pthread_t rdma_tid;
+                if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
+                    kvs_free(rdma_arg);
+                } else {
+                    pthread_detach(rdma_tid);
+                }
+            }
+#endif
+            g_slave_transport_kind = KVS_REPL_TRANSPORT_EBPF;
+            repl_transport_mark_active("ebpf");
+            rdma_fail_streak = 0;
+
+            g_slave_fd = tcp_fd;
+            repl_set_link_state(1);
+            unsigned char buf[BUFFER_CAP];
+            size_t blen = 0;
+
+            for (;;) {
+                if (slave_should_reconnect(gen)) break;
+
+                int had_new_data = 0;
+
+                /* Always process TCP first to ensure FULLRESYNC header
+                 * is parsed before RDMA snapshot data arrives. */
+                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, 0);
+                if (r > 0) {
+                    blen += (size_t)r;
+                    had_new_data = 1;
+                } else if (r == 0) {
+                    break;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
+                }
+
+                /* Also check RDMA for fullsync data */
+#if KVS_ENABLE_RDMA
+                if (g_repl_rdma_ctx.connected) {
+                    int recv_slot = -1;
+                    size_t rdma_blen = 0;
+                    if (repl_rdma_wait_cq_recv_completion(100, &recv_slot, &rdma_blen) == 0
+                        && recv_slot >= 0 && rdma_blen > 0) {
+                        unsigned char *payload;
+                        if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
+                            rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
+                        payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
+                        if (payload) {
+                            if (repl_rdma_repost_recv(recv_slot) == 0) {
+                                if (blen + rdma_blen <= sizeof(buf)) {
+                                    memcpy(buf + blen, payload, rdma_blen);
+                                    blen += rdma_blen;
+                                    had_new_data = 1;
+                                }
+                            }
+                            kvs_free(payload);
+                        }
+                    }
+                }
+#endif
+
+                /* Only parse when new data was added to avoid busy-loop
+                 * on incomplete data. */
+                if (had_new_data && blen > 0) {
+                    parse_resp_stream(NULL, buf, &blen, 1);
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
+                } else if (had_new_data) {
+                    /* TCP had data but parse_resp_stream consumed it all */
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
+                }
+            }
+
+            g_slave_fd = -1;
+            repl_transport_ebpf_disconnect_slave(tcp_fd);
+            g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+            repl_set_link_state(0);
+            sleep(1);
+            continue;
+        }
+
+        /* ---- Single transport path (backward compatible) ---- */
         int fd = repl_transport_ops()->connect_slave(host, port);
         if (fd < 0) {
             if (!strcasecmp(repl_transport_configured_name(), "rdma")) {
@@ -1627,6 +1862,7 @@ static void *slave_thread(void *arg) {
             repl_transport_mark_active("tcp");
             g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
         }
+        g_slave_fd = fd;
         repl_set_link_state(1);
         unsigned char buf[BUFFER_CAP];
         size_t blen = 0;
@@ -1646,6 +1882,7 @@ static void *slave_thread(void *arg) {
             break;
         }
 
+        g_slave_fd = -1;
         repl_transport_ops()->disconnect_slave(fd);
         g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
         repl_set_link_state(0);
@@ -1698,48 +1935,72 @@ static void *rdma_master_listener_thread(void *arg) {
     struct sockaddr_in addr;
     struct rdma_cm_event *event = NULL;
     struct rdma_conn_param param;
+    int consecutive_failures = 0;
     for (;;) {
         long long accept_start_ms = 0;
         long long initial_recv_start_ms = 0;
-        if (g_cfg.role != ROLE_MASTER || strcasecmp(g_cfg.repl_transport_backend, "rdma") != 0) {
+        if (g_cfg.role != ROLE_MASTER || (!repl_should_use_rdma_now())) {
             repl_rdma_reset_ctx();
+            consecutive_failures = 0;
             sleep(1);
             continue;
         }
+
+        /* Helper: on any setup failure, increment counter and fallback after 10 */
+        #define LISTENER_FAIL(step_name) do { \
+            consecutive_failures++; \
+            repl_rdma_log("listener", step_name " failed"); \
+            if (consecutive_failures >= 10) { \
+                fprintf(stderr, "repl rdma: listener - giving up after %d failures (%s), falling back to TCP for 10s\n", \
+                    consecutive_failures, step_name); \
+                repl_transport_trigger_fallback("rdma_listener_fail", 10000); \
+                repl_rdma_reset_ctx(); \
+                consecutive_failures = 0; \
+                sleep(3); \
+            } else { \
+                repl_rdma_reset_conn_ctx(1); \
+                usleep(500000); \
+            } \
+            continue; \
+        } while(0)
+
         if (!g_repl_rdma_ctx.ec) {
-            g_repl_rdma_ctx.ec = rdma_create_event_channel();
-            if (!g_repl_rdma_ctx.ec) {
-                repl_rdma_log("listener", "event channel create failed");
-                sleep(1);
-                continue;
+            for (int ec_retry = 0; ec_retry < 5; ec_retry++) {
+                g_repl_rdma_ctx.ec = rdma_create_event_channel();
+                if (g_repl_rdma_ctx.ec) break;
+                char ec_err[128];
+                snprintf(ec_err, sizeof(ec_err), "create failed errno=%d retry=%d", errno, ec_retry);
+                repl_rdma_log("listener", ec_err);
+                if (ec_retry < 4) usleep(200000);
             }
+            if (!g_repl_rdma_ctx.ec) {
+                LISTENER_FAIL("event channel create");
+            }
+            consecutive_failures = 0;
         }
         if (!g_repl_rdma_ctx.listen_id) {
             repl_rdma_drop_master_replica_shallow(&g_rdma_master_replica_conn);
             if (rdma_create_id(g_repl_rdma_ctx.ec, &g_repl_rdma_ctx.listen_id, NULL, RDMA_PS_TCP) != 0) {
-                repl_rdma_log("listener", "create listen id failed");
-                repl_rdma_reset_conn_ctx(1);
-                sleep(1);
-                continue;
+                LISTENER_FAIL("create listen id");
             }
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
             addr.sin_port = htons((uint16_t)g_cfg.port);
             if (inet_pton(AF_INET, g_cfg.master_host[0] ? g_cfg.master_host : "0.0.0.0", &addr.sin_addr) <= 0) addr.sin_addr.s_addr = htonl(INADDR_ANY);
             if (rdma_bind_addr(g_repl_rdma_ctx.listen_id, (struct sockaddr *)&addr) != 0) {
-                repl_rdma_log("listener", "bind failed");
-                repl_rdma_reset_conn_ctx(1);
-                sleep(1);
-                continue;
+                LISTENER_FAIL("bind");
             }
             if (rdma_listen(g_repl_rdma_ctx.listen_id, 4) != 0) {
-                repl_rdma_log("listener", "listen failed");
-                repl_rdma_reset_conn_ctx(1);
-                sleep(1);
-                continue;
+                /* Destroy failed listen_id before retry; preserve ec */
+                rdma_destroy_id(g_repl_rdma_ctx.listen_id);
+                g_repl_rdma_ctx.listen_id = NULL;
+                LISTENER_FAIL("listen");
             }
             repl_rdma_log("listener", "listening");
+            consecutive_failures = 0;
         }
+        #undef LISTENER_FAIL
+
         if (rdma_get_cm_event(g_repl_rdma_ctx.ec, &event) != 0) {
             repl_rdma_log("listener", "get_cm_event failed");
             repl_rdma_reset_ctx();
@@ -1753,6 +2014,7 @@ static void *rdma_master_listener_thread(void *arg) {
             sleep(1);
             continue;
         }
+        consecutive_failures = 0;
         repl_rdma_log("listener", "connect request received");
         g_repl_rdma_ctx.accepted_id = event->id;
         rdma_ack_cm_event(event);
@@ -1866,7 +2128,9 @@ static void *rdma_master_listener_thread(void *arg) {
 int start_rdma_master_listener(void) {
 #if KVS_ENABLE_RDMA
     pthread_t tid;
-    if (g_cfg.role != ROLE_MASTER || strcasecmp(g_cfg.repl_transport_backend, "rdma") != 0) return 0;
+    const char *fullsync_t = repl_fullsync_transport_name();
+    if (g_cfg.role != ROLE_MASTER) return 0;
+    if (strcasecmp(fullsync_t, "rdma") != 0 && strcasecmp(g_cfg.repl_transport_backend, "rdma") != 0) return 0;
     if (g_rdma_master_listener_started) return 0;
     if (pthread_create(&tid, NULL, rdma_master_listener_thread, NULL) != 0) return -1;
     pthread_detach(tid);

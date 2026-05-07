@@ -1,0 +1,91 @@
+python3 ./tools/repl/run_repl_sync_10w_demo.py --bin ./kvstore --host 192.168.233.128 --master-port 5160 --slave-port 5161 --pre-count 50000 --post-count 50000 --fullsync-transport tcp --realtime-transport tcp
+============================================================
+[Phase 1] Starting master on :5160
+============================================================
+[Phase 1] Master ready on :5160, fullsync=tcp, realtime=tcp
+  Pre-load: 1000/50000 keys, 2067 qps, 0.5s
+  Pre-load: 2000/50000 keys, 2511 qps, 0.8s
+  Pre-load: 3000/50000 keys, 2796 qps, 1.1s
+  Pre-load: 4000/50000 keys, 3107 qps, 1.3s
+  Pre-load: 5000/50000 keys, 3352 qps, 1.5s
+  Pre-load: 6000/50000 keys, 3460 qps, 1.7s
+  Pre-load: 7000/50000 keys, 3626 qps, 1.9s
+  Pre-load: 8000/50000 keys, 3775 qps, 2.1s
+  Pre-load: 9000/50000 keys, 3854 qps, 2.3s
+  Pre-load: 10000/50000 keys, 3893 qps, 2.6s
+  Pre-load: 11000/50000 keys, 3954 qps, 2.8s
+  Pre-load: 12000/50000 keys, 3990 qps, 3.0s
+  Pre-load: 13000/50000 keys, 3923 qps, 3.3s
+  Pre-load: 14000/50000 keys, 3880 qps, 3.6s
+  Pre-load: 15000/50000 keys, 3890 qps, 3.9s
+  Pre-load: 16000/50000 keys, 3900 qps, 4.1s
+  Pre-load: 17000/50000 keys, 3946 qps, 4.3s
+  Pre-load: 18000/50000 keys, 4007 qps, 4.5s
+  Pre-load: 19000/50000 keys, 4059 qps, 4.7s
+  Pre-load: 20000/50000 keys, 4107 qps, 4.9s
+  Pre-load: 21000/50000 keys, 4149 qps, 5.1s
+  Pre-load: 22000/50000 keys, 4140 qps, 5.3s
+  Pre-load: 23000/50000 keys, 4122 qps, 5.6s
+  Pre-load: 24000/50000 keys, 4075 qps, 5.9s
+  Pre-load: 25000/50000 keys, 4051 qps, 6.2s
+  Pre-load: 26000/50000 keys, 4025 qps, 6.5s
+  Pre-load: 27000/50000 keys, 4026 qps, 6.7s
+  Pre-load: 28000/50000 keys, 4020 qps, 7.0s
+  Pre-load: 29000/50000 keys, 4047 qps, 7.2s
+  Pre-load: 30000/50000 keys, 4019 qps, 7.5s
+  Pre-load: 31000/50000 keys, 3999 qps, 7.8s
+  Pre-load: 32000/50000 keys, 3949 qps, 8.1s
+  Pre-load: 33000/50000 keys, 3937 qps, 8.4s
+  Pre-load: 34000/50000 keys, 3947 qps, 8.6s
+  Pre-load: 35000/50000 keys, 3953 qps, 8.9s
+  Pre-load: 36000/50000 keys, 3943 qps, 9.1s
+  Pre-load: 37000/50000 keys, 3928 qps, 9.4s
+  Pre-load: 38000/50000 keys, 3916 qps, 9.7s
+  Pre-load: 39000/50000 keys, 3901 qps, 10.0s
+  Pre-load: 40000/50000 keys, 3886 qps, 10.3s
+  Pre-load: 41000/50000 keys, 3885 qps, 10.6s
+  Pre-load: 42000/50000 keys, 3881 qps, 10.8s
+  Pre-load: 43000/50000 keys, 3856 qps, 11.2s
+  Pre-load: 44000/50000 keys, 3855 qps, 11.4s
+  Pre-load: 45000/50000 keys, 3855 qps, 11.7s
+  Pre-load: 46000/50000 keys, 3858 qps, 11.9s
+  Pre-load: 47000/50000 keys, 3860 qps, 12.2s
+  Pre-load: 48000/50000 keys, 3838 qps, 12.5s
+  Pre-load: 49000/50000 keys, 3839 qps, 12.8s
+  Pre-load: 50000/50000 keys, 3840 qps, 13.0s
+[Phase 1] Pre-loaded 50000 keys in 13.02s
+============================================================
+[Phase 2] Starting slave on :5161
+============================================================
+[Phase 2] Slave ready on :5161
+[Phase 2] Waiting for fullsync to complete...
+[Phase 2] Fullsync completed
+  master fullsync_count=1
+  slave repl_offset=2238890
+  slave master_link=up
+============================================================
+[Phase 3] Inserting 50000 more keys to master (incremental sync)
+============================================================
+  Post-load: 1000/50000 keys, 3440 qps, 0.3s
+  Post-load: 2000/50000 keys, 4166 qps, 0.5s
+  Post-load: 3000/50000 keys, 4684 qps, 0.6s
+  Post-load: 4000/50000 keys, 4924 qps, 0.8s
+  Post-load: 5000/50000 keys, 4759 qps, 1.1s
+  Post-load: 6000/50000 keys, 4652 qps, 1.3s
+  Post-load: 7000/50000 keys, 4606 qps, 1.5s
+  Post-load: 8000/50000 keys, 4621 qps, 1.7s
+  Post-load: 9000/50000 keys, 4682 qps, 1.9s
+  Post-load: 10000/50000 keys, 4724 qps, 2.1s
+  Post-load: 11000/50000 keys, 4709 qps, 2.3s
+  Post-load: 12000/50000 keys, 4763 qps, 2.5s
+  Post-load: 13000/50000 keys, 4807 qps, 2.7s
+  Post-load: 14000/50000 keys, 4702 qps, 3.0s
+  Post-load: 15000/50000 keys, 4631 qps, 3.2s
+  Post-load: 16000/50000 keys, 4530 qps, 3.5s
+  Post-load: 17000/50000 keys, 4460 qps, 3.8s
+  Post-load: 18000/50000 keys, 4385 qps, 4.1s
+  Post-load: 19000/50000 keys, 4345 qps, 4.4s
+  Post-load: 20000/50000 keys, 4354 qps, 4.6s
+  Post-load: 21000/50000 keys, 4371 qps, 4.8s
+  Post-load: 22000/50000 keys, 4370 qps, 5.0s
+  Post-load: 23000/50000 keys, 4360 qps, 5.3s

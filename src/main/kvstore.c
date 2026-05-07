@@ -15,6 +15,8 @@ kv_config_t g_cfg = {
     .mem_backend = "libc",
     .net_backend = "reactor",
     .repl_transport_backend = "tcp",
+    .repl_fullsync_transport = "rdma",
+    .repl_realtime_transport = "ebpf",
     .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
     .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
     .ebpf_redirect = 0,
@@ -27,6 +29,7 @@ kv_config_t g_cfg = {
     .rdma_chunk_size = BUFFER_CAP / 4,
     .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
+    .log_mode = "info",
     .is_sentinel = 0,
     .sentinel_master_name = "mymaster",
     .sentinel_monitor_host = "127.0.0.1",
@@ -175,6 +178,14 @@ static int parse_args(int argc, char **argv) {
             if (parse_repl_transport_backend(argv[i + 1]) != 0) return -1;
             snprintf(g_cfg.repl_transport_backend, sizeof(g_cfg.repl_transport_backend), "%s", argv[++i]);
         }
+        else if (!strcmp(argv[i], "--repl-fullsync-transport") && i + 1 < argc) {
+            if (parse_repl_transport_backend(argv[i + 1]) != 0) return -1;
+            snprintf(g_cfg.repl_fullsync_transport, sizeof(g_cfg.repl_fullsync_transport), "%s", argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--repl-realtime-transport") && i + 1 < argc) {
+            if (parse_repl_transport_backend(argv[i + 1]) != 0) return -1;
+            snprintf(g_cfg.repl_realtime_transport, sizeof(g_cfg.repl_realtime_transport), "%s", argv[++i]);
+        }
         else if (!strcmp(argv[i], "--ebpf-obj") && i + 1 < argc) {
             snprintf(g_cfg.ebpf_obj_path, sizeof(g_cfg.ebpf_obj_path), "%s", argv[++i]);
         }
@@ -212,6 +223,9 @@ static int parse_args(int argc, char **argv) {
             kvs_aof_fsync_policy_t policy;
             if (parse_appendfsync_policy(argv[++i], &policy) != 0) return -1;
             g_cfg.aof_fsync = policy;
+        }
+        else if (!strcmp(argv[i], "--log-mode") && i + 1 < argc) {
+            snprintf(g_cfg.log_mode, sizeof(g_cfg.log_mode), "%s", argv[++i]);
         }
         else if (!strcmp(argv[i], "--autosnap") && i + 1 < argc) {
             persist_clear_autosnap_rules();
@@ -294,6 +308,14 @@ static int apply_config_kv(const char *key, const char *value) {
         if (parse_repl_transport_backend(value) != 0) return -1;
         snprintf(g_cfg.repl_transport_backend, sizeof(g_cfg.repl_transport_backend), "%s", value);
     }
+    else if (!strcmp(key, "repl_fullsync_transport")) {
+        if (parse_repl_transport_backend(value) != 0) return -1;
+        snprintf(g_cfg.repl_fullsync_transport, sizeof(g_cfg.repl_fullsync_transport), "%s", value);
+    }
+    else if (!strcmp(key, "repl_realtime_transport")) {
+        if (parse_repl_transport_backend(value) != 0) return -1;
+        snprintf(g_cfg.repl_realtime_transport, sizeof(g_cfg.repl_realtime_transport), "%s", value);
+    }
     else if (!strcmp(key, "ebpf_obj_path")) snprintf(g_cfg.ebpf_obj_path, sizeof(g_cfg.ebpf_obj_path), "%s", value);
     else if (!strcmp(key, "ebpf_pin_path")) snprintf(g_cfg.ebpf_pin_path, sizeof(g_cfg.ebpf_pin_path), "%s", value);
     else if (!strcmp(key, "ebpf_redirect")) g_cfg.ebpf_redirect = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
@@ -309,6 +331,7 @@ static int apply_config_kv(const char *key, const char *value) {
         if (parse_appendfsync_policy(value, &policy) != 0) return -1;
         g_cfg.aof_fsync = policy;
     }
+    else if (!strcmp(key, "log_mode")) snprintf(g_cfg.log_mode, sizeof(g_cfg.log_mode), "%s", value);
     else if (!strcmp(key, "autosnap")) {
         persist_clear_autosnap_rules();
         if (parse_autosnap_rules(value) != 0) return -1;
@@ -409,7 +432,7 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        if (repl_transport_send(c, raw, rawlen) != 0) {
+        if (repl_realtime_send(c, raw, rawlen) != 0) {
             if (repl_handle_replica_send_failure(c, pp)) continue;
             pp = &c->next_replica;
             continue;
@@ -422,8 +445,12 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
 }
 
 int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
+    return repl_send_chunked_ctx(c, buf, len, KVS_REPL_SEND_FULLSYNC);
+}
+
+int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int send_ctx) {
     size_t off = 0;
-    size_t chunk_cap = !strcasecmp(repl_transport_name(), "rdma") ? (g_cfg.rdma_chunk_size > 0 ? (size_t)g_cfg.rdma_chunk_size : (BUFFER_CAP / 4)) : len;
+    size_t chunk_cap = !strcasecmp(repl_fullsync_transport_name(), "rdma") ? (g_cfg.rdma_chunk_size > 0 ? (size_t)g_cfg.rdma_chunk_size : (BUFFER_CAP / 4)) : len;
     if (!buf || len == 0) return 0;
     repl_note_send_context("chunked", len, repl_master_offset(), buf);
     if (chunk_cap < 1024) chunk_cap = 1024;
@@ -432,7 +459,11 @@ int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
     while (off < len) {
         size_t chunk = len - off;
         if (chunk > chunk_cap) chunk = chunk_cap;
-        if (repl_transport_send(c, buf + off, chunk) != 0) return -1;
+        if (send_ctx == KVS_REPL_SEND_REALTIME) {
+            if (repl_realtime_send(c, buf + off, chunk) != 0) return -1;
+        } else {
+            if (repl_fullsync_send(c, buf + off, chunk) != 0) return -1;
+        }
         off += chunk;
     }
     return 0;
@@ -440,6 +471,7 @@ int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
 
 static int queue_snapshot(conn_t *c) {
     char hdr[128];
+    char tmp_path[512];
     FILE *fp;
     unsigned char buf[8192];
     size_t r;
@@ -449,12 +481,14 @@ static int queue_snapshot(conn_t *c) {
 #if KVS_ENABLE_RDMA
     fprintf(stderr, "repl rdma: queue_snapshot - begin replid=%s offset=%llu\n", repl_master_id(), repl_master_offset());
 #endif
-    fp = fopen(g_cfg.dump_path, "wb");
+    /* Use a temporary path so we don't overwrite the binary dump file */
+    snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
+    fp = fopen(tmp_path, "wb");
     if (!fp) return -1;
-    if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); return -1; }
+    if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); unlink(tmp_path); return -1; }
     fclose(fp);
-    fp = fopen(g_cfg.dump_path, "rb");
-    if (!fp) return -1;
+    fp = fopen(tmp_path, "rb");
+    if (!fp) { unlink(tmp_path); return -1; }
     while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) total_bytes += r;
     fclose(fp);
 
@@ -467,8 +501,8 @@ static int queue_snapshot(conn_t *c) {
 #endif
         return -1;
     }
-    fp = fopen(g_cfg.dump_path, "rb");
-    if (!fp) return -1;
+    fp = fopen(tmp_path, "rb");
+    if (!fp) { unlink(tmp_path); return -1; }
     while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) {
         total += r;
         repl_note_send_context("fullsync-snapshot", r, repl_master_offset(), buf);
@@ -477,10 +511,12 @@ static int queue_snapshot(conn_t *c) {
             fprintf(stderr, "repl rdma: queue_snapshot - snapshot chunk send failed total=%zu chunk=%zu\n", total, r);
 #endif
             fclose(fp);
+            unlink(tmp_path);
             return -1;
         }
     }
     fclose(fp);
+    unlink(tmp_path);
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
     c->repl_last_send_ms = kvs_now_ms();
@@ -611,34 +647,6 @@ static void repl_log_applied_command(const char *cmd, int argc, char **argv, siz
 
 static int repl_is_soak_key(const char *key) {
     return key && strstr(key, "rdma:soak:key:") == key;
-}
-
-static void repl_log_apply_verify(int engine, int argc, char **argv) {
-#if KVS_ENABLE_RDMA
-    char *readback;
-    if (argc < 3 || !argv || !argv[0] || !argv[1] || !argv[2]) return;
-    if (strcmp(argv[0], "SET") != 0) return;
-    if (!repl_is_soak_key(argv[1])) return;
-    readback = engine_get(engine, argv[1]);
-    fprintf(stderr, "repl rdma: slave_apply_verify - cmd=%s key=%s expected=%s readback=%s slave_offset=%llu\n",
-        argv[0], argv[1], argv[2], readback ? readback : "(null)", repl_slave_offset());
-#else
-    (void)engine;
-    (void)argc;
-    (void)argv;
-#endif
-}
-
-static void repl_log_slave_get_check(int engine, const char *key, const char *value) {
-#if KVS_ENABLE_RDMA
-    if (!repl_is_soak_key(key)) return;
-    fprintf(stderr, "repl rdma: slave_get_check - key=%s hit=%d value=%s slave_offset=%llu master_link=%s\n",
-        key ? key : "", value ? 1 : 0, value ? value : "(null)", repl_slave_offset(), repl_master_link_state_name());
-#else
-    (void)engine;
-    (void)key;
-    (void)value;
-#endif
 }
 
 static int engine_upsert(int engine, char *key, char *value) {
@@ -950,7 +958,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
             req_replid, req_offset, req_durable, repl_backlog_start_offset(), repl_backlog_end_offset(), can_continue ? 1 : 0);
 #endif
-        if (c && (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
+        if (c && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
+                || !strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
             c->repl_transport_kind = KVS_REPL_TRANSPORT_EBPF;
             if (repl_ebpf_register_fd(c->fd, 1) != 0) {
                 fprintf(stderr, "repl ebpf: fd registration failed on master replica link, using tcp-compatible path\n");
@@ -1445,31 +1454,26 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     int engine = cmd_engine(cmd);
     const char *op = strip_prefix(cmd);
     int rc = -1;
-    int should_reply_ok = 0;
     int should_reply_missing = 0;
 
     if (!strcmp(op, "SET") && argc == 3) {
         try_expire(engine, argv[1]);
         rc = engine_set(engine, argv[1], argv[2]);
-        should_reply_ok = 1;
         should_reply_missing = 1;
     }
     else if (!strcmp(op, "MSET")) {
         try_expire(engine, argv[1]);
         rc = handle_multi_set(engine, argc, argv);
-        should_reply_ok = 1;
     }
     else if (!strcmp(op, "MOD") && argc == 3) {
         try_expire(engine, argv[1]);
         rc = engine_mod(engine, argv[1], argv[2]);
-        should_reply_ok = 1;
         should_reply_missing = 1;
     }
     else if (!strcmp(op, "DEL") && argc == 2) {
         try_expire(engine, argv[1]);
         rc = engine_del(engine, argv[1]);
         kvs_expire_del(&global_expire, engine, argv[1]);
-        should_reply_ok = 1;
         should_reply_missing = 1;
     }
     else if (!strcmp(op, "GET") && argc == 2) {
@@ -1512,7 +1516,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         try_expire(engine, argv[1]);
         if (engine_exist(engine, argv[1]) != 0) rc = 1;
         else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
-        should_reply_ok = 1;
         should_reply_missing = 1;
     } else if (!strcmp(op, "TTL") && argc == 2) {
         try_expire(engine, argv[1]);
@@ -1528,7 +1531,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         try_expire(engine, argv[1]);
         if (engine_exist(engine, argv[1]) != 0) rc = 1;
         else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
-        should_reply_ok = 1;
         should_reply_missing = 1;
     } else {
         int expected_argc = 0;
@@ -1549,13 +1551,17 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             kvs_expire_persist(&global_expire, engine, argv[1]);
         }
         if (from_replication && is_write_cmd(cmd)) {
-            repl_log_applied_command(cmd, argc, argv, rawlen);
+            if (!persist_recover_in_progress()) {
+                repl_log_applied_command(cmd, argc, argv, rawlen);
+            }
             if (g_cfg.role == ROLE_SLAVE && !persist_recover_in_progress()) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
                 repl_slave_note_durable(rawlen);
             }
-            repl_slave_note_applied(rawlen);
+            if (!persist_recover_in_progress()) {
+                repl_slave_note_applied(rawlen);
+            }
         }
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
@@ -1874,6 +1880,93 @@ int kvs_snapshot_to_fd(int fd) {
     return snapshot_all_sink(&sink);
 }
 
+static int dump_skiptable_write_kv(const char *key, const char *value, void *arg) {
+    int fd = *(int *)arg;
+    size_t klen = strlen(key);
+    size_t vlen = strlen(value);
+    if (write(fd, key, klen) != (ssize_t)klen) return -1;
+    if (write(fd, "\n", 1) != 1) return -1;
+    if (write(fd, value, vlen) != (ssize_t)vlen) return -1;
+    if (write(fd, "\n", 1) != 1) return -1;
+    return 0;
+}
+
+int kvs_dump_to_fd(int fd) {
+    if (fd < 0) return -1;
+
+    /* dump helper: write key\nvalue\n to fd */
+#define DUMP_WRITE_KV(key, value) do { \
+    size_t _klen = strlen(key); \
+    size_t _vlen = strlen(value); \
+    if (write(fd, key, _klen) != (ssize_t)_klen) return -1; \
+    if (write(fd, "\n", 1) != 1) return -1; \
+    if (write(fd, value, _vlen) != (ssize_t)_vlen) return -1; \
+    if (write(fd, "\n", 1) != 1) return -1; \
+} while(0)
+
+    /* iterate all hash entries */
+    if (global_hash.nodes) {
+        for (int i = 0; i < global_hash.max_slots; ++i) {
+            for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
+                DUMP_WRITE_KV(node->key, node->value);
+            }
+        }
+    }
+
+    /* iterate array entries */
+    for (int i = 0; i < KVS_ARRAY_SIZE; ++i) {
+        if (global_array.table && global_array.table[i].key) {
+            DUMP_WRITE_KV(global_array.table[i].key, global_array.table[i].value);
+        }
+    }
+
+    /* iterate rbtree entries */
+    {
+        rbtree_node *nil = global_rbtree.nil;
+        rbtree_node **stack = (rbtree_node **)kvs_malloc(sizeof(rbtree_node*) * 256);
+        int top = 0;
+        rbtree_node *cur = global_rbtree.root;
+        if (stack) {
+            while (cur != nil || top > 0) {
+                while (cur != nil) {
+                    stack[top++] = cur;
+                    cur = cur->left;
+                }
+                cur = stack[--top];
+                DUMP_WRITE_KV(cur->key, (char*)cur->value);
+                cur = cur->right;
+            }
+            kvs_free(stack);
+        }
+    }
+
+    /* iterate skiptable entries */
+    kvs_skiptable_foreach(&global_skiptable, dump_skiptable_write_kv, &fd);
+
+    /* iterate doc entries (squash newlines to spaces) */
+    {
+        char doc_buf[BUFFER_CAP];
+        for (int i = 0; i < global_doc.size; ++i) {
+            for (kvs_doc_t *d = global_doc.buckets[i]; d; d = d->next) {
+                int doc_pos = 0;
+                for (int j = 0; j < d->bucket_count && doc_pos < (int)sizeof(doc_buf) - 4; ++j) {
+                    for (kvs_doc_field_t *f = d->fields[j]; f; f = f->next) {
+                        int n = snprintf(doc_buf + doc_pos, sizeof(doc_buf) - (size_t)doc_pos,
+                            "%s=%s ", f->name, f->value);
+                        if (n > 0) doc_pos += n;
+                    }
+                }
+                if (doc_pos > 0 && doc_buf[doc_pos-1] == ' ') doc_pos--;
+                doc_buf[doc_pos] = '\0';
+                DUMP_WRITE_KV(d->key, doc_buf);
+            }
+        }
+    }
+
+#undef DUMP_WRITE_KV
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
         fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore_repl_sockmap] [--ebpf-redirect --ebpf-redirect-key 0] [--rdma-dev rxe0] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
@@ -1902,10 +1995,11 @@ int main(int argc, char **argv) {
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
-    if (g_cfg.role == ROLE_MASTER && (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
+    if (g_cfg.role == ROLE_MASTER && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
+            || !strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
         if (repl_ebpf_init() != 0) {
             fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
-            /* Non-fatal: continue with TCP fallback, transport will auto-fallback at first send */
+            /* Non-fatal: continue with TCP fallback */
         }
     }
     if (start_rdma_master_listener() != 0) {

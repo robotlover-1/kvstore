@@ -1,849 +1,455 @@
-# kvstore - 高性能键值存储系统
+# kvstore — 高性能键值存储系统
 
-kvstore是一个用C语言实现的高性能、可扩展的键值存储系统，设计用于学习和研究目的。它提供了类似Redis的功能，支持多种存储引擎、内存后端和网络模型。
+kvstore 是一个用 C 语言实现的类 Redis 键值存储系统，面向学习和研究。支持多存储引擎、多内存后端、多网络模型、持久化、主从复制、文档型 value、TTL 过期、分布式锁等特性。
 
-## 主要特性
+---
 
-> 注意：下面分为“当前代码已实现并可验证的能力”和“后续规划能力”。本轮开始会按阶段推进实现，并在每一步提供对应验证方法。
+## 目录
 
-### 当前代码已实现并可验证的能力
+- [快速开始](#快速开始)
+- [项目结构](#项目结构)
+- [核心能力](#核心能力)
+- [命令参考](#命令参考)
+- [配置说明](#配置说明)
+- [测试体系](#测试体系)
+- [测试产物路径](#测试产物路径)
+- [性能基准](#性能基准)
+- [开发指南](#开发指南)
+- [常见问题](#常见问题)
 
-#### 存储引擎
-
-- **数组(Array)**：基础键值存储
-- **红黑树(RBTREE)**：前缀 `R*` 命令
-- **哈希表(Hash)**：前缀 `H*` 命令
-- **跳表(Skiptable)**：前缀 `X*` 命令
-
-#### 内存管理
-
-- **libc**：标准 C 库内存分配器
-- **jemalloc**：高性能内存分配器
-- **custom**：自定义内存分配器，支持 slab 与大块映射统计
-
-#### 网络模型
-
-- **Reactor**：基于 epoll
-- **Proactor**：基于 io_uring
-- **NtyCo**：协程模型
-
-#### 核心功能
-
-- **RESP 协议解析与响应**
-- **AOF + dump 恢复链路**：启动时可回放 `dump` 和 `aof`，恢复路径优先使用 `mmap` 加载文件内容，大文件或映射失败时回退到普通流式读取
-- **SAVE / BGSAVE / BGREWRITEAOF**：持久化落盘优先尝试 `io_uring` 文件写/`fsync`，失败时回退到传统同步文件 IO；AOF 主路径已切到 `fd-first`，不再依赖 `FILE*` 的 `fflush`，只有仍经过 stdio 的路径才需要先 `fflush`
-- **主从复制基础能力**：支持 `SLAVEOF`、`ROLE`、`REPLSYNC` 全量同步与增量广播
-- **TTL / 过期清理**：支持 `EXPIRE`、`TTL`、`PERSIST`
-- **分布式锁基础命令**：`LOCK`、`UNLOCK`、`RENEW`、`OWNER`
-- **文档型 value（最小对象模型）**：支持 `DOCSET`、`DOCGET`、`DOCDEL`、`DOCDROP`、`DOCEXIST`、`DOCCOUNT`、`DOCGETALL`
-- **INFO / MEMSTAT / 自动快照规则**
-
-### 当前尚未完成或需要继续增强的能力
-
-- 更严格的“10w/100w 数据级”持久化回归测试与性能结果整理
-- 更完整的主从异常恢复与断点续传机制
-- RDMA / eBPF 同步优化
-- README 中部分历史描述与实际实现的进一步对齐
+---
 
 ## 快速开始
 
-### 编译安装
+### 环境依赖
 
 ```bash
-# 清理并编译
+# Ubuntu/Debian
+sudo apt install gcc make liburing-dev libjemalloc-dev
+
+# RDMA 支持（可选）
+sudo apt install librdmacm-dev libibverbs-dev
+
+# eBPF 支持（可选，需 ENABLE_EBPF=1）
+sudo apt install libbpf-dev libelf-dev clang
+```
+
+### 编译
+
+```bash
+git clone --recurse-submodules <repo-url>
+cd kvstore
 make clean && make
-
-# 编译完成后生成可执行文件 kvstore
 ```
 
-### 启动服务
+> 编译产物：`./kvstore`（单可执行文件）。编译选项见 Makefile 顶部 `ENABLE_RDMA`、`ENABLE_EBPF` 开关。
+
+### 启动
 
 ```bash
-# 使用默认配置启动（若当前目录存在 kvstore.conf，会自动加载该配置文件）
-./kvstore
-
-# 显式指定配置文件启动
-./kvstore --config kvstore.conf
-
-# 指定端口和内存后端（命令行参数会覆盖配置文件同名项）
-./kvstore --config kvstore.conf --port 6380 --mem jemalloc
-
-# 指定网络模型
-./kvstore --config kvstore.conf --net proactor --port 5000
-
-# 启动从节点
-./kvstore --config kvstore.conf --role slave --master-host 127.0.0.1 --master-port 5000
-
-# 启动哨兵模式
-./kvstore --config kvstore.conf --sentinel --sentinel-master-name mymaster --sentinel-monitor-host 127.0.0.1 --sentinel-monitor-port 5000
+./kvstore                           # 自动加载 ./kvstore.conf（如存在）
+./kvstore --config kvstore.conf     # 显式指定配置
+./kvstore --port 6380 --mem jemalloc  # 命令行覆盖配置
 ```
 
-### 配置文件
-
-项目根目录已提供示例配置文件：`kvstore.conf`
-
-配置文件格式为 `key=value`，支持空行和 `#` 注释。例如：
-
-```ini
-port=5000
-role=master
-master_host=127.0.0.1
-master_port=5000
-
-dump_path=kvstore.dump
-aof_path=kvstore.aof
-mem_backend=libc
-net_backend=reactor
-appendfsync=always
-repl_transport_backend=tcp
-
-autosnap=60:1000,300:10
-
-sentinel=0
-sentinel_master_name=mymaster
-sentinel_monitor_host=127.0.0.1
-sentinel_monitor_port=5000
-sentinel_known_slaves=
-sentinel_down_after_ms=5000
-sentinel_failover_timeout_ms=10000
-sentinel_quorum=1
-```
-
-说明：
-
-- 如果当前目录存在 `kvstore.conf`，`./kvstore` 会自动加载它
-- 也可以通过 `--config <path>` 显式指定配置文件
-- 命令行参数优先级高于配置文件
-- 当前配置文件已覆盖现有主要启动配置项，包括 `port`、`dump_path`、`aof_path`、`mem_backend`、`net_backend`、`appendfsync`、`autosnap`、主从配置和哨兵配置
-- 复制 transport 当前支持配置为 `tcp` 或 `rdma`
-- 默认复制 transport 为 `tcp`；`rdma` 已具备实验性真实实现，可用于 smoke / stress / soak 验证，但仍建议视为高性能实验路径而非默认稳定主路径
-
-### 基本使用
-
-使用netcat或Redis客户端连接：
+### 快速验证
 
 ```bash
-# 设置键值
+# 启动服务后，用 nc 测试基本读写
 printf '*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n' | nc 127.0.0.1 5000
-
-# 获取键值
 printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
-
-# 删除键
-printf '*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
 ```
 
-## 命令行参数
+或使用 Redis 客户端（如 `redis-cli`）直接连接 5000 端口。
 
+---
 
-| 参数                          | 说明                                | 默认值       |
-| ----------------------------- | ----------------------------------- | ------------ |
-| `--config`                    | 配置文件路径                        | `kvstore.conf` |
-| `--port`                      | 监听端口                            | 5000         |
-| `--role`                      | 角色（master/slave）                | master       |
-| `--master-host`               | 主节点地址（从节点使用）            | 127.0.0.1    |
-| `--master-port`               | 主节点端口（从节点使用）            | 5000         |
-| `--dump`                      | RDB快照文件路径                     | kvstore.dump |
-| `--aof`                       | AOF文件路径                         | kvstore.aof  |
-| `--mem`                       | 内存后端（libc/jemalloc/custom）    | libc         |
-| `--net`                       | 网络模型（reactor/proactor/ntyco）  | reactor      |
-| `--repl-transport`            | 复制传输层（tcp/rdma）              | tcp          |
-| `--appendfsync`               | AOF同步策略（always/everysec）      | always       |
-| `--autosnap`                  | 自动快照规则（秒:变化数,秒:变化数） | 无           |
-| `--sentinel`                  | 启用哨兵模式                        | 关闭         |
-| `--sentinel-master-name`      | 哨兵监控的主节点名称                | mymaster     |
-| `--sentinel-monitor-host`     | 哨兵监控的主节点地址                | 127.0.0.1    |
-| `--sentinel-monitor-port`     | 哨兵监控的主节点端口                | 5000         |
-| `--sentinel-known-slaves`     | 已知从节点列表                      | 空           |
-| `--sentinel-down-after`       | 节点下线判定时间（毫秒）            | 5000         |
-| `--sentinel-failover-timeout` | 故障转移超时时间（毫秒）            | 10000        |
-| `--sentinel-quorum`           | 哨兵投票法定人数                    | 1            |
-
-## 支持的命令
-
-### 基本键值操作
-
-- **SET key value**：设置键值
-- **GET key**：获取键值
-- **DEL key**：删除键
-- **EXIST key**：检查键是否存在
-- **MSET key1 value1 key2 value2 ...**：批量设置
-- **MGET key1 key2 ...**：批量获取
-- **MOD key value**：修改键值（需键已存在）
-
-### 存储引擎前缀
-
-命令支持前缀指定存储引擎：
-
-- **RSET/RGET/RDEL**：红黑树引擎操作
-- **HSET/HGET/HDEL**：哈希表引擎操作
-- **XSET/XGET/XDEL**：跳表引擎操作
-- 无前缀：数组引擎操作
-
-### 过期和TTL
-
-- **EXPIRE key seconds**：设置键过期时间
-- **TTL key**：获取键剩余生存时间
-- **PERSIST key**：移除键的过期时间
-
-当前 TTL 系统已从“固定桶 + 全表扫描”优化为“哈希索引 + 最小堆调度 + 自适应主动清理预算”：
-
-- 过期项可通过哈希索引按 `engine + key` 快速定位
-- 主动过期优先处理最早到期的 key，不再每轮扫描整张过期表
-- 当过期 key 数量增大时，事件循环会自动提升每轮清理预算
-- 更适合大量 key 同时设置 TTL 的场景
-
-对于海量 TTL 压测，建议优先使用 `HSET/HGET/HEXPIRE/HTTL` 对应的哈希引擎命令，而不是默认数组引擎。默认数组引擎容量较小，更适合基础功能验证。
-
-### 服务器管理
-
-- **INFO**：获取服务器信息
-- **MEMSTAT**：获取内存统计信息
-- **PING**：测试连接
-- **QUIT**：关闭连接
-- **SAVE**：同步保存RDB快照
-- **BGSAVE**：后台保存RDB快照
-- **BGREWRITEAOF**：重写AOF文件
-- **APPENDFSYNC policy**：设置AOF同步策略
-- **CONFIG APPENDFSYNC policy**：配置AOF同步策略
-
-### 自动快照管理
-
-- **SNAPRULE seconds changes**：添加自动快照规则
-- **SNAPRULES**：查看所有快照规则
-- **SNAPRULECLEAR**：清除所有快照规则
-
-### 分布式锁
-
-- **LOCK key owner seconds**：获取锁
-- **UNLOCK key owner**：释放锁
-- **RENEW key owner seconds**：续期锁
-- **OWNER key**：查看锁的所有者
-
-### 文档型对象操作
-
-- **DOCSET key field value**：设置文档字段；若文档不存在则自动创建
-- **DOCGET key field**：获取文档字段值
-- **DOCDEL key field**：删除文档中的单个字段
-- **DOCDROP key**：删除整个文档
-- **DOCEXIST key**：检查文档是否存在
-- **DOCCOUNT key**：返回文档字段数量
-- **DOCGETALL key**：返回文档全部字段和值（RESP array）
-
-第一版文档模型是“扁平对象模型”：
-
-- 只支持 `key -> field -> string value`
-- 适合作为 plan 第四阶段的最小可用实现
-- 已接入 dump/AOF 恢复链路
-- 已接入主从复制广播链路
-
-### 复制和集群
-
-- **SLAVEOF host port**：设置为指定主节点的从节点
-- **SLAVEOF NO ONE**：停止复制，变为主节点
-- **ROLE**：查看服务器角色和复制状态
-
-当前复制链路已支持：
-
-- `FULLRESYNC` 全量同步
-- `CONTINUE` partial resync
-- replication backlog
-- slave 复制位点持久化
-- 进程内重连 partial resync
-- 跨进程重启 partial resync
-- `INFO` 中复制指标与 `repl_transport`
-
-## 测试与分析入口
-
-### 基础功能测试
-
-```bash
-make check
-```
-
-### 主从复制验证
-
-```bash
-make check-repl
-```
-
-覆盖内容：
-
-- 首次全量同步
-- 进程内断线重连 partial resync
-- 跨进程重启 partial resync
-
-### 复制指标基线
-
-```bash
-make check-repl-metrics
-```
-
-输出内容包括：
-
-- full sync / tail / restart 三阶段 `INFO` 指标
-- `repl_fullsync_count`
-- `repl_partialsync_ok_count`
-- `repl_partialsync_err_count`
-- `repl_backlog_histlen`
-- `repl_broadcast_bytes`
-- `repl_snapshot_bytes`
-- 进程 CPU / RSS / socket 摘要
-
-### 复制 profiling helper
-
-```bash
-make check-repl-profile
-```
-
-说明：
-
-- 默认先运行复制指标基线，并把结果保存到 `artifacts/repl/profile/`
-- 若环境存在 `perf`，可直接运行：
-
-```bash
-python3 ./scripts/run_repl_profile.py --perf
-```
-
-### perf / eBPF 环境探测
-
-```bash
-make check-repl-ebpf-env
-```
-
-该命令用于判断当前环境是否具备后续性能观测能力，例如：
-
-- `perf`
-- `bpftrace`
-- `bpftool`
-- `clang`
-- tracing/debugfs 可见性
-- `perf_event_paranoid`
-- `unprivileged_bpf_disabled`
-
-若输出为 `profiling_readiness=minimal`，表示当前环境仅适合保留基线和脚本入口，不适合继续做真实 eBPF/perf 实验。
-
-### RDMA / eBPF 环境前提与限制
-
-使用 RDMA / eBPF 实验路径前，建议明确以下前提：
-
-- 默认稳定复制路径仍是 `tcp`
-- `rdma` 当前定位为实验性高性能 transport，用于学习、验证和观测
-- 需要可用 RDMA 环境；在本项目验证中使用的是 Soft-RoCE (`rxe0`)
-- eBPF 观测通常需要 `root` 或足够的 capability
-- `tools/repl/run_repl_rdma_stress.py --ebpf` 会额外在对应 `artifacts/repl/rdma-stress/` 目录下生成 `rdma_ebpf.out`、`rdma_ebpf.err`、`rdma_ebpf_summary.txt`
-- 当前 RDMA 复制状态：
-  - 最小场景、半手工 postsync、小一档 stress（含 restart）、中等负载 stress（含 restart）均已通过
-  - `restart-rounds 0` 的 steady-state 验证下，`rdma_master_async_disconnect_seen=no`、`rdma_slave_async_disconnect_seen=no`
-  - 带 restart 的场景下，master 侧仍可能看到 `rdma_master_async_disconnect_seen=yes`，但已验证为 `impactful=no`，不会破坏 `fullsync_done / postsync_tail_ok / restart_rounds_ok / final_resume_ok`
-  - 因此当前 RDMA 已达到“功能正确、steady-state 干净、restart 场景可恢复”的状态，但是否称为“成熟版本”仍取决于你对长期 soak、极端负载、生产环境抖动容忍度的要求
-- 若 RDMA 不可用，应优先回退到 TCP 路径，而不是把 RDMA 视为默认必选项
-
-当前 RDMA / eBPF 路径的工程化结论：
-
-- fullsync、tail 增量、跨进程 restart partial resync、soak reconnect 恢复均已通过脚本验证
-- slave 复制写已接入本地持久化，避免重启后数据集落后于 `repl_offset`
-- 当前更适合作为实验性高性能扩展与观测入口，而不是 README 中宣称的默认稳定主链路
-
-### 代码结构
+## 项目结构
 
 ```
 kvstore/
-├── src/
-│   ├── main/           # 主程序入口
-│   ├── core/           # 网络模型实现
-│   ├── storage/        # 存储引擎实现
-│   ├── memory/         # 内存管理
-│   ├── expire/         # 键过期处理
-│   ├── persistence/    # 持久化实现
-│   ├── replication/    # 复制和哨兵
-│   └── utils/          # 工具函数
-├── include/kvstore/    # 头文件
-├── clients/            # 客户端示例
-├── benchmarks/         # 性能测试
-├── tests/              # 测试代码
-└── scripts/            # 辅助脚本
+├── src/                          # 核心源码
+│   ├── main/                     #   入口 (kvstore.c)
+│   ├── core/                     #   网络模型 (reactor / proactor / ntyco)
+│   ├── storage/                  #   存储引擎 (array / hash / rbtree / skiptable / doc)
+│   ├── memory/                   #   内存后端 (libc / jemalloc / custom)
+│   ├── expire/                   #   TTL 过期管理
+│   ├── persistence/              #   持久化 (dump + AOF)
+│   ├── replication/              #   主从复制 + 哨兵
+│   └── utils/                    #   工具函数
+├── include/kvstore/              # 公共头文件
+├── NtyCo/                        # 协程库 (git submodule)
+├── liburing/                     # io_uring 库
+├── tools/                        # 测试 & 辅助脚本
+│   ├── bench/                    #   性能基准脚本
+│   ├── persist/                  #   持久化验证脚本
+│   ├── repl/                     #   复制验证脚本
+│   ├── rdma/                     #   RDMA 探测脚本
+│   └── tests/                    #   通用测试辅助脚本
+├── tests/                        # 测试代码与集成测试
+│   ├── integration/              #   集成测试脚本
+│   └── unit/                     #   单元测试
+├── testdata/                     # 静态测试数据（样例 AOF / dump / 配置）
+├── artifacts/                    # 测试脚本生成的产物（日志 / 报告 / dump 等）
+│   ├── persist/                  #   持久化测试产物
+│   ├── repl/                     #   复制测试产物
+│   ├── rdma/                     #   RDMA 测试产物
+│   └── bench/                    #   基准测试产物
+├── benchmarks/                   # 基准测试数据与图表
+│   ├── data/                     #   CSV 测试数据
+│   └── plots/                    #   可视化图表
+├── assets/diagrams/              # 架构图 / 流程图
+├── clients/                      # 多语言客户端示例
+├── docs/                         # 文档
+├── kvstore.conf                  # 默认配置文件
+├── Makefile                      # 构建入口
+├── plan.md                       # 项目演进规划
+└── iteration-summary.md          # 迭代总结
 ```
 
-### 存储引擎架构
+---
 
-系统支持四种存储引擎，可通过编译宏启用或禁用：
+## 核心能力
 
-- `ENABLE_ARRAY`：数组存储
-- `ENABLE_RBTREE`：红黑树存储
-- `ENABLE_HASH`：哈希表存储
-- `ENABLE_SKIPTABLE`：跳表存储
+### 存储引擎
 
-### 内存管理架构
+| 引擎 | 前缀 | 说明 |
+|------|------|------|
+| Array  | 无前缀 | 基础数组存储，适合小数据量 |
+| Hash   | `H*` | 哈希表，适合大量 key 场景 |
+| RBTREE | `R*` | 红黑树，有序存储 |
+| Skiptable | `X*` | 跳表，适合范围查询 |
 
-自定义内存分配器（custom后端）特点：
+> 例：`HSET key value` 使用哈希引擎，`RSET key value` 使用红黑树引擎。
 
-- 小内存（≤1024B）：使用size class + slab page + freelist
-- 大内存（>1024B）：直接使用mmap
-- 详细的统计信息：分配次数、使用内存、碎片率等
+### 内存后端
 
-### 网络模型对比
+| 后端 | 特点 |
+|------|------|
+| `libc` | 标准 malloc/free，最通用 |
+| `jemalloc` | 高性能分配器，减少碎片 |
+| `custom` | 自研 slab + mmap 分配器，可观测碎片统计 |
 
-- **Reactor**：基于epoll，适合I/O密集型场景
-- **Proactor**：基于io_uring，适合高并发异步场景
-- **NtyCo**：基于协程，适合连接数多的场景
+### 网络模型
 
-## 性能基准测试
+| 模型 | 底层 | 适用场景 |
+|------|------|----------|
+| Reactor | epoll | I/O 密集型 |
+| Proactor | io_uring | 高并发异步 |
+| NtyCo | 协程 | 海量连接 |
 
-当前持久化链路说明：
+### 功能矩阵
 
-- AOF 主路径已切换为 `fd-first`，优先尝试 `io_uring` 文件写
-- dump / rewrite 快照序列化已支持直接写入目标 `fd`，不再必须经过 `FILE*`
-- AOF / dump / rewrite 的落盘同步优先尝试 `io_uring fsync`
-- 若运行环境、队列初始化或提交失败，则自动回退到 `pwrite/fsync`
-- 恢复加载路径优先使用 `mmap`，失败时回退到普通流式读取
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| RESP 协议 | ✅ 完成 | 完整解析与响应 |
+| 全量持久化 (dump) | ✅ 完成 | 二进制 `KVSD` 格式，优先 mmap 恢复 |
+| 增量持久化 (AOF) | ✅ 完成 | RESP 命令格式，优先 io_uring 写入 |
+| SAVE / BGSAVE / BGREWRITEAOF | ✅ 完成 | 支持同步/异步持久化 |
+| 主从复制 | ✅ 完成 | FULLRESYNC + partial resync + backlog |
+| RDMA 全量同步 | ✅ 完成 | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用 |
+| eBPF 实时同步 | ✅ 完成 | sockmap 转发路径，实时增量命令通过 eBPF 加速 |
+| TTL / 过期 | ✅ 完成 | 哈希索引 + 最小堆调度 |
+| 文档型 value | ✅ 完成 | DOCSET/DOCGET 等 7 个命令 |
+| 分布式锁 | ✅ 完成 | LOCK/UNLOCK/RENEW/OWNER |
+| 哨兵模式 | ⚠️ 基础 | 框架已有，自动故障转移待完善 |
+| 自动快照 | ✅ 完成 | 按时间+变化数规则触发 |
 
-项目提供完整的基准测试套件：
+---
+
+## 命令参考
+
+### 基本键值
+
+| 命令 | 说明 |
+|------|------|
+| `SET key value` | 设置键值 |
+| `GET key` | 获取键值 |
+| `DEL key` | 删除键 |
+| `EXIST key` | 检查键是否存在 |
+| `MSET k1 v1 k2 v2 ...` | 批量设置 |
+| `MGET k1 k2 ...` | 批量获取 |
+| `MOD key value` | 修改已有键的值 |
+
+### TTL / 过期
+
+| 命令 | 说明 |
+|------|------|
+| `EXPIRE key seconds` | 设置过期时间 |
+| `TTL key` | 查询剩余 TTL |
+| `PERSIST key` | 移除过期时间 |
+
+### 持久化
+
+| 命令 | 说明 |
+|------|------|
+| `SAVE` | 同步保存 dump |
+| `BGSAVE` | 后台保存 dump |
+| `BGREWRITEAOF` | 重写 AOF |
+| `APPENDFSYNC policy` | 设置 AOF 同步策略 |
+
+### 文档对象
+
+| 命令 | 说明 |
+|------|------|
+| `DOCSET key field value` | 设置字段 |
+| `DOCGET key field` | 获取字段 |
+| `DOCDEL key field` | 删除字段 |
+| `DOCDROP key` | 删除整个文档 |
+| `DOCEXIST key` | 文档是否存在 |
+| `DOCCOUNT key` | 字段数量 |
+| `DOCGETALL key` | 获取全部字段 |
+
+### 分布式锁
+
+| 命令 | 说明 |
+|------|------|
+| `LOCK key owner seconds` | 获取锁 |
+| `UNLOCK key owner` | 释放锁 |
+| `RENEW key owner seconds` | 续期 |
+| `OWNER key` | 查看持有者 |
+
+### 复制与集群
+
+| 命令 | 说明 |
+|------|------|
+| `SLAVEOF host port` | 设为从节点 |
+| `SLAVEOF NO ONE` | 提升为主节点 |
+| `ROLE` | 查看复制状态 |
+
+### 监控
+
+| 命令 | 说明 |
+|------|------|
+| `INFO` | 服务器综合信息 |
+| `MEMSTAT` | 内存统计 |
+| `PING` | 连接测试 |
+| `SNAPRULE sec changes` | 添加自动快照规则 |
+| `SNAPRULES` | 查看快照规则 |
+| `SNAPRULECLEAR` | 清除快照规则 |
+
+---
+
+## 配置说明
+
+配置文件格式为 `key=value`，支持 `#` 注释。默认加载 `./kvstore.conf`。
+
+### 全部配置项
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `port` | `5000` | 监听端口 |
+| `role` | `master` | 角色：`master` / `slave` |
+| `master_host` | `127.0.0.1` | 主节点地址 |
+| `master_port` | `5000` | 主节点端口 |
+| `dump_path` | `kvstore.dump` | dump 文件路径 |
+| `aof_path` | `kvstore.aof` | AOF 文件路径 |
+| `mem_backend` | `libc` | 内存后端：`libc` / `jemalloc` / `custom` |
+| `net_backend` | `reactor` | 网络模型：`reactor` / `proactor` / `ntyco` |
+| `log_mode` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
+| `appendfsync` | `always` | AOF 同步：`always` / `everysec` |
+| `repl_transport_backend` | `tcp` | 复制传输（单模式）：`tcp` / `rdma` / `ebpf` |
+| `repl_fullsync_transport` | `rdma` | 全量同步传输：`rdma` / `tcp` |
+| `repl_realtime_transport` | `ebpf` | 实时增量同步传输：`ebpf` / `tcp` |
+| `autosnap` | 无 | 自动快照规则，如 `60:1000,300:10` |
+| `sentinel` | `0` | 启用哨兵模式 |
+| `sentinel_master_name` | `mymaster` | 哨兵监控名称 |
+| `sentinel_quorum` | `1` | 哨兵法定人数 |
+
+> 命令行参数优先级高于配置文件。
+> **双通道模式**：设置 `repl_fullsync_transport=rdma` + `repl_realtime_transport=ebpf` 可使 RDMA 负责全量同步、eBPF 负责实时增量同步，两者同时工作。
+
+### 命令行参数
+
+```
+./kvstore --config <path> --port <n> --role <master|slave>
+          --mem <libc|jemalloc|custom> --net <reactor|proactor|ntyco>
+          --log-mode <debug|info|warn|error> --dump <path> --aof <path>
+          --master-host <ip> --master-port <n> --repl-transport <tcp|rdma>
+          --repl-fullsync-transport <rdma|tcp> --repl-realtime-transport <ebpf|tcp>
+          --sentinel --sentinel-master-name <name>
+```
+
+---
+
+## 测试体系
+
+### 快速验证
+
+```bash
+make check        # 运行全部基础测试 (resp + ttl + persist + doc)
+```
+
+### 全部测试目标
+
+| 命令 | 数据量 | 说明 | 产物路径 |
+|------|--------|------|----------|
+| `make check` | 小 | 基础功能全套 | — |
+| `make check-resp` | — | RESP 协议测试 | — |
+| `make check-ttl` | — | TTL 过期测试 | — |
+| `make check-persist` | — | 持久化基本测试 | — |
+| `make check-doc` | — | 文档对象测试 | — |
+| `make check-mass-ttl` | 1w | 海量 TTL 压测 | — |
+| `make check-uring-persist` | 1w | io_uring 持久化验证 | `artifacts/persist/uring-bench/` |
+| `make check-mmap-recover` | 1w | mmap 恢复验证 | `artifacts/persist/mmap-recover/` |
+| `make check-repl` | 5k | 主从复制基本验证 | — |
+| `make check-repl-metrics` | 5w+5k | 复制指标基线 | `artifacts/repl/metrics/` |
+| `make check-repl-profile` | 5w+5k | 复制 profiling | `artifacts/repl/profile/` |
+| `make check-demo-full-dump` | **10w** | 全量持久化演示 | `artifacts/persist/full-dump-demo/` |
+| `make check-demo-incr-aof` | **10w** | 增量持久化演示 | `artifacts/persist/incr-aof-demo/` |
+| `make check-demo-repl-sync` | **5w+5w=10w** | 主从同步演示 | `artifacts/repl/sync-demo/` |
+| `make check-repl-rdma-smoke` | 小 | RDMA 冒烟测试 | `artifacts/repl/rdma-smoke/` |
+| `make check-repl-rdma-stress` | 中 | RDMA 压力测试 | `artifacts/repl/rdma-stress/` |
+| `make check-repl-rdma-soak` | 中 | RDMA 长时浸泡 | `artifacts/repl/rdma-stress/` |
+| `make check-repl-ebpf-env` | — | eBPF 环境探测 | — |
+| `make check-rdma-standalone-probe` | — | RDMA 环境探测 | `artifacts/rdma/probe/` |
+| `make check-rdma-pingpong-smoke` | — | RDMA pingpong 测试 | `artifacts/rdma/pingpong/` |
+
+### 参数化运行
+
+```bash
+# 指定端口
+make check TEST_PORT=6380
+
+# 主从复制自定义端口
+make check-repl REPL_MASTER_PORT=7000 REPL_SLAVE_PORT=7001
+
+# 海量 TTL 自定义规模
+make check-mass-ttl MASS_TTL_KEYS=5000 MASS_TTL_SECONDS=2
+
+# io_uring 持久化自定义参数
+make check-uring-persist URING_PERSIST_COUNT=5000 URING_PERSIST_APPEND_FSYNC=everysec
+
+# mmap 恢复指定引擎
+make check-mmap-recover MMAP_RECOVER_ENGINE=hash MMAP_RECOVER_COUNT=20000
+```
+
+---
+
+## 测试产物路径
+
+所有测试脚本的输出统一存放在 `artifacts/` 目录下，按测试类型分子目录。
+
+| 测试场景 | 产物目录 | 典型内容 |
+|----------|----------|----------|
+| 全量持久化 10w 演示 | `artifacts/persist/full-dump-demo/` | dump 文件、验证日志 |
+| 增量持久化 10w 演示 | `artifacts/persist/incr-aof-demo/` | AOF 文件、验证日志 |
+| io_uring 持久化验证 | `artifacts/persist/uring-bench/` | 耗时报告、恢复日志 |
+| mmap 恢复验证 | `artifacts/persist/mmap-recover/` | 恢复时间报告 |
+| 复制指标基线 | `artifacts/repl/metrics/` | INFO 快照、CPU/RSS 摘要 |
+| 复制 profiling | `artifacts/repl/profile/` | perf 数据、调用栈 |
+| 主从同步 10w 演示 | `artifacts/repl/sync-demo/` | 同步一致性报告 |
+| eBPF 同步测试 | `artifacts/repl/ebpf-sync/` | eBPF 日志、验证报告 |
+| RDMA smoke / stress | `artifacts/repl/rdma-stress/` | 状态报告、fullsync 日志 |
+| RDMA 环境探测 | `artifacts/rdma/probe/` | 环境可用性报告 |
+| RDMA pingpong | `artifacts/rdma/pingpong/` | 延迟/吞吐报告 |
+| 基准测试 | `artifacts/bench/` | CSV 数据、图表 |
+
+> 此外，`testdata/` 存放手工编写的静态测试数据（样例 AOF、dump 文件、测试用配置文件），不会被脚本覆盖。
+
+---
+
+## 性能基准
+
+### 基准数据 (HSET, 50k~100k ops)
+
+| 后端 | ops | value 大小 | 耗时(s) | QPS | 内存(KB) |
+|------|-----|-----------|---------|-----|----------|
+| libc | 50000 | 128B | 23.76 | 2104 | 12960 |
+| jemalloc | 50000 | 128B | 24.47 | 2044 | 15908 |
+| custom | 50000 | 128B | 25.65 | 1949 | 21844 |
+| libc | 50000 | 4KB | 27.27 | 1833 | 207268 |
+| jemalloc | 50000 | 4KB | 25.88 | 1932 | 260952 |
+| custom | 50000 | 4KB | 32.47 | 1540 | 409968 |
+| libc | 100000 | 128B | 48.94 | 2044 | 23892 |
+| jemalloc | 100000 | 128B | 48.51 | 2061 | 27736 |
+| custom | 100000 | 128B | 49.30 | 2028 | 41488 |
+
+> 完整数据：`benchmarks/data/bench_results_all_rounds.csv`
 
 ### 运行基准测试
 
 ```bash
-# 进入基准测试目录
-cd benchmarks/scripts
-
-# 基础测试
+cd tools/bench
 python3 bench_mem_backend.py --ops 50000 --value-size 128
-
-# 带参数测试
 python3 bench_mem_backend.py --ops 100000 --value-size 256 --warmup 1000 --csv my_bench.csv
-
-# 使用包装脚本
-../run_benchmark.sh bench_mem_backend.py --ops 50000 --value-size 128
 ```
 
-### 测试指标
-
-- **QPS**：每秒操作数（SET/GET/HSET等）
-- **内存使用**：VmRSS（物理内存）、VmSize（虚拟内存）
-- **内存碎片**：内存间隙（VmSize - VmRSS）
-- **自定义内存统计**：slab使用情况、mmap统计等
-
-### 测试场景建议
-
-```bash
-# 小value测试（观察slab效果）
-python3 bench_mem_backend.py --ops 50000 --value-size 64
-
-# 大value测试（观察mmap效果）
-python3 bench_mem_backend.py --ops 20000 --value-size 4096
-
-# 混合场景测试
-python3 bench_mem_backend.py --ops 30000 --value-size 128 --csv bench_small.csv
-python3 bench_mem_backend.py --ops 30000 --value-size 4096 --csv bench_large.csv
-```
-
-## 客户端支持
-
-### Python客户端示例
-
-```python
-import socket
-
-def kvstore_command(host, port, *args):
-    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    conn.connect((host, port))
-  
-    # 构建RESP协议命令
-    cmd = f"*{len(args)}\r\n"
-    for arg in args:
-        cmd += f"${len(arg)}\r\n{arg}\r\n"
-  
-    conn.send(cmd.encode())
-    response = conn.recv(4096)
-    conn.close()
-    return response.decode()
-
-# 使用示例
-response = kvstore_command("127.0.0.1", 5000, "SET", "mykey", "myvalue")
-print(response)
-```
-
-### 其他语言客户端
-
-项目提供了多种语言的客户端示例：
-
-- `clients/py-kvstore.py`：Python示例
-- `clients/go-kvstore.go`：Go示例
-- `clients/js-kvstore.js`：JavaScript示例
-- `clients/javakvstore.java`：Java示例
-- `clients/rust-kvstore.rs`：Rust示例
-
-## 测试方法
-
-### 当前推荐的基线验证顺序
-
-在继续做后续功能改造前，建议先固定使用下面这套基线验证：
-
-```bash
-# 1. 编译
-make clean && make
-
-# 2. 启动服务
-./kvstore
-
-# 3. 运行基线验证
-make check
-
-# 4. 单独验证主从复制
-make check-repl
-```
-
-说明：
-
-- `make check-resp`：验证 RESP 基础读写、多包、精确返回格式
-- `make check-ttl`：验证 TTL / EXPIRE / PERSIST
-- `make check-persist`：验证基础持久化命令与文件落盘
-- `make check-doc`：验证文档型 value 的增删改查与保存
-- `make check-mass-ttl`：验证大量 TTL key 的写入、到期与回收行为
-- `make check-repl`：验证主从全量同步和增量复制
-
-### 阶段 9 复制链路基线指标
-
-`INFO` 已输出第一批复制链路指标，可作为后续 backlog / partial resync / eBPF 优化的基线：
-
-- `master_replid`
-- `master_repl_offset`
-- `connected_slaves`
-- `repl_fullsync_count`
-- `repl_partialsync_ok_count`
-- `repl_partialsync_err_count`
-- `repl_broadcast_bytes`
-- `repl_snapshot_bytes`
-- `repl_backlog_size`
-- `repl_backlog_histlen`
-- `repl_backlog_start_offset`
-- `repl_backlog_end_offset`
-
-当前这些指标主要用于观测：
-
-- 主节点复制流累计偏移
-- 当前已连接从节点数量
-- 全量同步次数
-- 后续部分重同步成功/失败次数
-- 增量广播字节量与全量快照发送字节量
-- 当前 backlog 容量、历史窗口长度以及可服务的 offset 范围
-
-当前已实现第一版 partial resync：
-
-- slave 在同一进程内通过 `SLAVEOF NO ONE` 再次执行 `SLAVEOF <host> <port>` 重连时，可基于 `replid + offset + backlog` 走 `CONTINUE`
-- 如果 slave 是跨进程重启，由于本地 `replid/offset` 尚未持久化，当前仍会退回 `FULLRESYNC`
-
-如果服务端口不是默认 `5000`，可以这样运行：
-
-```bash
-make check TEST_PORT=6380
-```
-
-如果主从测试端口需要调整：
-
-```bash
-make check-repl REPL_MASTER_PORT=7000 REPL_SLAVE_PORT=7001
-```
-
-### 单元测试
-
-当前 `tests/test.c` 为空，项目现阶段以集成验证脚本为主。后续在做文档型 value、mmap、TTL 扩展时，再补充真正的单元测试。
-
-### 集成测试
-
-```bash
-# RESP基础能力
-make check-resp
-
-# TTL能力
-make check-ttl
-
-# 持久化基础验证
-make check-persist
-
-# 文档型 value 验证
-make check-doc
-
-# 海量 TTL key 验证
-make check-mass-ttl
-
-# io_uring 持久化正确性/性能 smoke 验证
-make check-uring-persist
-
-# 主从复制验证
-make check-repl
-```
-
-### io_uring 持久化基准/正确性验证
-
-```bash
-# 默认 smoke 验证
-make check-uring-persist
-
-# 指定写入条数与 fsync 策略
-make check-uring-persist URING_PERSIST_COUNT=500 URING_PERSIST_APPEND_FSYNC=always
-```
-
-说明：
-
-- 该脚本会启动一个临时 kvstore 实例
-- 批量写入 key 后执行 `SAVE`
-- 输出写入耗时、SAVE 耗时、重启恢复校验耗时
-- 同时校验 `aof`/`dump` 文件存在且恢复后的 key 可读
-
-### mmap 恢复性能增强版验证
-
-```bash
-# 默认 mmap 恢复验证（默认使用 hash 引擎，适合较大 key 数）
-make check-mmap-recover
-
-# 指定恢复数据规模
-make check-mmap-recover MMAP_RECOVER_COUNT=5000 MMAP_RECOVER_APPEND_FSYNC=everysec
-
-# 指定底层引擎（array/hash/rbtree/skiptable）
-make check-mmap-recover MMAP_RECOVER_ENGINE=hash MMAP_RECOVER_COUNT=5000
-```
-
-说明：
-
-- 启动临时实例写入数据并生成 `dump` / `aof`
-- 重启后统计恢复 wall time
-- 通过 `INFO` 输出恢复阶段统计信息
-- 重点观测 `recover_mmap_attempts`、`recover_mmap_success`、`recover_mmap_fallbacks`、`recover_mmap_bytes`
-
-### 海量 TTL key 验证
-
-```bash
-# 先启动服务
-./kvstore --port 5100
-
-# 小规模验证
-make check-mass-ttl TEST_PORT=5100 MASS_TTL_KEYS=200 MASS_TTL_SECONDS=2 MASS_TTL_BATCH=50 MASS_TTL_SAMPLE=10
-
-# 更大规模验证
-make check-mass-ttl TEST_PORT=5100 MASS_TTL_KEYS=5000 MASS_TTL_SECONDS=2 MASS_TTL_BATCH=500 MASS_TTL_SAMPLE=20
-```
-
-可调参数：
-
-- `MASS_TTL_KEYS`：写入 key 总数
-- `MASS_TTL_SECONDS`：每个 key 的 TTL 秒数
-- `MASS_TTL_BATCH`：批次大小
-- `MASS_TTL_SAMPLE`：过期前后抽样检查数量
-
-说明：
-
-- `check-mass-ttl` 默认使用哈希引擎命令进行验证，更适合大量 key 场景
-- 该脚本会验证“写入成功 / 过期前可读 / 过期后删除 / 服务仍可响应”四类行为
-- 如果要逐步扩大规模，建议从 `200 -> 5000 -> 20000` 逐步提升
-
-### 第四阶段（文档型 value）建议验证步骤
-
-```bash
-# 1. 编译
-make clean && make
-
-# 2. 启动服务
-./kvstore --port 5099
-
-# 3. 运行文档对象测试
-make check-doc TEST_PORT=5099
-```
-
-如果你想手工验证，可以执行：
-
-```bash
-# 写入文档字段
-printf '*4\r\n$6\r\nDOCSET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n$5\r\nalice\r\n' | nc 127.0.0.1 5099
-
-# 读取文档字段
-printf '*3\r\n$6\r\nDOCGET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n' | nc 127.0.0.1 5099
-
-# 查看字段数量
-printf '*2\r\n$8\r\nDOCCOUNT\r\n$6\r\nuser:1\r\n' | nc 127.0.0.1 5099
-
-# 获取整个文档
-printf '*2\r\n$9\r\nDOCGETALL\r\n$6\r\nuser:1\r\n' | nc 127.0.0.1 5099
-```
-
-验证持久化恢复：
-
-```bash
-# 保存
-printf '*1\r\n$4\r\nSAVE\r\n' | nc 127.0.0.1 5099
-
-# 重启服务后再次读取
-printf '*3\r\n$6\r\nDOCGET\r\n$6\r\nuser:1\r\n$4\r\nname\r\n' | nc 127.0.0.1 5099
-```
-
-### 性能测试
-
-```bash
-# 运行完整性能测试套件
-./tools/bench/run_benchmark.sh
-
-# 运行复制全同步测试
-./tools/repl/run_repl_fullsync_test.sh
-
-# 运行持久化性能测试
-./tools/persist/run_save_bgsave_perf_test.sh
-```
-
-## 目录规划
-
-项目现在按工程化方式约定目录职责：
-
-- `src/`：核心源码
-- `include/`：头文件
-- `tests/`：集成测试脚本与测试源码
-- `tools/`：辅助脚本，按领域拆分
-  - `tools/repl/`
-  - `tools/rdma/`
-  - `tools/persist/`
-  - `tools/bench/`
-  - `tools/tests/`
-- `artifacts/`：统一存放脚本生成物
-  - `artifacts/repl/`
-  - `artifacts/rdma/`
-  - `artifacts/persist/`
-  - `artifacts/bench/`
-  - `artifacts/legacy/`
-- `testdata/`：测试样例配置、样例 AOF / dump 等静态测试数据
-- `assets/diagrams/`：设计草图、流程图、架构图等工程图示资源
-
-约定：新的验证脚本、压力脚本、性能脚本默认都应把日志、AOF、dump、profile、summary 等输出写入 `artifacts/` 子目录，而不是继续散落在项目根目录。
-
-### 脚本入口与产物落点速查表
-
-| 场景 | 命令入口 | 实际脚本 | 默认产物目录 |
-| --- | --- | --- | --- |
-| 持久化基础验证 | `make check-persist` | `tools/persist/test_resp_persist_nc.sh` | 无固定产物目录 |
-| 海量 TTL 验证 | `make check-mass-ttl` | `tools/persist/run_mass_ttl_validation.py` | 无固定产物目录 |
-| io_uring 持久化 smoke | `make check-uring-persist` | `tools/persist/run_uring_persist_bench.py` | `artifacts/persist/uring-bench/` |
-| mmap 恢复验证 | `make check-mmap-recover` | `tools/persist/run_mmap_recover_bench.py` | `artifacts/persist/mmap-recover/` |
-| 主从全同步验证 | `make check-repl` | `tools/repl/run_repl_fullsync_test.sh` | 脚本运行时工作目录下指定路径 |
-| 复制指标基线 | `make check-repl-metrics` | `tools/repl/run_repl_metrics_bench.py` | `artifacts/repl/metrics/` |
-| 复制 profile | `make check-repl-profile` | `tools/repl/run_repl_profile.py` | `artifacts/repl/profile/` |
-| 复制 eBPF 观测 | `make check-repl-ebpf` | `tools/repl/run_repl_profile.py --ebpf` | `artifacts/repl/profile/` |
-| RDMA fallback 验证 | `make check-repl-rdma-fallback` | `tools/repl/run_repl_rdma_stress.py --force-fallback` | `artifacts/repl/rdma-stress/` |
-| RDMA 长时 soak | `make check-repl-rdma-long-soak` | `tools/repl/run_repl_rdma_stress.py` | `artifacts/repl/rdma-stress/` |
-
-当前稳定化语义补充：
-
-- slave 通过 `REPLACK` 上报 `applied_offset` 与 `durable_offset`
-- partial resync 不仅检查 backlog，还要求 slave 上报的 durable 位点不落后于请求位点
-- `INFO` 可观测：`repl_transport_configured`、`repl_transport_active`、`repl_transport_fallback_reason`、`repl_transport_fallback_count`
-- RDMA 失败时系统允许回退到 TCP，以优先保证复制服务连续性
-
-| eBPF 环境探测 | `make check-repl-ebpf-env` | `tools/repl/run_repl_ebpf_env_probe.py` | 终端输出为主 |
-| RDMA unsupported 验证 | `make check-repl-rdma-unsupported` | `tools/repl/run_repl_rdma_unsupported.py` | `artifacts/repl/rdma-unsupported/` |
-| RDMA smoke | `make check-repl-rdma-smoke` | `tools/repl/run_repl_rdma_smoke.py` | `artifacts/repl/rdma-smoke/` |
-| RDMA stress / soak | `make check-repl-rdma-stress` / `make check-repl-rdma-soak` | `tools/repl/run_repl_rdma_stress.py` | `artifacts/repl/rdma-stress/` |
-| RDMA 环境探测 | `make check-rdma-standalone-probe` | `tools/rdma/run_rdma_standalone_probe.py` | `artifacts/rdma/probe/` |
-| RDMA pingpong smoke | `make check-rdma-pingpong-smoke` | `tools/rdma/run_rdma_pingpong_smoke.py` | `artifacts/rdma/pingpong/` |
-| 基准测试套件 | 手工运行 | `tools/bench/run_benchmark.sh` | 脚本参数指定输出目录 |
+---
 
 ## 开发指南
 
 ### 添加新命令
 
-1. 在`src/main/kvstore.c`的`handle_parsed_command`函数中添加命令处理逻辑
-2. 如果需要持久化，调用`persist_note_write()`和`persist_append_raw()`
-3. 如果需要复制，调用`repl_broadcast()`
-4. 添加相应的测试用例
+1. 在 `src/main/kvstore.c` 的 `handle_parsed_command()` 中添加处理分支
+2. 若需持久化，调用 `persist_note_write()` + `persist_append_raw()`
+3. 若需复制广播，调用 `repl_broadcast()`
+4. 在 `tests/integration/` 下补充测试脚本
 
 ### 添加新存储引擎
 
-1. 在`include/kvstore/kvstore.h`中定义引擎ID和数据结构
-2. 实现引擎的CRUD操作函数
-3. 在`src/storage/`目录下创建引擎实现文件
-4. 更新编译配置（Makefile）
-5. 在`handle_parsed_command`中集成引擎支持
+1. 在 `include/kvstore/kvstore.h` 定义引擎 ID 和数据结构
+2. 在 `src/storage/` 下实现 CRUD 操作
+3. 更新 `Makefile` 的 `SRCS` 列表
+4. 在 `handle_parsed_command()` 中集成新引擎路由
 
-### 内存后端开发
-
-1. 实现`kvs_malloc`、`kvs_free`等内存操作函数
-2. 实现`kvs_mem_get_stats`函数提供统计信息
-3. 在`kvs_mem_init`中初始化后端
-4. 更新`kvs_mem_prepare_process`处理进程启动
-
-## 故障排除
-
-### jemalloc启动问题
-
-如果遇到jemalloc模式的static TLS block问题，系统会自动通过LD_PRELOAD重启进程：
+### 编译选项
 
 ```bash
-# 错误信息示例
-jemalloc: ... static TLS block ...
+# RDMA 支持（默认开启）
+make ENABLE_RDMA=1
 
-# 自动处理
-系统会自动设置 LD_PRELOAD 并重启进程
+# eBPF 支持（默认关闭）
+make ENABLE_EBPF=1
+
+# 编译零警告策略
+make CFLAGS="-Wall -Wextra -O2"
 ```
 
-### 内存泄漏检测
+---
 
-使用MEMSTAT命令监控内存使用：
+## 常见问题
+
+### jemalloc TLS 问题
+
+若重启时出现 `static TLS block` 错误，系统会自动通过 `LD_PRELOAD` 重启进程，无需手动干预。
+
+### 端口冲突
+
+默认端口 5000，修改方式：
+
+```bash
+./kvstore --port 6380
+# 或修改 kvstore.conf 中 port=6380
+```
+
+### 内存观测
 
 ```bash
 printf '*1\r\n$7\r\nMEMSTAT\r\n' | nc 127.0.0.1 5000
 ```
 
-关键指标：
+关注指标：`current_small_inuse`、`peak_small_inuse`、`internal_fragment_ppm`。
 
-- `current_small_inuse`：当前使用的小内存块数
-- `peak_small_inuse`：小内存使用峰值
-- `current_large_inuse_bytes`：当前大内存使用字节数
-- `internal_fragment_ppm`：内部碎片率（百万分之一）
+### RDMA / eBPF 环境要求
 
-### 性能问题排查
-
-1. 检查网络模型是否适合场景
-2. 检查内存后端选择
-3. 使用INFO命令查看服务器状态
-4. 运行基准测试对比不同配置
-
-## 贡献指南
-
-### 开发环境设置
-
-1. 确保安装gcc、make、python3等基础工具
-2. 克隆仓库：`git clone <repository-url>`
-3. 编译：`make clean && make`
-
-### 代码规范
-
-1. 遵循项目已有的代码风格
-2. 添加必要的注释和文档
-3. 确保新功能有相应的测试
-4. 更新README和相关文档
-
-### 提交PR
-
-1. 从最新的main分支创建特性分支
-2. 确保所有测试通过
-3. 更新CHANGELOG（如果有）
-4. 提供详细的PR描述
-
-## 许可证
-
-本项目采用开源许可证。详细信息请查看LICENSE文件。
-
-## 参考资源
-
-- [Redis协议规范](https://redis.io/topics/protocol)
-- [io_uring文档](https://unixism.net/loti/)
-- [jemalloc文档](http://jemalloc.net/)
-- [NtyCo协程库](https://github.com/wangbojing/NtyCo)
-
-## 联系方式
-
-如有问题或建议，请通过以下方式联系：
-
-- 项目GitHub仓库
-- 提交Issue
-- 参与讨论
+- RDMA 使用 Soft-RoCE (`rxe0`) 验证，需要 `librdmacm-dev`、`libibverbs-dev`
+- eBPF 需要 `libbpf-dev`、`libelf-dev`、`clang`，通常需要 root 权限
+- 默认稳定复制路径为 TCP，RDMA/eBPF 为实验性扩展
 
 ---
 
-*最后更新：2026年*
+## 许可证
+
+本项目采用开源许可证。
+
+## 参考资源
+
+- [Redis 协议规范](https://redis.io/topics/protocol)
+- [io_uring 文档](https://unixism.net/loti/)
+- [jemalloc 文档](http://jemalloc.net/)
+- [NtyCo 协程库](https://github.com/wangbojing/NtyCo)
+
+---
+
+*最后更新：2026 年 5 月*

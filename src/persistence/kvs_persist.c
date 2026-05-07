@@ -193,6 +193,71 @@ static int replay_file(const char *path) {
     return replay_file_mmap(path);
 }
 
+static int replay_dump_file(const char *path) {
+    int fd;
+    struct stat st;
+    unsigned char *mapped;
+    size_t pos = 0, size, line_start;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) != 0) { close(fd); return 0; }
+    if (st.st_size <= 0) { close(fd); return 0; }
+
+    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) { close(fd); return 0; }
+    size = (size_t)st.st_size;
+    g_recover_mmap_success++;
+    g_recover_last_mmap_bytes += (unsigned long long)size;
+
+    /* parse key\nvalue\n entries: lines come in pairs (key, value) */
+    line_start = 0;
+    while (pos <= size) {
+        char *key, *value;
+
+        /* scan key line: find \n or EOF */
+        while (pos < size && mapped[pos] != '\n') pos++;
+        if (pos > line_start) {
+            size_t klen = pos - line_start;
+            key = (char *)kvs_malloc(klen + 1);
+            if (!key) break;
+            memcpy(key, mapped + line_start, klen);
+            key[klen] = '\0';
+        } else {
+            break; /* empty line -> done */
+        }
+        pos++; /* skip \n */
+        if (pos > size) { kvs_free(key); break; }
+
+        line_start = pos;
+        /* scan value line */
+        while (pos < size && mapped[pos] != '\n') pos++;
+        if (pos >= line_start) {
+            size_t vlen = pos - line_start;
+            value = (char *)kvs_malloc(vlen + 1);
+            if (!value) { kvs_free(key); break; }
+            memcpy(value, mapped + line_start, vlen);
+            value[vlen] = '\0';
+        } else {
+            kvs_free(key);
+            break;
+        }
+        pos++; /* skip \n */
+        line_start = pos;
+
+        kvs_hash_set(&global_hash, key, value);
+        kvs_free(key);
+        kvs_free(value);
+
+        if (pos >= size) break;
+    }
+
+    g_recover_last_tail_bytes += (unsigned long long)pos;
+    munmap(mapped, size);
+    close(fd);
+    return 0;
+}
+
 static int persist_flush_aof_fd(int fd) {
     if (fd < 0) return -1;
     if (persist_fsync_fd_best_effort(fd) != 0) return -1;
@@ -203,7 +268,7 @@ static int persist_save_dump_to(const char *path) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     int rc;
     if (fd < 0) return -1;
-    rc = kvs_snapshot_to_fd(fd);
+    rc = kvs_dump_to_fd(fd);
     if (rc == 0 && persist_fsync_fd(fd) != 0) rc = -1;
     close(fd);
     return rc;
@@ -385,7 +450,7 @@ int persist_recover(void) {
     g_recover_last_tail_bytes = 0;
 
     dump_begin_ms = kvs_now_ms();
-    replay_file(g_cfg.dump_path);
+    replay_dump_file(g_cfg.dump_path);
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
     aof_begin_ms = kvs_now_ms();

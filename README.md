@@ -284,11 +284,14 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 
 | 命令 | 数据量 | 说明 | 产物路径 |
 |------|--------|------|----------|
+| `make check-all` | 全部 | **一键运行全部测试**（自动探测 RDMA/eBPF 环境，跳过不可用项） | — |
+| `make check-all-quick` | 小+1w | 快速全套（跳过 RDMA/eBPF/复制/10w demo） | — |
 | `make check` | 小 | 基础功能全套 | — |
 | `make check-resp` | — | RESP 协议测试 | — |
 | `make check-ttl` | — | TTL 过期测试 | — |
 | `make check-persist` | — | 持久化基本测试 | — |
 | `make check-doc` | — | 文档对象测试 | — |
+| `make check-bulk-1w` | **1w** | 批量 1w 级全套回归（HSET/HGET/TTL/SAVE+恢复/DOC） | — |
 | `make check-mass-ttl` | 1w | 海量 TTL 压测 | — |
 | `make check-uring-persist` | 1w | io_uring 持久化验证 | `artifacts/persist/uring-bench/` |
 | `make check-mmap-recover` | 1w | mmap 恢复验证 | `artifacts/persist/mmap-recover/` |
@@ -304,6 +307,8 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 | `make check-repl-ebpf-env` | — | eBPF 环境探测 | — |
 | `make check-rdma-standalone-probe` | — | RDMA 环境探测 | `artifacts/rdma/probe/` |
 | `make check-rdma-pingpong-smoke` | — | RDMA pingpong 测试 | `artifacts/rdma/pingpong/` |
+
+> **注意**：若之前使用 `sudo make check-demo-repl-sync` 运行过，`artifacts/repl/sync-demo/` 下的文件属主为 root，再次运行时需先 `sudo rm -rf artifacts/repl/sync-demo` 清理，否则会报 `PermissionError`。
 
 ### 参数化运行
 
@@ -322,6 +327,18 @@ make check-uring-persist URING_PERSIST_COUNT=5000 URING_PERSIST_APPEND_FSYNC=eve
 
 # mmap 恢复指定引擎
 make check-mmap-recover MMAP_RECOVER_ENGINE=hash MMAP_RECOVER_COUNT=20000
+
+# 批量 1w 级回归自定义规模
+make check-bulk-1w BULK_COUNT=50000
+
+# 一键运行全部测试
+make check-all
+
+# 快速全套（跳过 RDMA/eBPF/复制/demo）
+make check-all-quick
+
+# 只跑特定目标
+python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 ```
 
 ---

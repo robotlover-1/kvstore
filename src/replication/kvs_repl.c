@@ -738,8 +738,9 @@ static int repl_transport_rdma_connect_slave(const char *host, int port) {
     (void)port;
 #if KVS_ENABLE_RDMA
     struct sockaddr_in dst;
+    int rdma_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : port + 1;
     repl_rdma_log("connect_slave", "begin");
-    if (repl_rdma_prepare_addr(host, port, &dst) != 0) {
+    if (repl_rdma_prepare_addr(host, rdma_port, &dst) != 0) {
         repl_rdma_log("prepare_addr", "failed");
         repl_transport_trigger_fallback("rdma_prepare_addr_failed", 5000);
         return -1;
@@ -1623,7 +1624,8 @@ static void *slave_thread(void *arg) {
         int use_ebpf_realtime = repl_realtime_should_use_ebpf();
 
         /* If using dual transport, always establish TCP as the primary link.
-         * RDMA is established separately for fullsync bulk data. */
+         * RDMA is established first (background), and REPLSYNC is delayed until
+         * RDMA is ready or a timeout expires, so fullsync can use RDMA. */
         if (use_rdma_fullsync && use_ebpf_realtime) {
             int tcp_fd = repl_transport_tcp_connect_slave(host, port);
             if (tcp_fd < 0) {
@@ -1632,24 +1634,9 @@ static void *slave_thread(void *arg) {
                 repl_slave_retry_pause(rdma_fail_streak);
                 continue;
             }
-            /* Send REPLSYNC immediately over TCP before attempting RDMA */
-            unsigned char cmd[256];
-            char offbuf[32], durablebuf[32];
-            snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
-            snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-            size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
-            if (send(tcp_fd, cmd, n, 0) < 0) {
-                repl_transport_tcp_disconnect_slave(tcp_fd);
-                repl_set_link_state(0);
-                sleep(1);
-                continue;
-            }
 
             /* Kick off RDMA connection attempt in a background thread.
-             * This must not block: fullsync data flows over TCP immediately
-             * after REPLSYNC, and we need to read it without delay.
-             * RDMA connect is non-fatal if it fails. */
+             * We delay REPLSYNC until RDMA is ready so fullsync can use RDMA. */
 #if KVS_ENABLE_RDMA
             repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
             if (rdma_arg) {
@@ -1667,13 +1654,47 @@ static void *slave_thread(void *arg) {
             repl_transport_mark_active("ebpf");
             rdma_fail_streak = 0;
 
+            /* Register TCP fd with eBPF sockmap for realtime sync */
+            if (repl_ebpf_register_fd(tcp_fd, 0) != 0) {
+                fprintf(stderr, "repl ebpf: fd registration failed on slave link, using tcp-compatible path\n");
+            }
+
             g_slave_fd = tcp_fd;
             repl_set_link_state(1);
             unsigned char buf[BUFFER_CAP];
             size_t blen = 0;
+            int replsync_sent = 0;
+            long long rdma_wait_start = kvs_now_ms();
 
             for (;;) {
                 if (slave_should_reconnect(gen)) break;
+
+                /* Delay REPLSYNC until RDMA is connected or timeout (5s).
+                 * This lets fullsync bulk data flow over RDMA when available. */
+                if (!replsync_sent) {
+                    int rdma_ready = 0;
+#if KVS_ENABLE_RDMA
+                    rdma_ready = g_repl_rdma_ctx.connected;
+#endif
+                    if (rdma_ready || (kvs_now_ms() - rdma_wait_start) > 5000) {
+                        unsigned char cmd[256];
+                        char offbuf[32], durablebuf[32];
+                        snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
+                        snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
+                        size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                            g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                        if (send(tcp_fd, cmd, n, 0) < 0) break;
+                        replsync_sent = 1;
+                        repl_transport_mark_active(rdma_ready ? "rdma+ebpf" : "ebpf");
+#if KVS_ENABLE_RDMA
+                        if (rdma_ready) repl_rdma_log("slave_loop", "REPLSYNC sent, fullsync will use RDMA");
+#endif
+                        continue;
+                    }
+                    /* Wait a bit for RDMA to connect, then retry */
+                    usleep(50000);  /* 50ms */
+                    continue;
+                }
 
                 int had_new_data = 0;
 
@@ -1985,7 +2006,10 @@ static void *rdma_master_listener_thread(void *arg) {
             }
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
-            addr.sin_port = htons((uint16_t)g_cfg.port);
+            {
+                int rdma_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : g_cfg.port + 1;
+                addr.sin_port = htons((uint16_t)rdma_port);
+            }
             if (inet_pton(AF_INET, g_cfg.master_host[0] ? g_cfg.master_host : "0.0.0.0", &addr.sin_addr) <= 0) addr.sin_addr.s_addr = htonl(INADDR_ANY);
             if (rdma_bind_addr(g_repl_rdma_ctx.listen_id, (struct sockaddr *)&addr) != 0) {
                 LISTENER_FAIL("bind");
@@ -2076,10 +2100,26 @@ static void *rdma_master_listener_thread(void *arg) {
             memset(&g_rdma_master_replica_conn, 0, sizeof(g_rdma_master_replica_conn));
             g_rdma_master_replica_conn.repl_transport_kind = KVS_REPL_TRANSPORT_RDMA;
             initial_recv_start_ms = kvs_now_ms();
+
+            /* In hybrid mode (RDMA fullsync + eBPF realtime), the main thread
+             * sends fullsync data over RDMA and polls the shared CQ for send
+             * completions. The listener must NOT compete for CQ entries;
+             * it just waits for the connection to close. */
+            int hybrid_mode = !strcasecmp(repl_fullsync_transport_name(), "rdma")
+                           && repl_realtime_should_use_ebpf();
+
             for (;;) {
                 unsigned char *payload;
                 size_t blen;
                 if (!g_repl_rdma_ctx.connected) break;
+
+                if (hybrid_mode) {
+                    /* Hybrid: let main thread own the CQ; just sleep and
+                     * periodically check connection status. */
+                    sleep(1);
+                    continue;
+                }
+
                 recv_slot = -1;
                 recv_len = 0;
                 if (repl_rdma_wait_cq_recv_completion(2000, &recv_slot, &recv_len) != 0 || recv_slot < 0 || recv_len == 0) {

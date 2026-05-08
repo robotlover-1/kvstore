@@ -284,6 +284,7 @@ typedef struct {
     char rdma_dev[32];
     int rdma_ib_port;
     int rdma_gid_idx;
+    int rdma_port;          /* RDMA listener port (0 = auto: main port + 1) */
     int rdma_recv_slots;
     int rdma_chunk_size;
     int rdma_qp_wr_depth;

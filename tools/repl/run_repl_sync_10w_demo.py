@@ -160,6 +160,8 @@ def main() -> int:
                     help="全量同步传输协议 (tcp/rdma)")
     ap.add_argument("--realtime-transport", default="tcp", choices=["tcp", "ebpf"],
                     help="实时同步传输协议 (tcp/ebpf)")
+    ap.add_argument("--rdma-dev", default="siw0",
+                    help="RDMA 设备名 (默认 siw0)")
     ap.add_argument("--work-dir", default="./artifacts/repl/sync-demo")
     args = ap.parse_args()
 
@@ -203,6 +205,7 @@ def main() -> int:
                  "--role", "master",
                  "--dump", str(master_dump), "--aof", str(master_aof),
                  "--appendfsync", "everysec",
+                 "--rdma-dev", args.rdma_dev,
                  "--repl-fullsync-transport", args.fullsync_transport,
                  "--repl-realtime-transport", args.realtime_transport],
                 stdout=logf, stderr=logf,
@@ -246,6 +249,7 @@ def main() -> int:
                  "--master-port", str(args.master_port),
                  "--dump", str(slave_dump), "--aof", str(slave_aof),
                  "--appendfsync", "everysec",
+                 "--rdma-dev", args.rdma_dev,
                  "--repl-fullsync-transport", args.fullsync_transport,
                  "--repl-realtime-transport", args.realtime_transport],
                 stdout=logf, stderr=logf,

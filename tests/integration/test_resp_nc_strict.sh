@@ -198,46 +198,46 @@ banner "RESP strict tests against $HOST:$PORT"
 
 # -------- Basic set/get/mod/del --------
 
-strict_expect "SET name alice" \
-'*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nalice\r\n' \
+strict_expect "HSET name alice" \
+'*3\r\n$4\r\nHSET\r\n$4\r\nname\r\n$5\r\nalice\r\n' \
 '+OK\r\n'
 
-strict_expect "GET name" \
-'*2\r\n$3\r\nGET\r\n$4\r\nname\r\n' \
+strict_expect "HGET name" \
+'*2\r\n$4\r\nHGET\r\n$4\r\nname\r\n' \
 '$5\r\nalice\r\n'
 
-strict_expect_one_of "EXIST name" \
-'*2\r\n$5\r\nEXIST\r\n$4\r\nname\r\n' \
+strict_expect_one_of "HEXIST name" \
+'*2\r\n$6\r\nHEXIST\r\n$4\r\nname\r\n' \
 ':1\r\n' \
 '+EXIST\r\n' \
 'EXIST\r\n'
 
-strict_expect "MOD name bob" \
-'*3\r\n$3\r\nMOD\r\n$4\r\nname\r\n$3\r\nbob\r\n' \
+strict_expect "HMOD name bob" \
+'*3\r\n$4\r\nHMOD\r\n$4\r\nname\r\n$3\r\nbob\r\n' \
 '+OK\r\n'
 
-strict_expect "GET name after MOD" \
-'*2\r\n$3\r\nGET\r\n$4\r\nname\r\n' \
+strict_expect "HGET name after HMOD" \
+'*2\r\n$4\r\nHGET\r\n$4\r\nname\r\n' \
 '$3\r\nbob\r\n'
 
 # -------- Complex key/value --------
 
 banner "Complex key/value"
 
-strict_expect "SET key with spaces" \
-'*3\r\n$3\r\nSET\r\n$11\r\nhello world\r\n$5\r\nvalue\r\n' \
+strict_expect "HSET key with spaces" \
+'*3\r\n$4\r\nHSET\r\n$11\r\nhello world\r\n$5\r\nvalue\r\n' \
 '+OK\r\n'
 
-strict_expect "GET key with spaces" \
-'*2\r\n$3\r\nGET\r\n$11\r\nhello world\r\n' \
+strict_expect "HGET key with spaces" \
+'*2\r\n$4\r\nHGET\r\n$11\r\nhello world\r\n' \
 '$5\r\nvalue\r\n'
 
-strict_expect "SET value with spaces" \
-'*3\r\n$3\r\nSET\r\n$8\r\nlong_key\r\n$16\r\nvalue with space\r\n' \
+strict_expect "HSET value with spaces" \
+'*3\r\n$4\r\nHSET\r\n$8\r\nlong_key\r\n$16\r\nvalue with space\r\n' \
 '+OK\r\n'
 
-strict_expect "GET value with spaces" \
-'*2\r\n$3\r\nGET\r\n$8\r\nlong_key\r\n' \
+strict_expect "HGET value with spaces" \
+'*2\r\n$4\r\nHGET\r\n$8\r\nlong_key\r\n' \
 '$16\r\nvalue with space\r\n'
 
 strict_expect "HSET JSON value" \
@@ -252,18 +252,18 @@ strict_expect "HGET JSON value" \
 
 banner "Pipeline / sticky packet"
 
-strict_expect "pipeline SET then GET" \
-'*3\r\n$3\r\nSET\r\n$4\r\npkey\r\n$4\r\npval\r\n*2\r\n$3\r\nGET\r\n$4\r\npkey\r\n' \
+strict_expect "pipeline HSET then HGET" \
+'*3\r\n$4\r\nHSET\r\n$4\r\npkey\r\n$4\r\npval\r\n*2\r\n$4\r\nHGET\r\n$4\r\npkey\r\n' \
 '+OK\r\n$4\r\npval\r\n'
 
-strict_expect_one_of "pipeline GET then EXIST" \
-'*2\r\n$3\r\nGET\r\n$4\r\npkey\r\n*2\r\n$5\r\nEXIST\r\n$4\r\npkey\r\n' \
+strict_expect_one_of "pipeline HGET then HEXIST" \
+'*2\r\n$4\r\nHGET\r\n$4\r\npkey\r\n*2\r\n$6\r\nHEXIST\r\n$4\r\npkey\r\n' \
 '$4\r\npval\r\n:1\r\n' \
 '$4\r\npval\r\n+EXIST\r\n' \
 '$4\r\npval\r\nEXIST\r\n'
 
-strict_expect_one_of "pipeline SET GET DEL" \
-'*3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n*2\r\n$3\r\nGET\r\n$2\r\nk3\r\n*2\r\n$3\r\nDEL\r\n$2\r\nk3\r\n' \
+strict_expect_one_of "pipeline HSET HGET HDEL" \
+'*3\r\n$4\r\nHSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n*2\r\n$4\r\nHGET\r\n$2\r\nk3\r\n*2\r\n$4\r\nHDEL\r\n$2\r\nk3\r\n' \
 '+OK\r\n$2\r\nv3\r\n+OK\r\n' \
 '+OK\r\n$2\r\nv3\r\nOK\r\n'
 
@@ -272,35 +272,35 @@ strict_expect_one_of "pipeline SET GET DEL" \
 banner "Half packet"
 
 strict_half_packet "half split in command token" \
-'*3\r\n$3\r\nSE' \
+'*3\r\n$4\r\nHSE' \
 'T\r\n$4\r\nhpk1\r\n$4\r\nval1\r\n' \
 '+OK\r\n'
 
-strict_expect "GET after half SET" \
-'*2\r\n$3\r\nGET\r\n$4\r\nhpk1\r\n' \
+strict_expect "HGET after half HSET" \
+'*2\r\n$4\r\nHGET\r\n$4\r\nhpk1\r\n' \
 '$4\r\nval1\r\n'
 
-strict_half_packet "half split GET command" \
-'*2\r\n$3\r\nG' \
+strict_half_packet "half split HGET command" \
+'*2\r\n$4\r\nHG' \
 'ET\r\n$4\r\nhpk1\r\n' \
 '$4\r\nval1\r\n'
 
 strict_half_packet "half packet plus pipeline" \
-'*3\r\n$3\r\nSET\r\n$4\r\nmix1\r\n$3\r\nva' \
-'l\r\n*2\r\n$3\r\nGET\r\n$4\r\nmix1\r\n' \
+'*3\r\n$4\r\nHSET\r\n$4\r\nmix1\r\n$3\r\nva' \
+'l\r\n*2\r\n$4\r\nHGET\r\n$4\r\nmix1\r\n' \
 '+OK\r\n$3\r\nval\r\n'
 
 # -------- Delete and miss --------
 
 banner "Delete / miss"
 
-strict_expect_one_of "DEL name" \
-'*2\r\n$3\r\nDEL\r\n$4\r\nname\r\n' \
+strict_expect_one_of "HDEL name" \
+'*2\r\n$4\r\nHDEL\r\n$4\r\nname\r\n' \
 '+OK\r\n' \
 'OK\r\n'
 
-strict_expect_one_of "GET deleted key" \
-'*2\r\n$3\r\nGET\r\n$4\r\nname\r\n' \
+strict_expect_one_of "HGET deleted key" \
+'*2\r\n$4\r\nHGET\r\n$4\r\nname\r\n' \
 '$-1\r\n' \
 'NO EXIST\r\n'
 
@@ -308,8 +308,8 @@ strict_expect_one_of "GET deleted key" \
 
 banner "Invalid request"
 
-strict_expect_one_of "wrong argc for SET" \
-'*1\r\n$3\r\nSET\r\n' \
+strict_expect_one_of "wrong argc for HSET" \
+'*1\r\n$4\r\nHSET\r\n' \
 '-ERR\r\n' \
 'ERROR\r\n' \
 '-ERR wrong number of arguments\r\n'

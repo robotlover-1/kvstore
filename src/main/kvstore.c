@@ -25,6 +25,7 @@ kv_config_t g_cfg = {
     .rdma_dev = "rxe0",
     .rdma_ib_port = 1,
     .rdma_gid_idx = 1,
+    .rdma_port = 0,
     .rdma_recv_slots = 32,
     .rdma_chunk_size = BUFFER_CAP / 4,
     .rdma_qp_wr_depth = 64,
@@ -210,6 +211,9 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rdma-gid-idx") && i + 1 < argc) {
             g_cfg.rdma_gid_idx = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--rdma-port") && i + 1 < argc) {
+            g_cfg.rdma_port = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--rdma-recv-slots") && i + 1 < argc) {
             g_cfg.rdma_recv_slots = atoi(argv[++i]);
         }
@@ -324,6 +328,7 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "rdma_dev")) snprintf(g_cfg.rdma_dev, sizeof(g_cfg.rdma_dev), "%s", value);
     else if (!strcmp(key, "rdma_ib_port")) g_cfg.rdma_ib_port = atoi(value);
     else if (!strcmp(key, "rdma_gid_idx")) g_cfg.rdma_gid_idx = atoi(value);
+    else if (!strcmp(key, "rdma_port")) g_cfg.rdma_port = atoi(value);
     else if (!strcmp(key, "rdma_recv_slots")) g_cfg.rdma_recv_slots = atoi(value);
     else if (!strcmp(key, "rdma_chunk_size")) g_cfg.rdma_chunk_size = atoi(value);
     else if (!strcmp(key, "rdma_qp_wr_depth")) g_cfg.rdma_qp_wr_depth = atoi(value);
@@ -953,7 +958,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         const char *req_replid = argc >= 2 ? argv[1] : "?";
         unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
         unsigned long long req_durable = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : req_offset;
-        int can_continue = (argc >= 3 && req_durable >= req_offset && repl_backlog_can_continue(req_replid, req_offset));
+        /* Use req_offset for backlog check (data the slave needs).
+         * req_durable may lag behind req_offset due to lazy AOF fsync,
+         * but that doesn't prevent partial resync since the master
+         * can replay from req_offset onward. */
+        int can_continue = (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset));
 #if KVS_ENABLE_RDMA
         fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
             req_replid, req_offset, req_durable, repl_backlog_start_offset(), repl_backlog_end_offset(), can_continue ? 1 : 0);
@@ -1969,7 +1978,7 @@ int kvs_dump_to_fd(int fd) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore_repl_sockmap] [--ebpf-redirect --ebpf-redirect-key 0] [--rdma-dev rxe0] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore_repl_sockmap] [--ebpf-redirect --ebpf-redirect-key 0] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

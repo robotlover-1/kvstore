@@ -194,7 +194,7 @@ def main() -> int:
 
     try:
         master = subprocess.Popen(
-            [args.bin, "--port", str(args.master_port), "--role", "master", "--dump", str(master_dump), "--aof", str(master_aof), "--repl-transport", "tcp"],
+            [args.bin, "--port", str(args.master_port), "--role", "master", "--dump", str(master_dump), "--aof", str(master_aof), "--repl-transport", "tcp", "--repl-fullsync-transport", "tcp", "--repl-realtime-transport", "tcp"],
             stdout=master_logf,
             stderr=master_logf,
             cwd=str(Path(args.bin).resolve().parent),
@@ -217,6 +217,8 @@ def main() -> int:
                 "--dump", str(slave_dump),
                 "--aof", str(slave_aof),
                 "--repl-transport", "tcp",
+                "--repl-fullsync-transport", "tcp",
+                "--repl-realtime-transport", "tcp",
             ],
             stdout=slave_logf,
             stderr=slave_logf,
@@ -267,6 +269,8 @@ def main() -> int:
                 "--dump", str(slave_dump),
                 "--aof", str(slave_aof),
                 "--repl-transport", "tcp",
+                "--repl-fullsync-transport", "tcp",
+                "--repl-realtime-transport", "tcp",
             ],
             stdout=slave_logf,
             stderr=slave_logf,

@@ -62,6 +62,29 @@ def wait_ready(host: str, port: int, retries: int = 80) -> None:
     raise RuntimeError(f"server {host}:{port} not ready")
 
 
+def kill_port(port: int) -> None:
+    """Kill any process listening on the given port to avoid stale processes
+    hijacking the test and writing AOF/dump to wrong paths."""
+    import shutil
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return
+    try:
+        result = subprocess.run(
+            [lsof, "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5)
+        for pid_str in result.stdout.strip().splitlines():
+            pid = int(pid_str.strip())
+            if pid <= 1:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception:
+        pass
+
+
 def stop_kill(proc: subprocess.Popen) -> None:
     if not proc or proc.poll() is not None:
         return
@@ -98,6 +121,10 @@ def main() -> int:
 
     bin_path = str(Path(args.bin).resolve())
     cwd = str(Path(args.bin).resolve().parent)
+
+    # Clean up any leftover process on the target port
+    kill_port(args.port)
+    time.sleep(0.5)
 
     # ---- Phase 1: Start server, insert 10w keys (AOF only, no SAVE) ----
     print("=" * 60)

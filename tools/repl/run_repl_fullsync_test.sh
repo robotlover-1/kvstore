@@ -13,6 +13,7 @@ SYNC_WAIT="${SYNC_WAIT:-8}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-3}"
 RESTART_WAIT="${RESTART_WAIT:-4}"
 INJECT_DELAY="${INJECT_DELAY:-0.2}"
+REPL_TRANSPORT="${REPL_TRANSPORT:-tcp}"
 
 MASTER_DIR="$BASE_DIR/master"
 SLAVE_DIR="$BASE_DIR/slave"
@@ -226,6 +227,9 @@ blue "starting master on :$MASTER_PORT"
 "$BIN" \
   --port "$MASTER_PORT" \
   --role master \
+  --repl-transport "$REPL_TRANSPORT" \
+  --repl-fullsync-transport "$REPL_TRANSPORT" \
+  --repl-realtime-transport "$REPL_TRANSPORT" \
   --dump "$MASTER_DUMP" \
   --aof "$MASTER_AOF" \
   >"$MASTER_LOG" 2>&1 &
@@ -259,6 +263,9 @@ blue "starting slave on :$SLAVE_PORT"
 "$BIN" \
   --port "$SLAVE_PORT" \
   --role slave \
+  --repl-transport "$REPL_TRANSPORT" \
+  --repl-fullsync-transport "$REPL_TRANSPORT" \
+  --repl-realtime-transport "$REPL_TRANSPORT" \
   --master-host 127.0.0.1 \
   --master-port "$MASTER_PORT" \
   --dump "$SLAVE_DUMP" \
@@ -387,6 +394,9 @@ blue "restarting slave on :$SLAVE_PORT"
 "$BIN" \
   --port "$SLAVE_PORT" \
   --role slave \
+  --repl-transport "$REPL_TRANSPORT" \
+  --repl-fullsync-transport "$REPL_TRANSPORT" \
+  --repl-realtime-transport "$REPL_TRANSPORT" \
   --master-host 127.0.0.1 \
   --master-port "$MASTER_PORT" \
   --dump "$SLAVE_DUMP" \

@@ -87,7 +87,7 @@ def wait_value(host: str, port: int, key: str, expect: str, retries: int = 80):
     last = b""
     for _ in range(retries):
         try:
-            last = req(host, port, "GET", key)
+            last = req(host, port, "HGET", key)
             if expect in last.decode(errors="ignore"):
                 return last
         except Exception:
@@ -135,7 +135,7 @@ def wait_value_with_grace(host: str, port: int, key: str, expect: str, fast_retr
     last_text = first_text
     while time.monotonic() < deadline:
         time.sleep(0.25)
-        cur = req(host, port, "GET", key).decode(errors="ignore")
+        cur = req(host, port, "HGET", key).decode(errors="ignore")
         last_text = cur
         if expect in cur:
             return True, cur
@@ -191,6 +191,10 @@ def start_slave(args, cwd, slog, slave_dump, slave_aof):
         str(slave_aof),
         "--repl-transport",
         "rdma",
+        "--repl-fullsync-transport",
+        "rdma",
+        "--repl-realtime-transport",
+        "tcp",
     ]
     if args.rdma_recv_slots > 0:
         cmd.extend(["--rdma-recv-slots", str(args.rdma_recv_slots)])
@@ -208,11 +212,11 @@ def start_slave(args, cwd, slog, slave_dump, slave_aof):
 
 
 def set_value(host: str, port: int, key: str, value: str) -> bytes:
-    return req(host, port, "SET", key, value)
+    return req(host, port, "HSET", key, value)
 
 
 def get_value_text(host: str, port: int, key: str) -> str:
-    return req(host, port, "GET", key).decode(errors="ignore")
+    return req(host, port, "HGET", key).decode(errors="ignore")
 
 
 def get_effective_tunable(value: int, default: int) -> int:
@@ -224,7 +228,7 @@ def main() -> int:
     ap.add_argument("--bin", default="./kvstore")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--master-port", type=int, default=5230)
-    ap.add_argument("--slave-port", type=int, default=5231)
+    ap.add_argument("--slave-port", type=int, default=5232)
     ap.add_argument("--wait", type=float, default=4.0)
     ap.add_argument("--work-dir", default="./artifacts/repl/rdma-stress")
     ap.add_argument("--preload", type=int, default=128)
@@ -239,6 +243,7 @@ def main() -> int:
     ap.add_argument("--allow-soak-failure", action="store_true")
     ap.add_argument("--ebpf", action="store_true")
     ap.add_argument("--force-fallback", action="store_true")
+    ap.add_argument("--rdma-dev", default="rxe0")
     args = ap.parse_args()
 
     root = Path(args.work_dir).resolve()
@@ -343,6 +348,12 @@ def main() -> int:
                 str(master_aof),
                 "--repl-transport",
                 "rdma",
+                "--repl-fullsync-transport",
+                "rdma",
+                "--repl-realtime-transport",
+                "tcp",
+                "--rdma-dev",
+                args.rdma_dev,
             ]
             + (["--rdma-recv-slots", str(args.rdma_recv_slots)] if args.rdma_recv_slots > 0 else [])
             + (["--rdma-chunk-size", str(args.rdma_chunk_size)] if args.rdma_chunk_size > 0 else [])

@@ -40,6 +40,47 @@ def req(host: str, port: int, *args: str) -> bytes:
     return b"".join(chunks)
 
 
+class PersistentConn:
+    """长连接：批量操作复用一个 TCP 连接，避免 TIME_WAIT 端口耗尽"""
+    def __init__(self, host: str, port: int, timeout: float = 5.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._sock: socket.socket | None = None
+
+    def _ensure(self) -> socket.socket:
+        if self._sock is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(self.timeout)
+            s.connect((self.host, self.port))
+            self._sock = s
+        return self._sock
+
+    def cmd(self, *args: str) -> bytes:
+        sock = self._ensure()
+        sock.sendall(build_resp(*args))
+        chunks = []
+        try:
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                if len(data) < 65536:
+                    break
+        except socket.timeout:
+            pass
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+
 def wait_ready(host: str, port: int, retries: int = 60) -> None:
     for _ in range(retries):
         try:
@@ -48,6 +89,27 @@ def wait_ready(host: str, port: int, retries: int = 60) -> None:
         except Exception:
             time.sleep(0.2)
     raise RuntimeError("server not ready")
+
+
+def kill_port(port: int) -> None:
+    import shutil
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return
+    try:
+        result = subprocess.run(
+            [lsof, "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5)
+        for pid_str in result.stdout.strip().splitlines():
+            pid = int(pid_str.strip())
+            if pid <= 1:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception:
+        pass
 
 
 def stop_proc(proc: subprocess.Popen) -> None:
@@ -90,6 +152,9 @@ def main() -> int:
         if p.exists():
             p.unlink()
 
+    kill_port(args.port)
+    time.sleep(0.5)
+
     logf = open(log_path, "ab")
     proc = subprocess.Popen(
         [args.bin, "--port", str(args.port), "--dump", str(dump_path), "--aof", str(aof_path), "--appendfsync", args.appendfsync],
@@ -102,10 +167,14 @@ def main() -> int:
     try:
         wait_ready(args.host, args.port)
 
+        pc = PersistentConn(args.host, args.port)
         t0 = time.perf_counter()
-        for i in range(args.count):
-            if req(args.host, args.port, "SET", f"bench:key:{i}", f"value:{i}") != b"+OK\r\n":
-                raise RuntimeError(f"SET failed at {i}")
+        try:
+            for i in range(args.count):
+                if pc.cmd("HSET", f"bench:key:{i}", f"value:{i}") != b"+OK\r\n":
+                    raise RuntimeError(f"HSET failed at {i}")
+        finally:
+            pc.close()
         t1 = time.perf_counter()
 
         save_resp = req(args.host, args.port, "SAVE")
@@ -132,7 +201,7 @@ def main() -> int:
         sample_idxs = [0, args.count // 2, max(0, args.count - 1)]
         for idx in sample_idxs:
             expected = f"$7\r\nvalue:{idx}\r\n".encode() if idx >= 10 else None
-            resp = req(args.host, args.port, "GET", f"bench:key:{idx}")
+            resp = req(args.host, args.port, "HGET", f"bench:key:{idx}")
             if f"value:{idx}".encode() not in resp:
                 raise RuntimeError(f"recovery mismatch for key {idx}: {resp!r}")
 

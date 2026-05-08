@@ -68,6 +68,27 @@ def stop_proc(proc: subprocess.Popen) -> None:
         pass
 
 
+def kill_port(port: int) -> None:
+    import shutil
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return
+    try:
+        result = subprocess.run(
+            [lsof, "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5)
+        for pid_str in result.stdout.strip().splitlines():
+            pid = int(pid_str.strip())
+            if pid <= 1:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception:
+        pass
+
+
 def parse_info(raw: bytes) -> dict:
     text = raw.decode(errors="ignore")
     out = {}
@@ -125,6 +146,9 @@ def main() -> int:
     for p in (dump_path, aof_path):
         if p.exists():
             p.unlink()
+
+    kill_port(args.port)
+    time.sleep(0.5)
 
     logf = open(log_path, "ab")
     proc = subprocess.Popen(

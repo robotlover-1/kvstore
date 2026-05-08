@@ -78,7 +78,7 @@ def wait_value(host: str, port: int, key: str, expect: str, retries: int = 50):
     last = b""
     for _ in range(retries):
         try:
-            last = req(host, port, "GET", key)
+            last = req(host, port, "HGET", key)
             if expect in last.decode(errors="ignore"):
                 return last
         except Exception:
@@ -111,7 +111,7 @@ def stop_proc(proc):
 
 def start_slave(args, cwd, slog, slave_dump, slave_aof):
     return subprocess.Popen(
-        [args.bin, "--port", str(args.slave_port), "--role", "slave", "--master-host", args.host, "--master-port", str(args.master_port), "--dump", str(slave_dump), "--aof", str(slave_aof), "--repl-transport", "rdma"],
+        [args.bin, "--port", str(args.slave_port), "--role", "slave", "--master-host", args.host, "--master-port", str(args.master_port), "--dump", str(slave_dump), "--aof", str(slave_aof), "--repl-transport", "rdma", "--repl-fullsync-transport", "rdma", "--repl-realtime-transport", "tcp", "--rdma-dev", args.rdma_dev],
         stdout=slog,
         stderr=slog,
         cwd=str(cwd),
@@ -122,10 +122,11 @@ def start_slave(args, cwd, slog, slave_dump, slave_aof):
 def main() -> int:
     ap = argparse.ArgumentParser(description="RDMA replication smoke helper for stage 9.3")
     ap.add_argument("--bin", default="./kvstore")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="192.168.233.128")
     ap.add_argument("--master-port", type=int, default=5220)
-    ap.add_argument("--slave-port", type=int, default=5221)
+    ap.add_argument("--slave-port", type=int, default=5222)
     ap.add_argument("--wait", type=float, default=4.0)
+    ap.add_argument("--rdma-dev", default="rxe0")
     ap.add_argument("--work-dir", default="./artifacts/repl/rdma-smoke")
     args = ap.parse_args()
 
@@ -163,26 +164,26 @@ def main() -> int:
     slog = open(slave_log, "ab")
     try:
         master = subprocess.Popen(
-            [args.bin, "--port", str(args.master_port), "--role", "master", "--master-host", args.host, "--dump", str(master_dump), "--aof", str(master_aof), "--repl-transport", "rdma"],
+            [args.bin, "--port", str(args.master_port), "--role", "master", "--master-host", args.host, "--dump", str(master_dump), "--aof", str(master_aof), "--repl-transport", "rdma", "--repl-fullsync-transport", "rdma", "--repl-realtime-transport", "tcp", "--rdma-dev", args.rdma_dev],
             stdout=mlog,
             stderr=mlog,
             cwd=str(cwd),
             preexec_fn=os.setsid,
         )
         wait_ready(args.host, args.master_port)
-        req(args.host, args.master_port, "SET", "rdma:smoke:key", "rdma-smoke-value")
+        req(args.host, args.master_port, "HSET", "rdma:smoke:key", "rdma-smoke-value")
 
         slave = start_slave(args, cwd, slog, slave_dump, slave_aof)
         wait_ready(args.host, args.slave_port)
         time.sleep(args.wait)
 
         info = wait_fullsync_done(args.host, args.slave_port)
-        slave_value = req(args.host, args.slave_port, "GET", "rdma:smoke:key")
+        slave_value = req(args.host, args.slave_port, "HGET", "rdma:smoke:key")
         slave_value_text = slave_value.decode(errors="ignore").replace("\r", "\\r").replace("\n", "\\n")
         fullsync_done = info.get("slave_fullsync_loading", "missing") == "0"
         replicated_ok = "rdma-smoke-value" in slave_value.decode(errors="ignore")
 
-        req(args.host, args.master_port, "SET", "rdma:postsync:key", "rdma-postsync-value")
+        req(args.host, args.master_port, "HSET", "rdma:postsync:key", "rdma-postsync-value")
         postsync_value = wait_value(args.host, args.slave_port, "rdma:postsync:key", "rdma-postsync-value")
         postsync_value_text = postsync_value.decode(errors="ignore").replace("\r", "\\r").replace("\n", "\\n")
         postsync_ok = "rdma-postsync-value" in postsync_value.decode(errors="ignore")
@@ -190,7 +191,7 @@ def main() -> int:
         stop_proc(slave)
         slave = None
         time.sleep(1.0)
-        req(args.host, args.master_port, "SET", "rdma:resume:key", "rdma-resume-value")
+        req(args.host, args.master_port, "HSET", "rdma:resume:key", "rdma-resume-value")
 
         slave = start_slave(args, cwd, slog, slave_dump, slave_aof)
         wait_ready(args.host, args.slave_port)

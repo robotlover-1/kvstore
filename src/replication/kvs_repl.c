@@ -1375,10 +1375,7 @@ void repl_slave_note_applied(size_t rawlen) {
 void repl_slave_note_durable(size_t rawlen) {
     (void)rawlen;
     if (g_slave_loading_fullsync) {
-#if KVS_ENABLE_RDMA
-        fprintf(stderr, "repl rdma: slave_durable - defer ack during fullsync applied=%llu durable=%llu\n",
-            g_slave_repl_applied_offset, g_slave_repl_durable_offset);
-#endif
+        repl_slave_send_ack();
         return;
     }
     if (g_slave_repl_durable_offset < g_slave_repl_applied_offset) {

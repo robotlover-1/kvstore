@@ -1617,6 +1617,7 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         unsigned long long durable_start = repl_slave_durable_offset();
                         if (continue_end < continue_start) continue_end = continue_start;
                         repl_slave_set_sync_state(argv[1], continue_start, durable_start, 0, 0);
+                        repl_slave_send_ack();
 #if KVS_ENABLE_RDMA
                         fprintf(stderr, "repl rdma: slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu\n", argv[1], continue_start, durable_start, continue_end);
 #endif

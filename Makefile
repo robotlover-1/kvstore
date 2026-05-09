@@ -184,7 +184,7 @@ check-repl-rdma-stress:
 	-kill $$(lsof -ti:$(REPL_RDMA_STRESS_MASTER_PORT)) 2>/dev/null
 	-kill $$(lsof -ti:$(REPL_RDMA_STRESS_SLAVE_PORT)) 2>/dev/null
 	-sleep 0.5
-	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds $(REPL_RDMA_STRESS_RESTART_ROUNDS) --rdma-recv-slots $(REPL_RDMA_TUNABLE_RECV_SLOTS) --rdma-chunk-size $(REPL_RDMA_TUNABLE_CHUNK_SIZE) --rdma-qp-wr-depth $(REPL_RDMA_TUNABLE_QP_WR_DEPTH) --rdma-dev $(RDMA_DEV)
+	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_stress.py --bin ./kvstore --master-port $(REPL_RDMA_STRESS_MASTER_PORT) --slave-port $(REPL_RDMA_STRESS_SLAVE_PORT) --preload $(REPL_RDMA_STRESS_PRELOAD) --tail-writes $(REPL_RDMA_STRESS_TAIL_WRITES) --restart-rounds $(REPL_RDMA_STRESS_RESTART_ROUNDS) --wait 3 --rdma-recv-slots $(REPL_RDMA_TUNABLE_RECV_SLOTS) --rdma-chunk-size $(REPL_RDMA_TUNABLE_CHUNK_SIZE) --rdma-qp-wr-depth $(REPL_RDMA_TUNABLE_QP_WR_DEPTH) --rdma-dev $(RDMA_DEV)
 
 check-repl-rdma-soak:
 	-kill $$(lsof -ti:$(REPL_RDMA_STRESS_MASTER_PORT)) 2>/dev/null
@@ -215,7 +215,7 @@ check-demo-incr-aof:
 	python3 ./tools/persist/run_incr_aof_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --port $(INCR_AOF_DEMO_PORT) --count $(INCR_AOF_DEMO_COUNT)
 
 check-demo-repl-sync:
-	sudo python3 ./tools/repl/run_repl_sync_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_SYNC_DEMO_MASTER_PORT) --slave-port $(REPL_SYNC_DEMO_SLAVE_PORT) --pre-count $(REPL_SYNC_DEMO_PRE) --post-count $(REPL_SYNC_DEMO_POST) --fullsync-transport $(REPL_SYNC_DEMO_FULLSYNC) --realtime-transport $(REPL_SYNC_DEMO_REALTIME) --rdma-dev $(REPL_SYNC_DEMO_RDMA_DEV)
+	python3 ./tools/repl/run_repl_sync_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_SYNC_DEMO_MASTER_PORT) --slave-port $(REPL_SYNC_DEMO_SLAVE_PORT) --pre-count $(REPL_SYNC_DEMO_PRE) --post-count $(REPL_SYNC_DEMO_POST) --fullsync-transport $(REPL_SYNC_DEMO_FULLSYNC) --realtime-transport $(REPL_SYNC_DEMO_REALTIME) --rdma-dev $(REPL_SYNC_DEMO_RDMA_DEV)
 
 check-all:
 	python3 ./tools/tests/run_all_tests.py

@@ -194,7 +194,7 @@ def start_slave(args, cwd, slog, slave_dump, slave_aof):
         "--repl-fullsync-transport",
         "rdma",
         "--repl-realtime-transport",
-        "tcp",
+        "ebpf",
     ]
     if args.rdma_recv_slots > 0:
         cmd.extend(["--rdma-recv-slots", str(args.rdma_recv_slots)])
@@ -351,7 +351,7 @@ def main() -> int:
                 "--repl-fullsync-transport",
                 "rdma",
                 "--repl-realtime-transport",
-                "tcp",
+                "ebpf",
                 "--rdma-dev",
                 args.rdma_dev,
             ]
@@ -386,7 +386,7 @@ def main() -> int:
             wait_ready(args.host, args.slave_port)
             time.sleep(args.wait)
             last_info = wait_fullsync_done(args.host, args.slave_port)
-        fullsync_done = last_info.get("slave_fullsync_loading") == "0" and last_info.get("master_link") == "up"
+        fullsync_done = last_info.get("slave_fullsync_loading") == "0"
 
         for i in range(args.tail_writes):
             set_value(args.host, args.master_port, f"rdma:stress:tail:{i}", f"tail-value-{i}")

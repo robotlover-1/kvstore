@@ -215,7 +215,7 @@ check-demo-incr-aof:
 	python3 ./tools/persist/run_incr_aof_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --port $(INCR_AOF_DEMO_PORT) --count $(INCR_AOF_DEMO_COUNT)
 
 check-demo-repl-sync:
-	python3 ./tools/repl/run_repl_sync_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_SYNC_DEMO_MASTER_PORT) --slave-port $(REPL_SYNC_DEMO_SLAVE_PORT) --pre-count $(REPL_SYNC_DEMO_PRE) --post-count $(REPL_SYNC_DEMO_POST) --fullsync-transport $(REPL_SYNC_DEMO_FULLSYNC) --realtime-transport $(REPL_SYNC_DEMO_REALTIME) --rdma-dev $(REPL_SYNC_DEMO_RDMA_DEV)
+	sudo python3 ./tools/repl/run_repl_sync_10w_demo.py --bin ./kvstore --host $(TEST_HOST) --master-port $(REPL_SYNC_DEMO_MASTER_PORT) --slave-port $(REPL_SYNC_DEMO_SLAVE_PORT) --pre-count $(REPL_SYNC_DEMO_PRE) --post-count $(REPL_SYNC_DEMO_POST) --fullsync-transport $(REPL_SYNC_DEMO_FULLSYNC) --realtime-transport $(REPL_SYNC_DEMO_REALTIME) --rdma-dev $(REPL_SYNC_DEMO_RDMA_DEV)
 
 check-all:
 	python3 ./tools/tests/run_all_tests.py

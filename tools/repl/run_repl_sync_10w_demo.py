@@ -276,6 +276,9 @@ def main() -> int:
         print(f"[Phase 3] Inserting {args.post_count} more keys to master (incremental sync)")
         print("=" * 60)
 
+        # Give slave a moment to finalize fullsync and establish realtime channel
+        time.sleep(1)
+
         post_count = args.post_count
         t2 = time.perf_counter()
         pc2 = PersistentConn(args.host, args.master_port)

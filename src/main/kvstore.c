@@ -1671,6 +1671,7 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
 
         while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
         if (p + 1 >= *len) break;
+        if (p - (pos + 1) >= 32) { pos = p + 2; continue; }
         char nbuf[32] = {0};
         memcpy(nbuf, buf + pos + 1, p - (pos + 1));
         int argc = atoi(nbuf);
@@ -1701,6 +1702,7 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                 incomplete = 1;
                 break;
             }
+            if (lp - (p + 1) >= 32) { malformed = 1; break; }
             char lbuf[32] = {0};
             memcpy(lbuf, buf + p + 1, lp - (p + 1));
             char *endp = NULL;

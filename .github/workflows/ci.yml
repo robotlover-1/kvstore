@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc make liburing-dev libbpf-dev libelf-dev clang
+
+    - name: Build (default)
+      run: |
+        make clean
+        make
+
+    - name: Build (no RDMA, no eBPF)
+      run: |
+        make clean
+        ENABLE_RDMA=0 ENABLE_EBPF=0 make
+
+    - name: Build test programs (if any)
+      run: |
+        make clean
+        make kvstore
+
+    - name: Build (with jemalloc available)
+      run: |
+        sudo apt-get install -y libjemalloc-dev || true
+        make clean
+        make

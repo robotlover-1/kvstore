@@ -276,8 +276,8 @@ def main() -> int:
         print(f"[Phase 3] Inserting {args.post_count} more keys to master (incremental sync)")
         print("=" * 60)
 
-        # Give slave a moment to finalize fullsync and establish realtime channel
-        time.sleep(1)
+        # Give slave time to finalize fullsync and settle RDMA/TCP connections
+        time.sleep(3)
 
         post_count = args.post_count
         t2 = time.perf_counter()
@@ -337,7 +337,11 @@ def main() -> int:
         for idx in pre_samples:
             key = f"pre:k:{idx:06d}"
             expected_val = f"v{idx}"
-            r = req(args.host, args.slave_port, "HGET", key)
+            for retry in range(5):
+                r = req(args.host, args.slave_port, "HGET", key)
+                if expected_val.encode() in r or f"${len(expected_val)}\r\n{expected_val}\r\n".encode() in r:
+                    break
+                time.sleep(1)
             if expected_val.encode() not in r and f"${len(expected_val)}\r\n{expected_val}\r\n".encode() not in r:
                 print(f"  FAIL [pre]: key={key} expected={expected_val!r} got={r!r}")
                 failed += 1
@@ -349,7 +353,11 @@ def main() -> int:
         for idx in post_samples:
             key = f"post:k:{idx:06d}"
             expected_val = f"v{pre_count + idx}"
-            r = req(args.host, args.slave_port, "HGET", key)
+            for retry in range(5):
+                r = req(args.host, args.slave_port, "HGET", key)
+                if expected_val.encode() in r or f"${len(expected_val)}\r\n{expected_val}\r\n".encode() in r:
+                    break
+                time.sleep(1)
             if expected_val.encode() not in r and f"${len(expected_val)}\r\n{expected_val}\r\n".encode() not in r:
                 print(f"  FAIL [post]: key={key} expected={expected_val!r} got={r!r}")
                 failed += 1

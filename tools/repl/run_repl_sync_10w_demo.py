@@ -277,7 +277,7 @@ def main() -> int:
         print("=" * 60)
 
         # Give slave time to finalize fullsync and settle RDMA/TCP connections
-        time.sleep(3)
+        time.sleep(5)
 
         post_count = args.post_count
         t2 = time.perf_counter()
@@ -302,7 +302,7 @@ def main() -> int:
 
         # Wait for incremental sync: poll slave offset until it catches up
         print("[Phase 3] Waiting for incremental sync to complete...")
-        max_wait = 30.0
+        max_wait = 120.0
         wait_start = time.perf_counter()
         caught_up = False
         while time.perf_counter() - wait_start < max_wait:

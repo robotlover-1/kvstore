@@ -194,6 +194,9 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ebpf-pin") && i + 1 < argc) {
             snprintf(g_cfg.ebpf_pin_path, sizeof(g_cfg.ebpf_pin_path), "%s", argv[++i]);
         }
+        else if (!strcmp(argv[i], "--ebpf-pin-path") && i + 1 < argc) {
+            snprintf(g_cfg.ebpf_pin_path, sizeof(g_cfg.ebpf_pin_path), "%s", argv[++i]);
+        }
         else if (!strcmp(argv[i], "--ebpf-redirect")) {
             g_cfg.ebpf_redirect = 1;
         }
@@ -1983,7 +1986,7 @@ int kvs_dump_to_fd(int fd) {
 
 int main(int argc, char **argv) {
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore_repl_sockmap] [--ebpf-redirect --ebpf-redirect-key 0] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--repl-fullsync-transport rdma] [--repl-realtime-transport ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore] [--ebpf-redirect --ebpf-redirect-key 0] [--ebpf-forward] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

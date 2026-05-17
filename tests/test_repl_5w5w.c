@@ -476,7 +476,6 @@ static int run_test(void) {
 
     int slave_ready = 0;
     struct timeval fs_begin, fs_end;
-    gettimeofday(&fs_begin, NULL);
 
     for (int i = 0; i < 300; i++) { /* 最多等 5 分钟 */
         char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
@@ -484,6 +483,7 @@ static int run_test(void) {
             char *role = info_field(info_s, "role");
             if (role && strcmp(role, "slave") == 0) {
                 slave_ready = 1;
+                gettimeofday(&fs_begin, NULL); /* 全量同步计时从 slave 连接开始 */
                 char *link = info_field(info_s, "master_link");
                 char *loading = info_field(info_s, "slave_fullsync_loading");
                 char *transport = info_field(info_s, "repl_transport_active");

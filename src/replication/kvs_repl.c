@@ -1357,6 +1357,20 @@ void repl_slave_finish_fullsync(void) {
 #if KVS_ENABLE_RDMA
     fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
+    /* 全量同步完成后，将当前内存数据保存到 dump 文件
+     * 格式与 kvs_dump_to_fd() 一致（二进制长度前缀格式）
+     * 后续增量数据通过 AOF 持续写入 */
+    int dump_fd = open(g_cfg.dump_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dump_fd >= 0) {
+        if (kvs_dump_to_fd(dump_fd) == 0) {
+            fprintf(stderr, "repl: slave fullsync dump saved to %s\n", g_cfg.dump_path);
+        } else {
+            fprintf(stderr, "repl: slave fullsync dump write failed\n");
+        }
+        close(dump_fd);
+    } else {
+        fprintf(stderr, "repl: slave fullsync dump open failed: %s\n", strerror(errno));
+    }
     repl_slave_state_save();
     repl_slave_send_ack();
 }

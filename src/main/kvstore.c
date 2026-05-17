@@ -1562,7 +1562,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!persist_recover_in_progress()) {
                 repl_log_applied_command(cmd, argc, argv, rawlen);
             }
-            if (g_cfg.role == ROLE_SLAVE && !persist_recover_in_progress()) {
+            if (g_cfg.role == ROLE_SLAVE && !persist_recover_in_progress()
+                && !repl_slave_loading_fullsync()) {
+                /* 全量同步期间不写 AOF（数据保存在 dump 文件）
+                 * 增量同步期间写入 AOF 用于持久化 */
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
                 repl_slave_note_durable(rawlen);

@@ -158,7 +158,7 @@ static unsigned char *recv_resp(int fd, size_t *out_len) {
             if (!tmp) { free(buf); return NULL; }
             buf = tmp;
         }
-        struct timeval tv = {0, 200000}; /* 200ms timeout */
+        struct timeval tv = {10, 0}; /* 10s timeout (master may be busy with replication) */
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         ssize_t r = read(fd, buf + len, cap - len - 1);
         if (r <= 0) break;

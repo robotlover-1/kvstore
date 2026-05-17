@@ -730,7 +730,7 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
         pthread_mutex_unlock(&g_repl_rdma_send_lock);
         return -1;
     }
-    rc = repl_rdma_wait_cq_send_completion(1000);
+    rc = repl_rdma_wait_cq_send_completion(30000);
     pthread_mutex_unlock(&g_repl_rdma_send_lock);
     return rc;
 }
@@ -1101,8 +1101,9 @@ int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len) {
     if (rc == 0) {
         return 0;
     }
-    /* Fallback: try TCP on failure */
+    /* Fallback: try TCP on failure, and disable RDMA retry for this session */
     transport_log("%s failed, fallback to TCP", ops->name);
+    repl_transport_trigger_fallback("fullsync_send_fail", 3600000); /* 1h cooldown */
     rc = repl_transport_tcp_send(c, buf, len);
     if (rc == 0) return 0;
     return -1;

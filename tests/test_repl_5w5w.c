@@ -475,7 +475,7 @@ static int run_test(void) {
     printf("\n  等待 Slave 连接...\n");
 
     int slave_ready = 0;
-    struct timeval fs_begin, fs_end;
+    struct timeval fs_begin;
 
     for (int i = 0; i < 300; i++) { /* 最多等 5 分钟 */
         char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
@@ -487,14 +487,9 @@ static int run_test(void) {
                 char *link = info_field(info_s, "master_link");
                 char *loading = info_field(info_s, "slave_fullsync_loading");
                 char *transport = info_field(info_s, "repl_transport_active");
-                int loading_val = (int)parse_ull(loading);
                 printf("  Slave 已连接! master_link=%-5s  transport=%-12s  fullsync_loading=%s\n",
                        link ? link : "?", transport ? transport : "?",
                        loading ? loading : "?");
-                /* 如果全量同步已完成（loading=0），记录以便 Phase 3 正确显示 */
-                if (loading_val == 0) {
-                    gettimeofday(&fs_end, NULL);
-                }
                 free(transport);
                 free(link);
                 free(loading);
@@ -525,40 +520,15 @@ static int run_test(void) {
     printf("  全量同步进度:\n\n");
 
     int fullsync_done = 0;
+    int fullsync_started = 0;  /* 标记是否已检测到 FULLRESYNC（loading=1） */
+    int fullsync_checked_hget = 0; /* 是否已用 HGET 兜底检测过 */
     unsigned long long prev_slave_off = 0;
     double prev_full_time = 0;
     int fullsync_timeout = 600; /* 10 分钟 */
 
-    /* 检查是否全量同步已完成 */
-    char *first_info = get_info(g_opt.slave_host, g_opt.slave_port);
-    if (first_info) {
-        char *first_loading = info_field(first_info, "slave_fullsync_loading");
-        if (first_loading && strcmp(first_loading, "0") == 0) {
-            fullsync_done = 1;
-        }
-        free(first_loading);
-        free(first_info);
-    }
-
-    if (fullsync_done) {
-        double fs_elapsed = time_elapsed_diff(&fs_end, &fs_begin);
-        printf("  %s全量同步已完成 (%.1fs)%s\n", ANSI_GREEN, fs_elapsed, ANSI_RESET);
-        /* 获取全量同步信息 */
-        char *info = get_info(g_opt.master_host, g_opt.master_port);
-        if (info) {
-            char *snap = info_field(info, "repl_snapshot_bytes");
-            char *fc = info_field(info, "repl_fullsync_count");
-            printf("  Snapshot bytes: %s\n", snap ? snap : "?");
-            printf("  Fullsync count: %s\n", fc ? fc : "?");
-            free(snap);
-            free(fc);
-            free(info);
-        }
-        test_pass("全量同步完成 (%.1fs)", fs_elapsed);
-    } else {
-        /* 全量同步未完成，轮询直到完成 */
-        for (int i = 0; i < fullsync_timeout; i++) {
-            char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
+    /* 轮询直到全量同步完成 */
+    for (int i = 0; i < fullsync_timeout; i++) {
+        char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
         if (!info_s) { usleep(500000); continue; }
 
         char *loading_s = info_field(info_s, "slave_fullsync_loading");
@@ -579,6 +549,14 @@ static int run_test(void) {
             free(master_info);
         }
 
+        int loading = (int)parse_ull(loading_s);
+
+        /* 首次检测到 loading=1 表示全量同步已开始 */
+        if (loading && !fullsync_started) {
+            fullsync_started = 1;
+            progress_print("  全量同步已开始");
+        }
+
         /* 清除上次输出 */
         progress_clear();
 
@@ -587,9 +565,8 @@ static int run_test(void) {
             "  master_link=%-5s  transport=%-12s  offset=%llu",
             link_s ? link_s : "?", transport_s ? transport_s : "?", slave_off);
 
-        int loading = (int)parse_ull(loading_s);
-
-        if (loading) {
+        if (fullsync_started && loading) {
+            /* 全量同步进行中 */
             char bar[PROGRESS_BAR_WIDTH + 1];
             if (snapshot_bytes > 0) {
                 progress_bar((double)slave_off, (double)snapshot_bytes, bar, PROGRESS_BAR_WIDTH);
@@ -618,12 +595,38 @@ static int run_test(void) {
             }
             progress_print(line1);
             progress_print(line2);
+        } else if (fullsync_started && !loading) {
+            /* 全量同步刚完成 */
+            fullsync_done = 1;
+            progress_print(line1);
+            progress_print(ANSI_GREEN "  全量同步完成!" ANSI_RESET);
         } else {
-            /* 全量同步完成 */
-            if (loading_s) {
-                fullsync_done = 1;
+            /* 全量同步尚未开始 — 但若轮询超过 30s 且 loading 始终为 0，
+             * 可能全量同步已完成但 loading=1→0 被漏掉了。用 HGET 兜底验证。 */
+            if (!fullsync_checked_hget && i > 60) { /* 60×500ms = 30s */
+                int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
+                if (vfd >= 0) {
+                    char *r = cmd(vfd, "HGET", "pre:k:000000", NULL);
+                    if (r && strcmp(r, "$2\r\nv0\r\n") == 0) {
+                        free(r); close(vfd);
+                        fullsync_done = 1;
+                        fullsync_started = 1; /* 标记为已开始+已完成 */
+                        progress_clear();
+                        progress_print(line1);
+                        progress_print(ANSI_GREEN "  全量同步完成 (快速模式)" ANSI_RESET);
+                        break;
+                    }
+                    free(r); close(vfd);
+                }
+                fullsync_checked_hget = 1;
+            }
+            if (!fullsync_done) {
+                char line2[256];
+                snprintf(line2, sizeof(line2),
+                    "  %s等待全量同步开始...%s  offset=%llu",
+                    ANSI_YELLOW, ANSI_RESET, slave_off);
                 progress_print(line1);
-                progress_print(ANSI_GREEN "  全量同步完成!" ANSI_RESET);
+                progress_print(line2);
             }
         }
 
@@ -635,8 +638,7 @@ static int run_test(void) {
 
         if (fullsync_done) break;
         usleep((useconds_t)g_opt.poll_ms * 1000);
-        } /* end for */
-    } /* end else */
+    } /* end for */
     fflush(stdout);
 
     if (!fullsync_done) {
@@ -648,29 +650,26 @@ static int run_test(void) {
     double fs_elapsed = time_elapsed(&fs_begin);
     test_pass("全量同步完成 (%.1fs)", fs_elapsed);
 
-    /* 等待 slave 数据实际就绪（master 的 queue_snapshot 可能还在 reactor 中发送）
-     * 轮询 slave 直到能读到第一个预存 key */
-    printf("  等待 slave 数据就绪...\n");
-    int data_ready = 0;
-    for (int i = 0; i < 100; i++) {
+    /* 快速验证 slave 数据已就绪（全量同步完成后应该立即可用） */
+    printf("  验证 slave 数据...\n");
+    for (int retry = 0; retry < 5; retry++) {
         int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
-        if (vfd >= 0) {
-            char *r = cmd(vfd, "HGET", "pre:k:000000", NULL);
-            if (r && strcmp(r, "$2\r\nv0\r\n") == 0) {
-                data_ready = 1;
-                free(r);
-                close(vfd);
-                break;
-            }
+        if (vfd < 0) { usleep(500000); continue; }
+        char *r = cmd(vfd, "HGET", "pre:k:000000", NULL);
+        if (r && strcmp(r, "$2\r\nv0\r\n") == 0) {
             free(r);
             close(vfd);
+            printf("  %sslave 数据已就绪%s\n", ANSI_GREEN, ANSI_RESET);
+            break;
+        }
+        free(r);
+        close(vfd);
+        if (retry == 4) {
+            fprintf(stderr, ANSI_RED "  ✗ slave 数据验证失败\n" ANSI_RESET);
+            close(master_fd);
+            return 1;
         }
         usleep(500000);
-    }
-    if (!data_ready) {
-        fprintf(stderr, ANSI_RED "  ✗ slave 数据未就绪，继续执行\n" ANSI_RESET);
-    } else {
-        printf("  %sslave 数据已就绪%s\n", ANSI_GREEN, ANSI_RESET);
     }
 
     /* 获取全量同步信息 */
@@ -689,6 +688,15 @@ static int run_test(void) {
      * Phase 4: 增量数据写入 Master
      * ═══════════════════════════════════════════ */
     banner("Phase 4: 增量数据写入 Master");
+
+    /* master_fd 是 Phase 1 打开的连接，经过长时间的 RDMA 全量同步后
+     * 可能已不可用，关闭旧连接并重新建立新连接 */
+    close(master_fd);
+    master_fd = tcp_connect(g_opt.master_host, g_opt.master_port, 10000);
+    if (master_fd < 0) {
+        fprintf(stderr, ANSI_RED "ERROR: 无法重新连接 Master 进行增量写入\n" ANSI_RESET);
+        return 1;
+    }
 
     int post_count = g_opt.post_count;
     struct timeval t2, t3;

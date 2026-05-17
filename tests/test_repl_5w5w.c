@@ -161,27 +161,83 @@ static int send_all(int fd, const unsigned char *buf, size_t len) {
 }
 
 static unsigned char *recv_resp(int fd, size_t *out_len) {
-    /* Set a 10-second receive timeout so we don't hang if server is busy */
     struct timeval tv = {10, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    size_t cap = 4096;
+    size_t cap = 65536;
     size_t len = 0;
     unsigned char *buf = (unsigned char *)malloc(cap);
     if (!buf) return NULL;
-    while (len < BUFFER_SIZE) {
-        if (cap - len < 1024) {
-            cap *= 2;
-            unsigned char *tmp = (unsigned char *)realloc(buf, cap);
-            if (!tmp) { free(buf); return NULL; }
-            buf = tmp;
+
+    /* Read initial chunk */
+    ssize_t r = read(fd, buf, cap - 1);
+    if (r <= 0) { free(buf); return NULL; }
+    len = (size_t)r;
+    buf[len] = '\0';
+
+    if (buf[0] == '$') {
+        /* Bulk string: $<len>\r\n<data>\r\n */
+        if (buf[1] == '-') { *out_len = len; return buf; } /* $-1\r\n null bulk */
+        char *crlf = strstr((char *)buf, "\r\n");
+        if (crlf) {
+            long blen = strtol((char *)buf + 1, NULL, 10);
+            if (blen >= 0) {
+                size_t header_end = (size_t)(crlf - (char *)buf) + 2;
+                size_t total = header_end + (size_t)blen + 2;
+                while (len < total && len < cap - 1) {
+                    ssize_t n = read(fd, buf + len, cap - len - 1);
+                    if (n <= 0) break;
+                    len += (size_t)n;
+                }
+                buf[len] = '\0';
+            }
         }
-        ssize_t r = read(fd, buf + len, cap - len - 1);
-        if (r <= 0) break;
-        len += (size_t)r;
-        if (len >= 2 && buf[len - 1] == '\n' && buf[len - 2] == '\r') {
-            break;
+        *out_len = len;
+        return buf;
+    }
+
+    if (buf[0] == '*') {
+        /* Array - read more until we have complete content */
+        while (1) {
+            /* Simple heuristic: try to parse the array completely */
+            int count = atoi((char *)buf + 1);
+            int all_ok = 0;
+            if (count > 0 && count <= 1024) {
+                all_ok = 1;
+                const char *p = strstr((char *)buf, "\r\n");
+                if (!p) { all_ok = 0; }
+                else {
+                    p += 2;
+                    for (int j = 0; j < count; j++) {
+                        if (!p || *p != '$') { if (j == 0) all_ok = 0; break; }
+                        long blen = strtol(p + 1, NULL, 10);
+                        if (blen < 0) { const char *nl = strstr(p, "\r\n"); p = nl ? nl + 2 : NULL; continue; }
+                        const char *nl = strstr(p, "\r\n");
+                        if (!nl) { all_ok = 0; break; }
+                        nl += 2;
+                        p = nl + (size_t)blen;
+                        if ((size_t)(p - (char *)buf) > len) { all_ok = 0; break; }
+                        if (*p != '\r' || *(p+1) != '\n') { all_ok = 0; break; }
+                        p += 2;
+                    }
+                }
+            }
+            if (all_ok) break;
+            ssize_t n = read(fd, buf + len, cap - len - 1);
+            if (n <= 0) break;
+            len += (size_t)n;
+            buf[len] = '\0';
         }
+        *out_len = len;
+        return buf;
+    }
+
+    /* Simple/error/integer: read until \r\n */
+    while (len < cap - 1) {
+        if (buf[len - 1] == '\n' && buf[len - 2] == '\r') break;
+        ssize_t n = read(fd, buf + len, cap - len - 1);
+        if (n <= 0) break;
+        len += (size_t)n;
     }
     buf[len] = '\0';
     *out_len = len;
@@ -667,17 +723,7 @@ static int run_test(void) {
     struct timeval incr_begin;
     gettimeofday(&incr_begin, NULL);
 
-    /* 获取 master 当前 offset 作为追赶目标 */
-    char *master_info_init = get_info(g_opt.master_host, g_opt.master_port);
-    unsigned long long target_offset = 0;
-    if (master_info_init) {
-        char *mo = info_field(master_info_init, "master_repl_offset");
-        target_offset = parse_ull(mo);
-        free(mo);
-        printf("  Master target offset: %llu\n", target_offset);
-        free(master_info_init);
-    }
-
+    /* 监控增量同步进度 */
     for (int i = 0; i < incr_timeout; i++) {
         char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
         if (!info_s) { usleep(500000); continue; }
@@ -686,14 +732,33 @@ static int run_test(void) {
         char *transport_s = info_field(info_s, "repl_transport_active");
         char *slave_off_s = info_field(info_s, "slave_repl_offset");
         unsigned long long slave_off = parse_ull(slave_off_s);
+        char *slave_loading_s = info_field(info_s, "slave_fullsync_loading");
+        int slave_loading = (int)parse_ull(slave_loading_s);
+        free(slave_loading_s);
 
         /* 也获取 master 的最新 offset */
         char *master_info2 = get_info(g_opt.master_host, g_opt.master_port);
-        unsigned long long master_off = target_offset;
+        unsigned long long master_off = 0;
         if (master_info2) {
             char *mo = info_field(master_info2, "master_repl_offset");
-            if (mo) { master_off = parse_ull(mo); free(mo); }
+            if (mo) {
+                master_off = parse_ull(mo);
+                fprintf(stderr, "\n[DEBUG] master_repl_offset='%s' -> %llu\n", mo, master_off);
+                free(mo);
+            } else {
+                fprintf(stderr, "\n[DEBUG] info_field('master_repl_offset') returned NULL\n");
+                fprintf(stderr, "[DEBUG] master INFO first 500 bytes:\n");
+                for (int di = 0; di < 500 && master_info2[di]; di++) {
+                    char c = master_info2[di];
+                    if (c == '\r') fputs("\\r", stderr);
+                    else if (c == '\n') fputs("\\n\n", stderr);
+                    else putc(c, stderr);
+                }
+                putc('\n', stderr);
+            }
             free(master_info2);
+        } else {
+            fprintf(stderr, "\n[DEBUG] get_info(master) returned NULL!\n");
         }
 
         double now = time_elapsed(&incr_begin);
@@ -702,20 +767,27 @@ static int run_test(void) {
 
         char line1[256];
         snprintf(line1, sizeof(line1),
-            "  master_link=%-5s  transport=%-12s  master_offset=%llu  slave_offset=%llu",
+            "  master_link=%-5s  transport=%-12s  master_offset=%llu  slave_offset=%llu  loading=%d",
             link_s ? link_s : "?", transport_s ? transport_s : "?",
-            master_off, slave_off);
+            master_off, slave_off, slave_loading);
         progress_print(line1);
+
+        /* 如果 master 还没有 offset（重启等情况），等一会再刷新 */
+        if (master_off == 0) {
+            progress_print("  master_offset=0 — 等待 master 数据就绪...");
+            free(link_s);
+            free(transport_s);
+            free(slave_off_s);
+            free(info_s);
+            usleep((useconds_t)g_opt.poll_ms * 1000);
+            continue;
+        }
 
         long long remaining = (long long)master_off - (long long)slave_off;
         if (remaining < 0) remaining = 0;
 
         char bar[PROGRESS_BAR_WIDTH + 1];
-        if (master_off > 0) {
-            progress_bar((double)slave_off, (double)master_off, bar, PROGRESS_BAR_WIDTH);
-        } else {
-            snprintf(bar, sizeof(bar), "[ === 等待数据 === ]");
-        }
+        progress_bar((double)slave_off, (double)master_off, bar, PROGRESS_BAR_WIDTH);
 
         double speed = 0;
         if (prev_incr_time > 0 && now - prev_incr_time > 0) {

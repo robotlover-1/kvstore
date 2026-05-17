@@ -49,6 +49,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
+#include <fcntl.h>
 
 /* ---------- 常量 ---------- */
 #define BUFFER_SIZE 65536
@@ -88,27 +90,39 @@ static struct {
 
 /* ---------- TCP / RESP 工具 ---------- */
 
-static int tcp_connect(const char *host, int port) {
+static int tcp_connect(const char *host, int port, int timeout_ms) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    struct hostent *he = gethostbyname(host);
-    if (he) {
+    /* Try numeric IP first, then hostname */
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        struct hostent *he = gethostbyname(host);
+        if (!he) { close(fd); return -1; }
         memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-    } else {
-        addr.sin_addr.s_addr = inet_addr(host);
-        if (addr.sin_addr.s_addr == (in_addr_t)-1) {
-            close(fd);
-            return -1;
-        }
     }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return -1;
+
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc == 0) { fcntl(fd, F_SETFL, flags); return fd; }
+    if (rc < 0 && errno != EINPROGRESS) { close(fd); return -1; }
+
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+    rc = poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : 5000);
+    if (rc <= 0) { close(fd); return -1; }
+
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
+        close(fd); return -1;
     }
+
+    fcntl(fd, F_SETFL, flags);
     return fd;
 }
 
@@ -147,6 +161,10 @@ static int send_all(int fd, const unsigned char *buf, size_t len) {
 }
 
 static unsigned char *recv_resp(int fd, size_t *out_len) {
+    /* Set a 10-second receive timeout so we don't hang if server is busy */
+    struct timeval tv = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     size_t cap = 4096;
     size_t len = 0;
     unsigned char *buf = (unsigned char *)malloc(cap);
@@ -158,17 +176,10 @@ static unsigned char *recv_resp(int fd, size_t *out_len) {
             if (!tmp) { free(buf); return NULL; }
             buf = tmp;
         }
-        struct timeval tv = {10, 0}; /* 10s timeout (master may be busy with replication) */
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         ssize_t r = read(fd, buf + len, cap - len - 1);
         if (r <= 0) break;
         len += (size_t)r;
         if (len >= 2 && buf[len - 1] == '\n' && buf[len - 2] == '\r') {
-            /* Try to read more (for pipelined responses) */
-            struct timeval tv2 = {0, 50000}; /* 50ms */
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
-            ssize_t extra = read(fd, buf + len, cap - len - 1);
-            if (extra > 0) len += (size_t)extra;
             break;
         }
     }
@@ -207,7 +218,7 @@ static char *cmd(int fd, const char *arg0, ...) {
 /* ---------- INFO 解析 ---------- */
 
 static char *get_info(const char *host, int port) {
-    int fd = tcp_connect(host, port);
+    int fd = tcp_connect(host, port, 5000);
     if (fd < 0) return NULL;
     char *info = cmd(fd, "INFO", NULL);
     close(fd);
@@ -334,12 +345,15 @@ static int run_test(void) {
     int master_fd = -1;
 
     banner("Phase 1: 预存数据到 Master");
+    fflush(stdout);
 
-    master_fd = tcp_connect(g_opt.master_host, g_opt.master_port);
+    printf("  正在连接 Master %s:%d ...\n", g_opt.master_host, g_opt.master_port);
+    fflush(stdout);
+    master_fd = tcp_connect(g_opt.master_host, g_opt.master_port, 10000);
     if (master_fd < 0) {
         fprintf(stderr, ANSI_RED "ERROR:" ANSI_RESET
-                " 无法连接 Master %s:%d — 请先启动 Master\n",
-                g_opt.master_host, g_opt.master_port);
+                " 无法连接 Master %s:%d (errno=%d: %s) — 请先启动 Master\n",
+                g_opt.master_host, g_opt.master_port, errno, strerror(errno));
         return 1;
     }
 
@@ -716,7 +730,7 @@ static int run_test(void) {
     gettimeofday(&t4, NULL);
 
     /* 从 slave 侧打开一个连接用于验证 */
-    int slave_fd = tcp_connect(g_opt.slave_host, g_opt.slave_port);
+    int slave_fd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 10000);
     if (slave_fd < 0) {
         fprintf(stderr, ANSI_RED "ERROR:" ANSI_RESET " 无法连接 Slave %s:%d\n",
                 g_opt.slave_host, g_opt.slave_port);
@@ -865,7 +879,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf(ANSI_BOLD "主从同步 5w+5w 测试用例\n" ANSI_RESET);
+    printf(ANSI_BOLD "主从同步 5w+5w 测试用例 (" __DATE__ " " __TIME__ ")\n" ANSI_RESET);
     printf("  Master: %s:%d\n", g_opt.master_host, g_opt.master_port);
     printf("  Slave:  %s:%d\n", g_opt.slave_host, g_opt.slave_port);
     printf("  Pre:    %d\n", g_opt.pre_count);

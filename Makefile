@@ -130,7 +130,7 @@ check-kvstore: $(TEST_KVSTORE_BIN)
 
 # ---- 5w+5w 主从同步测试 ----
 TEST_REPL_5W5W_SRC=tests/test_repl_5w5w.c
-TEST_REPL_5W5W_BIN=test_repl_5w5w
+TEST_REPL_5W5W_BIN=tests/test_repl_5w5w
 
 $(TEST_REPL_5W5W_BIN): $(TEST_REPL_5W5W_SRC) $(INC_DIR)/kvstore.h
 	$(CC) $(CFLAGS) -o $@ $<

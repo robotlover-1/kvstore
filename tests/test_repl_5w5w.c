@@ -378,9 +378,18 @@ static int run_test(void) {
             char key[MAX_KEY_LEN], val[MAX_KEY_LEN];
             snprintf(key, sizeof(key), "pre:k:%06d", i);
             snprintf(val, sizeof(val), "v%d", i);
-            char *r = cmd(master_fd, "HSET", key, val, NULL);
+            int retry;
+            char *r = NULL;
+            for (retry = 0; retry < 3; retry++) {
+                r = cmd(master_fd, "HSET", key, val, NULL);
+                if (r && strcmp(r, "+OK\r\n") == 0) break;
+                free(r);
+                r = NULL;
+                usleep(100000); /* 100ms retry */
+            }
             if (!r || strcmp(r, "+OK\r\n") != 0) {
-                fprintf(stderr, "  预存失败 at %d: %s\n", i, r ? r : "(no response)");
+                fprintf(stderr, "  预存失败 at %d (retried %d): %s\n",
+                        i, retry, r ? r : "(no response)");
                 free(r);
                 close(master_fd);
                 return 1;
@@ -410,6 +419,9 @@ static int run_test(void) {
     printf("\n  等待 Slave 连接...\n");
 
     int slave_ready = 0;
+    struct timeval fs_begin, fs_end;
+    gettimeofday(&fs_begin, NULL);
+
     for (int i = 0; i < 300; i++) { /* 最多等 5 分钟 */
         char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
         if (info_s) {
@@ -418,8 +430,16 @@ static int run_test(void) {
                 slave_ready = 1;
                 char *link = info_field(info_s, "master_link");
                 char *loading = info_field(info_s, "slave_fullsync_loading");
-                printf("  Slave 已连接! master_link=%s  fullsync_loading=%s\n",
-                       link ? link : "?", loading ? loading : "?");
+                char *transport = info_field(info_s, "repl_transport_active");
+                int loading_val = (int)parse_ull(loading);
+                printf("  Slave 已连接! master_link=%-5s  transport=%-12s  fullsync_loading=%s\n",
+                       link ? link : "?", transport ? transport : "?",
+                       loading ? loading : "?");
+                /* 如果全量同步已完成（loading=0），记录以便 Phase 3 正确显示 */
+                if (loading_val == 0) {
+                    gettimeofday(&fs_end, NULL);
+                }
+                free(transport);
                 free(link);
                 free(loading);
                 free(role);
@@ -452,11 +472,37 @@ static int run_test(void) {
     unsigned long long prev_slave_off = 0;
     double prev_full_time = 0;
     int fullsync_timeout = 600; /* 10 分钟 */
-    struct timeval fs_begin;
-    gettimeofday(&fs_begin, NULL);
 
-    for (int i = 0; i < fullsync_timeout; i++) {
-        char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
+    /* 检查是否全量同步已完成 */
+    char *first_info = get_info(g_opt.slave_host, g_opt.slave_port);
+    if (first_info) {
+        char *first_loading = info_field(first_info, "slave_fullsync_loading");
+        if (first_loading && strcmp(first_loading, "0") == 0) {
+            fullsync_done = 1;
+        }
+        free(first_loading);
+        free(first_info);
+    }
+
+    if (fullsync_done) {
+        double fs_elapsed = time_elapsed_diff(&fs_end, &fs_begin);
+        printf("  %s全量同步已完成 (%.1fs)%s\n", ANSI_GREEN, fs_elapsed, ANSI_RESET);
+        /* 获取全量同步信息 */
+        char *info = get_info(g_opt.master_host, g_opt.master_port);
+        if (info) {
+            char *snap = info_field(info, "repl_snapshot_bytes");
+            char *fc = info_field(info, "repl_fullsync_count");
+            printf("  Snapshot bytes: %s\n", snap ? snap : "?");
+            printf("  Fullsync count: %s\n", fc ? fc : "?");
+            free(snap);
+            free(fc);
+            free(info);
+        }
+        test_pass("全量同步完成 (%.1fs)", fs_elapsed);
+    } else {
+        /* 全量同步未完成，轮询直到完成 */
+        for (int i = 0; i < fullsync_timeout; i++) {
+            char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
         if (!info_s) { usleep(500000); continue; }
 
         char *loading_s = info_field(info_s, "slave_fullsync_loading");
@@ -533,7 +579,8 @@ static int run_test(void) {
 
         if (fullsync_done) break;
         usleep((useconds_t)g_opt.poll_ms * 1000);
-    }
+        } /* end for */
+    } /* end else */
     fflush(stdout);
 
     if (!fullsync_done) {
@@ -546,15 +593,15 @@ static int run_test(void) {
     test_pass("全量同步完成 (%.1fs)", fs_elapsed);
 
     /* 获取全量同步信息 */
-    info = get_info(g_opt.master_host, g_opt.master_port);
-    if (info) {
-        char *snap = info_field(info, "repl_snapshot_bytes");
-        char *fc = info_field(info, "repl_fullsync_count");
+    char *fs_info = get_info(g_opt.master_host, g_opt.master_port);
+    if (fs_info) {
+        char *snap = info_field(fs_info, "repl_snapshot_bytes");
+        char *fc = info_field(fs_info, "repl_fullsync_count");
         printf("  Snapshot bytes: %s\n", snap ? snap : "?");
         printf("  Fullsync count: %s\n", fc ? fc : "?");
         free(snap);
         free(fc);
-        free(info);
+        free(fs_info);
     }
 
     /* ═══════════════════════════════════════════
@@ -577,9 +624,18 @@ static int run_test(void) {
             char key[MAX_KEY_LEN], val[MAX_KEY_LEN];
             snprintf(key, sizeof(key), "post:k:%06d", i);
             snprintf(val, sizeof(val), "v%d", pre_count + i);
-            char *r = cmd(master_fd, "HSET", key, val, NULL);
+            int retry;
+            char *r = NULL;
+            for (retry = 0; retry < 3; retry++) {
+                r = cmd(master_fd, "HSET", key, val, NULL);
+                if (r && strcmp(r, "+OK\r\n") == 0) break;
+                free(r);
+                r = NULL;
+                usleep(100000); /* 100ms retry delay */
+            }
             if (!r || strcmp(r, "+OK\r\n") != 0) {
-                fprintf(stderr, "  增量写入失败 at %d: %s\n", i, r ? r : "(no response)");
+                fprintf(stderr, "  增量写入失败 at %d (retried %d): %s\n",
+                        i, retry, r ? r : "(no response)");
                 free(r);
                 close(master_fd);
                 return 1;

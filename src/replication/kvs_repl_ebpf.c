@@ -157,12 +157,9 @@ static int repl_ebpf_load_object(void) {
     int sk_msg_fd;
     int rc;
     if (g_repl_ebpf_obj) return 0;
-    if (!g_cfg.ebpf_obj_path[0]) {
-        repl_ebpf_set_error("missing_obj_path", EINVAL);
-        return -1;
-    }
-    repl_ebpf_raise_memlock();
-    /* 无论 master/slave，优先尝试连接已存在的 pinned maps（由独立 eBPF 进程挂载） */
+
+    /* 优先尝试连接已存在的 pinned maps（由独立 eBPF 守护进程挂载）
+     * 这不需要 ebpf_obj_path，因此放在 obj_path 检查之前 */
     if (g_cfg.ebpf_pin_path[0]) {
         int opened = 0;
         for (int i = 0; i < 50; ++i) {
@@ -184,6 +181,12 @@ static int repl_ebpf_load_object(void) {
         /* pinned maps 不可用，继续尝试直接加载 */
         repl_ebpf_set_error("open_pinned_maps", errno ? errno : ENOENT);
     }
+
+    if (!g_cfg.ebpf_obj_path[0]) {
+        repl_ebpf_set_error("missing_obj_path", EINVAL);
+        return -1;
+    }
+    repl_ebpf_raise_memlock();
     repl_ebpf_enable_libbpf_log();
     g_repl_ebpf_obj = bpf_object__open_file(g_cfg.ebpf_obj_path, NULL);
     if (libbpf_get_error(g_repl_ebpf_obj)) {

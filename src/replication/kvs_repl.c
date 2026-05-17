@@ -632,6 +632,7 @@ static int repl_rdma_wait_cq_send_completion(int timeout_ms) {
         }
         if (kvs_now_ms() >= deadline) {
             repl_rdma_drain_cm_events_nonblock();
+            g_repl_rdma_ctx.connected = 0;
             repl_rdma_log("send_cq", "poll timeout or error");
             return -1;
         }

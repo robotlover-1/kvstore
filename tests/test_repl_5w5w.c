@@ -747,8 +747,10 @@ static int run_test(void) {
     printf("  增量同步进度:\n\n");
 
     int caught_up = 0;
-    int incr_timeout = 300; /* 5 分钟 */
+    int incr_timeout = 600; /* 10 分钟 */
     struct timeval incr_begin;
+    unsigned long long prev_slave_off_incr = 0;
+    double prev_incr_time = 0;
     gettimeofday(&incr_begin, NULL);
 
     /* 监控增量同步进度 */
@@ -775,12 +777,36 @@ static int run_test(void) {
 
         progress_clear();
 
+        double now = time_elapsed(&incr_begin);
+        double delta = (double)(master_off > slave_off ? master_off - slave_off : 0);
+        double speed = 0;
+        if (prev_incr_time > 0 && now - prev_incr_time > 0) {
+            speed = (double)(slave_off - prev_slave_off_incr) / (now - prev_incr_time);
+        }
+        prev_slave_off_incr = slave_off;
+        prev_incr_time = now;
+
         char line1[256];
         snprintf(line1, sizeof(line1),
             "  master_link=%-5s  transport=%-12s  master_offset=%llu  slave_offset=%llu  loading=%d",
             link_s ? link_s : "?", transport_s ? transport_s : "?",
             master_off, slave_off, slave_loading);
         progress_print(line1);
+
+        char line2[256];
+        if (delta > 0) {
+            double eta = speed > 0 ? delta / speed : 0;
+            snprintf(line2, sizeof(line2),
+                "  %s追赶中...%s  落后 %s  (%s/s  ETA %.0fs)",
+                ANSI_YELLOW, ANSI_RESET,
+                fmt_bytes((unsigned long long)delta),
+                fmt_bytes((unsigned long long)speed), eta);
+        } else {
+            snprintf(line2, sizeof(line2),
+                "  %s等待同步...%s  slave_offset=%s",
+                ANSI_YELLOW, ANSI_RESET, fmt_bytes(slave_off));
+        }
+        progress_print(line2);
 
         /* 用 offset 判断是否完成（增量同步时才更新） */
         if (slave_off >= master_off && master_off > 0) {
@@ -791,13 +817,15 @@ static int run_test(void) {
             break;
         }
 
-        /* 后备检测：slave 卡住不动时，直接读 key 验证数据是否已同步 */
-        if (i > 30 && !caught_up) { /* 等了至少 15 秒后 */
+        /* 后备检测：slave 卡住不动时，直接读增量 key 验证数据是否已同步 */
+        if (i > 30 && !caught_up && g_opt.post_count > 0) { /* 等了至少 15 秒后 */
             int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
             if (vfd >= 0) {
                 char key[64], expected[64];
-                snprintf(key, sizeof(key), "pre:k:%06d", 0);
-                snprintf(expected, sizeof(expected), "v%d", 0);
+                /* 验证最后一条增量数据，确保所有增量都已同步 */
+                int last = g_opt.post_count - 1;
+                snprintf(key, sizeof(key), "post:k:%06d", last);
+                snprintf(expected, sizeof(expected), "v%d", last);
                 char *r = cmd(vfd, "HGET", key, NULL);
                 if (r) {
                     char check[256];

@@ -29,7 +29,7 @@ kv_config_t g_cfg = {
     .rdma_gid_idx = 1,
     .rdma_port = 0,
     .rdma_recv_slots = 32,
-    .rdma_chunk_size = BUFFER_CAP / 4,
+    .rdma_chunk_size = BUFFER_CAP * 4,
     .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
     .log_mode = "info",
@@ -461,11 +461,11 @@ int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
 
 int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int send_ctx) {
     size_t off = 0;
-    size_t chunk_cap = !strcasecmp(repl_fullsync_transport_name(), "rdma") ? (g_cfg.rdma_chunk_size > 0 ? (size_t)g_cfg.rdma_chunk_size : (BUFFER_CAP / 4)) : len;
+    size_t chunk_cap = !strcasecmp(repl_fullsync_transport_name(), "rdma") ? (g_cfg.rdma_chunk_size > 0 ? (size_t)g_cfg.rdma_chunk_size : (BUFFER_CAP * 4)) : len;
     if (!buf || len == 0) return 0;
     repl_note_send_context("chunked", len, repl_master_offset(), buf);
     if (chunk_cap < 1024) chunk_cap = 1024;
-    if (chunk_cap > BUFFER_CAP) chunk_cap = BUFFER_CAP;
+    if (chunk_cap > BUFFER_CAP * 4) chunk_cap = BUFFER_CAP * 4;
     if (chunk_cap == 0) chunk_cap = len;
     while (off < len) {
         size_t chunk = len - off;

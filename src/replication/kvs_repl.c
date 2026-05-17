@@ -89,7 +89,7 @@ static conn_t g_rdma_master_replica_conn = {0};
 #if KVS_ENABLE_RDMA
 #define KVS_RDMA_RECV_SLOTS_MAX 64
 #define KVS_RDMA_RECV_SLOTS_DEFAULT 32
-#define KVS_RDMA_CHUNK_SIZE_DEFAULT (BUFFER_CAP / 4)
+#define KVS_RDMA_CHUNK_SIZE_DEFAULT (BUFFER_CAP * 4)
 #define KVS_RDMA_QP_WR_DEPTH_DEFAULT 64
 
 typedef enum repl_rdma_state_e {
@@ -223,7 +223,7 @@ static int repl_rdma_cfg_qp_wr_depth(void) {
 static size_t repl_rdma_cfg_chunk_size(void) {
     size_t v = (g_cfg.rdma_chunk_size > 0) ? (size_t)g_cfg.rdma_chunk_size : (size_t)KVS_RDMA_CHUNK_SIZE_DEFAULT;
     if (v < 1024) v = 1024;
-    if (v > BUFFER_CAP) v = BUFFER_CAP;
+    if (v > BUFFER_CAP * 4) v = BUFFER_CAP * 4;
     return v;
 }
 
@@ -514,9 +514,10 @@ static int repl_rdma_connect_handshake(void) {
 }
 
 static int repl_rdma_prepare_buffers(void) {
-    const size_t cap = BUFFER_CAP;
-    int i;
     repl_rdma_refresh_runtime_cfg();
+    size_t cap = repl_rdma_cfg_chunk_size();
+    if (cap < BUFFER_CAP) cap = BUFFER_CAP;
+    int i;
     if (!g_repl_rdma_ctx.pd) return -1;
     g_repl_rdma_ctx.send_buf = (unsigned char *)kvs_malloc(cap);
     if (!g_repl_rdma_ctx.send_buf) {

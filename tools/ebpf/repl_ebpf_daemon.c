@@ -88,6 +88,8 @@ static int pin_map_fd(int fd, const char *pin_path, const char *name) {
         fprintf(stderr, "pin %s failed: %s\n", path, strerror(errno));
         return -1;
     }
+    /* 设置 0644 权限，使非 root 进程也能通过 bpf_obj_get() 访问 */
+    chmod(path, 0644);
     printf("  pinned: %s\n", path);
     return 0;
 }

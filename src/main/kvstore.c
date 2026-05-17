@@ -978,12 +978,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (repl_ebpf_register_fd(c->fd, 1) != 0) {
                 fprintf(stderr, "repl ebpf: fd registration failed on master replica link, using tcp-compatible path\n");
             }
-            /* In cross-machine forward mode, register the same fd at the redirect key
-             * so the BPF program can redirect data to this socket's send queue,
-             * transmitting it over TCP to the remote slave. */
-            if (g_cfg.ebpf_forward && repl_ebpf_register_forward_fd(c->fd) != 0) {
-                fprintf(stderr, "repl ebpf: forward fd registration failed, cross-machine forwarding disabled\n");
-            }
         }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);

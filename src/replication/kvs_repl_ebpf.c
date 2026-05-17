@@ -30,7 +30,9 @@ static int g_repl_ebpf_uses_pinned_maps = 0;
 static int g_repl_ebpf_print_initialized = 0;
 
 static int repl_ebpf_libbpf_print(enum libbpf_print_level level, const char *format, va_list args) {
-    (void)level;
+    /* 只打印 WARN 和 ERROR 级别，关闭 DEBUG/INFO 噪声 */
+    if (level == LIBBPF_DEBUG || level == LIBBPF_INFO)
+        return 0;
     return vfprintf(stderr, format, args);
 }
 
@@ -160,7 +162,8 @@ static int repl_ebpf_load_object(void) {
         return -1;
     }
     repl_ebpf_raise_memlock();
-    if (g_cfg.role == ROLE_SLAVE && g_cfg.ebpf_pin_path[0]) {
+    /* 无论 master/slave，优先尝试连接已存在的 pinned maps（由独立 eBPF 进程挂载） */
+    if (g_cfg.ebpf_pin_path[0]) {
         int opened = 0;
         for (int i = 0; i < 50; ++i) {
             if (repl_ebpf_open_pinned_maps() == 0) {
@@ -169,17 +172,17 @@ static int repl_ebpf_load_object(void) {
             }
             usleep(100000);
         }
-        if (!opened) {
-            repl_ebpf_set_error("open_pinned_maps", errno ? errno : ENOENT);
-            return -1;
+        if (opened) {
+            if (repl_ebpf_update_control() != 0) {
+                repl_ebpf_set_error("update_pinned_control", errno);
+                repl_ebpf_clear_fds();
+                return -1;
+            }
+            repl_ebpf_clear_error();
+            return 0;
         }
-        if (repl_ebpf_update_control() != 0) {
-            repl_ebpf_set_error("update_pinned_control", errno);
-            repl_ebpf_clear_fds();
-            return -1;
-        }
-        repl_ebpf_clear_error();
-        return 0;
+        /* pinned maps 不可用，继续尝试直接加载 */
+        repl_ebpf_set_error("open_pinned_maps", errno ? errno : ENOENT);
     }
     repl_ebpf_enable_libbpf_log();
     g_repl_ebpf_obj = bpf_object__open_file(g_cfg.ebpf_obj_path, NULL);

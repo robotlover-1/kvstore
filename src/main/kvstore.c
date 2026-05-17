@@ -19,6 +19,7 @@ kv_config_t g_cfg = {
     .repl_realtime_transport = "ebpf",
     .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
     .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
+    .ebpf_enabled = 0,
     .ebpf_redirect = 0,
     .ebpf_redirect_key = 0,
     .ebpf_forward = 0,
@@ -320,6 +321,7 @@ static int apply_config_kv(const char *key, const char *value) {
         if (parse_repl_transport_backend(value) != 0) return -1;
         snprintf(g_cfg.repl_realtime_transport, sizeof(g_cfg.repl_realtime_transport), "%s", value);
     }
+    else if (!strcmp(key, "ebpf_enabled")) g_cfg.ebpf_enabled = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
     else if (!strcmp(key, "ebpf_obj_path")) snprintf(g_cfg.ebpf_obj_path, sizeof(g_cfg.ebpf_obj_path), "%s", value);
     else if (!strcmp(key, "ebpf_pin_path")) snprintf(g_cfg.ebpf_pin_path, sizeof(g_cfg.ebpf_pin_path), "%s", value);
     else if (!strcmp(key, "ebpf_redirect")) g_cfg.ebpf_redirect = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
@@ -1894,26 +1896,26 @@ int kvs_snapshot_to_fd(int fd) {
 
 static int dump_skiptable_write_kv(const char *key, const char *value, void *arg) {
     int fd = *(int *)arg;
-    size_t klen = strlen(key);
-    size_t vlen = strlen(value);
+    uint32_t klen = (uint32_t)strlen(key);
+    uint32_t vlen = (uint32_t)strlen(value);
+    if (write(fd, &klen, sizeof(klen)) != sizeof(klen)) return -1;
     if (write(fd, key, klen) != (ssize_t)klen) return -1;
-    if (write(fd, "\n", 1) != 1) return -1;
+    if (write(fd, &vlen, sizeof(vlen)) != sizeof(vlen)) return -1;
     if (write(fd, value, vlen) != (ssize_t)vlen) return -1;
-    if (write(fd, "\n", 1) != 1) return -1;
     return 0;
 }
 
 int kvs_dump_to_fd(int fd) {
     if (fd < 0) return -1;
 
-    /* dump helper: write key\nvalue\n to fd */
+    /* dump helper: write uint32_t klen + key + uint32_t vlen + value (binary, length-prefixed) */
 #define DUMP_WRITE_KV(key, value) do { \
-    size_t _klen = strlen(key); \
-    size_t _vlen = strlen(value); \
+    uint32_t _klen = (uint32_t)strlen(key); \
+    uint32_t _vlen = (uint32_t)strlen(value); \
+    if (write(fd, &_klen, sizeof(_klen)) != sizeof(_klen)) return -1; \
     if (write(fd, key, _klen) != (ssize_t)_klen) return -1; \
-    if (write(fd, "\n", 1) != 1) return -1; \
+    if (write(fd, &_vlen, sizeof(_vlen)) != sizeof(_vlen)) return -1; \
     if (write(fd, value, _vlen) != (ssize_t)_vlen) return -1; \
-    if (write(fd, "\n", 1) != 1) return -1; \
 } while(0)
 
     /* iterate all hash entries */
@@ -2007,11 +2009,13 @@ int main(int argc, char **argv) {
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
-    if (g_cfg.role == ROLE_MASTER && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
-            || !strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
-        if (repl_ebpf_init() != 0) {
-            fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
-            /* Non-fatal: continue with TCP fallback */
+    if (g_cfg.ebpf_enabled) {
+        if (g_cfg.role == ROLE_MASTER && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
+                || !strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
+            if (repl_ebpf_init() != 0) {
+                fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
+                /* Non-fatal: continue with TCP fallback */
+            }
         }
     }
     if (start_rdma_master_listener() != 0) {

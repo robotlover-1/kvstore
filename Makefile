@@ -116,8 +116,47 @@ build/%.bpf.o: $(SRC_DIR)/%.bpf.c
 build_dir:
 	@mkdir -p build/main build/core build/storage build/memory build/expire build/persistence build/replication build/replication/bpf build/utils
 
+# ---- Comprehensive C test client ----
+TEST_KVSTORE_SRC=tests/test_kvstore.c
+TEST_KVSTORE_BIN=test_kvstore
+TEST_HOST ?= 127.0.0.1
+TEST_PORT ?= 5000
+
+$(TEST_KVSTORE_BIN): $(TEST_KVSTORE_SRC) $(INC_DIR)/kvstore.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+check-kvstore: $(TEST_KVSTORE_BIN)
+	python3 ./tools/tests/run_with_kvstore.py --bin ./kvstore --host $(TEST_HOST) --port $(TEST_PORT) -- ./$(TEST_KVSTORE_BIN) {HOST} {PORT}
+
+# ---- 5w+5w 主从同步测试 ----
+TEST_REPL_5W5W_SRC=tests/test_repl_5w5w.c
+TEST_REPL_5W5W_BIN=test_repl_5w5w
+
+$(TEST_REPL_5W5W_BIN): $(TEST_REPL_5W5W_SRC) $(INC_DIR)/kvstore.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+# ---- eBPF 独立守护进程 ----
+EBPF_DAEMON_SRC=tools/ebpf/repl_ebpf_daemon.c
+EBPF_DAEMON_BIN=tools/ebpf/repl_ebpf_daemon
+
+$(EBPF_DAEMON_BIN): $(EBPF_DAEMON_SRC)
+	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz
+
+# ---- 持久化演示测试 ----
+TEST_PERSIST_DUMP_SRC=tests/test_persist_dump_demo.c
+TEST_PERSIST_DUMP_BIN=test_persist_dump_demo
+TEST_PERSIST_AOF_SRC=tests/test_persist_aof_demo.c
+TEST_PERSIST_AOF_BIN=test_persist_aof_demo
+
+$(TEST_PERSIST_DUMP_BIN): $(TEST_PERSIST_DUMP_SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(TEST_PERSIST_AOF_BIN): $(TEST_PERSIST_AOF_SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -rf build kvstore kvstore.dump kvstore.aof
+	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN)
+	rm -f kvstore-master.dump kvstore-master.aof kvstore-slave.dump kvstore-slave.aof
 
 check-resp:
 	python3 ./tools/tests/run_with_kvstore.py --bin ./kvstore --host $(TEST_HOST) --port $(TEST_PORT) -- bash ./tests/integration/test_resp_nc_strict.sh {HOST} {PORT}
@@ -232,4 +271,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync
+.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync tools/ebpf/repl_ebpf_daemon

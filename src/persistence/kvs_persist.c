@@ -197,7 +197,7 @@ static int replay_dump_file(const char *path) {
     int fd;
     struct stat st;
     unsigned char *mapped;
-    size_t pos = 0, size, line_start;
+    size_t pos = 0, size;
 
     fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -210,40 +210,36 @@ static int replay_dump_file(const char *path) {
     g_recover_mmap_success++;
     g_recover_last_mmap_bytes += (unsigned long long)size;
 
-    /* parse key\nvalue\n entries: lines come in pairs (key, value) */
-    line_start = 0;
-    while (pos <= size) {
+    /* parse binary format: uint32_t klen, key, uint32_t vlen, value */
+    while (pos + 4 <= size) {
+        uint32_t klen, vlen;
         char *key, *value;
 
-        /* scan key line: find \n or EOF */
-        while (pos < size && mapped[pos] != '\n') pos++;
-        if (pos > line_start) {
-            size_t klen = pos - line_start;
-            key = (char *)kvs_malloc(klen + 1);
-            if (!key) break;
-            memcpy(key, mapped + line_start, klen);
-            key[klen] = '\0';
-        } else {
-            break; /* empty line -> done */
-        }
-        pos++; /* skip \n */
-        if (pos > size) { kvs_free(key); break; }
+        /* read key length */
+        memcpy(&klen, mapped + pos, sizeof(klen));
+        pos += sizeof(klen);
+        if (pos + klen > size) break;
 
-        line_start = pos;
-        /* scan value line */
-        while (pos < size && mapped[pos] != '\n') pos++;
-        if (pos >= line_start) {
-            size_t vlen = pos - line_start;
-            value = (char *)kvs_malloc(vlen + 1);
-            if (!value) { kvs_free(key); break; }
-            memcpy(value, mapped + line_start, vlen);
-            value[vlen] = '\0';
-        } else {
-            kvs_free(key);
-            break;
-        }
-        pos++; /* skip \n */
-        line_start = pos;
+        /* read key */
+        key = (char *)kvs_malloc(klen + 1);
+        if (!key) break;
+        if (klen > 0) memcpy(key, mapped + pos, klen);
+        key[klen] = '\0';
+        pos += klen;
+
+        if (pos + 4 > size) { kvs_free(key); break; }
+
+        /* read value length */
+        memcpy(&vlen, mapped + pos, sizeof(vlen));
+        pos += sizeof(vlen);
+        if (pos + vlen > size) { kvs_free(key); break; }
+
+        /* read value */
+        value = (char *)kvs_malloc(vlen + 1);
+        if (!value) { kvs_free(key); break; }
+        if (vlen > 0) memcpy(value, mapped + pos, vlen);
+        value[vlen] = '\0';
+        pos += vlen;
 
         kvs_hash_set(&global_hash, key, value);
         kvs_free(key);

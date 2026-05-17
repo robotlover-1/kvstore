@@ -276,6 +276,7 @@ typedef struct {
     char repl_transport_backend[32];
     char repl_fullsync_transport[32];   /* transport for fullsync/snapshot (RDMA) */
     char repl_realtime_transport[32];   /* transport for realtime broadcast (eBPF) */
+    int ebpf_enabled;               /* 0=禁用, 1=由独立进程管理eBPF */
     char ebpf_obj_path[256];
     char ebpf_pin_path[256];
     int ebpf_redirect;

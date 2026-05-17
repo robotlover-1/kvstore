@@ -730,7 +730,7 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
         pthread_mutex_unlock(&g_repl_rdma_send_lock);
         return -1;
     }
-    rc = repl_rdma_wait_cq_send_completion(2000);
+    rc = repl_rdma_wait_cq_send_completion(5000);
     pthread_mutex_unlock(&g_repl_rdma_send_lock);
     return rc;
 }

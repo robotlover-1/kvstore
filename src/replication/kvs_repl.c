@@ -495,8 +495,8 @@ static int repl_rdma_connect_handshake(void) {
     memset(&param, 0, sizeof(param));
     param.initiator_depth = 1;
     param.responder_resources = 1;
-    param.retry_count = 3;
-    param.rnr_retry_count = 3;
+    param.retry_count = 7;
+    param.rnr_retry_count = 7;
     repl_rdma_log("connect", "issuing rdma_connect");
     repl_rdma_set_state(REPL_RDMA_STATE_CONNECTING, "rdma_connect");
     if (rdma_connect(g_repl_rdma_ctx.id, &param) != 0) {

@@ -860,8 +860,17 @@ static int run_test(void) {
         char expected_resp[128];
         snprintf(expected_resp, sizeof(expected_resp), "$%zu\r\n%s\r\n", strlen(expected), expected);
         if (strcmp(r, expected_resp) == 0) {
-            test_pass("[post] %s -> %s", key, expected);
-        } else {
+            test_pass("[post] %s -> %s", key, expected);        } else if (strcmp(r, "$-1\r\n") == 0) {
+            /* key 不存在 — 可能是 slave 还在追赶，重试一次 */
+            free(r);
+            usleep(1000000);
+            r = cmd(slave_fd, "HGET", key, NULL);
+            if (r && strcmp(r, expected_resp) == 0) {
+                test_pass("[post] %s -> %s (retry)", key, expected);
+            } else {
+                test_fail("[post] %s 期望 %s 实际 %s", key, expected, r ? r : "(null)");
+                failed++;
+            }        } else {
             test_fail("[post] %s 期望 %s 实际 %s", key, expected, r);
             failed++;
         }

@@ -129,6 +129,7 @@ typedef struct repl_transport_ops_s {
 
 static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t len) {
     if (!c || !buf || len == 0) return 0;
+    fprintf(stderr, "[TRANSPORT] TCP send %zu bytes\n", len);
     return queue_bytes(c, buf, len);
 }
 
@@ -726,6 +727,7 @@ static void repl_transport_ebpf_disconnect_slave(int fd) {
 }
 
 static int repl_transport_rdma_send(conn_t *c, const unsigned char *buf, size_t len) {
+    fprintf(stderr, "[TRANSPORT] RDMA send %zu bytes\n", len);
     (void)c;
     (void)buf;
     (void)len;
@@ -1048,14 +1050,20 @@ const char *repl_realtime_transport_name(void) {
 static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) {
     if (send_ctx == KVS_REPL_SEND_FULLSYNC) {
         const char *t = repl_fullsync_transport_name();
-        if (!strcasecmp(t, "rdma") && g_repl_transport_rdma_ops.supported && g_repl_transport_fallback_until_ms <= kvs_now_ms())
+        if (!strcasecmp(t, "rdma") && g_repl_transport_rdma_ops.supported && g_repl_transport_fallback_until_ms <= kvs_now_ms()) {
+            fprintf(stderr, "[TRANSPORT] fullsync using RDMA\n");
             return &g_repl_transport_rdma_ops;
+        }
+        fprintf(stderr, "[TRANSPORT] fullsync using TCP\n");
         return &g_repl_transport_tcp_ops;
     }
     /* KVS_REPL_SEND_REALTIME */
     const char *t = repl_realtime_transport_name();
-    if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported())
+    if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported()) {
+        fprintf(stderr, "[TRANSPORT] realtime using EBPF\n");
         return &g_repl_transport_ebpf_ops;
+    }
+    fprintf(stderr, "[TRANSPORT] realtime using TCP\n");
     return &g_repl_transport_tcp_ops;
 }
 
@@ -1066,6 +1074,7 @@ int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len) {
         return 0;
     }
     /* Fallback: try TCP on failure */
+    fprintf(stderr, "[TRANSPORT] %s failed, fallback to TCP\n", ops->name);
     rc = repl_transport_tcp_send(c, buf, len);
     if (rc == 0) return 0;
     return -1;
@@ -1078,6 +1087,7 @@ int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len) {
         return 0;
     }
     /* Fallback: try TCP on failure */
+    fprintf(stderr, "[TRANSPORT] %s failed, fallback to TCP\n", ops->name);
     rc = repl_transport_tcp_send(c, buf, len);
     return rc;
 }

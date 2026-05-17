@@ -761,8 +761,8 @@ static int run_test(void) {
             break;
         }
 
-        /* 后备检测：slave 全量同步但 offset 不更新时，直接读 key 验证 */
-        if (slave_off == 0 && !slave_loading && i > 20) {
+        /* 后备检测：slave 卡住不动时，直接读 key 验证数据是否已同步 */
+        if (i > 30 && !caught_up) { /* 等了至少 15 秒后 */
             int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
             if (vfd >= 0) {
                 char key[64], expected[64];

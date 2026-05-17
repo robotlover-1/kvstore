@@ -133,7 +133,18 @@ static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t l
 }
 
 static int repl_transport_ebpf_send(conn_t *c, const unsigned char *buf, size_t len) {
-    return repl_transport_tcp_send(c, buf, len);
+    /* eBPF 增量传输：
+     *
+     * 数据路径: queue_bytes → reactor on_write → send(c->fd) 
+     *          → 内核触发 sk_msg BPF (因 fd 已注册到 sockmap)
+     *          → BPF 执行 bpf_msg_redirect_map() 
+     *          → sock_map[redirect_key] 的 TCP → 远端 slave
+     *
+     * c->fd 已通过 register_fd() 注册到 sock_map 和 role_map，
+     * 因此 send() 系统调用会被 BPF 程序拦截并重定向。
+     * 传输层为 TCP（跨机器数据必须走网络协议），
+     * 但数据路由由 eBPF 程序在内核态决策，而非直接走内核 TCP 栈。 */
+    return queue_bytes(c, buf, len);
 }
 
 static int repl_transport_tcp_connect_slave(const char *host, int port) {

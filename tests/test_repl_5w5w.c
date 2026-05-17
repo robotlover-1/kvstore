@@ -648,6 +648,31 @@ static int run_test(void) {
     double fs_elapsed = time_elapsed(&fs_begin);
     test_pass("全量同步完成 (%.1fs)", fs_elapsed);
 
+    /* 等待 slave 数据实际就绪（master 的 queue_snapshot 可能还在 reactor 中发送）
+     * 轮询 slave 直到能读到第一个预存 key */
+    printf("  等待 slave 数据就绪...\n");
+    int data_ready = 0;
+    for (int i = 0; i < 100; i++) {
+        int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
+        if (vfd >= 0) {
+            char *r = cmd(vfd, "HGET", "pre:k:000000", NULL);
+            if (r && strcmp(r, "$2\r\nv0\r\n") == 0) {
+                data_ready = 1;
+                free(r);
+                close(vfd);
+                break;
+            }
+            free(r);
+            close(vfd);
+        }
+        usleep(500000);
+    }
+    if (!data_ready) {
+        fprintf(stderr, ANSI_RED "  ✗ slave 数据未就绪，继续执行\n" ANSI_RESET);
+    } else {
+        printf("  %sslave 数据已就绪%s\n", ANSI_GREEN, ANSI_RESET);
+    }
+
     /* 获取全量同步信息 */
     char *fs_info = get_info(g_opt.master_host, g_opt.master_port);
     if (fs_info) {
@@ -664,9 +689,6 @@ static int run_test(void) {
      * Phase 4: 增量数据写入 Master
      * ═══════════════════════════════════════════ */
     banner("Phase 4: 增量数据写入 Master");
-
-    /* 等待片刻让 slave 稳定 */
-    sleep(2);
 
     int post_count = g_opt.post_count;
     struct timeval t2, t3;

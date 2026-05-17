@@ -1,5 +1,6 @@
 #include "kvstore/kvstore.h"
 #include <poll.h>
+#include <time.h>
 
 #if KVS_ENABLE_RDMA
 #include <rdma/rdma_cma.h>
@@ -7,6 +8,33 @@
 #endif
 
 #define KVS_REPL_BACKLOG_SIZE (1024 * 1024)
+
+/* 传输层日志 */
+static FILE *g_transport_log = NULL;
+static pthread_mutex_t g_transport_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void transport_log(const char *fmt, ...) {
+    va_list ap;
+    time_t now;
+    struct tm *tm_info;
+    char timestamp[64];
+
+    pthread_mutex_lock(&g_transport_log_lock);
+    if (!g_transport_log) {
+        g_transport_log = fopen("kvstore_transport.log", "a");
+        if (!g_transport_log) { pthread_mutex_unlock(&g_transport_log_lock); return; }
+    }
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    fprintf(g_transport_log, "[%s] ", timestamp);
+    va_start(ap, fmt);
+    vfprintf(g_transport_log, fmt, ap);
+    va_end(ap);
+    fprintf(g_transport_log, "\n");
+    fflush(g_transport_log);
+    pthread_mutex_unlock(&g_transport_log_lock);
+}
 
 typedef struct repl_backlog_s {
     unsigned char *buf;
@@ -129,7 +157,6 @@ typedef struct repl_transport_ops_s {
 
 static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t len) {
     if (!c || !buf || len == 0) return 0;
-    fprintf(stderr, "[TRANSPORT] TCP send %zu bytes\n", len);
     return queue_bytes(c, buf, len);
 }
 
@@ -727,7 +754,7 @@ static void repl_transport_ebpf_disconnect_slave(int fd) {
 }
 
 static int repl_transport_rdma_send(conn_t *c, const unsigned char *buf, size_t len) {
-    fprintf(stderr, "[TRANSPORT] RDMA send %zu bytes\n", len);
+    transport_log("RDMA send %zu bytes", len);
     (void)c;
     (void)buf;
     (void)len;
@@ -1051,19 +1078,19 @@ static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) 
     if (send_ctx == KVS_REPL_SEND_FULLSYNC) {
         const char *t = repl_fullsync_transport_name();
         if (!strcasecmp(t, "rdma") && g_repl_transport_rdma_ops.supported && g_repl_transport_fallback_until_ms <= kvs_now_ms()) {
-            fprintf(stderr, "[TRANSPORT] fullsync using RDMA\n");
+            transport_log("fullsync using RDMA");
             return &g_repl_transport_rdma_ops;
         }
-        fprintf(stderr, "[TRANSPORT] fullsync using TCP\n");
+        transport_log("fullsync using TCP");
         return &g_repl_transport_tcp_ops;
     }
     /* KVS_REPL_SEND_REALTIME */
     const char *t = repl_realtime_transport_name();
     if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported()) {
-        fprintf(stderr, "[TRANSPORT] realtime using EBPF\n");
+        transport_log("realtime using EBPF");
         return &g_repl_transport_ebpf_ops;
     }
-    fprintf(stderr, "[TRANSPORT] realtime using TCP\n");
+    transport_log("realtime using TCP");
     return &g_repl_transport_tcp_ops;
 }
 
@@ -1074,7 +1101,7 @@ int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len) {
         return 0;
     }
     /* Fallback: try TCP on failure */
-    fprintf(stderr, "[TRANSPORT] %s failed, fallback to TCP\n", ops->name);
+    transport_log("%s failed, fallback to TCP", ops->name);
     rc = repl_transport_tcp_send(c, buf, len);
     if (rc == 0) return 0;
     return -1;
@@ -1087,7 +1114,7 @@ int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len) {
         return 0;
     }
     /* Fallback: try TCP on failure */
-    fprintf(stderr, "[TRANSPORT] %s failed, fallback to TCP\n", ops->name);
+    transport_log("%s failed, fallback to TCP", ops->name);
     rc = repl_transport_tcp_send(c, buf, len);
     return rc;
 }

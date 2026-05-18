@@ -4,26 +4,51 @@
  * 编译:
  *   make test_repl_5w5w
  *
- * 用法 (使用公共配置文件 + 命令行覆盖 — 推荐):
+ * ═══════════════════════════════════════════════════════════════
+ * 启动顺序（重要!）:
+ *   1. 先启动 Master
+ *   2. 再启动本测试脚本（脚本会预存数据、轮询等待 slave 连接）
+ *   3. 看到 "等待 Slave 连接..." 提示后，再启动 Slave
+ * ═══════════════════════════════════════════════════════════════
  *
- *   # 终端 1: 启动 master (port/role 覆盖配置文件的默认值)
- *   ./kvstore --config kvstore.conf \
- *       --port 5160 --role master
+ * 用法一: RDMA 全量同步 + eBPF 增量同步（双虚拟机部署）
+ *   # 终端 1 (VM1): 启动 master（必须先启动）
+ *   sudo ./kvstore --port 5160 --role master \
+ *       --repl-fullsync-transport rdma \
+ *       --repl-realtime-transport ebpf \
+ *       --rdma-dev siw0 --rdma-recv-slots 64
  *
- *   # 终端 2: 运行本测试 (预存数据 + 监控同步进度)
+ *   # 终端 2 (任意机器): 运行本测试（预存数据，等待 slave）
+ *   ./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
+ *       --slave-host 192.168.233.129 --slave-port 5161 \
+ *       --pre 50000 --post 50000
+ *
+ *   # 看到 "等待 Slave 连接..." 后，在终端 3 (VM2) 启动 slave
+ *   sudo ./kvstore --port 5161 --role slave \
+ *       --master-host 192.168.233.128 --master-port 5160 \
+ *       --repl-fullsync-transport rdma \
+ *       --repl-realtime-transport ebpf
+ *
+ * 用法二: TCP 单机全量同步（无 RDMA/eBPF）
+ *   # 终端 1: 启动 master
+ *   ./kvstore --port 5160 --role master \
+ *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
+ *
+ *   # 终端 2: 运行本测试
  *   ./test_repl_5w5w --master-host 127.0.0.1 --master-port 5160 \
  *       --slave-host 127.0.0.1 --slave-port 5161 \
  *       --pre 50000 --post 50000
  *
- *   # 终端 3: 启动 slave
- *   ./kvstore --config kvstore.conf \
- *       --port 5161 --role slave \
- *       --master-host 127.0.0.1 --master-port 5160
+ *   # 看到 "等待 Slave 连接..." 后，在终端 3 启动 slave
+ *   ./kvstore --port 5161 --role slave \
+ *       --master-host 127.0.0.1 --master-port 5160 \
+ *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
  *
- * 双虚拟机部署:
- *   在 VM1 上启动 master，在 VM2 上启动 slave。
- *   master 用默认配置即可，slave 的 --master-host 指向 VM1 的 IP。
- *   测试程序可在任意机器上运行，指定对应 host 即可。
+ * 双虚拟机部署说明:
+ *   - VM1 上启动 master，VM2 上启动 slave
+ *   - master 的 --rdma-dev 指定本机 RDMA 设备（如 siw0 / rxe0）
+ *   - slave 的 --master-host 指向 VM1 的 IP
+ *   - 测试程序可在任意机器上运行，通过 --master-host / --slave-host 指定连接目标
  *
  * 流程:
  *   Phase 1: 预存数据到 Master
@@ -985,12 +1010,43 @@ static double time_elapsed_diff(const struct timeval *end, const struct timeval 
 
 static void print_usage(const char *prog) {
     printf("用法: %s [选项]\n", prog);
-    printf("\n推荐方式 (公共配置文件 + 命令行覆盖):\n");
-    printf("  # 终端 1: ./kvstore --config kvstore.conf --port 5160 --role master\n");
-    printf("  # 终端 2: %s --master-host 127.0.0.1 --master-port 5160 \\\n", prog);
-    printf("  #             --slave-host 127.0.0.1 --slave-port 5161\n");
-    printf("  # 终端 3: ./kvstore --config kvstore.conf --port 5161 --role slave \\\n");
-    printf("  #             --master-host 127.0.0.1 --master-port 5160\n");
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  启动顺序: Master → 本脚本 → Slave (等提示再启动)         ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+    printf("方式一: RDMA 全量 + eBPF 增量（双虚拟机）\n");
+    printf("  # 终端 1 (VM1, 先启动):\n");
+    printf("  sudo ./kvstore --port %d --role master \\\n", g_opt.master_port);
+    printf("      --repl-fullsync-transport rdma \\\n");
+    printf("      --repl-realtime-transport ebpf \\\n");
+    printf("      --rdma-dev siw0 --rdma-recv-slots 64\n");
+    printf("\n");
+    printf("  # 终端 2 (任意机器):\n");
+    printf("  %s --master-host <MASTER_IP> --master-port %d \\\n", prog, g_opt.master_port);
+    printf("      --slave-host <SLAVE_IP> --slave-port %d \\\n", g_opt.slave_port);
+    printf("      --pre %d --post %d\n", g_opt.pre_count, g_opt.post_count);
+    printf("\n");
+    printf("  # 终端 3 (VM2, 等\"等待 Slave 连接...\"提示后启动):\n");
+    printf("  sudo ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
+    printf("      --master-host <MASTER_IP> --master-port %d \\\n", g_opt.master_port);
+    printf("      --repl-fullsync-transport rdma \\\n");
+    printf("      --repl-realtime-transport ebpf\n");
+    printf("\n");
+    printf("方式二: TCP 全量（单机，无 RDMA/eBPF）\n");
+    printf("  # 终端 1 (先启动):\n");
+    printf("  ./kvstore --port %d --role master \\\n", g_opt.master_port);
+    printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
+    printf("\n");
+    printf("  # 终端 2:\n");
+    printf("  %s --master-host 127.0.0.1 --master-port %d \\\n", prog, g_opt.master_port);
+    printf("      --slave-host 127.0.0.1 --slave-port %d \\\n", g_opt.slave_port);
+    printf("      --pre %d --post %d\n", g_opt.pre_count, g_opt.post_count);
+    printf("\n");
+    printf("  # 终端 3 (等\"等待 Slave 连接...\"提示后启动):\n");
+    printf("  ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
+    printf("      --master-host 127.0.0.1 --master-port %d \\\n", g_opt.master_port);
+    printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
     printf("\n选项:\n");
     printf("  --master-host HOST   Master 地址 (默认 %s)\n", g_opt.master_host);
     printf("  --master-port PORT   Master 端口 (默认 %d)\n", g_opt.master_port);

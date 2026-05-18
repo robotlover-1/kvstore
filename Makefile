@@ -154,8 +154,34 @@ $(TEST_PERSIST_DUMP_BIN): $(TEST_PERSIST_DUMP_SRC)
 $(TEST_PERSIST_AOF_BIN): $(TEST_PERSIST_AOF_SRC)
 	$(CC) $(CFLAGS) -o $@ $<
 
+# ---- 新增测试程序 ----
+TEST_URING_PERSIST_SRC=tests/test_uring_persist.c
+TEST_URING_PERSIST_BIN=test_uring_persist
+TEST_MMAP_RECOVER_SRC=tests/test_mmap_recover.c
+TEST_MMAP_RECOVER_BIN=test_mmap_recover
+TEST_REPL_BASIC_SRC=tests/test_repl_basic.c
+TEST_REPL_BASIC_BIN=test_repl_basic
+
+$(TEST_URING_PERSIST_BIN): $(TEST_URING_PERSIST_SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(TEST_MMAP_RECOVER_BIN): $(TEST_MMAP_RECOVER_SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(TEST_REPL_BASIC_BIN): $(TEST_REPL_BASIC_SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
+check-uring-persist-c: $(TEST_URING_PERSIST_BIN)
+	./$(TEST_URING_PERSIST_BIN) --port $(URING_PERSIST_PORT) --count $(URING_PERSIST_COUNT) --appendfsync $(URING_PERSIST_APPEND_FSYNC)
+
+check-mmap-recover-c: $(TEST_MMAP_RECOVER_BIN)
+	./$(TEST_MMAP_RECOVER_BIN) --port $(MMAP_RECOVER_PORT) --count $(MMAP_RECOVER_COUNT) --engine $(MMAP_RECOVER_ENGINE) --appendfsync $(MMAP_RECOVER_APPEND_FSYNC)
+
+check-repl-basic: $(TEST_REPL_BASIC_BIN)
+	./$(TEST_REPL_BASIC_BIN) --master-port $(REPL_MASTER_PORT) --slave-port $(REPL_SLAVE_PORT) --count $(PRELOAD_COUNT) --repl-transport $(REPL_TRANSPORT)
+
 clean:
-	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN)
+	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN) $(TEST_URING_PERSIST_BIN) $(TEST_MMAP_RECOVER_BIN) $(TEST_REPL_BASIC_BIN)
 	rm -f kvstore-master.dump kvstore-master.aof kvstore-slave.dump kvstore-slave.aof
 
 check-resp:
@@ -271,4 +297,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync tools/ebpf/repl_ebpf_daemon
+.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic tools/ebpf/repl_ebpf_daemon

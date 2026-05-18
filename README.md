@@ -325,6 +325,326 @@ kvstore/
 make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 ```
 
+### C 测试程序 (`tests/`)
+
+`tests/` 目录下包含独立的 C 测试程序，通过 RESP 协议连接 kvstore 进行自动化验证。
+
+这些 C 测试程序**不依赖 hiredis 等第三方库**，直接通过 TCP socket 构造 RESP 协议报文，可在任何 Linux 环境下编译运行。
+
+编译方式：
+```bash
+# 通过 Makefile
+make test_kvstore              # → ./test_kvstore
+make test_repl_5w5w            # → tests/test_repl_5w5w
+make test_persist_dump_demo    # → ./test_persist_dump_demo
+make test_persist_aof_demo     # → ./test_persist_aof_demo
+make test_uring_persist        # → ./test_uring_persist
+make test_mmap_recover         # → ./test_mmap_recover
+make test_repl_basic           # → ./test_repl_basic
+
+# 或手动编译
+gcc -I./include -o test_kvstore tests/test_kvstore.c
+```
+
+---
+
+#### `test_kvstore` — 全功能 C 客户端测试
+
+```
+编译: make test_kvstore
+运行: ./test_kvstore <host> <port>
+```
+
+连接 kvstore 后依次测试 PING、各引擎 SET/GET/DEL、MSET/MGET、TTL/EXPIRE/PERSIST、
+LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、INFO 命令，
+最后输出 PASS/FAIL 汇总报告。
+
+```bash
+# 终端 1: 启动 kvstore（任意端口）
+./kvstore --port 5000
+
+# 终端 2: 运行全功能测试
+./test_kvstore 127.0.0.1 5000
+
+# 或通过 Makefile 自动启动 + 测试
+make check-kvstore TEST_PORT=5000
+```
+
+---
+
+#### `test_repl_5w5w` — 5w+5w 主从同步测试
+
+```
+编译: make test_repl_5w5w          # → tests/test_repl_5w5w
+运行: tests/test_repl_5w5w [选项]
+```
+
+测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF) → 验证 Slave 最终 10w 条数据一致性。
+
+**启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
+
+```bash
+# ── 方式一: RDMA 全量 + eBPF 增量（双虚拟机）──
+
+# 终端 1 (VM1, 先启动 Master):
+sudo ./kvstore --port 5160 --role master \
+    --repl-fullsync-transport rdma \
+    --repl-realtime-transport ebpf \
+    --rdma-dev siw0 --rdma-recv-slots 64
+
+# 终端 2 (任意机器, Master 启动后运行):
+./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
+    --slave-host 192.168.233.129 --slave-port 5161 \
+    --pre 50000 --post 50000
+
+# 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
+sudo ./kvstore --port 5161 --role slave \
+    --master-host 192.168.233.128 --master-port 5160 \
+    --repl-fullsync-transport rdma \
+    --repl-realtime-transport ebpf
+
+
+# ── 方式二: TCP 全量（单机，无 RDMA/eBPF）──
+
+# 终端 1 (先启动 Master):
+./kvstore --port 5160 --role master \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp
+
+# 终端 2 (Master 启动后运行):
+./test_repl_5w5w --master-host 127.0.0.1 --master-port 5160 \
+    --slave-host 127.0.0.1 --slave-port 5161 \
+    --pre 50000 --post 50000
+
+# 终端 3 (看到提示后再启动 Slave):
+./kvstore --port 5161 --role slave \
+    --master-host 127.0.0.1 --master-port 5160 \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--master-host HOST` | 127.0.0.1 | Master 地址 |
+| `--master-port PORT` | 5160 | Master 端口 |
+| `--slave-host HOST` | 127.0.0.1 | Slave 地址 |
+| `--slave-port PORT` | 5161 | Slave 端口 |
+| `--pre COUNT` | 50000 | 全量同步前预存数据量 |
+| `--post COUNT` | 50000 | 全量同步后增量数据量 |
+| `--batch SIZE` | 1000 | 每批写入量 |
+| `--poll MS` | 500 | 轮询间隔毫秒 |
+
+---
+
+#### `test_persist_dump_demo` — 全量持久化演示
+
+```
+编译: make test_persist_dump_demo    # → ./test_persist_dump_demo
+运行: ./test_persist_dump_demo [选项]
+```
+
+交互式流程：连接 kvstore → 写入 count 条数据 → 提示用户执行 `SAVE` → 提示用户停止并重启 kvstore → 自动验证数据从 dump 文件恢复。
+
+```bash
+# 终端 1: 启动 kvstore（必须 --appendfsync always 确保数据可恢复）
+./kvstore --port 5170 --role master --appendfsync always \
+    --dump kvstore.dump --aof kvstore.aof
+
+# 终端 2: 运行全量持久化演示
+./test_persist_dump_demo --port 5170 --count 100000
+
+# 程序会写入数据，然后提示你:
+#   >>> Please execute SAVE in kvstore (redis-cli SAVE or nc ...)
+# 在终端 1 执行 SAVE 后，程序继续提示:
+#   >>> Please stop kvstore (Ctrl+C) and restart it
+# 停止并重启 kvstore，程序自动检测重连并验证数据恢复
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--host HOST` | 127.0.0.1 | kvstore 地址 |
+| `--port PORT` | 5170 | kvstore 端口 |
+| `--count N` | 50000 | 写入数据量 |
+| `--batch N` | 1000 | 每批写入量 |
+
+---
+
+#### `test_persist_aof_demo` — 增量持久化演示 (AOF)
+
+```
+编译: make test_persist_aof_demo     # → ./test_persist_aof_demo
+运行: ./test_persist_aof_demo [选项]
+```
+
+交互式流程：连接 kvstore → 写入 count 条数据（**不执行 SAVE**）→ 提示用户停止并重启 kvstore → 自动验证数据从 AOF 文件恢复。
+
+> **重要**: kvstore 必须使用 `--appendfsync always`，确保每条写入即时落盘。
+> 使用 `--appendfsync everysec` 时，停止前需等最多 1 秒落盘，可能导致数据丢失。
+
+```bash
+# 终端 1: 启动 kvstore（必须 --appendfsync always）
+./kvstore --port 5170 --role master --appendfsync always \
+    --dump kvstore.dump --aof kvstore.aof
+
+# 终端 2: 运行增量持久化演示
+./test_persist_aof_demo --port 5170 --count 100000
+
+# 程序写入数据后提示:
+#   >>> Please stop kvstore (Ctrl+C) and restart it
+# 停止并重启 kvstore，程序自动验证 AOF 恢复（注意: 不执行 SAVE，数据仅靠 AOF）
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--host HOST` | 127.0.0.1 | kvstore 地址 |
+| `--port PORT` | 5170 | kvstore 端口 |
+| `--count N` | 50000 | 写入数据量 |
+| `--batch N` | 1000 | 每批写入量 |
+
+---
+
+#### `test_uring_persist` — io_uring 持久化验证
+
+```
+编译: make test_uring_persist       # → ./test_uring_persist
+运行: ./test_uring_persist [选项]
+```
+
+自动管理 kvstore 进程生命周期，测试 io_uring 写入路径的持久化正确性与性能。
+
+流程：自动启动 kvstore → HSET 写入 N 条数据 → SAVE → 停止 kvstore → 重启 → 验证数据恢复 → 输出性能指标。
+
+```bash
+# 终端 1: 启动 kvstore（先启动）
+./kvstore --port 5180 --role master --appendfsync always
+
+# 终端 2: 运行测试
+./test_uring_persist --port 5180 --count 10000
+
+# 程序写入数据后提示:
+#   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
+# 停止并重启 kvstore，程序自动验证数据恢复
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--host HOST` | 127.0.0.1 | kvstore 地址 |
+| `--port PORT` | 5180 | kvstore 端口 |
+| `--count N` | 10000 | 写入数据量 |
+| `--batch N` | 1000 | 每批写入量 |
+
+---
+
+#### `test_mmap_recover` — mmap 恢复验证
+
+```
+编译: make test_mmap_recover        # → ./test_mmap_recover
+运行: ./test_mmap_recover [选项]
+```
+
+自动管理 kvstore 进程生命周期，验证启动时通过 mmap 恢复 dump 文件的正确性与性能。
+支持指定存储引擎（array/hash/rbtree/skiptable）。
+
+流程：自动启动 kvstore → 按指定引擎写入 N 条数据 → SAVE → 停止 → 重启并计时 → 从 INFO 读取恢复统计（mmap 尝试次数/成功次数/回退次数/耗时）→ 验证数据一致性。
+
+```bash
+# 终端 1: 启动 kvstore（先启动）
+./kvstore --port 5190 --role master --appendfsync always
+
+# 终端 2: 运行测试（hash 引擎, 10000 条）
+./test_mmap_recover --port 5190 --engine hash --count 10000
+
+# 程序写入数据后提示:
+#   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
+# 停止并重启 kvstore，程序自动验证数据恢复并显示 mmap 统计
+
+# 使用其他引擎
+./test_mmap_recover --port 5190 --engine rbtree --count 5000
+./test_mmap_recover --port 5190 --engine array --count 10000   # 自动限制 1024
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--host HOST` | 127.0.0.1 | kvstore 地址 |
+| `--port PORT` | 5190 | kvstore 端口 |
+| `--count N` | 10000 | 写入数据量（array 引擎上限 1024） |
+| `--engine NAME` | hash | 引擎: array/hash/rbtree/skiptable |
+| `--batch N` | 1000 | 每批写入量 |
+
+---
+
+#### `test_repl_basic` — 主从复制基本验证
+
+```
+编译: make test_repl_basic          # → ./test_repl_basic
+运行: ./test_repl_basic [选项]
+```
+
+自动管理 Master/Slave 进程，验证主从复制全流程。
+
+流程：启动 Master → 跨引擎（Hash/Array/RBTREE/Skiptable）写入 N 条数据 → 启动 Slave → 等待全量同步完成 → 再写入增量数据 → 等待增量同步 → 验证各引擎数据一致性 → 测试 Partial Resync（SLAVEOF NO ONE → 断开写入 → SLAVEOF 重连）→ 验证断开期间数据同步。
+
+```bash
+# ── 三终端模式 ──
+
+# 终端 1: 启动 Master（先启动）
+./kvstore --port 6379 --role master \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp
+
+# 终端 2: 运行测试（Master 启动后运行）
+./test_repl_basic --master-port 6379 --slave-port 6380 --count 5000
+
+# 程序会写入数据到 Master，然后提示启动 Slave:
+#   >>> 请在另一个终端启动 Slave: ...
+# 此时在终端 3 启动 Slave:
+
+# 终端 3: 启动 Slave（看到提示后再启动）
+./kvstore --port 6380 --role slave \
+    --master-host 127.0.0.1 --master-port 6379 \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp
+
+
+# ── 双机部署 ──
+# 终端 1 (VM1, Master):
+./kvstore --port 6379 --role master
+
+# 终端 2 (本地, 运行测试):
+./test_repl_basic --host 192.168.1.100 --master-port 6379 \
+    --slave-port 6380 --count 5000
+
+# 终端 3 (VM2, Slave, 看到提示后启动):
+./kvstore --port 6380 --role slave \
+    --master-host 192.168.1.100 --master-port 6379
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--host HOST` | 127.0.0.1 | 主机地址 |
+| `--master-port PORT` | 6379 | Master 端口 |
+| `--slave-port PORT` | 6380 | Slave 端口 |
+| `--count N` | 5000 | 预存/增量数据量 |
+| `--batch N` | 500 | 每批写入量 |
+| `--poll MS` | 500 | 轮询间隔毫秒 |
+
+---
+
+#### 辅助文件
+
+| 文件 | 说明 |
+|------|------|
+| **testcase.c** | 测试框架工具库，提供 `send_msg()` / `recv_msg()` / `testcase()` / `connect_tcpserver()` 等 RESP 协议测试辅助函数，作为其他 C 测试的依赖引用 |
+| **test.c** | （空文件，预留） |
+
 ### 全部测试目标
 
 
@@ -337,24 +657,59 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 | `make check-ttl`                   | —            | TTL 过期测试                                                  | —                                  |
 | `make check-persist`               | —            | 持久化基本测试                                                | —                                  |
 | `make check-doc`                   | —            | 文档对象测试                                                  | —                                  |
+| `make check-kvstore`               | 小            | C 客户端综合测试（`tests/test_kvstore.c`）                    | —                                  |
 | `make check-bulk-1w`               | **1w**        | 批量 1w 级全套回归（HSET/HGET/TTL/SAVE+恢复/DOC）             | —                                  |
+| `make check-10w`                   | **1w~**       | 10w 级大容量功能测试                                          | —                                  |
 | `make check-mass-ttl`              | 1w            | 海量 TTL 压测                                                 | —                                  |
-| `make check-uring-persist`         | 1w            | io_uring 持久化验证                                           | `artifacts/persist/uring-bench/`    |
-| `make check-mmap-recover`          | 1w            | mmap 恢复验证                                                 | `artifacts/persist/mmap-recover/`   |
-| `make check-repl`                  | 5k            | 主从复制基本验证                                              | —                                  |
+| `make check-uring-persist`         | 1w            | io_uring 持久化验证（Python 脚本）                            | `artifacts/persist/uring-bench/`    |
+| `make check-uring-persist-c`       | 1w            | io_uring 持久化验证（C 程序，自动管理进程）                   | `artifacts/persist/uring-bench/`    |
+| `make check-mmap-recover`          | 1w            | mmap 恢复验证（Python 脚本）                                  | `artifacts/persist/mmap-recover/`   |
+| `make check-mmap-recover-c`        | 1w            | mmap 恢复验证（C 程序，支持指定引擎，自动管理进程）           | `artifacts/persist/mmap-recover/`   |
+| `make check-repl`                  | 5k            | 主从复制基本验证（shell 脚本）                                | —                                  |
+| `make check-repl-basic`            | 5k            | 主从复制基本验证（C 程序，自动管理 Master/Slave 进程）        | —                                  |
+| `make test_repl_5w5w`<br>（仅编译） | **5w+5w**     | 5w+5w 主从同步 C 测试（`tests/test_repl_5w5w.c`）<br>编译后手动运行：`tests/test_repl_5w5w --master-host H ...` | —                                  |
 | `make check-repl-metrics`          | 5w+5k         | 复制指标基线                                                  | `artifacts/repl/metrics/`           |
 | `make check-repl-profile`          | 5w+5k         | 复制 profiling                                                | `artifacts/repl/profile/`           |
+| `make check-repl-ebpf`             | 5w+5k         | eBPF 实时同步 profiling                                       | `artifacts/repl/profile/`           |
+| `make check-repl-ebpf-env`         | —            | eBPF 环境探测                                                 | —                                  |
+| `make check-repl-ebpf-sync`        | 64            | eBPF sockmap 同步验证                                         | `artifacts/repl/ebpf-sync/`         |
+| `make check-repl-ebpf-sync-required` | 64          | eBPF 同步验证（要求 eBPF 可用）                               | `artifacts/repl/ebpf-sync/`         |
+| `make check-repl-ebpf-redirect`    | 64            | eBPF ingress 重定向验证                                       | `artifacts/repl/ebpf-sync/`         |
+| `make check-repl-rdma-unsupported` | 小            | RDMA 不可用时的优雅降级测试                                   | —                                  |
+| `make check-repl-rdma-smoke`       | 小            | RDMA 冒烟测试                                                 | `artifacts/repl/rdma-smoke/`        |
+| `make check-repl-rdma-stress`      | 中            | RDMA 压力测试（重启轮次 + 尾写验证）                          | `artifacts/repl/rdma-stress/`       |
+| `make check-repl-rdma-soak`        | 中            | RDMA 长时浸泡（可配小时级）                                   | `artifacts/repl/rdma-stress/`       |
+| `make check-repl-rdma-long-soak`   | 中            | RDMA 超长浸泡（默认 1800s）                                   | `artifacts/repl/rdma-stress/`       |
+| `make check-repl-rdma-fallback`    | 小            | RDMA 强制降级到 TCP 验证                                      | —                                  |
 | `make check-demo-full-dump`        | **10w**       | 全量持久化演示                                                | `artifacts/persist/full-dump-demo/` |
 | `make check-demo-incr-aof`         | **10w**       | 增量持久化演示                                                | `artifacts/persist/incr-aof-demo/`  |
-| `make check-demo-repl-sync`        | **5w+5w=10w** | 主从同步演示                                                  | `artifacts/repl/sync-demo/`         |
-| `make check-repl-rdma-smoke`       | 小            | RDMA 冒烟测试                                                 | `artifacts/repl/rdma-smoke/`        |
-| `make check-repl-rdma-stress`      | 中            | RDMA 压力测试                                                 | `artifacts/repl/rdma-stress/`       |
-| `make check-repl-rdma-soak`        | 中            | RDMA 长时浸泡                                                 | `artifacts/repl/rdma-stress/`       |
-| `make check-repl-ebpf-env`         | —            | eBPF 环境探测                                                 | —                                  |
+| `make check-demo-repl-sync`        | **5w+5w=10w** | 主从同步演示（可配 RDMA+eBPF 混合传输）                       | `artifacts/repl/sync-demo/`         |
 | `make check-rdma-standalone-probe` | —            | RDMA 环境探测                                                 | `artifacts/rdma/probe/`             |
 | `make check-rdma-pingpong-smoke`   | —            | RDMA pingpong 测试                                            | `artifacts/rdma/pingpong/`          |
 
 > **注意**：若之前使用 `sudo make check-demo-repl-sync` 运行过，`artifacts/repl/sync-demo/` 下的文件属主为 root，再次运行时需先 `sudo rm -rf artifacts/repl/sync-demo` 清理，否则会报 `PermissionError`。
+
+### 辅助测试脚本（非 Makefile 目标）
+
+以下脚本位于 `tools/` 目录下，可直接运行，未绑定 Makefile 目标：
+
+| 脚本 | 位置 | 说明 |
+|------|------|------|
+| `test_master_slave_multi_engine_nc.sh` | `tools/tests/` | 多引擎主从复制 nc 测试（手动指定 host/port） |
+| `test_kv.sh` | `tools/tests/` | kvstore 基本功能测试 |
+| `run_save_bgsave_perf_test.sh` | `tools/persist/` | SAVE/BGSAVE 性能测试 |
+| `repl_ebpf_session.py` | `tools/repl/` | eBPF 复制会话管理（交互式调试） |
+| `run_repl_rdma_unsupported.py` | `tools/repl/` | RDMA 不可用场景模拟测试 |
+| `repl_ebpf_daemon.c` | `tools/ebpf/` | eBPF 独立守护进程（需编译） |
+
+示例：
+```bash
+# 多引擎主从测试
+bash tools/tests/test_master_slave_multi_engine_nc.sh 127.0.0.1 5000
+
+# SAVE/BGSAVE 性能测试
+bash tools/persist/run_save_bgsave_perf_test.sh
+```
 
 ### 参数化运行
 
@@ -364,6 +719,9 @@ make check TEST_PORT=6380
 
 # 主从复制自定义端口
 make check-repl REPL_MASTER_PORT=7000 REPL_SLAVE_PORT=7001
+
+# 10w 级测试自定义数据量
+make check-10w CHECK_10W_COUNT=50000
 
 # 海量 TTL 自定义规模
 make check-mass-ttl MASS_TTL_KEYS=5000 MASS_TTL_SECONDS=2
@@ -376,6 +734,27 @@ make check-mmap-recover MMAP_RECOVER_ENGINE=hash MMAP_RECOVER_COUNT=20000
 
 # 批量 1w 级回归自定义规模
 make check-bulk-1w BULK_COUNT=50000
+
+# eBPF 同步测试
+make check-repl-ebpf-sync REPL_EBPF_SYNC_COUNT=128
+
+# RDMA 压力测试自定义参数
+make check-repl-rdma-stress REPL_RDMA_STRESS_PRELOAD=256 REPL_RDMA_STRESS_TAIL_WRITES=64 REPL_RDMA_STRESS_RESTART_ROUNDS=5
+
+# RDMA 浸泡测试自定义时长
+make check-repl-rdma-soak REPL_RDMA_SOAK_SECONDS=300 REPL_RDMA_SOAK_WRITE_INTERVAL_MS=100
+
+# RDMA 长浸泡（30 分钟）
+make check-repl-rdma-long-soak
+
+# RDMA 可调参数测试（recv slots / chunk size / QP depth）
+make check-repl-rdma-stress REPL_RDMA_TUNABLE_RECV_SLOTS=64 REPL_RDMA_TUNABLE_CHUNK_SIZE=65536 REPL_RDMA_TUNABLE_QP_WR_DEPTH=128
+
+# RDMA 强制降级验证
+make check-repl-rdma-fallback REPL_RDMA_FORCE_FALLBACK=1
+
+# 全量同步演示自定义传输方式
+make check-demo-repl-sync REPL_SYNC_DEMO_FULLSYNC=rdma REPL_SYNC_DEMO_REALTIME=ebpf
 
 # 一键运行全部测试
 make check-all
@@ -403,9 +782,12 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | 复制指标基线        | `artifacts/repl/metrics/`           | INFO 快照、CPU/RSS 摘要 |
 | 复制 profiling      | `artifacts/repl/profile/`           | perf 数据、调用栈       |
 | 主从同步 10w 演示   | `artifacts/repl/sync-demo/`         | 同步一致性报告          |
-| eBPF 同步测试       | `artifacts/repl/ebpf-sync/`         | eBPF 日志、验证报告     |
-| RDMA smoke / stress | `artifacts/repl/rdma-stress/`       | 状态报告、fullsync 日志 |
-| RDMA 环境探测       | `artifacts/rdma/probe/`             | 环境可用性报告          |
+| eBPF 同步测试          | `artifacts/repl/ebpf-sync/`           | eBPF 日志、验证报告           |
+| eBPF 同步测试(ingress) | `artifacts/repl/ebpf-sync/`           | ingress 重定向验证报告        |
+| RDMA 冒烟测试          | `artifacts/repl/rdma-smoke/`          | RDMA 全量同步状态报告         |
+| RDMA 压力/浸泡测试     | `artifacts/repl/rdma-stress/`         | 状态报告、fullsync 日志、重启日志 |
+| RDMA 手动测试          | `artifacts/repl/rdma-manual/`         | 手动 RDMA 测试日志            |
+| RDMA 环境探测          | `artifacts/rdma/probe/`               | 环境可用性报告                |
 | RDMA pingpong       | `artifacts/rdma/pingpong/`          | 延迟/吞吐报告           |
 | 基准测试            | `artifacts/bench/`                  | CSV 数据、图表          |
 

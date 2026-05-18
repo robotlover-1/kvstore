@@ -643,12 +643,12 @@ flowchart LR
     DUMP_LOAD --> Recovery
 ```
 
-**恢复顺序**：先恢复 dump 文件（全量），再重放 AOF（增量）。
+**恢复顺序**：先恢复 dump 文件（全量二进制），再重放 AOF（增量 RESP 命令）。
 
 ```c
 // src/persistence/kvs_persist.c
 int persist_recover(void) {
-    // Step 1: 恢复 dump 文件 (key\\nvalue\\n 格式)
+    // Step 1: 恢复 dump 文件 (uint32_t klen + key + uint32_t vlen + value 二进制格式)
     replay_dump_file(g_cfg.dump_path);
 
     // Step 2: 重放 AOF 文件 (RESP 命令格式)
@@ -658,13 +658,12 @@ int persist_recover(void) {
 
 ### 5.2 Dump 格式 (KVSD)
 
-**格式**：最简单的 `key\nvalue\n` 逐行存储，每两行一对。
+**格式**：二进制长度前缀格式，`uint32_t klen (4字节) + key (klen 字节) + uint32_t vlen (4字节) + value (vlen 字节)`，每对 key-value 为一条记录。
 
 ```
-key1
-value1
-key2
-value2
+[4B klen][key bytes][4B vlen][value bytes]
+[4B klen][key bytes][4B vlen][value bytes]
+...
 ```
 
 **mmap 恢复**：优先使用 mmap，减少用户态拷贝，失败回退到 fread。
@@ -678,30 +677,43 @@ static int replay_dump_file(const char *path) {
     mapped = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE, fd, 0);
     if (mapped == MAP_FAILED) { close(fd); return 0; }
+    size = (size_t)st.st_size;
 
-    // Step 2: 逐行解析 key\\nvalue\\n
-    size_t pos = 0;
-    while (pos <= size) {
-        // 读 key 行
-        while (pos < size && mapped[pos] != '\\n') pos++;
-        key = kvs_malloc(klen + 1);
-        memcpy(key, mapped + line_start, klen);
-        key[klen] = '\\0';
-        pos++;  // 跳过 \\n
-
-        // 读 value 行
-        // ... 同理 ...
-
+    // Step 2: 解析二进制格式 uint32_t klen + key + uint32_t vlen + value
+    while (pos + 4 <= size) {
+        uint32_t klen, vlen;
+        // 读 key 长度
+        memcpy(&klen, mapped + pos, sizeof(klen));
+        pos += sizeof(klen);
+        if (pos + klen > size) break;
+        // 读 key
+        key = (char *)kvs_malloc(klen + 1);
+        if (klen > 0) memcpy(key, mapped + pos, klen);
+        key[klen] = '\0';
+        pos += klen;
+        // 读 value 长度
+        if (pos + 4 > size) { kvs_free(key); break; }
+        memcpy(&vlen, mapped + pos, sizeof(vlen));
+        pos += sizeof(vlen);
+        // 读 value
+        value = (char *)kvs_malloc(vlen + 1);
+        if (vlen > 0) memcpy(value, mapped + pos, vlen);
+        value[vlen] = '\0';
+        pos += vlen;
         // 恢复数据
         kvs_hash_set(&global_hash, key, value);
-        kvs_free(key);
-        kvs_free(value);
+        kvs_free(key); kvs_free(value);
     }
-
     munmap(mapped, size);
     close(fd);
 }
 ```
+
+> ⚠️ **注意**：恢复时只恢复到 Hash 引擎。`kvs_load_dump_from_fd()` 在头文件中有声明，但目前**未实现**。
+
+**kvs_dump_to_fd() 实现**：遍历所有 5 个引擎（array/hash/rbtree/skiptable/doc），统一写入二进制长度前缀格式。文档引擎的 value 会平铺为 `name=value name=value` 格式。
+
+**kvs_snapshot_to_fd()**：与 dump 不同，snapshot 使用 **RESP 命令格式**（`SET key value\r\n`、`HSET key value\r\n` 等），用于 AOF 重写（BGREWRITEAOF）和全量同步。
 
 **SAVE / BGSAVE**：
 
@@ -859,14 +871,25 @@ repl_realtime_transport=ebpf    # 实时同步走 eBPF
 **Master 侧命令广播** (`src/main/kvstore.c`)：
 
 ```c
-void repl_broadcast(conn_t *skip, const unsigned char *raw, size_t rawlen) {
+void repl_broadcast(const unsigned char *raw, size_t rawlen) {
+    repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
+    repl_backlog_feed(raw, rawlen);  // 也写入 backlog（供 partial resync）
+    repl_note_broadcast(rawlen);
     pthread_mutex_lock(&g_repl_lock);
 
     for (conn_t **pp = &g_replicas; *pp; ) {
         conn_t *c = *pp;
-        if (c == skip) { pp = &c->next_replica; continue; }
-
-        // 优先尝试实时传输 (eBPF)
+        if (c->repl_draining) {
+            *pp = c->next_replica;   // 清理正在排空的 replica
+            c->next_replica = NULL;
+            c->is_replica = 0;
+            continue;
+        }
+        if (c->repl_fullsync_pending) {
+            pp = &c->next_replica;   // 全量同步未完成的跳过
+            continue;
+        }
+        // 优先尝试实时传输 (eBPF/sockmap)
         if (repl_realtime_send(c, raw, rawlen) != 0) {
             if (repl_handle_replica_send_failure(c, pp)) continue;
         }
@@ -875,12 +898,11 @@ void repl_broadcast(conn_t *skip, const unsigned char *raw, size_t rawlen) {
         c->repl_last_send_ms = kvs_now_ms();
         pp = &c->next_replica;
     }
-
-    // 同时写入 backlog（供 partial resync 使用）
-    repl_backlog_append(raw, rawlen);
     pthread_mutex_unlock(&g_repl_lock);
 }
 ```
+
+> ⚠️ **注意**：实际签名是 `void repl_broadcast(const unsigned char *raw, size_t rawlen)`，**没有** `skip` 参数。排空（`repl_draining`）和全量同步等待（`repl_fullsync_pending`）机制替代了早期的 skip 逻辑。
 
 **Backlog (环形缓冲区)**：
 
@@ -929,6 +951,8 @@ static void *slave_thread(void *arg) {
 
 **详细实现**参见 `docs/rdma-fullsync-implementation.md`。这里给出核心要点：
 
+#### 6.5.1 基础架构
+
 **Master RDMA Listener 线程** (`src/replication/kvs_repl.c`)：
 
 ```c
@@ -951,18 +975,21 @@ static void *rdma_master_listener_thread(void *arg) {
         ibv_alloc_pd(id->verbs);          // 保护域
         ibv_create_cq(id->verbs, ...);    // 完成队列
         repl_rdma_create_qp();             // 可靠连接 QP (IBV_QPT_RC)
-        repl_rdma_prepare_buffers();       // 注册 MR
-        repl_rdma_post_initial_recv();     // 预 post 32 个 recv WR
+        repl_rdma_prepare_buffers();       // 注册 MR + 分配 pipeline send slots
+        repl_rdma_post_initial_recv();     // 预 post recv WR
 
         // Accept
         rdma_accept(id, &param);
         repl_rdma_wait_event(ESTABLISHED, 5000);
         g_repl_rdma_ctx.connected = 1;
+        // pipeline 模式下启动 CQ 轮询线程
+        if (g_repl_rdma_ctx.send_pipeline_enabled)
+            repl_rdma_start_cq_poll_thread();
 
-        // 接收循环
+        // 接收循环（hybrid 模式 sleep，非 hybrid 模式 poll recv）
         for (;;) {
             if (!g_repl_rdma_ctx.connected) break;
-            // 等待 recv completion → 解析 REPLSYNC 等
+            if (hybrid_mode) { sleep(1); continue; }
             repl_rdma_wait_cq_recv_completion(2000, &slot, &len);
             parse_resp_stream(&conn, stream_buf, &stream_len, 0);
         }
@@ -970,16 +997,16 @@ static void *rdma_master_listener_thread(void *arg) {
 }
 ```
 
-**RDMA Send (master → slave 发送快照)**：
+#### 6.5.2 同步发送模式（原始实现）
+
+Pipeline 之前的原始发送模式，每次 send 同步等待 CQ completion：
 
 ```c
 static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     pthread_mutex_lock(&g_repl_rdma_send_lock);
 
-    // 拷贝到预注册的 send_buf
     memcpy(g_repl_rdma_ctx.send_buf, buf, len);
 
-    // 构建 SGE + WR
     struct ibv_sge sge = {
         .addr = (uintptr_t)g_repl_rdma_ctx.send_buf,
         .length = (uint32_t)len,
@@ -987,17 +1014,196 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     };
     struct ibv_send_wr wr = {
         .sg_list = &sge, .num_sge = 1,
-        .opcode = IBV_WR_SEND,          // 双边 Send 语义
-        .send_flags = IBV_SEND_SIGNALED, // 需要 CQ 通知
+        .opcode = IBV_WR_SEND,
+        .send_flags = IBV_SEND_SIGNALED,
     };
 
     ibv_post_send(g_repl_rdma_ctx.id->qp, &wr, &bad_wr);
-
-    // 同步等待 Send Completion
-    repl_rdma_wait_cq_send_completion(1000);
+    repl_rdma_wait_cq_send_completion(1000);  // ← 流水线阻断点
 
     pthread_mutex_unlock(&g_repl_rdma_send_lock);
 }
+```
+
+**瓶颈**：单 send buffer，每次 post 后必须等待 completion 才能准备下一块数据。在 soft-iWARP 上每次软件 WR 延迟约 100-500μs。
+
+#### 6.5.3 Pipeline 发送模式（当前实现）
+
+**设计目标**：通过多 send buffer 环形队列 + 后台 CQ 轮询线程，将数据拷贝、WR 提交、DMA 传输三者重叠。
+
+**新增数据结构**：
+
+```c
+#define KVS_RDMA_PIPELINE_DEPTH      4   /* 多发送缓冲区深度 */
+#define KVS_RDMA_CQ_BATCH            8   /* CQ 批量 poll 大小 */
+#define KVS_RDMA_PIPELINE_WR_ID_FLAG 0x80000000UL  /* wr_id 高位标记 */
+
+/* Pipeline 发送缓冲区槽位 */
+typedef struct repl_rdma_send_slot_s {
+    struct ibv_mr *mr;          /* 注册的内存区域 */
+    unsigned char *buf;         /* 缓冲区 */
+    size_t cap;                 /* 容量 */
+    int in_flight;              /* 1 = 已 post 但未完成 */
+    uint64_t wr_id;             /* 对应的 wr_id */
+} repl_rdma_send_slot_t;
+```
+
+**非阻塞发送流水线**：
+
+```c
+static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
+    pthread_mutex_lock(&g_repl_rdma_send_lock);
+
+    // pipeline 模式：非阻塞发送
+    int slot = repl_rdma_acquire_send_slot(5000);  // 获取空闲 slot
+    if (slot < 0) { ... }
+
+    memcpy(g_repl_rdma_ctx.send_slots[slot].buf, buf, len);
+
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)g_repl_rdma_ctx.send_slots[slot].buf,
+        .length = (uint32_t)len,
+        .lkey = g_repl_rdma_ctx.send_slots[slot].mr->lkey,
+    };
+    struct ibv_send_wr wr = {
+        .wr_id = (uint64_t)slot | KVS_RDMA_PIPELINE_WR_ID_FLAG,
+        .sg_list = &sge, .num_sge = 1,
+        .opcode = IBV_WR_SEND,
+        .send_flags = IBV_SEND_SIGNALED,
+    };
+
+    ibv_post_send(qp, &wr, &bad_wr);
+    g_repl_rdma_ctx.send_slots[slot].in_flight = 1;  // 标记飞行中
+    g_repl_rdma_ctx.send_slots_in_flight++;
+
+    pthread_mutex_unlock(&g_repl_rdma_send_lock);
+    return 0;  // ← 立即返回，不等待 CQ
+}
+```
+
+**后台 CQ 轮询线程**：使用 completion channel 事件驱动，避免 busy poll。
+
+```c
+static void *repl_rdma_cq_poll_thread(void *arg) {
+    while (running && connected) {
+        ibv_get_cq_event(comp_chan, &ev_cq, &ev_ctx);  // 阻塞等待事件
+        ibv_ack_cq_events(cq, 1);
+
+        // 批量 poll
+        while ((n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc)) > 0) {
+            for (int i = 0; i < n; i++) {
+                if (wc[i].opcode == IBV_WC_SEND) {
+                    // 释放 send slot
+                    int slot = wc[i].wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG;
+                    g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
+                    g_repl_rdma_ctx.send_slots_in_flight--;
+                } else if (wc[i].opcode == IBV_WC_RECV) {
+                    // 推入 pending recv 队列
+                    int slot = (int)(wc[i].wr_id - 1);
+                    repl_rdma_pending_recv_push(slot, wc[i].byte_len);
+                }
+            }
+        }
+        /* 标准 re-arm → drain 模式 */
+        ibv_req_notify_cq(cq, 0);
+        ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc);  // 确认无漏网 completion
+    }
+}
+```
+
+**自适应 Pipeline 深度**：根据 in_flight 数量动态调节 2~4：
+
+```c
+static void repl_rdma_adjust_pipeline_depth(void) {
+    int in_flight = g_repl_rdma_ctx.send_slots_in_flight;
+    int depth = g_repl_rdma_ctx.send_pipeline_depth;
+
+    if (in_flight <= depth / 2 && depth < KVS_RDMA_PIPELINE_DEPTH)
+        g_repl_rdma_ctx.send_pipeline_depth = depth + 1;  // 增加深度
+    else if (in_flight >= depth && depth > KVS_RDMA_PIPELINE_DEPTH_MIN)
+        g_repl_rdma_ctx.send_pipeline_depth = depth - 1;  // 减少深度
+}
+```
+
+**Pipeline 架构数据流**：
+
+```mermaid
+flowchart LR
+    subgraph MasterSend["Master 发送端"]
+        ACQ["acquire_send_slot()\n获取空闲 slot"]
+        CPY["memcpy → slot buffer"]
+        POST["ibv_post_send()\n非阻塞，立即返回"]
+    end
+
+    subgraph CQThread["CQ 轮询线程（后台）"]
+        EVT["ibv_get_cq_event()\n等待 completion"]
+        POLL["ibv_poll_cq()\n批量取 WC"]
+        SEND_CMP["SEND completion\n→ release_send_slot()"]
+        RECV_CMP["RECV completion\n→ pending_recv_push()"]
+    end
+
+    subgraph SlaveRecv["Slave 接收端"]
+        RECV_DEQ["wait_cq_recv_completion()\n从 pending 队列取"]
+        REPOST["repost_recv()\n重新挂载 recv WR"]
+        PARSE["parse_resp_stream()"]
+    end
+
+    ACQ --> CPY --> POST
+    POST -->|"QP 硬件"| EVT
+    EVT --> POLL
+    POLL --> SEND_CMP
+    POLL --> RECV_CMP
+    SEND_CMP -.->|"释放 slot"| ACQ
+    RECV_CMP --> RECV_DEQ
+    RECV_DEQ --> REPOST
+    RECV_DEQ --> PARSE
+```
+
+#### 6.5.4 CQ 编程的关键陷阱与修复
+
+在 Pipeline 实现中遇到了两个典型的 RDMA 编程问题：
+
+**陷阱一：Notification re-arm 窗口期死锁**
+
+```
+错误顺序:
+  ibv_poll_cq() → 全空 → ibv_req_notify_cq() → ibv_get_cq_event()
+                            ↑
+                      completion 在此窗口到达 → 永远丢失 event → 线程死锁
+
+正确顺序 (re-arm → drain):
+  ibv_req_notify_cq() → ibv_poll_cq()
+                          ├─ 有数据 → 处理 → 重试
+                          └─ 无数据 → ibv_get_cq_event() 等待
+```
+
+**陷阱二：多线程同时 poll 同一 CQ**
+
+当 CQ 轮询线程运行时，其他路径（`wait_cq_recv_completion`、`acquire_send_slot`）不得直接 `ibv_poll_cq()`，否则会导致 completion channel event 被错误消费。解决方案：CQ 线程运行时，所有其他路径只检查 pending 队列，不碰 CQ。
+
+```c
+/* 正确做法：CQ 线程运行时，只等 pending 队列 */
+if (g_repl_rdma_ctx.cq_poll_thread_running) {
+    while (kvs_now_ms() < deadline) {
+        if (repl_rdma_pending_recv_pop(&slot, &len) == 0) return 0;
+        usleep(1000);
+    }
+    return -1;
+}
+/* 无 CQ 线程：直接 poll CQ（向后兼容） */
+ibv_poll_cq(...);
+```
+
+#### 6.5.5 Pipeline 性能对比
+
+| 指标 | 同步模式（改前） | Pipeline 模式（改后） | 预期提升 |
+|---|---|---|---|
+| 每次 send 阻塞 | 等待 100-500μs | 立即返回 (0μs) | 2-4x 吞吐 |
+| CQ 轮询方式 | busy poll (100% 单核) | 事件驱动 (ibv_get_cq_event) | CPU ↓80% |
+| send buffer 数量 | 1（无法 prep 下一块） | 4（环形队列重叠拷贝与 DMA） | 有效带宽翻倍 |
+| CQ 多线程竞争 | N/A | 通过 cq_poll_thread_running 隔离 | 消除竞争死锁 |
+
+**当前状态**：✅ Pipeline 模式默认启用 (`send_pipeline_enabled=1`)，不影响 TCP/eBPF 等其他传输路径。`repl_rdma_batch_send()` 批量 WR 提交接口已预留但未接入调用方。
 ```
 
 ### 6.6 eBPF 实时同步
@@ -1058,6 +1264,44 @@ int repl_ebpf_register_fd(int fd, int is_master_side) {
     bpf_map_update_elem(g_repl_ebpf_sock_map_fd, &key, &fd, BPF_ANY);
 }
 ```
+
+#### 6.6.1 eBPF 独立守护进程模式
+
+实际部署时，eBPF 加载和管理可由独立进程 `tools/ebpf/repl_ebpf_daemon` 完成（通过 `ebpf_enabled=0` 配置），kvstore 自身不加载 BPF 对象。
+
+```bash
+# 独立守护进程启动
+tools/ebpf/repl_ebpf_daemon -c kvstore-ebpf.conf
+```
+
+配置文件 `kvstore-ebpf.conf`：
+```
+ebpf_obj_path=build/replication/bpf/repl_sockmap.bpf.o
+ebpf_pin_path=/sys/fs/bpf/kvstore
+ebpf_redirect=1
+ebpf_redirect_key=0
+ebpf_forward=0
+```
+
+当 `ebpf_enabled=1` 时，kvstore 直接在进程内加载 BPF 对象（向后兼容模式）。守护进程模式下 kvstore 通过 pin 路径与 eBPF maps 共享。
+
+#### 6.6.2 传输层降级机制 (Transport Fallback)
+
+当配置的传输层（RDMA/eBPF）运行中不可用或失败时，系统自动降级到 TCP：
+
+```c
+// 降级逻辑位于 repl_realtime_send() / repl_fullsync_send() 内部
+// 当 RDMA WR 失败或 eBPF 重定向失败时，自动标记降级
+if (repl_rdma_try_send(...) != 0 && g_repl_rdma_ctx.state == REPL_RDMA_STATE_FALLBACK_TCP) {
+    // → 自动切到 repl_transport_tcp_send()
+}
+```
+
+降级状态和原因可通过 `INFO` 命令的以下字段查看：
+- `repl_transport_active`：当前活跃的传输层
+- `repl_transport_fallback_count`：降级次数
+- `repl_transport_fallback_reason`：降级原因
+- `repl_transport_fallback_until_ms`：降级持续到的时间戳
 
 **数据流**：
 
@@ -1198,16 +1442,33 @@ kv_config_t g_cfg = {
     .repl_transport_backend = "tcp",
     .repl_fullsync_transport = "rdma",
     .repl_realtime_transport = "ebpf",
+    .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
+    .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
+    .ebpf_enabled = 0,
+    .ebpf_redirect = 0,
+    .ebpf_redirect_key = 0,
+    .ebpf_forward = 0,
     .rdma_dev = "rxe0",
+    .rdma_ib_port = 1,
+    .rdma_gid_idx = 1,
+    .rdma_port = 0,
     .rdma_recv_slots = 32,
-    .rdma_chunk_size = BUFFER_CAP / 4,  // 16384
+    .rdma_chunk_size = BUFFER_CAP * 4,  // 262144
     .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
     .log_mode = "info",
+    .is_sentinel = 0,
+    .sentinel_master_name = "mymaster",
+    .sentinel_monitor_host = "127.0.0.1",
+    .sentinel_monitor_port = 5000,
+    .sentinel_known_slaves = "",
+    .sentinel_down_after_ms = 5000,
+    .sentinel_failover_timeout_ms = 10000,
     .sentinel_quorum = 1,
-    // ...
 };
 ```
+
+> ⚠️ **注意**：`rdma_chunk_size` 的实际默认值是 `BUFFER_CAP * 4` (262144)，**不是** `BUFFER_CAP / 4` (16384)。`ebpf_enabled=0` 表示由独立守护进程管理 eBPF。
 
 ### 8.2 配置加载链
 
@@ -1218,26 +1479,28 @@ flowchart LR
 ```
 
 1. 结构体初始化为默认值
-2. `parse_config(path)` 逐行解析配置文件，覆盖默认值
-3. `parse_args(argc, argv)` 解析命令行参数，覆盖配置文件
+2. `parse_args()` 中先查找配置文件路径，调用 `parse_config_file()` 逐行解析配置文件，覆盖默认值
+3. 然后解析命令行参数，覆盖配置文件
 
 ```c
 // 配置解析：key=value 格式
-static void parse_config(const char *path) {
+static int parse_config_file(const char *path) {
     FILE *fp = fopen(path, "r");
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#' || line[0] == '\\n') continue;
-        char *key = strtok(line, "=");
-        char *value = strtok(NULL, "\\n");
-        trim(key); trim(value);
-
-        if (!strcmp(key, "port")) g_cfg.port = atoi(value);
-        else if (!strcmp(key, "role")) snprintf(g_cfg.role_str, ...);
-        else if (!strcmp(key, "mem_backend")) snprintf(g_cfg.mem_backend, ...);
-        // ... 每个配置项逐一解析
+        trim_inplace(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+        char *eq = strchr(line, '=');
+        if (!eq) return -1;
+        *eq = '\0';
+        char *key = line;
+        char *value = eq + 1;
+        trim_inplace(key); trim_inplace(value);
+        apply_config_kv(key, value);  // 统一键值对分发函数
     }
 }
 ```
+
+> 实际函数名为 `parse_config_file` 而非 `parse_config`。通过 `apply_config_kv()` 统一处理键值对分发，支持所有配置项。
 
 ---
 
@@ -1307,15 +1570,23 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len,
 
 ### 9.3 命令分发 (`handle_parsed_command`)
 
-收到解析后的命令数组，进行字符串匹配后分发给对应的处理逻辑：
+收到解析后的命令数组，进行字符串匹配后分发给对应的处理逻辑。完整支持的写命令列表：
+
+| 类别 | 命令 |
+|------|------|
+| **基本 KV** | `SET`, `MSET`, `MOD`, `DEL` |
+| **引擎前缀 + KV** | `RSET`, `RMSET`, `RMOD`, `RDEL`, `HSET`, `HMSET`, `HMOD`, `HDEL`, `XSET`, `XMSET`, `XMOD`, `XDEL` |
+| **TTL** | `EXPIRE`, `PERSIST`, `REXPIRE`, `RPERSIST`, `HEXPIRE`, `HPERSIST`, `XEXPIRE`, `XPERSIST` |
+| **文档** | `DOCSET`, `DOCDEL`, `DOCDROP` |
+| **分布式锁** | `LOCK`, `UNLOCK`, `RENEW` |
 
 ```c
 if (!strcmp(cmd, "SET")) {
     // 存储引擎 + 过期 + 持久化 + 复制广播
     engine_set(engine, key, value);
     kvs_expire_set(&global_expire, engine, key, ttl_ms);
-    persist_aof_append(raw, rawlen);
-    repl_broadcast(c, raw, rawlen);
+    persist_append_raw(raw, rawlen);
+    repl_broadcast(raw, rawlen);
     resp_simple_string(resp, cap, "OK");
     queue_bytes(c, resp, n);
 }
@@ -1327,9 +1598,19 @@ else if (!strcmp(cmd, "GET")) {
 }
 else if (!strcmp(cmd, "REPLSYNC")) {
     // 复制同步请求
+    int can_continue = repl_backlog_can_continue(req_replid, req_offset);
     repl_add_slave(c);
     if (can_continue) repl_backlog_send_continue(c, req_offset);
     else queue_snapshot(c);
+}
+else if (!strcmp(cmd, "LOCK") && argc == 4) {
+    // 分布式锁：LOCK key owner seconds
+    int lrc = lock_acquire(KVS_ENGINE_ARRAY, argv[1], argv[2], atoll(argv[3]));
+    if (lrc == 0) {
+        // 成功获取
+        persist_append_raw(raw, rawlen);
+        if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+    }
 }
 ```
 
@@ -1349,7 +1630,10 @@ flowchart TB
         RESP["test_resp_nc_strict.sh\nRESP 协议验证"]
         TTL["test_resp_ttl_nc.sh\nTTL 验证"]
         DOC["test_doc_nc.sh\n文档型验证"]
+        QUEUE["test_resp_queue_recovery.sh\n队列恢复验证"]
     end
+
+> ⚠️ **注意**：`tests/unit/` 目录存在但仅含 `.gitkeep`，**目前无实际单元测试**。所有测试均为集成测试级别。
 
     subgraph PersistTest["持久化测试 (tools/persist/)"]
         PERSIST["test_resp_persist_nc.sh\n基本链路"]
@@ -1427,17 +1711,42 @@ make check-repl-rdma-stress \
 | `--net` | 网络模型: reactor/proactor/ntyco | reactor |
 | `--mem` | 内存后端: libc/jemalloc/custom | libc |
 | `--role` | 角色: master/slave | master |
+| `--master-host` | 主节点地址 | 127.0.0.1 |
+| `--master-port` | 主节点端口 | 5000 |
+| `--repl-transport` | 复制传输（单模式）: tcp/rdma/ebpf | tcp |
 | `--repl-fullsync-transport` | 全量同步传输: tcp/rdma | rdma |
-| `--repl-realtime-transport` | 实时同步传输: tcp/ebpf | ebpf |
+| `--repl-realtime-transport` | 实时同步传输: tcp/ebpf/sockmap | ebpf |
+| `--ebpf-obj` | eBPF 对象文件路径 | build/replication/bpf/... |
+| `--ebpf-pin` / `--ebpf-pin-path` | eBPF pin 路径 | /sys/fs/bpf/kvstore_repl_sockmap |
+| `--ebpf-redirect` | 启用 eBPF 重定向 | 0 |
+| `--ebpf-redirect-key` | eBPF 重定向 key | 0 |
+| `--ebpf-forward` | 启用 eBPF 转发 | 0 |
 | `--rdma-dev` | RDMA 设备 | rxe0 |
+| `--rdma-ib-port` | RDMA IB 端口 | 1 |
+| `--rdma-gid-idx` | RDMA GID 索引 | 1 |
+| `--rdma-port` | RDMA 监听端口（0=自动: 主端口+1） | 0 |
+| `--rdma-recv-slots` | RDMA 接收槽位数 | 32 |
+| `--rdma-chunk-size` | RDMA 分块大小（默认 BUFFER_CAP*4=262144） | 262144 |
+| `--rdma-qp-wr-depth` | RDMA QP WR 深度 | 64 |
 | `--appendfsync` | AOF 同步: always/everysec | always |
-| `--autosnap` | 自动快照规则 | 空(禁用) |
+| `--dump` | dump 文件路径 | kvstore.dump |
+| `--aof` | AOF 文件路径 | kvstore.aof |
+| `--log-mode` | 日志级别: debug/info/warn/error | info |
+| `--autosnap` | 自动快照规则 (格式: sec:changes,...) | 空(禁用) |
+| `--sentinel` | 启用哨兵模式 | 0 |
+| `--sentinel-master-name` | 哨兵监控名称 | mymaster |
+| `--sentinel-monitor-host` | 哨兵监控主机 | 127.0.0.1 |
+| `--sentinel-monitor-port` | 哨兵监控端口 | 5000 |
+| `--sentinel-known-slaves` | 已知从节点列表 | 空 |
+| `--sentinel-down-after` | 判定下线毫秒数 | 5000 |
+| `--sentinel-failover-timeout` | 故障转移超时毫秒数 | 10000 |
+| `--sentinel-quorum` | 哨兵法定人数 | 1 |
 
 ### C. 关键文件索引
 
 | 模块 | 文件 | 函数/功能 |
 |------|------|-----------|
-| 入口 | `src/main/kvstore.c` | `main()`, `handle_parsed_command()`, `queue_snapshot()`, `repl_broadcast()`, `parse_resp_stream()` |
+| 入口 | `src/main/kvstore.c` | `main()`, `handle_parsed_command()`, `queue_snapshot()`, `repl_broadcast(const unsigned char *raw, size_t rawlen)`, `parse_resp_stream()`, `kvs_dump_to_fd()`, `kvs_snapshot_to_fd()` |
 | Reactor | `src/core/reactor.c` | `reactor_start()`, `on_read()`, `on_write()`, `on_accept()`, `queue_bytes()`, `close_conn()` |
 | Proactor | `src/core/proactor.c` | `proactor_start()`, `submit_accept()`, `submit_read()`, `submit_write()` |
 | NtyCo | `src/core/ntyco.c` | `ntyco_start()`, `ntyco_server()`, `server_reader()` |
@@ -1448,9 +1757,11 @@ make check-repl-rdma-stress \
 | 内存管理 | `src/memory/kvs_mem.c` | `kvs_malloc/free/calloc` + slab+mmap |
 | 持久化 | `src/persistence/kvs_persist.c` | `persist_recover()`, `persist_bgsave()`, `persist_bgrewriteaof()`, `persist_write_fd_uring()` |
 | TTL | `src/expire/kvs_expire.c` | `kvs_expire_set()`, `kvs_active_expire_cycle()`, 堆操作 |
-| 复制核心 | `src/replication/kvs_repl.c` | `repl_broadcast()`, `slave_thread()`, `rdma_master_listener_thread()`, `repl_rdma_try_send()`, `repl_rdma_post_initial_recv()` |
-| eBPF | `src/replication/kvs_repl_ebpf.c` | `repl_ebpf_init()`, `repl_ebpf_register_fd()` |
+| 复制核心 | `src/replication/kvs_repl.c` | `repl_broadcast()`, `slave_thread()`, `rdma_master_listener_thread()`, `repl_rdma_try_send()`, `repl_rdma_post_initial_recv()`, `repl_rdma_acquire_send_slot()`, `repl_rdma_cq_poll_thread()`, `repl_backlog_feed()`, `repl_backlog_write_range()` |
+| eBPF | `src/replication/kvs_repl_ebpf.c` | `repl_ebpf_init()`, `repl_ebpf_register_fd()`, `repl_ebpf_get_stats()` |
 | BPF 程序 | `src/replication/bpf/repl_sockmap.bpf.c` | `kvstore_repl_sk_msg()` |
 | 哨兵 | `src/replication/kvs_sentinel.c` | `sentinel_start()` |
-| 头文件 | `include/kvstore/kvstore.h` | `conn_t`, `kv_config_t`, `repl_rdma_ctx_t` 等全部类型定义 |
-| 头文件 | `include/kvstore/server.h` | `conn` 结构体, `kvs_stream_t` |
+| eBPF 守护进程 | `tools/ebpf/repl_ebpf_daemon.c` | eBPF 独立管理进程（通过 `ebpf_enabled=0` 启用） |
+| 哈希工具 | `src/utils/hash.c` | 旧版哈希表实现（基于字符数组，未在 kvstore 中使用） |
+| 头文件 | `include/kvstore/kvstore.h` | `conn_t`, `kv_config_t`, `repl_rdma_ctx_t`, `kvs_repl_ebpf_stats_t`, `kvs_expire_table_t` 等全部类型定义 |
+| 头文件 | `include/kvstore/server.h` | `conn` 结构体（`kvs_stream_t` 未定义，当前未使用的遗留代码） |

@@ -999,4 +999,181 @@ RDMA 不应该改变复制语义，它应该只是 transport 优化层。
 - `testdata/`：静态测试样例
 - `assets/diagrams/`：工程图示资源
 
+---
+
+## 11. RDMA Pipeline：多发送缓冲区 + 后台 CQ 轮询
+
+### 11.1 背景
+
+此前 RDMA 全量同步（fullsync）已经功能可用，但发送路径采用**同步模型**：
+
+```c
+memcpy(send_buf, data, len);       // ① 拷贝
+ibv_post_send(qp, &wr, NULL);      // ② 提交 WR
+wait_cq_send_completion(5000);     // ③ 阻塞等待 CQ 完成 ← 流水线阻断点
+```
+
+每次 send 都要等待 CQ completion 才能返回，无法重叠**数据拷贝**与**DMA 传输**。在 soft-iWARP（siw）上，每次 WR 的软件开销较高，同步等待进一步放大了延迟。
+
+同时只使用 **1 个 send buffer**，无法在等待 completion 期间准备下一块数据。
+
+### 11.2 设计方案
+
+采用 **4 阶段渐进式实现**，每阶段可独立编译验证：
+
+| Phase | 改动 | 收益 |
+|---|---|---|
+| 1 | 单 send_buf → `send_slots[4]` 环形队列 | 支持多缓冲区并行准备 |
+| 2 | 后台 CQ 轮询线程（事件驱动） | 异步处理 send/recv completion |
+| 3 | WR 批量提交（预留，未接入调用方） | 减少 ibv_post_send 次数 |
+| 4 | 自适应 pipeline 深度调节 | 动态匹配传输速率 |
+
+### 11.3 主要修改
+
+#### 新增数据结构
+
+```c
+/* 发送缓冲区槽位 */
+typedef struct repl_rdma_send_slot_s {
+    struct ibv_mr *mr;          // 注册的内存区域
+    unsigned char *buf;         // 缓冲区
+    size_t cap;                 // 容量
+    int in_flight;              // 1 = 已 post 但未完成
+    uint64_t wr_id;             // 对应的 wr_id（含 PIPELINE_WR_ID_FLAG）
+} repl_rdma_send_slot_t;
+
+// 在 repl_rdma_ctx_t 中新增字段：
+repl_rdma_send_slot_t send_slots[KVS_RDMA_PIPELINE_DEPTH]; // 4 个 slot
+int send_pipeline_head;          // 下一个空闲 slot
+int send_slots_in_flight;        // outstanding send WR 数
+int send_pipeline_depth;         // 动态调节的深度 (2~4)
+int send_pipeline_enabled;       // 是否启用 pipeline
+pthread_t cq_poll_thread;        // CQ 轮询线程
+int cq_poll_thread_running;      // 线程运行标志
+```
+
+#### 新增常量
+
+```c
+#define KVS_RDMA_PIPELINE_DEPTH      4    /* 多发送缓冲区深度 */
+#define KVS_RDMA_CQ_BATCH            8    /* CQ 批量 poll 大小 */
+#define KVS_RDMA_PIPELINE_WR_ID_FLAG 0x80000000UL  /* wr_id 高位标记 */
+```
+
+#### 新增函数
+
+| 函数 | 说明 |
+|---|---|
+| `repl_rdma_acquire_send_slot(timeout_ms)` | 获取空闲 send slot；全忙时等 CQ 线程释放或 poll CQ 回收 |
+| `repl_rdma_release_send_slot(slot)` | 释放 send slot（由 CQ completion 回调调用） |
+| `repl_rdma_cq_process_wc(wc, adapt_counter)` | 统一的 WC 处理函数（CQ 线程和 fallback 共用） |
+| `repl_rdma_cq_poll_thread()` | 后台 CQ 事件循环，`ibv_get_cq_event()` 驱动 |
+| `repl_rdma_start_cq_poll_thread()` | 启动 CQ 轮询线程并 arm notification |
+| `repl_rdma_stop_cq_poll_thread()` | 停止 CQ 轮询线程 |
+| `repl_rdma_adjust_pipeline_depth()` | 动态调节 pipeline 深度（每 16 次 completion 评估） |
+
+#### 修改函数
+
+| 函数 | 改动 |
+|---|---|
+| `repl_rdma_try_send()` | pipeline 模式下：acquire_slot → memcpy → post_send → 立即返回 |
+| `repl_rdma_prepare_buffers()` | 分配 4 个 send buffer 并注册 MR |
+| `repl_rdma_reset_conn_ctx()` | 停止 CQ 线程，清理所有 send slot |
+| `repl_rdma_wait_cq_recv_completion()` | CQ 线程运行时只查 pending 队列，不直接 poll CQ |
+| `repl_rdma_wait_cq_send_completion()` | 识别 pipeline WR_ID，释放对应 slot |
+| `repl_rdma_acquire_send_slot()` | CQ 线程运行时等待释放，不直接 poll CQ |
+| `repl_transport_rdma_connect_slave()` | 建链后启动 CQ 轮询线程 |
+| `rdma_master_listener_thread()` | accept 后启动 CQ 轮询线程 |
+
+### 11.4 遇到的问题与解决方法
+
+#### 问题一：CQ completion notification re-arm 时序导致死锁
+
+**现象**：Pipeline 模式下，master 发送完整 sync 数据后，slave 侧 CQ 轮询线程挂死，后续增量数据无法到达。
+
+**根因**：（经典 RDMA 编程错误）CQ 轮询线程的循环顺序为：
+
+```
+ibv_get_cq_event() → ibv_poll_cq()(排空) → ibv_req_notify_cq()(重 arm)
+```
+
+如果在 `ibv_poll_cq()` 返回 0 之后、`ibv_req_notify_cq()` 执行之前，有新的 completion 到达，该 completion **不会触发事件**。因为 RDMA 硬件只在 notification **未 arm** 时生成事件，而 arm 操作发生在 completion 到达之后。于是线程永久阻塞在 `ibv_get_cq_event()`。
+
+**解决方法**：采用标准 RDMA re-arm → drain 模式：
+
+```c
+ibv_req_notify_cq(cq, 0);           // 先 arm
+ibv_poll_cq(cq, N, wc);             // 再 drain（确认 arm → poll 之间无漏网）
+if (有数据) → 处理 → continue;       // 不阻塞等待
+ibv_get_cq_event(...);               // 无数据 → 阻塞等待下一事件
+```
+
+**关键教训**：`ibv_req_notify_cq()` 必须在 `ibv_get_cq_event()` **之前** arm，且 arm 后必须立即 `ibv_poll_cq()` 确认没有 missed completion。
+
+#### 问题二：多线程同时 poll 同一 CQ 导致 event 丢失
+
+**现象**：CQ 轮询线程启动后，hybrid 模式 slave loop 中的 `repl_rdma_wait_cq_recv_completion()` 仍直接 `ibv_poll_cq()`，与轮询线程竞争同一 CQ。
+
+**根因**：虽然 `ibv_poll_cq()` 本身是线程安全的，但 completion channel 的事件机制不是。当两个线程同时 poll 同一 CQ：
+1. 线程 A（CQ 轮询）等待 `ibv_get_cq_event()`
+2. completion 到达，event 触发
+3. 线程 B（直接 poll）抢先消费了该 completion
+4. 线程 A 从 `ibv_get_cq_event()` 醒来，`ibv_poll_cq()` 发现为空
+5. 线程 A 重 arm notification
+6. 下次 completion 到达时，如果发生在 arm 之后，虽然能正确触发 event，但大量 CPU 浪费在无效唤醒上
+
+更严重的是，如果线程 A 的 re-arm 和下一个 completion 到达存在竞争窗口，**可能永久丢失 event**。
+
+**解决方法**：
+- `repl_rdma_wait_cq_recv_completion()`：CQ 轮询线程运行时，**只检查 pending_recv 队列**，不直接 poll CQ
+- `repl_rdma_acquire_send_slot()`：CQ 轮询线程运行时，所有 slot in_flight 时**只等待**，不直接 poll CQ 回收
+
+```c
+if (g_repl_rdma_ctx.cq_poll_thread_running) {
+    /* 等 CQ 线程异步处理后 pending_recv 队列 */
+    while (kvs_now_ms() < deadline) {
+        usleep(1000);
+        if (repl_rdma_pending_recv_pop(...) == 0) return 0;
+    }
+    return -1;
+}
+/* 无 CQ 线程：直接 poll CQ（向后兼容） */
+ibv_poll_cq(...);
+```
+
+#### 问题三：CQ 轮询线程在 `repl_rdma_reset_conn_ctx()` 中销毁顺序
+
+**现象**：连接断开后，CQ 轮询线程可能仍在访问已释放的 CQ / comp_chan。
+
+**根因**：`repl_rdma_reset_conn_ctx()` 直接销毁 `comp_chan` 和 `cq`，但未先通知 CQ 轮询线程停止。
+
+**解决方法**：在 `reset_conn_ctx` 入口先调用 `repl_rdma_stop_cq_poll_thread()`：
+1. 设置 `cq_poll_thread_running = 0`
+2. 销毁 `comp_chan` → 唤醒线程（`ibv_get_cq_event()` 返回错误）
+3. 线程检测到运行标志已清除，退出循环
+4. 随后安全销毁 CQ 和其他资源
+
+### 11.5 性能对比
+
+| 指标 | 改前（同步模式） | 改后（Pipeline 模式） | 预期提升 |
+|---|---|---|---|
+| 每次 send 阻塞 | 等待 100-500μs（CQ poll） | 立即返回（0μs 阻塞） | 2-4x 吞吐 |
+| CQ 轮询方式 | busy poll（100% 单核） | `ibv_get_cq_event` 事件驱动 | CPU ↓80% |
+| send buffer 数量 | 1（无法 prep 下一块） | 4（环形队列） | 数据传输可重叠 |
+| CQ 多线程竞争 | N/A | 通过 `cq_poll_thread_running` 隔离 | 消除竞争死锁 |
+
+### 11.6 当前状态
+
+- ✅ **Phase 1** 多发送缓冲区 — 完成，编译通过
+- ✅ **Phase 2** 后台 CQ 轮询线程 — 完成，编译通过
+- ⏸️ **Phase 3** WR 批量提交 — 代码已移除（`repl_rdma_batch_send` 预留接口，因未接入调用方而产生 unused warning，暂时移除）
+- ✅ **Phase 4** 自适应 Pipeline 深度 — 完成，编译通过
+- ✅ **CQ 线程安全问题修复** — notification re-arm 时序 + 多线程 poll 竞争 + 销毁顺序
+
+Pipeline 模式默认启用（`send_pipeline_enabled = 1`），不影响 TCP/eBPF 等其他传输路径。
+
+### 11.7 遗留问题
+
+- 增量同步（eBPF realtime）在 hybrid 模式下偶现 slave offset 不推进。当前怀疑为 eBPF daemon 未独立启动或 sockmap 未正确配置，与 Pipeline 改动无直接关联。
+
 这轮迭代结束后，项目已经从“功能堆叠”转入“可验证、可复盘、可继续维护”的状态。

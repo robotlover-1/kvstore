@@ -484,10 +484,17 @@ static int queue_snapshot(conn_t *c) {
     char hdr[128];
     char tmp_path[512];
     FILE *fp;
-    unsigned char buf[8192];
+    size_t buf_size = BUFFER_CAP;
+    {
+        size_t eff = (size_t)repl_rdma_effective_chunk_size();
+        if (eff > buf_size) buf_size = eff;
+    }
+    unsigned char *buf = (unsigned char *)kvs_malloc(buf_size);
+    if (!buf) return -1;
     size_t r;
     size_t total = 0;
     size_t total_bytes = 0;
+    int ret = -1;
 
 #if KVS_ENABLE_RDMA
     fprintf(stderr, "repl rdma: queue_snapshot - begin replid=%s offset=%llu\n", repl_master_id(), repl_master_offset());
@@ -495,13 +502,14 @@ static int queue_snapshot(conn_t *c) {
     /* Use a temporary path so we don't overwrite the binary dump file */
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
     fp = fopen(tmp_path, "wb");
-    if (!fp) return -1;
-    if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); unlink(tmp_path); return -1; }
+    if (!fp) goto out;
+    if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); unlink(tmp_path); goto out; }
     fclose(fp);
     fp = fopen(tmp_path, "rb");
-    if (!fp) { unlink(tmp_path); return -1; }
-    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) total_bytes += r;
+    if (!fp) { unlink(tmp_path); goto out; }
+    while ((r = fread(buf, 1, buf_size, fp)) > 0) total_bytes += r;
     fclose(fp);
+    fp = NULL;
 
     int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu\r\n", repl_master_id(), repl_master_offset(), total_bytes);
 
@@ -510,11 +518,11 @@ static int queue_snapshot(conn_t *c) {
 #if KVS_ENABLE_RDMA
         fprintf(stderr, "repl rdma: queue_snapshot - header send failed\n");
 #endif
-        return -1;
+        goto out;
     }
     fp = fopen(tmp_path, "rb");
-    if (!fp) { unlink(tmp_path); return -1; }
-    while ((r = fread(buf, 1, sizeof(buf), fp)) > 0) {
+    if (!fp) { unlink(tmp_path); goto out; }
+    while ((r = fread(buf, 1, buf_size, fp)) > 0) {
         total += r;
         repl_note_send_context("fullsync-snapshot", r, repl_master_offset(), buf);
         if (repl_send_chunked(c, buf, r) != 0) {
@@ -523,29 +531,34 @@ static int queue_snapshot(conn_t *c) {
 #endif
             fclose(fp);
             unlink(tmp_path);
-            return -1;
+            goto out;
         }
     }
     fclose(fp);
+    fp = NULL;
     unlink(tmp_path);
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
     c->repl_last_send_ms = kvs_now_ms();
     {
-        size_t done = resp_build_cmd1(buf, sizeof(buf), "REPLDONE");
+        size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
         repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
         if (repl_send_chunked(c, buf, done) != 0) {
 #if KVS_ENABLE_RDMA
             fprintf(stderr, "repl rdma: queue_snapshot - REPLDONE send failed\n");
 #endif
-            return -1;
+            goto out;
         }
     }
     c->repl_fullsync_pending = 0;
+    ret = 0;
 #if KVS_ENABLE_RDMA
     fprintf(stderr, "repl rdma: queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu\n", total, repl_master_offset());
 #endif
-    return 0;
+out:
+    if (fp) fclose(fp);
+    kvs_free(buf);
+    return ret;
 }
 
 static int is_readonly_slave_blocked(const char *cmd) {

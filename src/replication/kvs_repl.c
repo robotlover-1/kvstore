@@ -1396,6 +1396,22 @@ void repl_slave_finish_fullsync(void) {
     }
 #if KVS_ENABLE_RDMA
     fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
+    {
+        extern kv_config_t g_cfg;
+        extern kvs_hash_t global_hash;
+        int cnt = 0;
+        if (global_hash.nodes) {
+            for (int i = 0; i < global_hash.max_slots; ++i) {
+                for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
+                    cnt++;
+                }
+            }
+        }
+        fprintf(stderr, "repl rdma: slave_debug - total_hash_entries=%d\n", cnt);
+        /* 打印 key=pre:k:000000 的值 */
+        char *v = kvs_hash_get(&global_hash, "pre:k:000000");
+        fprintf(stderr, "repl rdma: slave_debug - HGET pre:k:000000 = %s\n", v ? v : "(null)");
+    }
 #endif
     /* 全量同步完成后，将当前内存数据保存到 dump 文件
      * 格式与 kvs_dump_to_fd() 一致（二进制长度前缀格式）
@@ -1723,7 +1739,7 @@ static void *slave_thread(void *arg) {
 
             g_slave_fd = tcp_fd;
             repl_set_link_state(1);
-            unsigned char buf[BUFFER_CAP];
+            unsigned char buf[BUFFER_CAP * 4 + 4096];
             size_t blen = 0;
             int replsync_sent = 0;
             long long rdma_wait_start = kvs_now_ms();
@@ -1760,16 +1776,26 @@ static void *slave_thread(void *arg) {
 
                 int had_new_data = 0;
 
-                /* Always process TCP first to ensure FULLRESYNC header
-                 * is parsed before RDMA snapshot data arrives. */
-                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, 0);
+                /* TCP recv is non-blocking; FULLRESYNC header arrives via RDMA
+                 * alongside snapshot data, so we don't block waiting for TCP. */
+                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
                 if (r > 0) {
                     blen += (size_t)r;
                     had_new_data = 1;
+                    /* Parse TCP data immediately to free buffer space for RDMA */
+                    parse_resp_stream(NULL, buf, &blen, 1);
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
                 } else if (r == 0) {
                     break;
                 } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     break;
+                }
+
+                /* Parse any leftover from previous RDMA chunk to maximize
+                 * buffer space before checking for new RDMA data */
+                if (blen > 0) {
+                    parse_resp_stream(NULL, buf, &blen, 1);
                 }
 
                 /* Also check RDMA for fullsync data */
@@ -1785,10 +1811,15 @@ static void *slave_thread(void *arg) {
                         payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
                         if (payload) {
                             if (repl_rdma_repost_recv(recv_slot) == 0) {
+                                fprintf(stderr, "repl rdma: slave_debug_rdma - recv_slot=%d rdma_blen=%zu blen_before=%zu buf_size=%zu\n",
+                                    recv_slot, rdma_blen, blen, sizeof(buf));
                                 if (blen + rdma_blen <= sizeof(buf)) {
                                     memcpy(buf + blen, payload, rdma_blen);
                                     blen += rdma_blen;
                                     had_new_data = 1;
+                                } else {
+                                    fprintf(stderr, "repl rdma: slave_debug_rdma - BUFFER OVERFLOW! blen=%zu rdma_blen=%zu sizeof(buf)=%zu\n",
+                                        blen, rdma_blen, sizeof(buf));
                                 }
                             }
                             kvs_free(payload);
@@ -1800,7 +1831,10 @@ static void *slave_thread(void *arg) {
                 /* Only parse when new data was added to avoid busy-loop
                  * on incomplete data. */
                 if (had_new_data && blen > 0) {
+                    size_t before = blen;
                     parse_resp_stream(NULL, buf, &blen, 1);
+                    fprintf(stderr, "repl rdma: slave_debug_parse - before=%zu after=%zu consumed=%zu\n",
+                        before, blen, before - blen);
                     repl_slave_ack_heartbeat();
                     repl_set_link_state(1);
                 } else if (had_new_data) {
@@ -1833,7 +1867,7 @@ static void *slave_thread(void *arg) {
 
         if (!strcasecmp(repl_transport_name(), "rdma")) {
             unsigned char cmd[256];
-            unsigned char stream_buf[BUFFER_CAP];
+            unsigned char stream_buf[BUFFER_CAP * 4];
             char offbuf[32];
             char durablebuf[32];
             size_t n;
@@ -2157,7 +2191,7 @@ static void *rdma_master_listener_thread(void *arg) {
         {
             int recv_slot = -1;
             size_t recv_len = 0;
-            unsigned char stream_buf[BUFFER_CAP];
+            unsigned char stream_buf[BUFFER_CAP * 4];
             size_t stream_len = 0;
             memset(&g_rdma_master_replica_conn, 0, sizeof(g_rdma_master_replica_conn));
             g_rdma_master_replica_conn.repl_transport_kind = KVS_REPL_TRANSPORT_RDMA;

@@ -370,6 +370,18 @@ LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、
 make check-kvstore TEST_PORT=5000
 ```
 
+**验证**: 测试通过后，用 redis-cli 确认数据正确：
+```bash
+redis-cli -p 5000 PING
++PONG
+redis-cli -p 5000 GET a:pre:1
+"av:1"
+redis-cli -p 5000 HGET h:pre:100
+"hv:100"
+redis-cli -p 5000 INFO
+# 查看 role、mem、dirty 等信息
+```
+
 ---
 
 #### `test_repl_5w5w` — 5w+5w 主从同步测试
@@ -398,6 +410,8 @@ sudo ./kvstore --port 5160 --role master \
     --pre 50000 --post 50000
 
 # 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
+# 先清理旧数据文件，避免上次测试残留影响
+rm -f kvstore.dump kvstore.aof
 sudo ./kvstore --port 5161 --role slave \
     --master-host 192.168.233.128 --master-port 5160 \
     --repl-fullsync-transport rdma \
@@ -416,6 +430,8 @@ sudo ./kvstore --port 5161 --role slave \
     --pre 50000 --post 50000
 
 # 终端 3 (看到提示后再启动 Slave):
+# 先清理旧数据文件，避免上次测试残留影响
+rm -f kvstore.dump kvstore.aof
 ./kvstore --port 5161 --role slave \
     --master-host 127.0.0.1 --master-port 5160 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
@@ -433,6 +449,33 @@ sudo ./kvstore --port 5161 --role slave \
 | `--post COUNT` | 50000 | 全量同步后增量数据量 |
 | `--batch SIZE` | 1000 | 每批写入量 |
 | `--poll MS` | 500 | 轮询间隔毫秒 |
+
+**验证**: 测试通过后，确认主从数据一致：
+```bash
+# 在 Master 上查询
+redis-cli -p 5160 HGET h:pre:50000
+"hv:50000"
+redis-cli -p 5160 HGET h:post:50000
+"hv_post:50000"
+redis-cli -p 5160 GET a:pre:512
+"av:512"
+redis-cli -p 5160 RGET r:pre:500
+"rv:500"
+redis-cli -p 5160 XGET x:pre:999
+"xv:999"
+
+# 在 Slave 上查询（结果应与 Master 完全一致）
+redis-cli -p 5161 HGET h:pre:50000
+"hv:50000"
+redis-cli -p 5161 HGET h:post:50000
+"hv_post:50000"
+redis-cli -p 5161 GET a:pre:512
+"av:512"
+redis-cli -p 5161 RGET r:pre:500
+"rv:500"
+redis-cli -p 5161 XGET x:pre:999
+"xv:999"
+```
 
 ---
 
@@ -458,6 +501,16 @@ sudo ./kvstore --port 5161 --role slave \
 # 在终端 1 执行 SAVE 后，程序继续提示:
 #   >>> Please stop kvstore (Ctrl+C) and restart it
 # 停止并重启 kvstore，程序自动检测重连并验证数据恢复
+```
+
+**验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
+```bash
+redis-cli -p 5170 SAVE
++OK
+redis-cli -p 5170 HGET bench:key:1
+"value:1"
+redis-cli -p 5170 HGET bench:key:50000
+"value:50000"
 ```
 
 选项说明：
@@ -496,6 +549,23 @@ sudo ./kvstore --port 5161 --role slave \
 # 停止并重启 kvstore，程序自动验证 AOF 恢复（注意: 不执行 SAVE，数据仅靠 AOF）
 ```
 
+**验证**: AOF 恢复后，确认重启前后的数据一致：
+```bash
+# 重启前验证
+redis-cli -p 5170 HGET bench:key:1
+"value:1"
+redis-cli -p 5170 HGET bench:key:50000
+"value:50000"
+
+# 停止并重启 kvstore 后，再次验证（数据应仍在）
+redis-cli -p 5170 HGET bench:key:1
+"value:1"
+redis-cli -p 5170 HGET bench:key:50000
+"value:50000"
+redis-cli -p 5170 PING
++PONG
+```
+
 选项说明：
 
 | 选项 | 默认值 | 说明 |
@@ -528,6 +598,18 @@ sudo ./kvstore --port 5161 --role slave \
 # 程序写入数据后提示:
 #   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
 # 停止并重启 kvstore，程序自动验证数据恢复
+```
+
+**验证**: 测试完成后，用 redis-cli 手动确认：
+```bash
+redis-cli -p 5180 HGET uring:key:1
+"value:1"
+redis-cli -p 5180 HGET uring:key:5000
+"value:5000"
+redis-cli -p 5180 HGET uring:key:10000
+"value:10000"
+redis-cli -p 5180 INFO | grep mem
+# 查看内存后端和统计信息
 ```
 
 选项说明：
@@ -569,6 +651,27 @@ sudo ./kvstore --port 5161 --role slave \
 ./test_mmap_recover --port 5190 --engine array --count 10000   # 自动限制 1024
 ```
 
+**验证**: 测试完成后，确认各引擎数据恢复正确：
+```bash
+# Hash 引擎（--engine hash）
+redis-cli -p 5190 HGET mmap:key:10000
+"value:10000"
+redis-cli -p 5190 HGET mmap:key:1
+"value:1"
+
+# RBTREE 引擎（--engine rbtree）
+redis-cli -p 5190 RGET mmap:key:5000
+"value:5000"
+
+# Skiptable 引擎（--engine skiptable）
+redis-cli -p 5190 XGET mmap:key:5000
+"value:5000"
+
+# Array 引擎（--engine array，上限 1024）
+redis-cli -p 5190 GET mmap:key:1024
+"value:1024"
+```
+
 选项说明：
 
 | 选项 | 默认值 | 说明 |
@@ -588,12 +691,12 @@ sudo ./kvstore --port 5161 --role slave \
 运行: ./test_repl_basic [选项]
 ```
 
-自动管理 Master/Slave 进程，验证主从复制全流程。
+用户手动管理 Master/Slave 进程，程序负责写入、监控、验证。
 
-流程：启动 Master → 跨引擎（Hash/Array/RBTREE/Skiptable）写入 N 条数据 → 启动 Slave → 等待全量同步完成 → 再写入增量数据 → 等待增量同步 → 验证各引擎数据一致性 → 测试 Partial Resync（SLAVEOF NO ONE → 断开写入 → SLAVEOF 重连）→ 验证断开期间数据同步。
+流程：用户启动 Master → 程序跨引擎（Hash/Array/RBTREE/Skiptable）写入 N 条数据 → 提示用户启动 Slave → 等待全量同步完成 → 再写入增量数据 → 等待增量同步 → 验证各引擎数据一致性。
 
 ```bash
-# ── 三终端模式 ──
+# ── 单机三终端模式 ──
 
 # 终端 1: 启动 Master（先启动）
 ./kvstore --port 6379 --role master \
@@ -607,29 +710,80 @@ sudo ./kvstore --port 5161 --role slave \
 # 此时在终端 3 启动 Slave:
 
 # 终端 3: 启动 Slave（看到提示后再启动）
+# 先清理旧数据文件，避免上次测试残留影响
+rm -f kvstore.dump kvstore.aof
 ./kvstore --port 6380 --role slave \
     --master-host 127.0.0.1 --master-port 6379 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 
 
-# ── 双机部署 ──
-# 终端 1 (VM1, Master):
-./kvstore --port 6379 --role master
+# ── 双机部署（跨机器测试）──
 
-# 终端 2 (本地, 运行测试):
-./test_repl_basic --host 192.168.1.100 --master-port 6379 \
-    --slave-port 6380 --count 5000
+# 终端 1 (VM1, 先启动 Master):
+./kvstore --port 6380 --role master \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp
 
-# 终端 3 (VM2, Slave, 看到提示后启动):
-./kvstore --port 6380 --role slave \
-    --master-host 192.168.1.100 --master-port 6379
+# 终端 2 (本地, Master 启动后运行):
+./test_repl_basic --master-host 192.168.233.128 --master-port 6380 \
+    --slave-host 192.168.233.129 --slave-port 6381 \
+    --count 5000
+
+# 终端 3 (VM2, 看到提示后再启动 Slave):
+# 先清理旧数据文件，避免上次测试残留影响
+rm -f kvstore.dump kvstore.aof
+./kvstore --port 6381 --role slave \
+    --master-host 192.168.233.128 --master-port 6380 \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
+
+**验证**: 测试通过后，用 redis-cli 确认主从数据完全一致：
+```bash
+# 在 Master 上查询
+redis-cli -p 6380 HGET h:pre:5000
+"hv:5000"
+redis-cli -p 6380 HGET h:pre:50
+"hv:50"
+redis-cli -p 6380 HGET h:post:891
+"hv_post:891"
+redis-cli -p 6380 HGET h:post:1232
+(nil)                       # 只写了 1000 条增量(post)，1232 不存在正常
+redis-cli -p 6380 GET a:pre:1
+"av:1"
+redis-cli -p 6380 RGET r:pre:500
+"rv:500"
+redis-cli -p 6380 XGET x:pre:999
+"xv:999"
+
+# 在 Slave 上查询（结果必须与 Master 完全一致）
+redis-cli -p 6381 HGET h:pre:5000
+"hv:5000"
+redis-cli -p 6381 HGET h:pre:50
+"hv:50"
+redis-cli -p 6381 HGET h:post:891
+"hv_post:891"
+redis-cli -p 6381 GET a:pre:1
+"av:1"
+redis-cli -p 6381 RGET r:pre:500
+"rv:500"
+redis-cli -p 6381 XGET x:pre:999
+"xv:999"
+
+# 检查 Slave 只读（写操作应被拒绝）
+redis-cli -p 6381 SET should_fail x
+-ERR read only slave
+```
+
+两种验证方法：
+- **全量同步验证**: 查询 `h:pre:*`（预存 5000 条）— 确认 Slave 有全部预存数据
+- **增量同步验证**: 查询 `h:post:*`（全量完成后写入 1000 条）— 确认增量数据也同步到了 Slave
+- **跨引擎验证**: 分别用 `GET`/`HGET`/`RGET`/`XGET` 确认 Array/Hash/RBTREE/Skiptable 四个引擎的数据都一致
 
 选项说明：
 
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
-| `--host HOST` | 127.0.0.1 | 主机地址 |
+| `--master-host HOST` | 127.0.0.1 | Master 地址 |
+| `--slave-host HOST` | 127.0.0.1 | Slave 地址 |
 | `--master-port PORT` | 6379 | Master 端口 |
 | `--slave-port PORT` | 6380 | Slave 端口 |
 | `--count N` | 5000 | 预存/增量数据量 |

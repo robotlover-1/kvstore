@@ -287,15 +287,24 @@ static char *cmd_resp(const char *host, int port, const char *arg0, ...) {
 }
 
 /* 从 RESP 响应中提取批量字符串的值 */
-/* 输入: "$6\r\nhv:1\r\n" → 输出 "hv:1"（需 free）*/
+/* 输入: "$5\r\nhello\r\n" → 输出 "hello"（需 free）*/
+/* 输入: "$-1\r\n" → 输出 NULL（空值）*/
 static char *extract_bulk(const char *resp) {
     if (!resp || resp[0] != '$') return NULL;
-    /* 跳过 $len\r\n */
-    const char *p = resp + 1;
+    /* 解析 $len\r\n */
+    long blen = atol(resp + 1);
+    if (blen < 0) return NULL; /* $-1 = null bulk */
+    /* 找到数据起始位置（跳过 $len\r\n） */
+    const char *p = resp;
     while (*p && *p != '\r') p++;
     if (*p != '\r') return NULL;
     p += 2; /* 跳过 \r\n */
-    return strdup(p);
+    /* 复制 blen 字节，截掉尾部 \r\n */
+    char *out = (char *)malloc((size_t)blen + 1);
+    if (!out) return NULL;
+    memcpy(out, p, (size_t)blen);
+    out[blen] = '\0';
+    return out;
 }
 
 /* 对比 master 和 slave 上同一个 key 的值 */
@@ -419,8 +428,9 @@ int main(int argc, char **argv) {
             printf("  %s --master-port %d --slave-port %d --count %d\n",
                    argv[0], g_opt.master_port, g_opt.slave_port, g_opt.count);
             printf("  # 终端 3 (看到提示后启动 Slave):\n");
-            printf("  ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
-            printf("      --master-host %s --master-port %d \\\n", g_opt.master_host, g_opt.master_port);
+            printf("  rm -f kvstore.dump kvstore.aof    # 清理旧数据\n");
+            printf("  ./kvstore --port %%d --role slave \\\n", g_opt.slave_port);
+            printf("      --master-host %%s --master-port %%d \\\n", g_opt.master_host, g_opt.master_port);
             printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
             return 0;
         } else {

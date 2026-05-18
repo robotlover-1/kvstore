@@ -1772,8 +1772,9 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
     g_slave_fullsync_target_bytes = fullsync_loading ? fullsync_target_bytes : 0;
     g_slave_fullsync_loaded_bytes = 0;
 #if KVS_ENABLE_RDMA
-    fprintf(stderr, "repl rdma: slave_sync_state - replid=%s applied_offset=%llu durable_offset=%llu fullsync_loading=%d target_bytes=%llu\n",
-        g_slave_master_replid, g_slave_repl_applied_offset, g_slave_repl_durable_offset, g_slave_loading_fullsync, g_slave_fullsync_target_bytes);
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+        fprintf(stderr, "repl rdma: slave_sync_state - replid=%s applied_offset=%llu durable_offset=%llu fullsync_loading=%d target_bytes=%llu\n",
+            g_slave_master_replid, g_slave_repl_applied_offset, g_slave_repl_durable_offset, g_slave_loading_fullsync, g_slave_fullsync_target_bytes);
 #endif
     repl_slave_state_save();
 }
@@ -1786,22 +1787,23 @@ void repl_slave_finish_fullsync(void) {
         g_slave_repl_durable_offset = g_slave_repl_applied_offset;
     }
 #if KVS_ENABLE_RDMA
-    fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
-    {
-        extern kv_config_t g_cfg;
-        extern kvs_hash_t global_hash;
-        int cnt = 0;
-        if (global_hash.nodes) {
-            for (int i = 0; i < global_hash.max_slots; ++i) {
-                for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
-                    cnt++;
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")) {
+        fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
+        {
+            extern kv_config_t g_cfg;
+            extern kvs_hash_t global_hash;
+            int cnt = 0;
+            if (global_hash.nodes) {
+                for (int i = 0; i < global_hash.max_slots; ++i) {
+                    for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
+                        cnt++;
+                    }
                 }
             }
+            fprintf(stderr, "repl rdma: slave_debug - total_hash_entries=%d\n", cnt);
+            char *v = kvs_hash_get(&global_hash, "pre:k:000000");
+            fprintf(stderr, "repl rdma: slave_debug - HGET pre:k:000000 = %s\n", v ? v : "(null)");
         }
-        fprintf(stderr, "repl rdma: slave_debug - total_hash_entries=%d\n", cnt);
-        /* 打印 key=pre:k:000000 的值 */
-        char *v = kvs_hash_get(&global_hash, "pre:k:000000");
-        fprintf(stderr, "repl rdma: slave_debug - HGET pre:k:000000 = %s\n", v ? v : "(null)");
     }
 #endif
     /* 全量同步完成后，将当前内存数据保存到 dump 文件
@@ -1828,6 +1830,7 @@ void repl_slave_note_applied(size_t rawlen) {
         g_slave_repl_applied_offset += (unsigned long long)rawlen;
         g_slave_repl_offset = g_slave_repl_applied_offset;
 #if KVS_ENABLE_RDMA
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
         fprintf(stderr, "repl rdma: slave_apply - applied_before=%llu rawlen=%zu applied_after=%llu durable=%llu\n",
             before, rawlen, g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
@@ -1835,8 +1838,9 @@ void repl_slave_note_applied(size_t rawlen) {
     } else {
         g_slave_fullsync_loaded_bytes += (unsigned long long)rawlen;
 #if KVS_ENABLE_RDMA
-        fprintf(stderr, "repl rdma: slave_apply - fullsync_chunk=%zu loaded=%llu target=%llu\n",
-            rawlen, g_slave_fullsync_loaded_bytes, g_slave_fullsync_target_bytes);
+        if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+            fprintf(stderr, "repl rdma: slave_apply - fullsync_chunk=%zu loaded=%llu target=%llu\n",
+                rawlen, g_slave_fullsync_loaded_bytes, g_slave_fullsync_target_bytes);
 #endif
         if (g_slave_fullsync_target_bytes > 0 && g_slave_fullsync_loaded_bytes >= g_slave_fullsync_target_bytes) {
             repl_slave_finish_fullsync();
@@ -1855,8 +1859,9 @@ void repl_slave_note_durable(size_t rawlen) {
         repl_slave_state_save();
     }
 #if KVS_ENABLE_RDMA
-    fprintf(stderr, "repl rdma: slave_durable - applied=%llu durable=%llu\n",
-        g_slave_repl_applied_offset, g_slave_repl_durable_offset);
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+        fprintf(stderr, "repl rdma: slave_durable - applied=%llu durable=%llu\n",
+            g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
     repl_slave_send_ack();
 }

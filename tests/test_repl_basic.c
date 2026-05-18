@@ -67,14 +67,16 @@
 #define ANSI_RESET   "\033[0m"
 
 static struct {
-    const char *host;
+    const char *master_host;
+    const char *slave_host;
     int master_port;
     int slave_port;
     int count;
     int batch;
     int poll_ms;
 } g_opt = {
-    .host = "127.0.0.1",
+    .master_host = "127.0.0.1",
+    .slave_host = "127.0.0.1",
     .master_port = 6379,
     .slave_port = 6380,
     .count = 5000,
@@ -139,29 +141,49 @@ static void stat_line(const char *label, const char *fmt, ...) {
 }
 /* ── TCP / RESP ── */
 
-static int tcp_connect(const char *host, int port) {
+/* 带超时（3 秒）的 TCP 连接 */
+static int tcp_connect_timeout(const char *host, int port, int timeout_ms) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    struct hostent *he = gethostbyname(host);
-    if (he) {
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        struct hostent *he = gethostbyname(host);
+        if (!he) { close(fd); return -1; }
         memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-    } else {
-        addr.sin_addr.s_addr = inet_addr(host);
-        if (addr.sin_addr.s_addr == (in_addr_t)-1) {
-            close(fd); return -1;
-        }
     }
-    struct timeval tv = {2, 0};
+
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc == 0) {
+        fcntl(fd, F_SETFL, flags);
+        struct timeval tv = {3, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        return fd;
+    }
+    if (rc < 0 && errno != EINPROGRESS) { close(fd); return -1; }
+
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+    rc = poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : 3000);
+    if (rc <= 0) { close(fd); return -1; }
+
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+    if (err) { close(fd); return -1; }
+
+    fcntl(fd, F_SETFL, flags);
+    struct timeval tv = {3, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd); return -1;
-    }
     return fd;
 }
+
+#define tcp_connect(h, p) tcp_connect_timeout(h, p, 3000)
 
 static unsigned char *build_resp(int argc, const char **argv, size_t *out_len) {
     size_t cap = 64;
@@ -239,9 +261,10 @@ static char *cmd_at(int fd, const char *arg0, ...) {
     return (char *)recv_resp(fd);
 }
 
-static int cmd_port(int port, const char *arg0, ...) {
-    int fd = tcp_connect(g_opt.host, port);
-    if (fd < 0) return -1;
+/* 从指定端口发送命令并返回原始 RESP 响应 */
+static char *cmd_resp(const char *host, int port, const char *arg0, ...) {
+    int fd = tcp_connect(host, port);
+    if (fd < 0) return NULL;
     int argc = 1;
     const char *args[64];
     args[0] = arg0;
@@ -255,35 +278,93 @@ static int cmd_port(int port, const char *arg0, ...) {
     va_end(ap);
     size_t wlen;
     unsigned char *wbuf = build_resp(argc, args, &wlen);
-    if (!wbuf) { close(fd); return -1; }
-    int ok = send_all(fd, wbuf, wlen);
+    if (!wbuf) { close(fd); return NULL; }
+    send_all(fd, wbuf, wlen);
     free(wbuf);
-    if (ok != 0) { close(fd); return -1; }
     char *resp = (char *)recv_resp(fd);
     close(fd);
-    if (!resp) return -1;
-    int r = strcmp(resp, "+OK\r\n") == 0 || strcmp(resp, ":1\r\n") == 0 ? 0 : -1;
-    free(resp);
-    return r;
+    return resp;
 }
 
-static int wait_port_ready(int port, int retries, double interval) {
+/* 从 RESP 响应中提取批量字符串的值 */
+/* 输入: "$6\r\nhv:1\r\n" → 输出 "hv:1"（需 free）*/
+static char *extract_bulk(const char *resp) {
+    if (!resp || resp[0] != '$') return NULL;
+    /* 跳过 $len\r\n */
+    const char *p = resp + 1;
+    while (*p && *p != '\r') p++;
+    if (*p != '\r') return NULL;
+    p += 2; /* 跳过 \r\n */
+    return strdup(p);
+}
+
+/* 对比 master 和 slave 上同一个 key 的值 */
+static int compare_key(const char *get_cmd, const char *key) {
+    char *mv = cmd_resp(g_opt.master_host, g_opt.master_port, get_cmd, key, NULL);
+    char *sv = cmd_resp(g_opt.slave_host, g_opt.slave_port, get_cmd, key, NULL);
+    int ret = -1;
+    /* 提取批量字符串 payload */
+    char *mval = mv ? extract_bulk(mv) : NULL;
+    char *sval = sv ? extract_bulk(sv) : NULL;
+    if (mval && sval && strcmp(mval, sval) == 0) {
+        pass("数据一致: %s %s = %s", get_cmd, key, mval);
+        ret = 0;
+    } else {
+        fail("数据不一致: %s %s, master=[%s], slave=[%s]",
+             get_cmd, key, mval ? mval : "(null)", sval ? sval : "(null)");
+    }
+    free(mv); free(sv); free(mval); free(sval);
+    return ret;
+}
+
+/* 发送 PING 并检查是否收到 +PONG，带 3 秒超时 */
+static int ping_port(const char *host, int port) {
+    int fd = tcp_connect_timeout(host, port, 3000);
+    if (fd < 0) {
+        fprintf(stderr, "  [dbg] ping_port %d: connect failed (errno=%d)\n", port, errno);
+        return -1;
+    }
+
+    /* 发送 *1\r\n$4\r\nPING\r\n */
+    unsigned char ping[] = "*1\r\n$4\r\nPING\r\n";
+    if (send_all(fd, ping, sizeof(ping) - 1) != 0) {
+        fprintf(stderr, "  [dbg] ping_port %d: send failed (errno=%d)\n", port, errno);
+        close(fd); return -1;
+    }
+
+    /* 用 poll + 单次 read 检查响应，最多等 2 秒 */
+    unsigned char buf[64];
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int pret = poll(&pfd, 1, 2000);
+    if (pret <= 0) {
+        fprintf(stderr, "  [dbg] ping_port %d: poll timeout/err (pret=%d, errno=%d)\n", port, pret, errno);
+        close(fd); return -1;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        fprintf(stderr, "  [dbg] ping_port %d: read failed (n=%zd, errno=%d)\n", port, n, errno);
+        return -1;
+    }
+    buf[n] = '\0';
+    if (strstr((char *)buf, "+PONG") == NULL) {
+        fprintf(stderr, "  [dbg] ping_port %d: unexpected resp [%s]\n", port, (char *)buf);
+        return -1;
+    }
+    return 0;
+}
+
+static int wait_port_ready(const char *host, int port, int retries, double interval) {
     for (int i = 0; i < retries; i++) {
-        int fd = tcp_connect(g_opt.host, port);
-        if (fd >= 0) {
-            char *r = cmd_at(fd, "PING", NULL);
-            close(fd);
-            if (r && strcmp(r, "+PONG\r\n") == 0) { free(r); return 0; }
-            free(r);
-        }
+        if (ping_port(host, port) == 0) return 0;
         usleep((useconds_t)(interval * 1000000));
     }
     return -1;
 }
 
 /* 查询 INFO 字段 */
-static int check_info_field(int port, const char *field, const char *value) {
-    int fd = tcp_connect(g_opt.host, port);
+static int check_info_field(const char *host, int port, const char *field, const char *value) {
+    int fd = tcp_connect(host, port);
     if (fd < 0) return -1;
     char *info = cmd_at(fd, "INFO", NULL);
     close(fd);
@@ -299,8 +380,10 @@ static int check_info_field(int port, const char *field, const char *value) {
 
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
-            g_opt.host = argv[++i];
+        if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
+            g_opt.master_host = argv[++i];
+        else if (strcmp(argv[i], "--slave-host") == 0 && i + 1 < argc)
+            g_opt.slave_host = argv[++i];
         else if (strcmp(argv[i], "--master-port") == 0 && i + 1 < argc)
             g_opt.master_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--slave-port") == 0 && i + 1 < argc)
@@ -320,7 +403,8 @@ int main(int argc, char **argv) {
             printf("  3. 提示用户启动 Slave\n");
             printf("  4. 等待全量同步 → 写入增量 → 验证一致性\n\n");
             printf("选项:\n");
-            printf("  --host HOST           主机地址 (默认 %s)\n", g_opt.host);
+            printf("  --master-host HOST   Master 地址 (默认 %s)\n", g_opt.master_host);
+            printf("  --slave-host HOST    Slave 地址 (默认 %s)\n", g_opt.slave_host);
             printf("  --master-port PORT    Master 端口 (默认 %d)\n", g_opt.master_port);
             printf("  --slave-port PORT     Slave 端口 (默认 %d)\n", g_opt.slave_port);
             printf("  --count N             预存/增量数据量 (默认 %d)\n", g_opt.count);
@@ -336,7 +420,7 @@ int main(int argc, char **argv) {
                    argv[0], g_opt.master_port, g_opt.slave_port, g_opt.count);
             printf("  # 终端 3 (看到提示后启动 Slave):\n");
             printf("  ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
-            printf("      --master-host %s --master-port %d \\\n", g_opt.host, g_opt.master_port);
+            printf("      --master-host %s --master-port %d \\\n", g_opt.master_host, g_opt.master_port);
             printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
             return 0;
         } else {
@@ -346,15 +430,15 @@ int main(int argc, char **argv) {
     }
 
     banner("主从复制基本验证测试");
-    info("Master: %s:%d, Slave: %s:%d", g_opt.host, g_opt.master_port, g_opt.host, g_opt.slave_port);
+    info("Master: %s:%d, Slave: %s:%d", g_opt.master_host, g_opt.master_port, g_opt.slave_host, g_opt.slave_port);
     info("预存/增量数据量: %d", g_opt.count);
     info("");
 
     /* ── Step 1: 连接 Master ── */
     banner("Step 1: 连接 Master 并预存数据");
-    prompt("请确保 Master 已在 %s:%d 上启动", g_opt.host, g_opt.master_port);
+    prompt("请确保 Master 已在 %s:%d 上启动", g_opt.master_host, g_opt.master_port);
 
-    int fd = tcp_connect(g_opt.host, g_opt.master_port);
+    int fd = tcp_connect(g_opt.master_host, g_opt.master_port);
     if (fd < 0) { fail("无法连接 Master"); return 1; }
     info("Master 已连接 ✓");
 
@@ -422,10 +506,11 @@ int main(int argc, char **argv) {
     /* ── Step 2: 启动 Slave ── */
     banner("Step 2: 启动 Slave 并等待全量同步");
     prompt("请在另一个终端启动 Slave:\n  ./kvstore --port %d --role slave \\\n      --master-host %s --master-port %d \\\n      --repl-fullsync-transport tcp --repl-realtime-transport tcp",
-           g_opt.slave_port, g_opt.host, g_opt.master_port);
+           g_opt.slave_port, g_opt.master_host, g_opt.master_port);
 
-    info("等待 Slave (%s:%d) 就绪...", g_opt.host, g_opt.slave_port);
-    if (wait_port_ready(g_opt.slave_port, 120, 0.5) != 0) {
+    info("等待 Slave (%s:%d) 就绪...", g_opt.slave_host, g_opt.slave_port);
+    info("（最多等待 120 秒，每 0.5 秒探测一次 PING 响应）");
+    if (wait_port_ready(g_opt.slave_host, g_opt.slave_port, 240, 0.5) != 0) {
         fail("Slave 未就绪"); return 1;
     }
     info("Slave 已就绪 ✓");
@@ -434,8 +519,8 @@ int main(int argc, char **argv) {
     info("监控全量同步进度...");
     int sync_ok = 0;
     for (int i = 0; i < 120; i++) {
-        if (check_info_field(g_opt.slave_port, "slave_fullsync_loading", "0") == 0 &&
-            check_info_field(g_opt.slave_port, "master_link", "up") == 0) {
+        if (check_info_field(g_opt.slave_host, g_opt.slave_port, "slave_fullsync_loading", "0") == 0 &&
+            check_info_field(g_opt.slave_host, g_opt.slave_port, "master_link", "up") == 0) {
             pass("全量同步完成");
             sync_ok = 1;
             break;
@@ -448,7 +533,7 @@ int main(int argc, char **argv) {
     banner("Step 3: 增量写入并等待同步");
 
     int post_count = g_opt.count > 1000 ? 1000 : g_opt.count;
-    fd = tcp_connect(g_opt.host, g_opt.master_port);
+    fd = tcp_connect(g_opt.master_host, g_opt.master_port);
     if (fd < 0) { fail("无法连接 Master"); return 1; }
 
     for (int i = 1; i <= post_count; i++) {
@@ -471,65 +556,25 @@ int main(int argc, char **argv) {
     banner("Step 4: 验证主从数据一致性");
 
     int ok = 1;
-    /* Hash */
-    ok = (cmd_port(g_opt.master_port, "HGET", "h:pre:1", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "HGET", "h:pre:1", NULL) == 0) ? ok : 0;
-    ok = (cmd_port(g_opt.master_port, "HGET", "h:pre:100", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "HGET", "h:pre:100", NULL) == 0) ? ok : 0;
-    ok = (cmd_port(g_opt.master_port, "HGET", "h:pre:5000", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "HGET", "h:pre:5000", NULL) == 0) ? ok : 0;
-    /* Array */
-    ok = (cmd_port(g_opt.master_port, "GET", "a:pre:1", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "GET", "a:pre:1", NULL) == 0) ? ok : 0;
-    ok = (cmd_port(g_opt.master_port, "GET", "a:pre:512", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "GET", "a:pre:512", NULL) == 0) ? ok : 0;
-    /* RBTREE */
-    ok = (cmd_port(g_opt.master_port, "RGET", "r:pre:1", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "RGET", "r:pre:1", NULL) == 0) ? ok : 0;
-    ok = (cmd_port(g_opt.master_port, "RGET", "r:pre:500", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "RGET", "r:pre:500", NULL) == 0) ? ok : 0;
-    /* Skiptable */
-    ok = (cmd_port(g_opt.master_port, "XGET", "x:pre:1", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "XGET", "x:pre:1", NULL) == 0) ? ok : 0;
-    ok = (cmd_port(g_opt.master_port, "XGET", "x:pre:999", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "XGET", "x:pre:999", NULL) == 0) ? ok : 0;
+    /* Hash 引擎预存 */
+    ok &= (compare_key("HGET", "h:pre:1") == 0) ? 1 : 0;
+    ok &= (compare_key("HGET", "h:pre:100") == 0) ? 1 : 0;
+    ok &= (compare_key("HGET", "h:pre:5000") == 0) ? 1 : 0;
+    /* Array 引擎预存 */
+    ok &= (compare_key("GET", "a:pre:1") == 0) ? 1 : 0;
+    ok &= (compare_key("GET", "a:pre:512") == 0) ? 1 : 0;
+    /* RBTREE 引擎预存 */
+    ok &= (compare_key("RGET", "r:pre:1") == 0) ? 1 : 0;
+    ok &= (compare_key("RGET", "r:pre:500") == 0) ? 1 : 0;
+    /* Skiptable 引擎预存 */
+    ok &= (compare_key("XGET", "x:pre:1") == 0) ? 1 : 0;
+    ok &= (compare_key("XGET", "x:pre:999") == 0) ? 1 : 0;
     /* 增量数据 */
-    ok = (cmd_port(g_opt.master_port, "HGET", "h:post:1", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "HGET", "h:post:1", NULL) == 0) ? ok : 0;
-    ok = (cmd_port(g_opt.master_port, "HGET", "h:post:1000", NULL) == 0 &&
-          cmd_port(g_opt.slave_port, "HGET", "h:post:1000", NULL) == 0) ? ok : 0;
+    ok &= (compare_key("HGET", "h:post:1") == 0) ? 1 : 0;
+    ok &= (compare_key("HGET", "h:post:1000") == 0) ? 1 : 0;
 
     if (ok) pass("数据一致性验证通过 (4 引擎, 含增量)");
     else    fail("数据一致性验证失败");
-
-    /* ── Step 5: Partial Resync ── */
-    banner("Step 5: Partial Resync 测试 (可选)");
-    prompt("是否继续测试 Partial Resync? 如需要, 按 Enter 继续; 否则 Ctrl+C 退出");
-    info("测试 SLAVEOF NO ONE → 断开写入 → SLAVEOF 重连");
-
-    if (cmd_port(g_opt.slave_port, "SLAVEOF", "NO", "ONE", NULL) == 0)
-        pass("Slave 已断开");
-    else
-        info("SLAVEOF NO ONE 跳过");
-    sleep(1);
-
-    /* 断开期间写入 */
-    if (cmd_port(g_opt.master_port, "HSET", "h:reconnect:key1", "rv1", NULL) == 0)
-        pass("断开期间写入成功");
-
-    /* 重新连接 */
-    char mhost[32], mport[16];
-    snprintf(mhost, sizeof(mhost), "%s", g_opt.host);
-    snprintf(mport, sizeof(mport), "%d", g_opt.master_port);
-    if (cmd_port(g_opt.slave_port, "SLAVEOF", mhost, mport, NULL) == 0) {
-        pass("Slave 已重新连接");
-        sleep(3);
-        if (cmd_port(g_opt.master_port, "HGET", "h:reconnect:key1", NULL) == 0 &&
-            cmd_port(g_opt.slave_port, "HGET", "h:reconnect:key1", NULL) == 0)
-            pass("断开期间数据已同步");
-        else
-            fail("断开期间数据未同步");
-    }
 
     /* ── 结果 ── */
     banner("结果汇总");

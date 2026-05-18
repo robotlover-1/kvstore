@@ -6,6 +6,18 @@
 
 #define KVS_DEFAULT_CONFIG_PATH "kvstore.conf"
 
+/* 仅当 RDMA 被实际配置为传输层时才打印 RDMA 调试日志 */
+#if KVS_ENABLE_RDMA
+#define repl_rdma_log(fmt, ...) do { \
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || \
+        !strcasecmp(g_cfg.repl_transport_backend, "rdma")) { \
+        fprintf(stderr, "repl rdma: " fmt "\n", ##__VA_ARGS__); \
+    } \
+} while(0)
+#else
+#define repl_rdma_log(fmt, ...) ((void)0)
+#endif
+
 kv_config_t g_cfg = {
     .role = ROLE_MASTER,
     .port = 5000,
@@ -496,9 +508,7 @@ static int queue_snapshot(conn_t *c) {
     size_t total_bytes = 0;
     int ret = -1;
 
-#if KVS_ENABLE_RDMA
-    fprintf(stderr, "repl rdma: queue_snapshot - begin replid=%s offset=%llu\n", repl_master_id(), repl_master_offset());
-#endif
+    repl_rdma_log("queue_snapshot - begin replid=%s offset=%llu", repl_master_id(), repl_master_offset());
     /* Use a temporary path so we don't overwrite the binary dump file */
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
     fp = fopen(tmp_path, "wb");
@@ -515,9 +525,7 @@ static int queue_snapshot(conn_t *c) {
 
     repl_note_send_context("fullsync-header", (size_t)n, repl_master_offset(), (unsigned char *)hdr);
     if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)n) != 0) {
-#if KVS_ENABLE_RDMA
-        fprintf(stderr, "repl rdma: queue_snapshot - header send failed\n");
-#endif
+        repl_rdma_log("queue_snapshot - header send failed");
         goto out;
     }
     fp = fopen(tmp_path, "rb");
@@ -526,9 +534,7 @@ static int queue_snapshot(conn_t *c) {
         total += r;
         repl_note_send_context("fullsync-snapshot", r, repl_master_offset(), buf);
         if (repl_send_chunked(c, buf, r) != 0) {
-#if KVS_ENABLE_RDMA
-            fprintf(stderr, "repl rdma: queue_snapshot - snapshot chunk send failed total=%zu chunk=%zu\n", total, r);
-#endif
+            repl_rdma_log("queue_snapshot - snapshot chunk send failed total=%zu chunk=%zu", total, r);
             fclose(fp);
             unlink(tmp_path);
             goto out;
@@ -544,17 +550,13 @@ static int queue_snapshot(conn_t *c) {
         size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
         repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
         if (repl_send_chunked(c, buf, done) != 0) {
-#if KVS_ENABLE_RDMA
-            fprintf(stderr, "repl rdma: queue_snapshot - REPLDONE send failed\n");
-#endif
+            repl_rdma_log("queue_snapshot - REPLDONE send failed");
             goto out;
         }
     }
     c->repl_fullsync_pending = 0;
     ret = 0;
-#if KVS_ENABLE_RDMA
-    fprintf(stderr, "repl rdma: queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu\n", total, repl_master_offset());
-#endif
+    repl_rdma_log("queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu", total, repl_master_offset());
 out:
     if (fp) fclose(fp);
     kvs_free(buf);
@@ -567,6 +569,7 @@ static int is_readonly_slave_blocked(const char *cmd) {
         && strcmp(cmd, "HGET") && strcmp(cmd, "HMGET") && strcmp(cmd, "HTTL") && strcmp(cmd, "HEXIST")
         && strcmp(cmd, "XGET") && strcmp(cmd, "XMGET") && strcmp(cmd, "XTTL") && strcmp(cmd, "XEXIST")
         && strcmp(cmd, "INFO") && strcmp(cmd, "MEMSTAT")
+        && strcmp(cmd, "PING") && strcmp(cmd, "ECHO") && strcmp(cmd, "QUIT")
         && strcmp(cmd, "SLAVEOF") && strcmp(cmd, "ROLE")
         && strcmp(cmd, "DOCGET") && strcmp(cmd, "DOCGETALL") && strcmp(cmd, "DOCEXIST") && strcmp(cmd, "DOCCOUNT");
 }
@@ -655,18 +658,12 @@ static int try_expire(int engine, char *key) {
 static int resp_array_from_values(char *out, size_t cap, int count, char **values);
 
 static void repl_log_applied_command(const char *cmd, int argc, char **argv, size_t rawlen) {
-#if KVS_ENABLE_RDMA
     const char *key = (argc >= 2 && argv && argv[1]) ? argv[1] : "";
     unsigned long long before = repl_slave_offset();
     unsigned long long after = before + (unsigned long long)rawlen;
-    fprintf(stderr, "repl rdma: slave_apply_cmd - cmd=%s key=%s rawlen=%zu offset_before=%llu offset_after=%llu\n",
+    repl_rdma_log("slave_apply_cmd - cmd=%s key=%s rawlen=%zu offset_before=%llu offset_after=%llu",
         cmd ? cmd : "?", key, rawlen, before, after);
-#else
-    (void)cmd;
     (void)argc;
-    (void)argv;
-    (void)rawlen;
-#endif
 }
 
 static int repl_is_soak_key(const char *key) {
@@ -982,10 +979,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
          * but that doesn't prevent partial resync since the master
          * can replay from req_offset onward. */
         int can_continue = (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset));
-#if KVS_ENABLE_RDMA
-        fprintf(stderr, "repl rdma: master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d\n",
+        repl_rdma_log("master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d",
             req_replid, req_offset, req_durable, repl_backlog_start_offset(), repl_backlog_end_offset(), can_continue ? 1 : 0);
-#endif
         if (c && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
                 || !strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
             c->repl_transport_kind = KVS_REPL_TRANSPORT_EBPF;
@@ -1002,9 +997,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         } else {
             repl_note_partialsync_result(argc >= 3 ? 0 : 1);
             if (queue_snapshot(c) != 0) {
-#if KVS_ENABLE_RDMA
-                fprintf(stderr, "repl rdma: master_replsync - queue_snapshot failed\n");
-#endif
+                repl_rdma_log("master_replsync - queue_snapshot failed");
                 c->repl_draining = 1;
                 c->repl_fullsync_pending = 0;
             }
@@ -1018,9 +1011,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {
-#if KVS_ENABLE_RDMA
-        fprintf(stderr, "repl rdma: slave_parse - REPLDONE\n");
-#endif
+        repl_rdma_log("slave_parse - REPLDONE");
         repl_slave_finish_fullsync();
         return 0;
     }
@@ -1503,7 +1494,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char *v = engine_get(engine, argv[1]);
 #if KVS_ENABLE_RDMA
         if (g_cfg.role == ROLE_SLAVE && !from_replication && repl_is_soak_key(argv[1])) {
-            fprintf(stderr, "repl rdma: slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s\n",
+            repl_rdma_log("slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
                 argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
         }
 #endif
@@ -1518,7 +1509,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             for (int i = 1; i < argc; ++i) {
                 if (repl_is_soak_key(argv[i])) {
                     char *mv = engine_get(engine, argv[i]);
-                    fprintf(stderr, "repl rdma: slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s\n",
+                    repl_rdma_log("slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
                         argv[i], mv ? 1 : 0, mv ? mv : "(null)", repl_slave_offset(), repl_master_link_state_name());
                 }
             }
@@ -1624,9 +1615,7 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                     if (argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
                         unsigned long long fullsync_target = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : 0;
                         repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), (unsigned long long)strtoull(argv[2], NULL, 10), 1, fullsync_target);
-#if KVS_ENABLE_RDMA
-                        fprintf(stderr, "repl rdma: slave_parse - FULLRESYNC replid=%s offset=%s target=%s\n", argv[1], argv[2], argc >= 4 ? argv[3] : "0");
-#endif
+                        repl_rdma_log("slave_parse - FULLRESYNC replid=%s offset=%s target=%s", argv[1], argv[2], argc >= 4 ? argv[3] : "0");
                     } else if (argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
                         unsigned long long continue_end = (unsigned long long)strtoull(argv[2], NULL, 10);
                         unsigned long long continue_start = repl_slave_offset();
@@ -1634,9 +1623,7 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         if (continue_end < continue_start) continue_end = continue_start;
                         repl_slave_set_sync_state(argv[1], continue_start, durable_start, 0, 0);
                         repl_slave_send_ack();
-#if KVS_ENABLE_RDMA
-                        fprintf(stderr, "repl rdma: slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu\n", argv[1], continue_start, durable_start, continue_end);
-#endif
+                        repl_rdma_log("slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu", argv[1], continue_start, durable_start, continue_end);
                     }
                     kvs_free(line);
                 }
@@ -2033,9 +2020,12 @@ int main(int argc, char **argv) {
             }
         }
     }
-    if (start_rdma_master_listener() != 0) {
-        fprintf(stderr, "failed to start rdma master listener thread\n");
-        return 1;
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") ||
+        !strcasecmp(g_cfg.repl_transport_backend, "rdma")) {
+        if (start_rdma_master_listener() != 0) {
+            fprintf(stderr, "failed to start rdma master listener thread\n");
+            return 1;
+        }
     }
 
     if (!strcmp(g_cfg.net_backend, "reactor")) {

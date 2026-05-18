@@ -92,6 +92,12 @@ static conn_t g_rdma_master_replica_conn = {0};
 #define KVS_RDMA_CHUNK_SIZE_DEFAULT (BUFFER_CAP * 4)
 #define KVS_RDMA_QP_WR_DEPTH_DEFAULT 64
 
+/* ---- Pipeline Constants ---- */
+#define KVS_RDMA_PIPELINE_DEPTH      4   /* 多发送缓冲区深度 */
+#define KVS_RDMA_CQ_BATCH            8   /* CQ 批量 poll 大小 */
+#define KVS_RDMA_BATCH_MAX           8   /* 批量 send WR 上限 */
+#define KVS_RDMA_PIPELINE_WR_ID_FLAG 0x80000000UL  /* wr_id 高位标记，区分 pipeline send vs recv */
+
 typedef enum repl_rdma_state_e {
     REPL_RDMA_STATE_INIT = 0,
     REPL_RDMA_STATE_CONNECTING,
@@ -116,6 +122,15 @@ typedef struct repl_rdma_recv_slot_s {
     int posted;
 } repl_rdma_recv_slot_t;
 
+/* ---- Pipeline 发送缓冲区槽位 ---- */
+typedef struct repl_rdma_send_slot_s {
+    struct ibv_mr *mr;          /* 注册的内存区域 */
+    unsigned char *buf;         /* 缓冲区 */
+    size_t cap;                 /* 容量 */
+    int in_flight;              /* 1 = 已 post 但未完成 */
+    uint64_t wr_id;             /* 对应的 wr_id（含 PIPELINE_WR_ID_FLAG） */
+} repl_rdma_send_slot_t;
+
 typedef struct repl_rdma_ctx_s {
     struct rdma_event_channel *ec;
     struct rdma_cm_id *id;
@@ -124,6 +139,7 @@ typedef struct repl_rdma_ctx_s {
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_comp_channel *comp_chan;
+    /* ---- 旧单 send_buf 保留作 fallback, send_pipeline 启用后不再使用 ---- */
     struct ibv_mr *send_mr;
     unsigned char *send_buf;
     size_t send_buf_cap;
@@ -142,6 +158,16 @@ typedef struct repl_rdma_ctx_s {
     int qp_ready;
     int connected;
     repl_rdma_state_t state;
+    /* ---- Pipeline 发送缓冲区 ---- */
+    repl_rdma_send_slot_t send_slots[KVS_RDMA_PIPELINE_DEPTH];
+    int send_pipeline_head;          /* 下一个可用的空闲 slot 索引 */
+    int send_slots_in_flight;        /* 当前 outstanding send WR 数 */
+    int send_pipeline_depth;         /* 当前生效的 pipeline 深度（≤ KVS_RDMA_PIPELINE_DEPTH） */
+    int send_pipeline_enabled;       /* 是否启用 pipeline 模式 */
+
+    /* ---- CQ 轮询线程 ---- */
+    pthread_t cq_poll_thread;        /* CQ 轮询线程 ID */
+    int cq_poll_thread_running;      /* CQ 轮询线程是否运行 */
 } repl_rdma_ctx_t;
 
 static repl_rdma_ctx_t g_repl_rdma_ctx = {0};
@@ -233,6 +259,81 @@ static void repl_rdma_refresh_runtime_cfg(void) {
     g_repl_rdma_ctx.active_chunk_size = repl_rdma_cfg_chunk_size();
 }
 
+/* 前向声明 */
+static int repl_rdma_pending_recv_push(int slot, size_t len);
+static int repl_rdma_pending_recv_pop(int *slot_out, size_t *len_out);
+static void repl_rdma_stop_cq_poll_thread(void);
+static int repl_rdma_start_cq_poll_thread(void);
+
+/* ---- Pipeline: 获取一个空闲的 send slot ----
+ * 返回 slot 索引，-1 表示所有 slot 均在飞行中。
+ * 如果 timeout_ms > 0，会忙等待直到有 slot 可用或超时。
+ */
+static int repl_rdma_acquire_send_slot(int timeout_ms) {
+    int slot;
+    long long deadline = timeout_ms > 0 ? kvs_now_ms() + timeout_ms : 0;
+    for (;;) {
+        /* 线性扫描取第一个空闲 slot */
+        for (int i = 0; i < g_repl_rdma_ctx.send_pipeline_depth; ++i) {
+            slot = (g_repl_rdma_ctx.send_pipeline_head + i) % g_repl_rdma_ctx.send_pipeline_depth;
+            if (!g_repl_rdma_ctx.send_slots[slot].in_flight) {
+                g_repl_rdma_ctx.send_pipeline_head = (slot + 1) % g_repl_rdma_ctx.send_pipeline_depth;
+                return slot;
+            }
+        }
+        /* 所有 slot 均在飞行中 */
+        if (g_repl_rdma_ctx.cq_poll_thread_running) {
+            /* CQ 轮询线程在后台运行，不直接 poll CQ，等它释放 slot */
+            if (timeout_ms <= 0) break;
+            if (kvs_now_ms() >= deadline) break;
+            usleep(500);
+            continue;
+        }
+        /* CQ 轮询线程未运行：直接 poll CQ 回收 completion */
+        if (g_repl_rdma_ctx.cq) {
+            struct ibv_wc wc;
+            if (ibv_poll_cq(g_repl_rdma_ctx.cq, 1, &wc) > 0) {
+                if (wc.status == IBV_WC_SUCCESS &&
+                    (wc.opcode == IBV_WC_SEND) &&
+                    (wc.wr_id & KVS_RDMA_PIPELINE_WR_ID_FLAG)) {
+                    int done_slot = (int)(wc.wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
+                    if (done_slot >= 0 && done_slot < g_repl_rdma_ctx.send_pipeline_depth) {
+                        g_repl_rdma_ctx.send_slots[done_slot].in_flight = 0;
+                        g_repl_rdma_ctx.send_slots[done_slot].wr_id = 0;
+                        g_repl_rdma_ctx.send_slots_in_flight--;
+                        continue; /* 重试 */
+                    }
+                } else if (wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_RECV) {
+                    /* 顺便处理 recv completion */
+                    int recv_slot = (wc.wr_id > 0 && wc.wr_id <= (uint64_t)g_repl_rdma_ctx.active_recv_slots)
+                        ? (int)(wc.wr_id - 1) : -1;
+                    if (recv_slot >= 0 && recv_slot < g_repl_rdma_ctx.active_recv_slots) {
+                        g_repl_rdma_ctx.recv_slots[recv_slot].posted = 0;
+                        repl_rdma_pending_recv_push(recv_slot, (size_t)wc.byte_len);
+                    }
+                    continue;
+                } else {
+                    fprintf(stderr, "repl rdma: acquire_send_slot unexpected wc status=%d opcode=%d\n",
+                        wc.status, wc.opcode);
+                }
+            }
+        }
+        if (timeout_ms <= 0) break;
+        if (kvs_now_ms() >= deadline) break;
+        usleep(500);
+    }
+    return -1;
+}
+
+/* ---- Pipeline: 释放一个 send slot（由 CQ completion 回调调用）---- */
+static void repl_rdma_release_send_slot(int slot) {
+    if (slot >= 0 && slot < g_repl_rdma_ctx.send_pipeline_depth) {
+        g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
+        g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
+        g_repl_rdma_ctx.send_slots_in_flight--;
+    }
+}
+
 static int repl_rdma_pending_recv_push(int slot, size_t len) {
     if (slot < 0 || slot >= KVS_RDMA_RECV_SLOTS_MAX) return -1;
     if (g_repl_rdma_ctx.pending_recv_count >= KVS_RDMA_RECV_SLOTS_MAX) return -1;
@@ -258,6 +359,8 @@ static int repl_rdma_pending_recv_pop(int *slot_out, size_t *len_out) {
 
 static void repl_rdma_reset_conn_ctx(int preserve_listener) {
     int i;
+    /* 先停止 CQ 轮询线程（后续销毁 comp_chan/cq 时会唤醒线程） */
+    repl_rdma_stop_cq_poll_thread();
     for (i = 0; i < KVS_RDMA_RECV_SLOTS_MAX; ++i) {
         if (g_repl_rdma_ctx.recv_slots[i].mr) {
             ibv_dereg_mr(g_repl_rdma_ctx.recv_slots[i].mr);
@@ -270,6 +373,7 @@ static void repl_rdma_reset_conn_ctx(int preserve_listener) {
         g_repl_rdma_ctx.recv_slots[i].cap = 0;
         g_repl_rdma_ctx.recv_slots[i].posted = 0;
     }
+    /* 清理旧单 send_buf（兼容） */
     if (g_repl_rdma_ctx.send_mr) {
         ibv_dereg_mr(g_repl_rdma_ctx.send_mr);
         g_repl_rdma_ctx.send_mr = NULL;
@@ -279,6 +383,24 @@ static void repl_rdma_reset_conn_ctx(int preserve_listener) {
         g_repl_rdma_ctx.send_buf = NULL;
     }
     g_repl_rdma_ctx.send_buf_cap = 0;
+    /* 清理 pipeline 多发送缓冲区 */
+    for (i = 0; i < KVS_RDMA_PIPELINE_DEPTH; ++i) {
+        if (g_repl_rdma_ctx.send_slots[i].mr) {
+            ibv_dereg_mr(g_repl_rdma_ctx.send_slots[i].mr);
+            g_repl_rdma_ctx.send_slots[i].mr = NULL;
+        }
+        if (g_repl_rdma_ctx.send_slots[i].buf) {
+            kvs_free(g_repl_rdma_ctx.send_slots[i].buf);
+            g_repl_rdma_ctx.send_slots[i].buf = NULL;
+        }
+        g_repl_rdma_ctx.send_slots[i].cap = 0;
+        g_repl_rdma_ctx.send_slots[i].in_flight = 0;
+        g_repl_rdma_ctx.send_slots[i].wr_id = 0;
+    }
+    g_repl_rdma_ctx.send_pipeline_head = 0;
+    g_repl_rdma_ctx.send_slots_in_flight = 0;
+    g_repl_rdma_ctx.send_pipeline_depth = KVS_RDMA_PIPELINE_DEPTH;
+    g_repl_rdma_ctx.send_pipeline_enabled = 0;
     g_repl_rdma_ctx.recv_buf_cap = 0;
     memset(g_repl_rdma_ctx.pending_recv_slots, 0, sizeof(g_repl_rdma_ctx.pending_recv_slots));
     memset(g_repl_rdma_ctx.pending_recv_lens, 0, sizeof(g_repl_rdma_ctx.pending_recv_lens));
@@ -519,9 +641,32 @@ static int repl_rdma_prepare_buffers(void) {
     if (cap < BUFFER_CAP) cap = BUFFER_CAP;
     int i;
     if (!g_repl_rdma_ctx.pd) return -1;
+    /* 分配 pipeline 多发送缓冲区 */
+    g_repl_rdma_ctx.send_slots_in_flight = 0;
+    g_repl_rdma_ctx.send_pipeline_head = 0;
+    g_repl_rdma_ctx.send_pipeline_depth = KVS_RDMA_PIPELINE_DEPTH;
+    g_repl_rdma_ctx.send_pipeline_enabled = 1;
+    for (i = 0; i < KVS_RDMA_PIPELINE_DEPTH; ++i) {
+        g_repl_rdma_ctx.send_slots[i].buf = (unsigned char *)kvs_malloc(cap);
+        if (!g_repl_rdma_ctx.send_slots[i].buf) {
+            repl_rdma_log("prepare_buffers", "pipeline send buffer alloc failed");
+            return -1;
+        }
+        g_repl_rdma_ctx.send_slots[i].cap = cap;
+        g_repl_rdma_ctx.send_slots[i].in_flight = 0;
+        g_repl_rdma_ctx.send_slots[i].wr_id = 0;
+        memset(g_repl_rdma_ctx.send_slots[i].buf, 0, cap);
+        g_repl_rdma_ctx.send_slots[i].mr = ibv_reg_mr(g_repl_rdma_ctx.pd,
+            g_repl_rdma_ctx.send_slots[i].buf, cap, IBV_ACCESS_LOCAL_WRITE);
+        if (!g_repl_rdma_ctx.send_slots[i].mr) {
+            repl_rdma_log("prepare_buffers", "pipeline send mr register failed");
+            return -1;
+        }
+    }
+    /* 旧单 send_buf 保留作兼容 */
     g_repl_rdma_ctx.send_buf = (unsigned char *)kvs_malloc(cap);
     if (!g_repl_rdma_ctx.send_buf) {
-        repl_rdma_log("prepare_buffers", "buffer alloc failed");
+        repl_rdma_log("prepare_buffers", "legacy buffer alloc failed");
         return -1;
     }
     g_repl_rdma_ctx.send_buf_cap = cap;
@@ -529,7 +674,7 @@ static int repl_rdma_prepare_buffers(void) {
     memset(g_repl_rdma_ctx.send_buf, 0, cap);
     g_repl_rdma_ctx.send_mr = ibv_reg_mr(g_repl_rdma_ctx.pd, g_repl_rdma_ctx.send_buf, cap, IBV_ACCESS_LOCAL_WRITE);
     if (!g_repl_rdma_ctx.send_mr) {
-        repl_rdma_log("prepare_buffers", "send mr register failed");
+        repl_rdma_log("prepare_buffers", "legacy send mr register failed");
         return -1;
     }
     for (i = 0; i < g_repl_rdma_ctx.active_recv_slots; ++i) {
@@ -605,6 +750,15 @@ static int repl_rdma_wait_cq_send_completion(int timeout_ms) {
         n = ibv_poll_cq(g_repl_rdma_ctx.cq, 1, &wc);
         if (n > 0) {
             if (wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_SEND) {
+                /* Pipeline send completion */
+                if (wc.wr_id & KVS_RDMA_PIPELINE_WR_ID_FLAG) {
+                    int slot = (int)(wc.wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
+                    if (slot >= 0 && slot < g_repl_rdma_ctx.send_pipeline_depth) {
+                        g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
+                        g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
+                        g_repl_rdma_ctx.send_slots_in_flight--;
+                    }
+                }
                 pthread_mutex_unlock(&g_repl_rdma_cq_lock);
                 return 0;
             }
@@ -646,12 +800,39 @@ static int repl_rdma_wait_cq_recv_completion(int timeout_ms, int *slot_out, size
     long long deadline = kvs_now_ms() + timeout_ms;
     if (slot_out) *slot_out = -1;
     if (recv_len) *recv_len = 0;
-    pthread_mutex_lock(&g_repl_rdma_cq_lock);
-    if (repl_rdma_pending_recv_pop(slot_out, recv_len) == 0) {
+
+    /* 优先从 pending_recv 队列取（CQ 轮询线程异步填充） */
+    for (;;) {
+        pthread_mutex_lock(&g_repl_rdma_cq_lock);
+        if (repl_rdma_pending_recv_pop(slot_out, recv_len) == 0) {
+            pthread_mutex_unlock(&g_repl_rdma_cq_lock);
+            return (slot_out && *slot_out >= 0) ? 0 : -1;
+        }
         pthread_mutex_unlock(&g_repl_rdma_cq_lock);
-        return (slot_out && *slot_out >= 0) ? 0 : -1;
+        /* pending 队列为空 */
+        break;
     }
-    pthread_mutex_unlock(&g_repl_rdma_cq_lock);
+
+    /* CQ 轮询线程运行时，不直接 poll CQ（避免竞争），只等 pending 队列 */
+    if (g_repl_rdma_ctx.cq_poll_thread_running) {
+        /* 忙等待 pending 队列直到超时 */
+        while (kvs_now_ms() < deadline) {
+            usleep(1000);
+            pthread_mutex_lock(&g_repl_rdma_cq_lock);
+            if (repl_rdma_pending_recv_pop(slot_out, recv_len) == 0) {
+                pthread_mutex_unlock(&g_repl_rdma_cq_lock);
+                return (slot_out && *slot_out >= 0) ? 0 : -1;
+            }
+            pthread_mutex_unlock(&g_repl_rdma_cq_lock);
+            if (repl_rdma_drain_cm_events_nonblock() != 0 || !g_repl_rdma_ctx.connected) {
+                repl_rdma_log("recv_cq", "transport already disconnected");
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    /* ---- CQ 轮询线程未运行：直接 poll CQ（向后兼容） ---- */
     if (!g_repl_rdma_ctx.cq) return -1;
     for (;;) {
         int n;
@@ -667,6 +848,15 @@ static int repl_rdma_wait_cq_recv_completion(int timeout_ms, int *slot_out, size
                 return (slot >= 0) ? 0 : -1;
             }
             if (wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_SEND) {
+                /* Pipeline send completion — release slot */
+                if (wc.wr_id & KVS_RDMA_PIPELINE_WR_ID_FLAG) {
+                    int slot = (int)(wc.wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
+                    if (slot >= 0 && slot < g_repl_rdma_ctx.send_pipeline_depth) {
+                        g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
+                        g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
+                        g_repl_rdma_ctx.send_slots_in_flight--;
+                    }
+                }
                 pthread_mutex_unlock(&g_repl_rdma_cq_lock);
                 continue;
             }
@@ -695,7 +885,7 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     struct ibv_sge sge;
     struct ibv_send_wr wr;
     struct ibv_send_wr *bad_wr = NULL;
-    int rc;
+    int slot;
     if (!buf || len == 0) return 0;
     pthread_mutex_lock(&g_repl_rdma_send_lock);
     if (repl_rdma_drain_cm_events_nonblock() != 0) {
@@ -706,6 +896,47 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
         pthread_mutex_unlock(&g_repl_rdma_send_lock);
         return -1;
     }
+    if (g_repl_rdma_ctx.send_pipeline_enabled) {
+        /* ---- Pipeline 模式：非阻塞发送 ---- */
+        if (len > g_repl_rdma_ctx.send_slots[0].cap) {
+            repl_rdma_log("try_send", "pipeline payload too large");
+            pthread_mutex_unlock(&g_repl_rdma_send_lock);
+            return -1;
+        }
+        /* 获取空闲 send slot（等待不超过 5s） */
+        slot = repl_rdma_acquire_send_slot(5000);
+        if (slot < 0) {
+            repl_rdma_log("try_send", "no available send slot");
+            pthread_mutex_unlock(&g_repl_rdma_send_lock);
+            return -1;
+        }
+        /* 拷贝数据到 slot buffer */
+        memcpy(g_repl_rdma_ctx.send_slots[slot].buf, buf, len);
+        memset(&sge, 0, sizeof(sge));
+        sge.addr = (uintptr_t)g_repl_rdma_ctx.send_slots[slot].buf;
+        sge.length = (uint32_t)len;
+        sge.lkey = g_repl_rdma_ctx.send_slots[slot].mr->lkey;
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uint64_t)slot | KVS_RDMA_PIPELINE_WR_ID_FLAG;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        if (ibv_post_send(g_repl_rdma_ctx.id->qp, &wr, &bad_wr) != 0) {
+            repl_rdma_log("try_send", "pipeline ibv_post_send failed");
+            repl_rdma_release_send_slot(slot);
+            g_repl_rdma_ctx.connected = 0;
+            pthread_mutex_unlock(&g_repl_rdma_send_lock);
+            return -1;
+        }
+        /* 标记 in_flight，立即返回（不等待 CQ） */
+        g_repl_rdma_ctx.send_slots[slot].in_flight = 1;
+        g_repl_rdma_ctx.send_slots[slot].wr_id = wr.wr_id;
+        g_repl_rdma_ctx.send_slots_in_flight++;
+        pthread_mutex_unlock(&g_repl_rdma_send_lock);
+        return 0;
+    }
+    /* ---- 兼容旧模式：同步发送 ---- */
     if (!g_repl_rdma_ctx.send_buf || !g_repl_rdma_ctx.send_mr) {
         pthread_mutex_unlock(&g_repl_rdma_send_lock);
         return -1;
@@ -731,11 +962,167 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
         pthread_mutex_unlock(&g_repl_rdma_send_lock);
         return -1;
     }
-    rc = repl_rdma_wait_cq_send_completion(5000);
+    /* 旧模式仍同步等待 completion */
+    int rc = repl_rdma_wait_cq_send_completion(5000);
     pthread_mutex_unlock(&g_repl_rdma_send_lock);
     return rc;
 }
 #endif
+
+/* ---- 自适应 Pipeline 深度调节 ----
+ * 根据当前 in_flight 数量动态调整 send_pipeline_depth。
+ * 目标：保持 pipeline 深度与传输速率匹配，避免过度 in_flight 导致 OOO。
+ * 在 CQ 轮询线程中定期调用。
+ */
+#define KVS_RDMA_PIPELINE_DEPTH_MIN 2
+
+static void repl_rdma_adjust_pipeline_depth(void) {
+    int in_flight = g_repl_rdma_ctx.send_slots_in_flight;
+    int depth = g_repl_rdma_ctx.send_pipeline_depth;
+
+    if (in_flight <= depth / 2 && depth < KVS_RDMA_PIPELINE_DEPTH) {
+        /* pipeline 利用率低 → 增加深度 */
+        g_repl_rdma_ctx.send_pipeline_depth = depth + 1;
+#if KVS_REPL_DEBUG
+        fprintf(stderr, "repl rdma: pipeline depth %d -> %d (in_flight=%d)\n",
+            depth, depth + 1, in_flight);
+#endif
+    } else if (in_flight >= depth && depth > KVS_RDMA_PIPELINE_DEPTH_MIN) {
+        /* pipeline 饱和 → 减少深度 */
+        g_repl_rdma_ctx.send_pipeline_depth = depth - 1;
+#if KVS_REPL_DEBUG
+        fprintf(stderr, "repl rdma: pipeline depth %d -> %d (in_flight=%d)\n",
+            depth, depth - 1, in_flight);
+#endif
+    }
+}
+
+/* ---- CQ completion 处理函数（CQ 轮询线程和 fallback 路径共用）---- */
+static void repl_rdma_cq_process_wc(struct ibv_wc *wc, int *adapt_counter) {
+    if (wc->status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "repl rdma: cq_poll error status=%d opcode=%d wr_id=0x%lx\n",
+            wc->status, wc->opcode, (unsigned long)wc->wr_id);
+        if (wc->opcode == IBV_WC_SEND) g_rdma_send_cq_error_count++;
+        else g_rdma_recv_cq_error_count++;
+        g_repl_rdma_ctx.connected = 0;
+        return;
+    }
+    if (wc->opcode == IBV_WC_SEND) {
+        if (wc->wr_id & KVS_RDMA_PIPELINE_WR_ID_FLAG) {
+            int slot = (int)(wc->wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
+            repl_rdma_release_send_slot(slot);
+            if (adapt_counter && ++(*adapt_counter) >= 16) {
+                repl_rdma_adjust_pipeline_depth();
+                *adapt_counter = 0;
+            }
+        }
+    } else if (wc->opcode == IBV_WC_RECV) {
+        int slot = (wc->wr_id > 0 && wc->wr_id <= (uint64_t)g_repl_rdma_ctx.active_recv_slots)
+            ? (int)(wc->wr_id - 1) : -1;
+        if (slot >= 0 && slot < g_repl_rdma_ctx.active_recv_slots) {
+            g_repl_rdma_ctx.recv_slots[slot].posted = 0;
+            repl_rdma_pending_recv_push(slot, (size_t)wc->byte_len);
+        }
+    }
+}
+
+/* ---- CQ 轮询线程 ----
+ * 后台独立 poll CQ，将完成事件分发到对应队列。
+ * 在 pipeline 模式下，发送/接收 completion 均由此线程异步处理。
+ */
+static void *repl_rdma_cq_poll_thread(void *arg) {
+    (void)arg;
+    struct ibv_cq *cq = g_repl_rdma_ctx.cq;
+    struct ibv_wc wc_batch[KVS_RDMA_CQ_BATCH];
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    int adapt_counter = 0;
+
+    repl_rdma_log("cq_poll", "thread started");
+    while (g_repl_rdma_ctx.cq_poll_thread_running && g_repl_rdma_ctx.connected) {
+        /* 使用 completion channel 事件驱动，避免 busy poll */
+        if (ibv_get_cq_event(g_repl_rdma_ctx.comp_chan, &ev_cq, &ev_ctx) != 0) {
+            if (errno == EINTR) continue;
+            repl_rdma_log("cq_poll", "ibv_get_cq_event failed");
+            usleep(10000);
+            continue;
+        }
+        ibv_ack_cq_events(cq, 1);
+
+        /* 批量 poll completions */
+        for (;;) {
+            int n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
+            if (n <= 0) break;
+            for (int i = 0; i < n; i++) {
+                repl_rdma_cq_process_wc(&wc_batch[i], &adapt_counter);
+                if (!g_repl_rdma_ctx.connected) break;
+            }
+            if (!g_repl_rdma_ctx.connected) break;
+        }
+
+        /* 标准 RDMA 编程模式: re-arm → poll(再确认) → wait.
+         *
+         * 必须先 re-arm 再 poll，因为:
+         * 如果先 poll(全空) 再 re-arm，中间有 completion 到达时
+         * 该 completion 不会触发 event，导致永久阻塞。
+         */
+        if (g_repl_rdma_ctx.cq && g_repl_rdma_ctx.connected) {
+            ibv_req_notify_cq(cq, 0);
+            /*  Drain: poll 一次确认 poll→re-arm 之间没有漏掉 completion */
+            int n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
+            if (n > 0) {
+                for (int i = 0; i < n; i++) {
+                    repl_rdma_cq_process_wc(&wc_batch[i], &adapt_counter);
+                    if (!g_repl_rdma_ctx.connected) break;
+                }
+                /* 有数据，不阻塞等待，立即继续 re-arm→drain 循环 */
+                continue;
+            }
+        }
+        /* 无更多 completion → 回到 ibv_get_cq_event 阻塞等待 */
+    }
+    /* Drain remaining events on exit */
+    if (g_repl_rdma_ctx.comp_chan) {
+        struct ibv_cq *drain_cq;
+        void *drain_ctx;
+        while (ibv_get_cq_event(g_repl_rdma_ctx.comp_chan, &drain_cq, &drain_ctx) == 0) {
+            ibv_ack_cq_events(cq, 1);
+        }
+    }
+    repl_rdma_log("cq_poll", "thread exiting");
+    return NULL;
+}
+
+static int repl_rdma_start_cq_poll_thread(void) {
+    if (g_repl_rdma_ctx.cq_poll_thread_running) return 0;
+    if (!g_repl_rdma_ctx.comp_chan || !g_repl_rdma_ctx.cq) return -1;
+    /* 先 arm CQ notification */
+    if (ibv_req_notify_cq(g_repl_rdma_ctx.cq, 0) != 0) {
+        repl_rdma_log("cq_poll", "ibv_req_notify_cq failed");
+        return -1;
+    }
+    g_repl_rdma_ctx.cq_poll_thread_running = 1;
+    if (pthread_create(&g_repl_rdma_ctx.cq_poll_thread, NULL,
+                       repl_rdma_cq_poll_thread, NULL) != 0) {
+        g_repl_rdma_ctx.cq_poll_thread_running = 0;
+        repl_rdma_log("cq_poll", "pthread_create failed");
+        return -1;
+    }
+    pthread_detach(g_repl_rdma_ctx.cq_poll_thread);
+    repl_rdma_log("cq_poll", "thread started");
+    return 0;
+}
+
+static void repl_rdma_stop_cq_poll_thread(void) {
+    if (!g_repl_rdma_ctx.cq_poll_thread_running) return;
+    g_repl_rdma_ctx.cq_poll_thread_running = 0;
+    /* 断开 completion channel 以唤醒线程 */
+    if (g_repl_rdma_ctx.comp_chan) {
+        ibv_destroy_comp_channel(g_repl_rdma_ctx.comp_chan);
+        g_repl_rdma_ctx.comp_chan = NULL;
+    }
+    repl_rdma_log("cq_poll", "thread stop signalled");
+}
 
 static void repl_transport_tcp_disconnect_slave(int fd) {
     if (fd >= 0) close(fd);
@@ -879,6 +1266,10 @@ static int repl_transport_rdma_connect_slave(const char *host, int port) {
         repl_transport_trigger_fallback("rdma_connect_handshake_failed", 5000);
         repl_rdma_reset_ctx();
         return -1;
+    }
+    /* 启动 CQ 轮询线程（pipeline 模式：异步处理 send/recv completion） */
+    if (g_repl_rdma_ctx.send_pipeline_enabled) {
+        repl_rdma_start_cq_poll_thread();
     }
     repl_transport_mark_active("rdma");
     repl_rdma_log("connect_slave", "path complete but transport still experimental");
@@ -2188,6 +2579,10 @@ static void *rdma_master_listener_thread(void *arg) {
         fprintf(stderr, "repl rdma: listener_established_ok - elapsed_ms=%lld\n", kvs_now_ms() - accept_start_ms);
         g_repl_rdma_ctx.connected = 1;
         repl_rdma_log("listener", "established");
+        /* 启动 CQ 轮询线程（pipeline 模式） */
+        if (g_repl_rdma_ctx.send_pipeline_enabled) {
+            repl_rdma_start_cq_poll_thread();
+        }
         {
             int recv_slot = -1;
             size_t recv_len = 0;

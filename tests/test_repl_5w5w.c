@@ -32,8 +32,8 @@
  *       --repl-fullsync-transport rdma \
  *       --repl-realtime-transport ebpf
  *
- * 用法二: eBPF sockmap 增量（双虚拟机，无kprobe内核支持时自动回退至此）
- *   与用法一相同，区别在于内核不支持 CONFIG_BPF_KPROBE_OVERRIDE
+ * 用法二: eBPF sockmap 增量（双虚拟机，kprobe不可用时自动回退至此）
+ *   与用法一相同，区别在于内核不支持 kprobe 附件（如 kprobe_events 不可写）
  *   自动走 sk_msg → bpf_msg_redirect_map → TCP 路径
  *
  * 用法三: TCP 全量（单机，无 RDMA/eBPF）
@@ -957,7 +957,7 @@ static int run_test(void) {
         char *tport = info_cap ? info_field(info_cap, "repl_transport_active") : NULL;
         printf("  %s✗ kprobe+RDMA 未生效%s\n", ANSI_RED, ANSI_RESET);
         printf("  当前传输层: %s\n", tport ? tport : "?");
-        printf("  可能原因: ebpf_enabled=0, 内核不支持 BPF_KPROBE_OVERRIDE, 或 eBPF 未加载\n");
+        printf("  可能原因: ebpf_enabled=0, kprobe_events 不可写, 或 eBPF 未加载\n");
         printf("  数据已通过 TCP fallback 正常同步\n");
         free(tport);
         free(info_cap);
@@ -1093,8 +1093,8 @@ static void print_usage(const char *prog) {
     printf("╚══════════════════════════════════════════════════════════════╝\n");
     printf("\n");
     printf("方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，推荐）\n");
-    printf("  当内核支持 CONFIG_BPF_KPROBE_OVERRIDE 时，增量数据经\n");
-    printf("  kprobe 捕获 → ring buffer → RDMA pipeline → Slave\n");
+    printf("  增量数据经 kprobe 捕获 → ring buffer → RDMA pipeline → Slave\n");
+    printf("  TCP 路径保持不变，数据同时走 TCP 和 RDMA，Slave 端通过 offset 去重\n");
     printf("  回退链: kprobe+RDMA → eBPF sockmap → TCP\n");
     printf("\n");
     printf("  # 终端 1 (VM1, 先启动):\n");
@@ -1115,7 +1115,7 @@ static void print_usage(const char *prog) {
     printf("      --repl-realtime-transport ebpf\n");
     printf("\n");
     printf("方式二: eBPF sockmap 增量（双虚拟机，kprobe不可用时自动回退）\n");
-    printf("  启动参数同方式一，区别在于内核不支持 override，\n");
+    printf("  启动参数同方式一，区别在于内核不支持 kprobe 附件，\n");
     printf("  走 sk_msg → bpf_msg_redirect_map → TCP 路径\n");
     printf("\n");
     printf("方式三: TCP 全量（单机，无 RDMA/eBPF）\n");

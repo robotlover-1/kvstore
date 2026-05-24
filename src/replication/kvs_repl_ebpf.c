@@ -28,9 +28,16 @@ void repl_ebpf_set_rdma_send_fn(int (*fn)(const unsigned char *, size_t)) {
     g_repl_capture_rdma_send_fn = fn;
 }
 
-/* 设置捕获的目标 fd */
+/* 前向声明 */
+static int repl_capture_update_ctl(void);
+
+/* 设置捕获的目标 fd 并同步到 BPF map */
 void repl_capture_set_target_fd(int fd) {
     g_repl_capture_target_fd = fd;
+    /* 更新 BPF 控制 map 以使 kprobe 生效 */
+    if (g_repl_capture_initialized) {
+        repl_capture_update_ctl();
+    }
 }
 
 /* 获取捕获的目标 fd */

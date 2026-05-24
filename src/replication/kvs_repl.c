@@ -189,33 +189,30 @@ static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t l
 static int repl_transport_ebpf_send(conn_t *c, const unsigned char *buf, size_t len) {
     /* eBPF 增量传输：
      *
-     * 有两种模式，由配置 --ebpf-capture 控制：
+     * 有三种模式：
      *
      * 模式 A (传统 sockmap 重定向):
      *    queue_bytes → reactor on_write → send(c->fd) 
      *    → 内核触发 sk_msg BPF → bpf_msg_redirect_map()
      *    → sock_map[redirect_key] 的 TCP → 远端 slave
      *
-     * 模式 B (kprobe + RDMA 加速):
-     *    send(c->fd, buf, len, MSG_NOSIGNAL) → kprobe on __sys_sendto 捕获
-     *    → BPF 拷贝数据到 ring buffer → 返回 -EPERM 阻止 TCP
-     *    → 用户态消费者线程读 ring buffer → RDMA pipeline → Slave
+     * 模式 B (kprobe 捕获 + RDMA 加速):
+     *    send(c->fd) → kprobe on __sys_sendto 捕获数据 → ring buffer
+     *    → 用户态消费者线程 → RDMA pipeline → Slave
+     *    TCP 路径不变，数据同时走 TCP 和 RDMA，Slave 端通过 offset 去重
      *
-     * 当 kprobe 未生效 (fallback) 时回退到 queue_bytes。
+     * 模式 C: kprobe 未生效时回退到 queue_bytes (TCP-only)
      */
 #if KVS_ENABLE_RDMA
-    /* kprobe+RDMA 模式：直接 send，期望被 BPF 捕获 */
+    /* kprobe+RDMA 模式：数据同时走 TCP（可靠）和 RDMA（加速） */
     if (g_repl_rdma_ctx.connected && c) {
         extern int repl_capture_get_target_fd(void);
         int target_fd = repl_capture_get_target_fd();
         if (target_fd >= 0) {
+            /* send 触发 kprobe 捕获（不阻塞，捕获并行进行） */
             int rc = send(c->fd, buf, len, MSG_NOSIGNAL);
-            if (rc < 0 && errno == EPERM) {
-                /* BPF 捕获成功，数据已进入 ring buffer → RDMA */
-                return 0;
-            }
             if (rc > 0) {
-                /* 数据走了 TCP（kprobe 未生效），已成功发送 */
+                /* TCP 发送成功；kprobe 同时捕获数据到 ring buffer */
                 return 0;
             }
             /* send 失败，回退到 queue_bytes */

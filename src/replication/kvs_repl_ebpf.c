@@ -4,6 +4,9 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #endif
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/perf_event.h>
 
 static int g_repl_ebpf_initialized = 0;
 static int g_repl_capture_initialized = 0;
@@ -190,28 +193,21 @@ static int repl_capture_update_ctl(void) {
 /* Ring buffer 事件处理回调 */
 static int repl_capture_ringbuf_cb(void *ctx, void *data, size_t data_sz) {
     (void)ctx;
+    /* 匹配 BPF 中的 struct capture_event: { __u64 len; unsigned char data[2048]; } */
+    if (data_sz < 8) return 0;  /* 至少要有 len 字段 */
+    __u64 len = *(const __u64 *)data;
+    if (len == 0 || len > 2048) return 0;
+    const unsigned char *payload = (const unsigned char *)data + 8;
 
-    struct capture_event {
-        __u64 len;
-        __u64 flags;
-        unsigned char data[];
-    };
-
-    if (data_sz < sizeof(struct capture_event)) return 0;
-    struct capture_event *e = (struct capture_event *)data;
-
-    if (e->len == 0 || e->len > 65536) return 0;
     g_repl_capture_count++;
-    g_repl_capture_bytes += e->len;
+    g_repl_capture_bytes += len;
 
-    /* 通过 RDMA 发送捕获的数据 */
     if (g_repl_capture_rdma_send_fn) {
-        if (g_repl_capture_rdma_send_fn(e->data, (size_t)e->len) != 0) {
+        if (g_repl_capture_rdma_send_fn(payload, (size_t)len) != 0) {
             g_repl_capture_rdma_fail++;
-            fprintf(stderr, "repl capture: RDMA send failed (len=%llu)\n", e->len);
+            fprintf(stderr, "repl capture: RDMA send failed (len=%llu)\n", len);
         }
     }
-
     return 0;
 }
 
@@ -219,19 +215,9 @@ static int repl_capture_ringbuf_cb(void *ctx, void *data, size_t data_sz) {
 static void *repl_capture_consumer_thread(void *arg) {
     (void)arg;
     fprintf(stderr, "repl capture: consumer thread started\n");
-
-    /* 设置 ring buffer 回调 */
-    g_repl_capture_rb = ring_buffer__new(g_repl_capture_ringbuf_fd,
-        repl_capture_ringbuf_cb, NULL, NULL);
-    if (!g_repl_capture_rb) {
-        fprintf(stderr, "repl capture: ring_buffer__new failed\n");
-        return NULL;
-    }
-
     g_repl_capture_consumer_running = 1;
     while (g_repl_capture_consumer_running) {
-        /* 阻塞等待 ring buffer 事件 */
-        int rc = ring_buffer__poll(g_repl_capture_rb, 100); /* 100ms timeout */
+        int rc = ring_buffer__poll(g_repl_capture_rb, 100);
         if (rc < 0 && errno != EINTR) {
             if (g_repl_capture_consumer_running) {
                 fprintf(stderr, "repl capture: ring_buffer__poll error %d\n", rc);
@@ -239,9 +225,6 @@ static void *repl_capture_consumer_thread(void *arg) {
             }
         }
     }
-
-    ring_buffer__free(g_repl_capture_rb);
-    g_repl_capture_rb = NULL;
     fprintf(stderr, "repl capture: consumer thread exiting\n");
     return NULL;
 }
@@ -292,32 +275,90 @@ static int repl_capture_load_object(void) {
         return -1;
     }
 
-    /* 尝试附加 kprobe 程序（非致命，失败时只使用 tracepoint） */
+    /* 附加 kprobe — 通过 kprobe_events + PERF_TYPE_TRACEPOINT + ioctl
+     *
+     * 因为 BPF 程序不含 bpf_override_return，所以 ioctl SET_BPF 可成功。
+     * 流程：
+     *   1) 写入 /sys/kernel/debug/tracing/kprobe_events 创建 kprobe
+     *   2) 读取 /sys/kernel/debug/tracing/events/kprobes/kvstore_cap/id
+     *   3) perf_event_open(PERF_TYPE_TRACEPOINT, id)
+     *   4) ioctl PERF_EVENT_IOC_SET_BPF + PERF_EVENT_IOC_ENABLE
+     */
     prog = bpf_object__find_program_by_name(g_repl_capture_obj, "kp_capture_sendto");
     if (prog) {
-        struct bpf_link *link = bpf_program__attach_kprobe(prog, false /* kprobe */,
-            "__sys_sendto");
-        if (libbpf_get_error(link)) {
-            fprintf(stderr, "repl capture: kprobe attach skipped (kernel may not support BPF_KPROBE_OVERRIDE)\n");
-        } else {
-            fprintf(stderr, "repl capture: kprobe attached (with override)\n");
-        }
-    }
+        int prog_fd = bpf_program__fd(prog);
+        int pfd = -1;
 
-    /* 附加 tracepoint 程序（兜底） */
-    prog = bpf_object__find_program_by_name(g_repl_capture_obj, "tp_capture_sendto");
-    if (prog) {
-        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_sendto");
-        if (libbpf_get_error(link)) {
-            fprintf(stderr, "repl capture: tracepoint attach failed\n");
+        if (prog_fd >= 0) {
+            /* Step 1: 创建 kprobe event */
+            FILE *kpe = fopen("/sys/kernel/debug/tracing/kprobe_events", "w");
+            if (kpe) {
+                fprintf(kpe, "p:kprobes/kvstore_cap __sys_sendto\n");
+                fclose(kpe);
+
+                /* Step 2: 读取 event id */
+                char idpath[256];
+                int evt_id = -1;
+                snprintf(idpath, sizeof(idpath),
+                         "/sys/kernel/debug/tracing/events/kprobes/kvstore_cap/id");
+                FILE *idf = fopen(idpath, "r");
+                if (idf) {
+                    if (fscanf(idf, "%d", &evt_id) == 1) {
+                        /* Step 3+4: perf_event_open + ioctl */
+                        struct perf_event_attr attr = { 0 };
+                        attr.type = PERF_TYPE_TRACEPOINT;  /* = 2 */
+                        attr.size = sizeof(attr);
+                        attr.config = evt_id;                /* kprobe event id */
+                        attr.sample_period = 1;
+                        attr.wakeup_events = 1;
+
+                        pfd = syscall(__NR_perf_event_open, &attr,
+                                      -1, 0, -1, PERF_FLAG_FD_CLOEXEC);
+                        if (pfd >= 0) {
+                            if (ioctl(pfd, PERF_EVENT_IOC_SET_BPF, prog_fd) == 0) {
+                                ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0);
+                                fprintf(stderr, "repl capture: kprobe attached (kprobe_events+tp)\n");
+                            } else {
+                                fprintf(stderr, "repl capture: ioctl SET_BPF failed: %s\n",
+                                        strerror(errno));
+                                close(pfd);
+                                pfd = -1;
+                            }
+                        } else {
+                            fprintf(stderr, "repl capture: perf_event_open (tracepoint) failed: %s\n",
+                                    strerror(errno));
+                        }
+                    } else {
+                        fprintf(stderr, "repl capture: failed to read kprobe event id\n");
+                    }
+                    fclose(idf);
+                } else {
+                    fprintf(stderr, "repl capture: cannot open %s: %s\n", idpath, strerror(errno));
+                }
+            } else {
+                fprintf(stderr, "repl capture: cannot open kprobe_events: %s\n", strerror(errno));
+            }
         } else {
-            fprintf(stderr, "repl capture: tracepoint attached\n");
+            repl_ebpf_set_error("capture_prog_fd", EBADF);
+        }
+        if (pfd < 0) {
+            fprintf(stderr, "repl capture: kprobe attach failed, realtime will not use RDMA capture\n");
         }
     }
 
     /* 更新控制 map */
     if (repl_capture_update_ctl() != 0) {
         repl_ebpf_set_error("capture_update_ctl", errno);
+        bpf_object__close(g_repl_capture_obj);
+        g_repl_capture_obj = NULL;
+        return -1;
+    }
+
+    /* 创建 ring buffer 消费者 */
+    g_repl_capture_rb = ring_buffer__new(g_repl_capture_ringbuf_fd,
+        repl_capture_ringbuf_cb, NULL, NULL);
+    if (!g_repl_capture_rb) {
+        repl_ebpf_set_error("capture_ringbuf_new", errno);
         bpf_object__close(g_repl_capture_obj);
         g_repl_capture_obj = NULL;
         return -1;
@@ -356,6 +397,12 @@ void repl_capture_cleanup(void) {
     g_repl_capture_consumer_running = 0;
     g_repl_capture_target_fd = -1;
 #if KVS_ENABLE_EBPF
+    /* 清理 kprobe */
+    FILE *f = fopen("/sys/kernel/debug/tracing/kprobe_events", "w");
+    if (f) {
+        fprintf(f, "-:kprobes/kvstore_cap\n");
+        fclose(f);
+    }
     if (g_repl_capture_obj) {
         bpf_object__close(g_repl_capture_obj);
         g_repl_capture_obj = NULL;
@@ -363,6 +410,10 @@ void repl_capture_cleanup(void) {
     g_repl_capture_ringbuf_fd = -1;
     g_repl_capture_ctl_fd = -1;
     g_repl_capture_stats_fd = -1;
+    if (g_repl_capture_rb) {
+        ring_buffer__free(g_repl_capture_rb);
+        g_repl_capture_rb = NULL;
+    }
 #endif
     g_repl_capture_initialized = 0;
 }

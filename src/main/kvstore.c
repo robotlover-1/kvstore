@@ -216,6 +216,9 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ebpf-redirect-key") && i + 1 < argc) {
             g_cfg.ebpf_redirect_key = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--ebpf-enabled")) {
+            g_cfg.ebpf_enabled = 1;
+        }
         else if (!strcmp(argv[i], "--ebpf-forward")) {
             g_cfg.ebpf_forward = 1;
         }
@@ -1997,7 +2000,7 @@ int kvs_dump_to_fd(int fd) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--repl-fullsync-transport rdma] [--repl-realtime-transport ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore] [--ebpf-redirect --ebpf-redirect-key 0] [--ebpf-forward] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--repl-fullsync-transport rdma] [--repl-realtime-transport ebpf] [--ebpf-enabled] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore] [--ebpf-redirect --ebpf-redirect-key 0] [--ebpf-forward] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {
@@ -2029,6 +2032,11 @@ int main(int argc, char **argv) {
             if (repl_ebpf_init() != 0) {
                 fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
                 /* Non-fatal: continue with TCP fallback */
+            }
+            /* 加载 kprobe 捕获 BPF 程序（加载 BPF + 启动消费者线程）
+             * target_fd 将在 slave 连接时通过 repl_capture_set_target_fd() 设置 */
+            if (repl_capture_init(-1) != 0) {
+                fprintf(stderr, "repl capture: kprobe BPF init failed (non-fatal, using regular path)\n");
             }
         }
     }

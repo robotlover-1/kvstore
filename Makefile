@@ -93,6 +93,7 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
 
 OBJS=$(patsubst $(SRC_DIR)/%.c, build/%.o, $(SRCS))
 BPF_SRCS=$(SRC_DIR)/replication/bpf/repl_sockmap.bpf.c \
+         $(SRC_DIR)/replication/bpf/repl_realtime_capture.bpf.c \
          $(SRC_DIR)/replication/bpf/repl_realtime_capture.bpf.c
 BPF_OBJS=$(patsubst $(SRC_DIR)/%.bpf.c, build/%.bpf.o, $(BPF_SRCS))
 KVS_BPF_OBJS=$(if $(filter 1,$(ENABLE_EBPF)),$(BPF_OBJS),)

@@ -99,7 +99,7 @@ static conn_t g_rdma_master_replica_conn = {0};
 #define KVS_RDMA_PIPELINE_WR_ID_FLAG 0x80000000UL  /* wr_id 高位标记，区分 pipeline send vs recv */
 
 /* ---- Keepalive ---- */
-#define KVS_RDMA_KEEPALIVE_INTERVAL_MS 1500  /* siw 空闲超时前发送保活（实测约 3s 超时，设 1.5s 留余量） */
+#define KVS_RDMA_KEEPALIVE_INTERVAL_MS 200   /* siw 空闲超时前发送保活（实测约 500ms 超时，设 200ms 留余量） */
 static long long g_repl_rdma_last_send_ms = 0;  /* 上次 send 成功时间戳 */
 
 typedef enum repl_rdma_state_e {
@@ -2658,7 +2658,7 @@ static void *rdma_master_listener_thread(void *arg) {
                         unsigned char ka = 0;
                         repl_rdma_try_send(&ka, 1);
                     }
-                    usleep(500000); /* 0.5s 粒度 */
+                    usleep(100000); /* 0.1s 粒度，匹配 keepalive 间隔 */
                     continue;
                 }
 

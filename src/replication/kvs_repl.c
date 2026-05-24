@@ -189,15 +189,39 @@ static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t l
 static int repl_transport_ebpf_send(conn_t *c, const unsigned char *buf, size_t len) {
     /* eBPF 增量传输：
      *
-     * 数据路径: queue_bytes → reactor on_write → send(c->fd) 
-     *          → 内核触发 sk_msg BPF (因 fd 已注册到 sockmap)
-     *          → BPF 执行 bpf_msg_redirect_map() 
-     *          → sock_map[redirect_key] 的 TCP → 远端 slave
+     * 有两种模式，由配置 --ebpf-capture 控制：
      *
-     * c->fd 已通过 register_fd() 注册到 sock_map 和 role_map，
-     * 因此 send() 系统调用会被 BPF 程序拦截并重定向。
-     * 传输层为 TCP（跨机器数据必须走网络协议），
-     * 但数据路由由 eBPF 程序在内核态决策，而非直接走内核 TCP 栈。 */
+     * 模式 A (传统 sockmap 重定向):
+     *    queue_bytes → reactor on_write → send(c->fd) 
+     *    → 内核触发 sk_msg BPF → bpf_msg_redirect_map()
+     *    → sock_map[redirect_key] 的 TCP → 远端 slave
+     *
+     * 模式 B (kprobe + RDMA 加速):
+     *    send(c->fd, buf, len, MSG_NOSIGNAL) → kprobe on __sys_sendto 捕获
+     *    → BPF 拷贝数据到 ring buffer → 返回 -EPERM 阻止 TCP
+     *    → 用户态消费者线程读 ring buffer → RDMA pipeline → Slave
+     *
+     * 当 kprobe 未生效 (fallback) 时回退到 queue_bytes。
+     */
+#if KVS_ENABLE_RDMA
+    /* kprobe+RDMA 模式：直接 send，期望被 BPF 捕获 */
+    if (g_repl_rdma_ctx.connected && c) {
+        extern int repl_capture_get_target_fd(void);
+        int target_fd = repl_capture_get_target_fd();
+        if (target_fd >= 0) {
+            int rc = send(c->fd, buf, len, MSG_NOSIGNAL);
+            if (rc < 0 && errno == EPERM) {
+                /* BPF 捕获成功，数据已进入 ring buffer → RDMA */
+                return 0;
+            }
+            if (rc > 0) {
+                /* 数据走了 TCP（kprobe 未生效），已成功发送 */
+                return 0;
+            }
+            /* send 失败，回退到 queue_bytes */
+        }
+    }
+#endif
     return queue_bytes(c, buf, len);
 }
 
@@ -967,6 +991,14 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     pthread_mutex_unlock(&g_repl_rdma_send_lock);
     return rc;
 }
+
+/* ---- kprobe+RDMA 外部调用入口 ----
+ * 由 eBPF capture 消费者线程调用（通过函数指针注册）。
+ * 封装 repl_rdma_try_send 供外部模块使用。
+ */
+int repl_rdma_send_from_ebpf(const unsigned char *buf, size_t len) {
+    return repl_rdma_try_send(buf, len);
+}
 #endif
 
 /* ---- 自适应 Pipeline 深度调节 ----
@@ -1478,13 +1510,15 @@ static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) 
         return &g_repl_transport_tcp_ops;
     }
     /* KVS_REPL_SEND_REALTIME */
-    const char *t = repl_realtime_transport_name();
-    if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported()) {
-        transport_log("realtime using EBPF");
-        return &g_repl_transport_ebpf_ops;
+    {
+        const char *t = repl_realtime_transport_name();
+        if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported()) {
+            transport_log("realtime using EBPF");
+            return &g_repl_transport_ebpf_ops;
+        }
+        transport_log("realtime using TCP");
+        return &g_repl_transport_tcp_ops;
     }
-    transport_log("realtime using TCP");
-    return &g_repl_transport_tcp_ops;
 }
 
 int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len) {

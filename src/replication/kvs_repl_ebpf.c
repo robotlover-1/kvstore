@@ -6,10 +6,38 @@
 #endif
 
 static int g_repl_ebpf_initialized = 0;
+static int g_repl_capture_initialized = 0;
 static unsigned long long g_repl_ebpf_register_attempts = 0;
 static unsigned long long g_repl_ebpf_register_failures = 0;
 static int g_repl_ebpf_last_errno = 0;
 static char g_repl_ebpf_last_error[128] = "none";
+
+/* 捕获模块统计 */
+static unsigned long long g_repl_capture_count = 0;
+static unsigned long long g_repl_capture_bytes = 0;
+static unsigned long long g_repl_capture_rdma_fail = 0;
+static int g_repl_capture_target_fd = -1;
+
+/* RDMA 发送回调（由 kvs_repl.c 注册） */
+static int (*g_repl_capture_rdma_send_fn)(const unsigned char *buf, size_t len) = NULL;
+
+void repl_ebpf_set_rdma_send_fn(int (*fn)(const unsigned char *, size_t)) {
+    g_repl_capture_rdma_send_fn = fn;
+}
+
+/* 设置捕获的目标 fd */
+void repl_capture_set_target_fd(int fd) {
+    g_repl_capture_target_fd = fd;
+}
+
+/* 获取捕获的目标 fd */
+int repl_capture_get_target_fd(void) {
+    return g_repl_capture_target_fd;
+}
+
+int repl_capture_is_initialized(void) {
+    return g_repl_capture_initialized;
+}
 
 static void repl_ebpf_set_error(const char *stage, int err) {
     g_repl_ebpf_last_errno = err;
@@ -28,6 +56,16 @@ static int g_repl_ebpf_stats_map_fd = -1;
 static int g_repl_ebpf_control_map_fd = -1;
 static int g_repl_ebpf_uses_pinned_maps = 0;
 static int g_repl_ebpf_print_initialized = 0;
+
+/* ---- 捕获模块 (kprobe + ring buffer) ---- */
+static struct bpf_object *g_repl_capture_obj = NULL;
+static int g_repl_capture_ringbuf_fd = -1;
+static int g_repl_capture_ctl_fd = -1;
+static int g_repl_capture_stats_fd = -1;
+static int g_repl_capture_print_initialized = 0;
+static pthread_t g_repl_capture_consumer_tid = 0;
+static int g_repl_capture_consumer_running = 0;
+static struct ring_buffer *g_repl_capture_rb = NULL;
 
 static int repl_ebpf_libbpf_print(enum libbpf_print_level level, const char *format, va_list args) {
     /* 只打印 WARN 和 ERROR 级别，关闭 DEBUG/INFO 噪声 */
@@ -128,6 +166,213 @@ static int repl_ebpf_pin_loaded_maps(void) {
     if (repl_ebpf_pin_map_fd(g_repl_ebpf_stats_map_fd, "stats_map") != 0) return -1;
     if (repl_ebpf_pin_map_fd(g_repl_ebpf_control_map_fd, "control_map") != 0) return -1;
     return 0;
+}
+
+/* ---- 捕获模块函数 ---- */
+
+/* 更新 capture 控制 map */
+static int repl_capture_update_ctl(void) {
+    if (g_repl_capture_ctl_fd < 0) return -1;
+    __u32 key;
+    __u64 value;
+
+    key = 0; /* enabled */
+    value = (g_repl_capture_target_fd >= 0) ? 1u : 0u;
+    if (bpf_map_update_elem(g_repl_capture_ctl_fd, &key, &value, BPF_ANY) != 0) return -1;
+
+    key = 1; /* target_fd */
+    value = (__u64)(g_repl_capture_target_fd >= 0 ? g_repl_capture_target_fd : 0);
+    if (bpf_map_update_elem(g_repl_capture_ctl_fd, &key, &value, BPF_ANY) != 0) return -1;
+
+    return 0;
+}
+
+/* Ring buffer 事件处理回调 */
+static int repl_capture_ringbuf_cb(void *ctx, void *data, size_t data_sz) {
+    (void)ctx;
+
+    struct capture_event {
+        __u64 len;
+        __u64 flags;
+        unsigned char data[];
+    };
+
+    if (data_sz < sizeof(struct capture_event)) return 0;
+    struct capture_event *e = (struct capture_event *)data;
+
+    if (e->len == 0 || e->len > 65536) return 0;
+    g_repl_capture_count++;
+    g_repl_capture_bytes += e->len;
+
+    /* 通过 RDMA 发送捕获的数据 */
+    if (g_repl_capture_rdma_send_fn) {
+        if (g_repl_capture_rdma_send_fn(e->data, (size_t)e->len) != 0) {
+            g_repl_capture_rdma_fail++;
+            fprintf(stderr, "repl capture: RDMA send failed (len=%llu)\n", e->len);
+        }
+    }
+
+    return 0;
+}
+
+/* 消费者线程：从 ring buffer 读取并发送 RDMA */
+static void *repl_capture_consumer_thread(void *arg) {
+    (void)arg;
+    fprintf(stderr, "repl capture: consumer thread started\n");
+
+    /* 设置 ring buffer 回调 */
+    g_repl_capture_rb = ring_buffer__new(g_repl_capture_ringbuf_fd,
+        repl_capture_ringbuf_cb, NULL, NULL);
+    if (!g_repl_capture_rb) {
+        fprintf(stderr, "repl capture: ring_buffer__new failed\n");
+        return NULL;
+    }
+
+    g_repl_capture_consumer_running = 1;
+    while (g_repl_capture_consumer_running) {
+        /* 阻塞等待 ring buffer 事件 */
+        int rc = ring_buffer__poll(g_repl_capture_rb, 100); /* 100ms timeout */
+        if (rc < 0 && errno != EINTR) {
+            if (g_repl_capture_consumer_running) {
+                fprintf(stderr, "repl capture: ring_buffer__poll error %d\n", rc);
+                usleep(100000);
+            }
+        }
+    }
+
+    ring_buffer__free(g_repl_capture_rb);
+    g_repl_capture_rb = NULL;
+    fprintf(stderr, "repl capture: consumer thread exiting\n");
+    return NULL;
+}
+
+/* 加载 capture BPF 对象 */
+static int repl_capture_load_object(void) {
+    struct bpf_program *prog;
+    const char *capture_obj_path;
+
+    if (g_repl_capture_obj) return 0;
+
+    /* 查找 capture BPF 对象文件路径 */
+    capture_obj_path = "build/replication/bpf/repl_realtime_capture.bpf.o";
+    if (access(capture_obj_path, F_OK) != 0) {
+        repl_ebpf_set_error("capture_obj_not_found", ENOENT);
+        return -1;
+    }
+
+    repl_ebpf_raise_memlock();
+    if (!g_repl_capture_print_initialized) {
+        libbpf_set_print(repl_ebpf_libbpf_print);
+        g_repl_capture_print_initialized = 1;
+    }
+
+    g_repl_capture_obj = bpf_object__open_file(capture_obj_path, NULL);
+    if (libbpf_get_error(g_repl_capture_obj)) {
+        repl_ebpf_set_error("capture_open_object", (int)-libbpf_get_error(g_repl_capture_obj));
+        g_repl_capture_obj = NULL;
+        return -1;
+    }
+
+    if (bpf_object__load(g_repl_capture_obj) != 0) {
+        repl_ebpf_set_error("capture_load_object", errno);
+        bpf_object__close(g_repl_capture_obj);
+        g_repl_capture_obj = NULL;
+        return -1;
+    }
+
+    /* 查找 maps */
+    g_repl_capture_ringbuf_fd = bpf_object__find_map_fd_by_name(g_repl_capture_obj, "capture_ringbuf");
+    g_repl_capture_ctl_fd = bpf_object__find_map_fd_by_name(g_repl_capture_obj, "capture_ctl");
+    g_repl_capture_stats_fd = bpf_object__find_map_fd_by_name(g_repl_capture_obj, "capture_stats");
+
+    if (g_repl_capture_ringbuf_fd < 0 || g_repl_capture_ctl_fd < 0 || g_repl_capture_stats_fd < 0) {
+        repl_ebpf_set_error("capture_find_maps", ENOENT);
+        bpf_object__close(g_repl_capture_obj);
+        g_repl_capture_obj = NULL;
+        return -1;
+    }
+
+    /* 尝试附加 kprobe 程序（非致命，失败时只使用 tracepoint） */
+    prog = bpf_object__find_program_by_name(g_repl_capture_obj, "kp_capture_sendto");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_kprobe(prog, false /* kprobe */,
+            "__sys_sendto");
+        if (libbpf_get_error(link)) {
+            fprintf(stderr, "repl capture: kprobe attach skipped (kernel may not support BPF_KPROBE_OVERRIDE)\n");
+        } else {
+            fprintf(stderr, "repl capture: kprobe attached (with override)\n");
+        }
+    }
+
+    /* 附加 tracepoint 程序（兜底） */
+    prog = bpf_object__find_program_by_name(g_repl_capture_obj, "tp_capture_sendto");
+    if (prog) {
+        struct bpf_link *link = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_sendto");
+        if (libbpf_get_error(link)) {
+            fprintf(stderr, "repl capture: tracepoint attach failed\n");
+        } else {
+            fprintf(stderr, "repl capture: tracepoint attached\n");
+        }
+    }
+
+    /* 更新控制 map */
+    if (repl_capture_update_ctl() != 0) {
+        repl_ebpf_set_error("capture_update_ctl", errno);
+        bpf_object__close(g_repl_capture_obj);
+        g_repl_capture_obj = NULL;
+        return -1;
+    }
+
+    /* 启动消费者线程 */
+    if (pthread_create(&g_repl_capture_consumer_tid, NULL,
+                       repl_capture_consumer_thread, NULL) != 0) {
+        repl_ebpf_set_error("capture_consumer_thread", errno);
+        bpf_object__close(g_repl_capture_obj);
+        g_repl_capture_obj = NULL;
+        return -1;
+    }
+    pthread_detach(g_repl_capture_consumer_tid);
+
+    repl_ebpf_clear_error();
+    return 0;
+}
+
+/* 初始化捕获模块 */
+int repl_capture_init(int target_fd) {
+    if (g_repl_capture_initialized) return 0;
+#if KVS_ENABLE_EBPF
+    g_repl_capture_target_fd = target_fd;
+    if (repl_capture_load_object() != 0) return -1;
+#else
+    (void)target_fd;
+    return -1;
+#endif
+    g_repl_capture_initialized = 1;
+    return 0;
+}
+
+/* 停止捕获模块 */
+void repl_capture_cleanup(void) {
+    g_repl_capture_consumer_running = 0;
+    g_repl_capture_target_fd = -1;
+#if KVS_ENABLE_EBPF
+    if (g_repl_capture_obj) {
+        bpf_object__close(g_repl_capture_obj);
+        g_repl_capture_obj = NULL;
+    }
+    g_repl_capture_ringbuf_fd = -1;
+    g_repl_capture_ctl_fd = -1;
+    g_repl_capture_stats_fd = -1;
+#endif
+    g_repl_capture_initialized = 0;
+}
+
+/* 获取捕获统计 */
+void repl_capture_get_stats(unsigned long long *count, unsigned long long *bytes,
+                            unsigned long long *rdma_fail) {
+    if (count) *count = g_repl_capture_count;
+    if (bytes) *bytes = g_repl_capture_bytes;
+    if (rdma_fail) *rdma_fail = g_repl_capture_rdma_fail;
 }
 
 static int repl_ebpf_update_control(void) {
@@ -266,6 +511,7 @@ int repl_ebpf_init(void) {
 }
 
 void repl_ebpf_cleanup(void) {
+    repl_capture_cleanup();
 #if KVS_ENABLE_EBPF
     if (g_repl_ebpf_obj) {
         bpf_object__close(g_repl_ebpf_obj);

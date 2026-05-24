@@ -987,6 +987,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (repl_ebpf_register_fd(c->fd, 1) != 0) {
                 fprintf(stderr, "repl ebpf: fd registration failed on master replica link, using tcp-compatible path\n");
             }
+            /* kprobe+RDMA 捕获：设置捕获目标 fd */
+            repl_capture_set_target_fd(c->fd);
         }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
@@ -1020,6 +1022,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
+        unsigned long long cap_count = 0, cap_bytes = 0, cap_rdma_fail = 0;
+        repl_capture_get_stats(&cap_count, &cap_bytes, &cap_rdma_fail);
         repl_ebpf_get_stats(&ebpf_stats);
 
         unsigned long long max_replica_applied = 0;
@@ -1095,6 +1099,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "ebpf_role_unknown:%llu\n"
             "ebpf_role_master:%llu\n"
             "ebpf_role_slave:%llu\n"
+            "capture_initialized:%d\n"
+            "capture_target_fd:%d\n"
+            "capture_count:%llu\n"
+            "capture_bytes:%llu\n"
+            "capture_rdma_fail:%llu\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -1162,6 +1171,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             ebpf_stats.role_unknown,
             ebpf_stats.role_master,
             ebpf_stats.role_slave,
+            repl_capture_is_initialized(),
+            repl_capture_get_target_fd(),
+            cap_count, cap_bytes, cap_rdma_fail,
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
@@ -2027,6 +2039,10 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+#if KVS_ENABLE_RDMA
+    /* 注册 kprobe+RDMA 捕获的回调函数 */
+    repl_ebpf_set_rdma_send_fn(repl_rdma_send_from_ebpf);
+#endif
 
     if (!strcmp(g_cfg.net_backend, "reactor")) {
         return reactor_start();

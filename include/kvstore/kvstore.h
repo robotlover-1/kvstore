@@ -473,6 +473,19 @@ int repl_ebpf_register_forward_fd(int fd);
 int repl_ebpf_unregister_fd(int fd);
 int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats);
 
+/* ---- kprobe+RDMA 捕获模块 ---- */
+#if KVS_ENABLE_RDMA
+int repl_rdma_send_from_ebpf(const unsigned char *buf, size_t len);
+#endif
+void repl_ebpf_set_rdma_send_fn(int (*fn)(const unsigned char *, size_t));
+void repl_capture_set_target_fd(int fd);
+int repl_capture_get_target_fd(void);
+int repl_capture_is_initialized(void);
+int repl_capture_init(int target_fd);
+void repl_capture_cleanup(void);
+void repl_capture_get_stats(unsigned long long *count, unsigned long long *bytes,
+                            unsigned long long *rdma_fail);
+
 int persist_init(void);
 void persist_close(void);
 int persist_append_raw(const unsigned char *buf, size_t len);

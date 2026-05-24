@@ -476,6 +476,7 @@ int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats);
 /* ---- kprobe+RDMA 捕获模块 ---- */
 #if KVS_ENABLE_RDMA
 int repl_rdma_send_from_ebpf(const unsigned char *buf, size_t len);
+int repl_rdma_is_connected(void);
 #endif
 void repl_ebpf_set_rdma_send_fn(int (*fn)(const unsigned char *, size_t));
 void repl_capture_set_target_fd(int fd);

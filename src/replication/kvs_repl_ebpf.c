@@ -209,10 +209,17 @@ static int repl_capture_ringbuf_cb(void *ctx, void *data, size_t data_sz) {
     g_repl_capture_count++;
     g_repl_capture_bytes += len;
 
+    /* 检查 RDMA 连接是否可用，避免在断开时无效重试 */
     if (g_repl_capture_rdma_send_fn) {
-        if (g_repl_capture_rdma_send_fn(payload, (size_t)len) != 0) {
+        extern int repl_rdma_is_connected(void);
+        if (repl_rdma_is_connected()) {
+            if (g_repl_capture_rdma_send_fn(payload, (size_t)len) != 0) {
+                g_repl_capture_rdma_fail++;
+                /* RDMA 发送失败（如 pipeline 满），TCP 已送达，静默跳过 */
+            }
+        } else {
+            /* RDMA 未连接（全量同步后断开），TCP 已送达，统计但静默 */
             g_repl_capture_rdma_fail++;
-            fprintf(stderr, "repl capture: RDMA send failed (len=%llu)\n", len);
         }
     }
     return 0;

@@ -2234,16 +2234,20 @@ static void *slave_thread(void *arg) {
                 /* Also check RDMA for fullsync data */
 #if KVS_ENABLE_RDMA
                 if (g_repl_rdma_ctx.connected) {
-                    /* 批量消费所有可用 recv，防止 pending_recv 队列溢出 */
+                    /* 批量消费可用 recv，防止 pending_recv 队列溢出，
+                     * 但不超过 buf 剩余空间，避免覆盖全量同步大块数据 */
                     for (;;) {
                         int recv_slot = -1;
                         size_t rdma_blen = 0;
                         if (repl_rdma_wait_cq_recv_completion(0, &recv_slot, &rdma_blen) != 0
                             || recv_slot < 0) break;
                         if (rdma_blen <= 1) {
-                            /* 0/1 字节 keepalive，直接 repost */
                             repl_rdma_repost_recv(recv_slot);
                             continue;
+                        }
+                        if (blen + rdma_blen > sizeof(buf)) {
+                            /* buf 空间不足，留给下次迭代 */
+                            break;
                         }
                         unsigned char *payload;
                         if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
@@ -2251,14 +2255,9 @@ static void *slave_thread(void *arg) {
                         payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
                         if (payload) {
                             if (repl_rdma_repost_recv(recv_slot) == 0) {
-                                if (blen + rdma_blen <= sizeof(buf)) {
-                                    memcpy(buf + blen, payload, rdma_blen);
-                                    blen += rdma_blen;
-                                    had_new_data = 1;
-                                } else {
-                                    fprintf(stderr, "repl rdma: slave_debug_rdma - BUFFER OVERFLOW! blen=%zu rdma_blen=%zu sizeof(buf)=%zu\n",
-                                        blen, rdma_blen, sizeof(buf));
-                                }
+                                memcpy(buf + blen, payload, rdma_blen);
+                                blen += rdma_blen;
+                                had_new_data = 1;
                             }
                             kvs_free(payload);
                         }

@@ -1197,6 +1197,13 @@ static int repl_should_use_rdma_now(void);
 static void repl_transport_mark_active(const char *name);
 static void repl_transport_trigger_fallback(const char *reason, int cooldown_ms);
 static int repl_realtime_should_use_ebpf(void);
+#if KVS_ENABLE_RDMA
+typedef struct repl_rdma_bg_connect_arg_s {
+    char host[128];
+    int port;
+} repl_rdma_bg_connect_arg_t;
+static void *repl_rdma_bg_connect_thread(void *arg);
+#endif
 
 static int repl_transport_rdma_connect_slave(const char *host, int port) {
     (void)host;
@@ -1355,7 +1362,37 @@ static int repl_transport_kprobe_rdma_send(conn_t *c, const unsigned char *buf, 
 
 static int repl_transport_kprobe_rdma_connect_slave(const char *host, int port) {
 #if KVS_ENABLE_KPROBE_RDMA
-    return repl_kprobe_rdma_establish(host, port);
+    int tcp_fd = repl_kprobe_rdma_establish(host, port);
+    if (tcp_fd < 0) return -1;
+
+    /* 后台启动 RDMA fullsync QP 连接（用于全量同步）
+     * 与 kprobe-rdma QP 独立，复用现有 RDMA 全量同步逻辑 */
+#if KVS_ENABLE_RDMA
+    if (!strcasecmp(repl_fullsync_transport_name(), "rdma")) {
+        repl_rdma_bg_connect_arg_t *rdma_arg =
+            (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
+        if (rdma_arg) {
+            snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
+            rdma_arg->port = port;
+            pthread_t rdma_tid;
+            if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
+                kvs_free(rdma_arg);
+            } else {
+                pthread_detach(rdma_tid);
+            }
+        }
+        /* 等一小段时间让 RDMA fullsync 连接建立 */
+        for (int wait = 0; wait < 100; wait++) {
+            if (g_repl_rdma_ctx.connected) break;
+            usleep(50000); /* 50ms × 100 = 5s max */
+        }
+        if (g_repl_rdma_ctx.connected)
+            fprintf(stderr, "repl kprobe-rdma: RDMA fullsync QP ready\n");
+        else
+            fprintf(stderr, "repl kprobe-rdma: RDMA fullsync QP not ready, will fallback to TCP for fullsync\n");
+    }
+#endif
+    return tcp_fd;
 #else
     (void)host; (void)port;
     return -1;
@@ -2148,11 +2185,6 @@ static void repl_slave_ack_heartbeat(void) {
 }
 
 #if KVS_ENABLE_RDMA
-typedef struct repl_rdma_bg_connect_arg_s {
-    char host[128];
-    int port;
-} repl_rdma_bg_connect_arg_t;
-
 static void *repl_rdma_bg_connect_thread(void *arg) {
     repl_rdma_bg_connect_arg_t *a = (repl_rdma_bg_connect_arg_t *)arg;
     repl_transport_rdma_connect_slave(a->host, a->port);

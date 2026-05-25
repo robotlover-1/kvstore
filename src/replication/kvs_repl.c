@@ -2436,7 +2436,7 @@ static void *slave_thread(void *arg) {
         if (!strcasecmp(repl_transport_name(), "rdma") ||
             !strcasecmp(repl_transport_name(), "rdma+kprobe")) {
             unsigned char cmd[256];
-            unsigned char stream_buf[BUFFER_CAP * 4];
+            unsigned char stream_buf[BUFFER_CAP * 4 + 4096];
             char offbuf[32];
             char durablebuf[32];
             size_t n;
@@ -2485,10 +2485,9 @@ static void *slave_thread(void *arg) {
                     }
                     if (stream_len + blen > sizeof(stream_buf)) {
                         kvs_free(payload);
-                        /* stream 积压过多，丢弃已处理完的数据重新开始 */
                         stream_len = 0;
                         repl_rdma_log("slave_loop", "stream buffer overflow while appending recv payload");
-                        continue;
+                        break;
                     }
 #if KVS_ENABLE_RDMA
                     {
@@ -2803,7 +2802,7 @@ static void *rdma_master_listener_thread(void *arg) {
         {
             int recv_slot = -1;
             size_t recv_len = 0;
-            unsigned char stream_buf[BUFFER_CAP * 4];
+            unsigned char stream_buf[BUFFER_CAP * 4 + 4096];
             size_t stream_len = 0;
             memset(&g_rdma_master_replica_conn, 0, sizeof(g_rdma_master_replica_conn));
             g_rdma_master_replica_conn.repl_transport_kind = KVS_REPL_TRANSPORT_RDMA;
@@ -2854,7 +2853,7 @@ static void *rdma_master_listener_thread(void *arg) {
                     kvs_free(payload);
                     stream_len = 0;
                     repl_rdma_log("listener", "stream buffer overflow while appending recv payload");
-                    continue;
+                    break;
                 }
                 memcpy(stream_buf + stream_len, payload, blen);
                 stream_len += blen;

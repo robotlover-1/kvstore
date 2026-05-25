@@ -756,6 +756,9 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     g_rdma_kprobe.connected = 1;
     fprintf(stderr, "kprobe rdma: master QP connected to slave\n");
 
+    /* 等 slave listener 完成 MR 注册后再发 KPROBEMR */
+    usleep(500000);  /* 500ms */
+
     /* 发送 KPROBEMR 请求触发 slave 返回 MR 信息 */
     {
         const char req[] = "KPROBEMR\r\n";

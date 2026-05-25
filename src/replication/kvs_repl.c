@@ -1480,7 +1480,15 @@ static int repl_should_use_ebpf_now(void) {
 static const repl_transport_ops_t *repl_transport_ops(void) {
     /* In hybrid mode, the main ops are for realtime transport */
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_kprobe_realtime) {
+        /* Hybrid: RDMA for fullsync, kprobe+RDMA WRITE for realtime.
+         * The main transport is kprobe-rdma (TCP control + RDMA WRITE data). */
+        if (g_repl_transport_kprobe_rdma_ops.supported && g_cfg.kprobe_enabled)
+            return &g_repl_transport_kprobe_rdma_ops;
+        return &g_repl_transport_tcp_ops;
+    }
     if (use_rdma_fullsync && use_ebpf_realtime) {
         /* Hybrid: RDMA for fullsync, eBPF for realtime.
          * The main transport is eBPF (over TCP) for realtime data. */

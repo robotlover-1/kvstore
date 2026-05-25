@@ -932,6 +932,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!resp) return -1;
 
     (void)argl;
+    /* 日志: 记录每个收到的命令（便于调试 kprobe-rdma 的 KPROBEMR 交换） */
+    if (argc > 0 && argv[0] && (!strcmp(argv[0], "KPROBEMR") || !strcmp(argv[0], "KPROBERDMA"))) {
+        fprintf(stderr, "kprobe rdma: [CMD] %s from_replication=%d role=%s\n",
+            argv[0], from_replication,
+            g_cfg.role == ROLE_MASTER ? "master" : "slave");
+    }
+
     if (argc <= 0) {
         rc_ret = -1;
         goto out;

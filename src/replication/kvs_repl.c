@@ -2433,7 +2433,8 @@ static void *slave_thread(void *arg) {
             continue;
         }
 
-        if (!strcasecmp(repl_transport_name(), "rdma")) {
+        if (!strcasecmp(repl_transport_name(), "rdma") ||
+            !strcasecmp(repl_transport_name(), "rdma+kprobe")) {
             unsigned char cmd[256];
             unsigned char stream_buf[BUFFER_CAP * 4];
             char offbuf[32];

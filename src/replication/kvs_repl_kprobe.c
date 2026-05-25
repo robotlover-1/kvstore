@@ -670,23 +670,53 @@ int repl_kprobe_rdma_slave_init(void) {
     return 0;
 }
 
-/* Master 侧建立 RDMA QP + 交换 MR 信息
- * 通过 TCP 控制通道发送 REPLSYNC，从响应中解析 MR 信息 */
+/* kprobe+RDMA 建立连接
+ *
+ * 实际需要返回一个 TCP socket fd，供 slave 线程用于控制消息
+ * （REPLSYNC、REPLACK 等）。数据通过独立的 RDMA QP + WRITE 传输。
+ *
+ * 返回: TCP fd（成功）, -1（失败） */
 int repl_kprobe_rdma_establish(const char *host, int port) {
+    int tcp_fd = -1;
+    struct sockaddr_in addr;
+    struct timeval tv;
+
     if (!host || port <= 0) return -1;
 
     fprintf(stderr, "kprobe rdma: establishing connection to %s:%d\n", host, port);
 
-    /* 1. 建立 RDMA QP */
-    if (kprobe_rdma_qp_connect(host, port) != 0) {
-        fprintf(stderr, "kprobe rdma: QP connect failed\n");
+    /* 1. 建立 TCP 控制连接（用于 REPLSYNC/REPLACK） */
+    tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_fd < 0) return -1;
+
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        close(tcp_fd);
         return -1;
     }
 
-    /* 2. 设置 kprobe fd 过滤 — 这里在建立 TCP 控制连接后设置 */
-    g_kprobe_running = 1;
+    if (connect(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(tcp_fd);
+        fprintf(stderr, "kprobe rdma: TCP connect to %s:%d failed\n", host, port);
+        return -1;
+    }
+
+    /* 2. 建立 RDMA QP（用于 RDMA WRITE 数据通道） */
+    if (kprobe_rdma_qp_connect(host, port) != 0) {
+        fprintf(stderr, "kprobe rdma: QP connect failed, closing TCP\n");
+        close(tcp_fd);
+        return -1;
+    }
 
     /* 3. 启动转发线程 */
+    g_kprobe_running = 1;
     if (!g_master_forward_started) {
         if (pthread_create(&g_master_forward_tid, NULL,
                 kprobe_rdma_forward_thread, NULL) == 0) {
@@ -695,7 +725,8 @@ int repl_kprobe_rdma_establish(const char *host, int port) {
         }
     }
 
-    return 0;
+    fprintf(stderr, "kprobe rdma: established (TCP fd=%d)\n", tcp_fd);
+    return tcp_fd;
 }
 
 /* 从握手响应中解析 Slave MR 信息 */
@@ -822,7 +853,7 @@ int repl_kprobe_rdma_enqueue(const unsigned char *data, size_t len) {
 int repl_kprobe_rdma_master_init(void) { return 0; }
 int repl_kprobe_rdma_slave_init(void) { return 0; }
 int repl_kprobe_rdma_establish(const char *h, int p)
-    { (void)h; (void)p; return -1; }
+    { (void)h; (void)p; return -1; }  /* 返回 -1 表示失败，slave 线程会重试 */
 int repl_kprobe_rdma_slave_accept(struct ibv_pd *pd, char *r, size_t c)
     { (void)pd; (void)r; (void)c; return -1; }
 void repl_kprobe_rdma_cleanup(void) {}

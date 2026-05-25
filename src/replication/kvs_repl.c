@@ -648,16 +648,7 @@ static int repl_rdma_connect_handshake(void) {
     repl_rdma_log("connect", "issuing rdma_connect");
     repl_rdma_set_state(REPL_RDMA_STATE_CONNECTING, "rdma_connect");
     if (rdma_connect(g_repl_rdma_ctx.id, &param) != 0) {
-        fprintf(stderr, "repl rdma: connect - rdma_connect failed errno=%d (%s)\n",
-            errno, strerror(errno));
-        /* Try to drain any stale CM events that might have accumulated */
-        {   struct rdma_cm_event *e = NULL;
-            while (rdma_get_cm_event(g_repl_rdma_ctx.ec, &e) == 0) {
-                fprintf(stderr, "repl rdma: connect - draining stale event: %s\n",
-                    rdma_event_str(e->event));
-                rdma_ack_cm_event(e);
-            }
-        }
+        repl_rdma_log("connect", "rdma_connect failed");
         return -1;
     }
     if (repl_rdma_wait_event(RDMA_CM_EVENT_ESTABLISHED, establish_timeout_ms) != 0) {

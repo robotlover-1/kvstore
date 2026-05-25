@@ -1052,13 +1052,24 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         /* Slave 侧收到 KPROBEMR 请求：返回 MR 信息 */
         fprintf(stderr, "kprobe rdma: KPROBEMR received, sending MR info...\n");
         char resp[384];
-        int rn = repl_kprobe_rdma_get_mr_text(resp, sizeof(resp));
+        /* 重试等待 MR 就绪（listener 线程可能尚未完成注册） */
+        int rn = -1;
+        for (int retry = 0; retry < 50; retry++) {
+            rn = repl_kprobe_rdma_get_mr_text(resp, sizeof(resp));
+            if (rn > 0 && strstr(resp, "0 0 0 0 0") == NULL) {
+                fprintf(stderr, "kprobe rdma: MR ready after %d retries, rkey=%s\n",
+                    retry, resp + 12);  /* skip "+KPROBERDMA " */
+                break;
+            }
+            usleep(10000);  /* 10ms */
+        }
         if (rn > 0 && c) {
             queue_bytes(c, (unsigned char *)resp, (size_t)rn);
-            fprintf(stderr, "kprobe rdma: KPROBEMR response sent (%d bytes)\n", rn);
+            fprintf(stderr, "kprobe rdma: KPROBEMR response sent (%d bytes): %s",
+                rn, resp);
         } else {
             const char *err = "-ERR KPROBERDMA MR not ready\r\n";
-            fprintf(stderr, "kprobe rdma: MR not ready!\n");
+            fprintf(stderr, "kprobe rdma: MR not ready after retries!\n");
             if (c) queue_bytes(c, (unsigned char *)err, strlen(err));
         }
         return 0;

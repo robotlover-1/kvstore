@@ -536,7 +536,6 @@ static void *kprobe_rdma_slave_listener(void *arg) {
             fprintf(stderr, "kprobe rdma: listener reg_mr failed\n"); break;
         }
         fprintf(stderr, "kprobe rdma: [DBG] slave listener - MR registered\n");
-
         g_slave_ringbuf->producer_head = 0;
         g_slave_ringbuf->consumer_tail = 0;
 

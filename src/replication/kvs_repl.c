@@ -1569,6 +1569,8 @@ static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) 
         transport_log("realtime using EBPF");
         return &g_repl_transport_ebpf_ops;
     }
+    transport_log("realtime using TCP");
+    return &g_repl_transport_tcp_ops;
 }
 
 int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len) {

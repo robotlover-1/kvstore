@@ -31,6 +31,10 @@
 #define KVS_ENABLE_EBPF 0
 #endif
 
+#ifndef KVS_ENABLE_KPROBE_RDMA
+#define KVS_ENABLE_KPROBE_RDMA 0
+#endif
+
 #define BUFFER_CAP 65536
 #define MAX_EVENTS 1024
 #define LISTEN_BACKLOG 128
@@ -41,6 +45,7 @@
 #define KVS_REPL_TRANSPORT_TCP 1
 #define KVS_REPL_TRANSPORT_RDMA 2
 #define KVS_REPL_TRANSPORT_EBPF 3
+#define KVS_REPL_TRANSPORT_KPROBE_RDMA 4
 
 /* Replication send context: which transport to use */
 #define KVS_REPL_SEND_FULLSYNC  1   /* bulk existing data: RDMA */
@@ -302,6 +307,10 @@ typedef struct {
     int sentinel_down_after_ms;
     int sentinel_failover_timeout_ms;
     int sentinel_quorum;
+
+    /* kprobe+RDMA 增量同步 */
+    int kprobe_enabled;                 /* 0=禁用 1=启用 */
+    char repl_kprobe_obj_path[256];     /* kprobe BPF 对象文件路径 */
 } kv_config_t;
 
 typedef struct {
@@ -521,6 +530,29 @@ size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const ch
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);
+
+/* ---- kprobe+RDMA 增量同步 ---- */
+struct ibv_pd; /* 前向声明，避免非 RDMA 编译单元警告 */
+typedef struct {
+    unsigned long long total_events;
+    unsigned long long total_bytes;
+    unsigned long long rdma_writes;
+    unsigned long long rdma_errors;
+    unsigned long long kprobe_hits;
+    unsigned long long kprobe_bytes;
+    int kprobe_initialized;
+    int rdma_connected;
+} kvs_repl_kprobe_stats_t;
+
+int repl_kprobe_rdma_master_init(void);
+int repl_kprobe_rdma_slave_init(void);
+int repl_kprobe_rdma_establish(const char *host, int port);
+int repl_kprobe_rdma_slave_accept(struct ibv_pd *pd, char *resp, size_t resp_cap);
+void repl_kprobe_rdma_cleanup(void);
+int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *stats);
+int repl_kprobe_rdma_set_pid(pid_t pid);
+int repl_kprobe_rdma_parse_mr_info(const char *resp);
+int repl_kprobe_rdma_enqueue(const unsigned char *data, size_t len);
 
 const char *repl_master_link_state_name(void);
 

@@ -1,4 +1,5 @@
 #include "kvstore/kvstore.h"
+#include "kvstore/replication/repl_kprobe.h"
 #include <poll.h>
 #include <time.h>
 
@@ -1309,6 +1310,38 @@ static const repl_transport_ops_t g_repl_transport_rdma_ops = {
     .disconnect_slave = repl_transport_rdma_disconnect_slave,
 };
 
+/* kprobe+RDMA WRITE transport ops — kprobe 透明拦截 TCP send，
+ * 用户态转发模块通过 RDMA WRITE 发送。send() 不应被直接调用。 */
+static int repl_transport_kprobe_rdma_send(conn_t *c, const unsigned char *buf, size_t len) {
+    (void)c; (void)buf; (void)len;
+    /* kprobe 透明拦截，此函数不应被调用。如被调用表示回退到 TCP */
+    return -1;
+}
+
+static int repl_transport_kprobe_rdma_connect_slave(const char *host, int port) {
+#if KVS_ENABLE_KPROBE_RDMA
+    return repl_kprobe_rdma_establish(host, port);
+#else
+    (void)host; (void)port;
+    return -1;
+#endif
+}
+
+static void repl_transport_kprobe_rdma_disconnect_slave(int fd) {
+    (void)fd;
+#if KVS_ENABLE_KPROBE_RDMA
+    repl_kprobe_rdma_cleanup();
+#endif
+}
+
+static const repl_transport_ops_t g_repl_transport_kprobe_rdma_ops = {
+    .name = "kprobe-rdma",
+    .supported = KVS_ENABLE_KPROBE_RDMA,
+    .send = repl_transport_kprobe_rdma_send,
+    .connect_slave = repl_transport_kprobe_rdma_connect_slave,
+    .disconnect_slave = repl_transport_kprobe_rdma_disconnect_slave,
+};
+
 static const char *repl_rdma_state_name(repl_rdma_state_t st) {
     switch (st) {
         case REPL_RDMA_STATE_INIT: return "INIT";
@@ -1349,16 +1382,21 @@ static void repl_transport_trigger_fallback(const char *reason, int cooldown_ms)
 
 const char *repl_transport_configured_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
+    if (!strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma")) return "kprobe-rdma";
     return "tcp";
 }
 
 const char *repl_transport_active_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     return g_repl_transport_active[0] ? g_repl_transport_active : repl_transport_configured_name();
 }
@@ -1379,10 +1417,12 @@ static const repl_transport_ops_t *repl_transport_ops_for_conn(conn_t *c) {
     if (!c) {
         if (g_slave_transport_kind == KVS_REPL_TRANSPORT_RDMA) return &g_repl_transport_rdma_ops;
         if (g_slave_transport_kind == KVS_REPL_TRANSPORT_EBPF) return &g_repl_transport_ebpf_ops;
+        if (g_slave_transport_kind == KVS_REPL_TRANSPORT_KPROBE_RDMA) return &g_repl_transport_kprobe_rdma_ops;
         return &g_repl_transport_tcp_ops;
     }
     if (c->repl_transport_kind == KVS_REPL_TRANSPORT_RDMA) return &g_repl_transport_rdma_ops;
     if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF) return &g_repl_transport_ebpf_ops;
+    if (c->repl_transport_kind == KVS_REPL_TRANSPORT_KPROBE_RDMA) return &g_repl_transport_kprobe_rdma_ops;
     return &g_repl_transport_tcp_ops;
 }
 
@@ -1420,13 +1460,16 @@ static const repl_transport_ops_t *repl_transport_ops(void) {
 
 static int repl_transport_supported(void) {
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return g_repl_transport_rdma_ops.supported;
+    if (!strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma")) return g_repl_transport_kprobe_rdma_ops.supported;
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return g_repl_transport_ebpf_ops.supported && repl_ebpf_supported();
     return 1;
 }
 
 const char *repl_transport_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
+    int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     return repl_transport_active_name();
 }
@@ -1442,6 +1485,9 @@ int repl_transport_send(conn_t *c, const unsigned char *buf, size_t len) {
         repl_transport_trigger_fallback("rdma_send_failure", 5000);
     } else if (ops == &g_repl_transport_ebpf_ops) {
         repl_transport_trigger_fallback("ebpf_send_failure", 5000);
+    } else if (ops == &g_repl_transport_kprobe_rdma_ops) {
+        /* kprobe-rdma send 不应被调用；如失败，回退到 TCP */
+        repl_transport_trigger_fallback("kprobe_rdma_send_failure", 5000);
     }
     return rc;
 }
@@ -1464,6 +1510,7 @@ const char *repl_fullsync_transport_name(void) {
 const char *repl_realtime_transport_name(void) {
     if (g_cfg.repl_realtime_transport[0]) return g_cfg.repl_realtime_transport;
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
+    if (!strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma")) return "kprobe-rdma";
     return "tcp";
 }
 
@@ -1479,6 +1526,10 @@ static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) 
     }
     /* KVS_REPL_SEND_REALTIME */
     const char *t = repl_realtime_transport_name();
+    if (!strcasecmp(t, "kprobe-rdma") && g_repl_transport_kprobe_rdma_ops.supported && g_cfg.kprobe_enabled) {
+        transport_log("realtime using KPROBE+RDMA");
+        return &g_repl_transport_kprobe_rdma_ops;
+    }
     if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported()) {
         transport_log("realtime using EBPF");
         return &g_repl_transport_ebpf_ops;

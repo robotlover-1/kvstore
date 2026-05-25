@@ -2485,9 +2485,10 @@ static void *slave_thread(void *arg) {
                     }
                     if (stream_len + blen > sizeof(stream_buf)) {
                         kvs_free(payload);
+                        /* stream 积压过多，丢弃已处理完的数据重新开始 */
                         stream_len = 0;
                         repl_rdma_log("slave_loop", "stream buffer overflow while appending recv payload");
-                        break;
+                        continue;
                     }
 #if KVS_ENABLE_RDMA
                     {
@@ -2511,6 +2512,8 @@ static void *slave_thread(void *arg) {
                 }
                 repl_set_link_state(1);
             }
+            /* 主动断开 RDMA 连接，触发重连 */
+            g_repl_rdma_ctx.connected = 0;
             while (!slave_should_reconnect(gen) && g_repl_rdma_ctx.connected) {
                 sleep(1);
                 repl_set_link_state(1);
@@ -2851,7 +2854,7 @@ static void *rdma_master_listener_thread(void *arg) {
                     kvs_free(payload);
                     stream_len = 0;
                     repl_rdma_log("listener", "stream buffer overflow while appending recv payload");
-                    break;
+                    continue;
                 }
                 memcpy(stream_buf + stream_len, payload, blen);
                 stream_len += blen;

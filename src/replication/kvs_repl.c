@@ -2508,12 +2508,45 @@ static void *slave_thread(void *arg) {
         }
         g_slave_fd = fd;
         repl_set_link_state(1);
-        unsigned char buf[BUFFER_CAP];
+        unsigned char buf[BUFFER_CAP * 4 + 4096];
         size_t blen = 0;
 
         for (;;) {
             if (slave_should_reconnect(gen)) break;
-            ssize_t r = recv(fd, buf + blen, sizeof(buf) - blen, 0);
+
+            /* 当 fullsync transport 为 RDMA 时，全量数据通过 RDMA QP 到达，
+             * TCP 通道只传输控制消息。在此也轮询 RDMA recv completion。 */
+            int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma")
+                                 && KVS_ENABLE_RDMA && g_repl_rdma_ctx.connected;
+
+            if (use_rdma_fullsync) {
+                int recv_slot = -1;
+                size_t rdma_blen = 0;
+                if (repl_rdma_wait_cq_recv_completion(200, &recv_slot, &rdma_blen) == 0
+                    && recv_slot >= 0 && rdma_blen > 0) {
+                    unsigned char *payload;
+                    if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
+                        rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
+                    payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
+                    if (payload) {
+                        if (blen + rdma_blen <= sizeof(buf)) {
+                            memcpy(buf + blen, payload, rdma_blen);
+                            blen += rdma_blen;
+                            parse_resp_stream(NULL, buf, &blen, 1);
+                        }
+                        kvs_free(payload);
+                    }
+                    if (repl_rdma_repost_recv(recv_slot) != 0)
+                        break;
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
+                    continue;
+                }
+                if (!g_repl_rdma_ctx.connected && g_repl_rdma_ctx.qp_ready)
+                    break;
+            }
+
+            ssize_t r = recv(fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
             if (r > 0) {
                 blen += (size_t)r;
                 parse_resp_stream(NULL, buf, &blen, 1);
@@ -2522,7 +2555,10 @@ static void *slave_thread(void *arg) {
                 continue;
             }
             if (r == 0) break;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!use_rdma_fullsync) usleep(1000);
+                continue;
+            }
             break;
         }
 

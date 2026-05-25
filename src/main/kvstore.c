@@ -2131,14 +2131,19 @@ int main(int argc, char **argv) {
 #endif
 
     /* kprobe+RDMA 增量同步初始化 */
-    if (g_cfg.kprobe_enabled &&
-        !strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
+    if (!strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
         if (g_cfg.role == ROLE_MASTER) {
-            if (repl_kprobe_rdma_master_init() != 0) {
-                fprintf(stderr, "kprobe rdma master init failed, disabling\n");
-                g_cfg.kprobe_enabled = 0;
+            if (g_cfg.kprobe_enabled) {
+                if (repl_kprobe_rdma_master_init() != 0) {
+                    fprintf(stderr, "kprobe rdma master init failed, disabling\n");
+                    g_cfg.kprobe_enabled = 0;
+                }
+            } else {
+                fprintf(stderr, "kprobe rdma: master kprobe disabled (use --kprobe-enabled)\n");
             }
         } else if (g_cfg.role == ROLE_SLAVE) {
+            /* Slave 侧不需要加载 BPF，但需要启动 kprobe-rdma listener */
+            fprintf(stderr, "kprobe rdma: slave init (starting listener)\n");
             repl_kprobe_rdma_slave_init();
         }
     }

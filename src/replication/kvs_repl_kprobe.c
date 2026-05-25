@@ -760,6 +760,21 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     g_rdma_kprobe.connected = 1;
     fprintf(stderr, "kprobe rdma: master QP connected to slave\n");
 
+    /* 启动转发线程（轮询 BPF ringbuf → RDMA WRITE）
+     * 必须在 QP 连接成功后启动，因为 forward thread 依赖 g_rdma_kprobe.connected */
+    g_kprobe_running = 1;
+    if (!g_master_forward_started) {
+        pthread_t fwd_tid;
+        if (pthread_create(&fwd_tid, NULL,
+                kprobe_rdma_forward_thread, NULL) == 0) {
+            pthread_detach(fwd_tid);
+            g_master_forward_started = 1;
+            fprintf(stderr, "kprobe rdma: forward thread started (from connect_mr)\n");
+        } else {
+            fprintf(stderr, "kprobe rdma: [ERR] forward thread create failed\n");
+        }
+    }
+
     /* 等 slave listener 完成 MR 注册后再发 KPROBEMR */
     usleep(500000);  /* 500ms */
 
@@ -772,7 +787,7 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     }
 
     /* +KPROBERDMA 响应由 reactor 的事件循环读取并解析 */
-    fprintf(stderr, "kprobe rdma: connect_mr DONE (QP connected, KPROBEMR sent)\n");
+    fprintf(stderr, "kprobe rdma: connect_mr DONE (QP connected, forward thread started, KPROBEMR sent)\n");
     return 0;
 }
 

@@ -708,11 +708,14 @@ int repl_kprobe_rdma_establish(const char *host, int port) {
         return -1;
     }
 
-    /* 2. 建立 RDMA QP（用于 RDMA WRITE 数据通道） */
+    /* 2. 建立 RDMA QP（用于 RDMA WRITE 数据通道）
+     * 注意: kprobe-rdma QP 需要 slave 端有 listener。如果 slave 尚未准备好
+     * （如初次连接），QP 连接可能失败。这里不阻塞主流程——TCP 控制通道和
+     * RDMA fullsync QP（由背景线程建立）仍然可独立工作。 */
     if (kprobe_rdma_qp_connect(host, port) != 0) {
-        fprintf(stderr, "kprobe rdma: QP connect failed, closing TCP\n");
-        close(tcp_fd);
-        return -1;
+        fprintf(stderr, "kprobe rdma: kprobe-rdma QP connect failed"
+            " (slave listener may not be ready), TCP control channel OK\n");
+        /* 非致命: TCP 和 fullsync RDMA 仍然可用 */
     }
 
     /* 3. 启动转发线程 */

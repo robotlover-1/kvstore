@@ -23,6 +23,8 @@ typedef struct __attribute__((packed)) kprobe_rdma_ringbuf_s {
 extern kprobe_rdma_ringbuf_t *g_slave_ringbuf;
 struct ibv_mr;  /* 前向声明 */
 extern struct ibv_mr *g_slave_ringbuf_mr;
+extern volatile int g_kprobe_mr_ready;  /* 1 = MR 已就绪（用于竞态检测） */
+extern volatile int g_slave_mr_ready;
 
 /* ---- 函数声明 ---- */
 

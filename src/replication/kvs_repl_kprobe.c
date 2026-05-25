@@ -81,6 +81,8 @@ static struct {
 /* ---- Slave 侧环形缓冲区（仅在 Slave 进程使用） ---- */
 kprobe_rdma_ringbuf_t *g_slave_ringbuf = NULL;
 struct ibv_mr *g_slave_ringbuf_mr = NULL;
+volatile int g_kprobe_mr_ready = 0;  /* 1 = MR 已注册，reactor 线程可见 */
+volatile int g_slave_mr_ready = 0;  /* 原子标志: listener 线程写入, reactor 读取 */
 static pthread_t g_slave_poll_tid;
 static int g_slave_poll_started = 0;
 static pthread_t g_master_forward_tid;
@@ -536,6 +538,9 @@ static void *kprobe_rdma_slave_listener(void *arg) {
             fprintf(stderr, "kprobe rdma: listener reg_mr failed\n"); break;
         }
         fprintf(stderr, "kprobe rdma: [DBG] slave listener - MR registered\n");
+        /* 设置原子标志，确保 reactor 线程能看到 MR 就绪 */
+        __sync_synchronize();  /* 内存屏障 */
+        g_slave_mr_ready = 1;
         g_slave_ringbuf->producer_head = 0;
         g_slave_ringbuf->consumer_tail = 0;
 
@@ -1025,7 +1030,9 @@ void repl_kprobe_rdma_cleanup(void) {
 /* 获取当前 MR 信息文本格式（用于 KPROBEMR 响应） */
 int repl_kprobe_rdma_get_mr_text(char *buf, size_t cap) {
     if (!buf || cap < 64) return -1;
-    if (!g_slave_ringbuf_mr || !g_slave_ringbuf) {
+    /* 读原子标志 + 屏障确保看到 listener 线程的 MR 写入 */
+    __sync_synchronize();
+    if (!g_slave_mr_ready || !g_slave_ringbuf_mr || !g_slave_ringbuf) {
         return snprintf(buf, cap, "+KPROBERDMA 0 0 0 0 0\r\n");
     }
     return snprintf(buf, cap, "+KPROBERDMA %u %lu %zu %zu %zu\r\n",

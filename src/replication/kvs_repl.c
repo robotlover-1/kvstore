@@ -1368,7 +1368,7 @@ static int repl_transport_kprobe_rdma_send(conn_t *c, const unsigned char *buf, 
                 char host[64];
                 inet_ntop(AF_INET, &peer.sin_addr, host, sizeof(host));
                 fprintf(stderr, "kprobe rdma: lazy connecting to slave MR listener %s\n", host);
-                repl_kprobe_rdma_connect_mr(host, ntohs(peer.sin_port), c->fd);
+                repl_kprobe_rdma_connect_mr(host, 0, c->fd);
             } else {
                 fprintf(stderr, "kprobe rdma: getpeername failed, errno=%d\n", errno);
             }

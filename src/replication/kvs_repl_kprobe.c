@@ -458,8 +458,12 @@ static void *kprobe_rdma_slave_listener(void *arg) {
     struct rdma_event_channel *ec = NULL;
     char resp_buf[256];
 
-    int kprobe_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : (g_cfg.port + 1);
-    kprobe_port += 10;  /* kprobe-rdma 专用端口偏移 */
+    /* kprobe-rdma 端口: 基于 master 端口计算，双方一致
+     * slave 使用 g_cfg.master_port（已知 master 端口） */
+    int base_port = (g_cfg.role == ROLE_SLAVE && g_cfg.master_port > 0)
+        ? g_cfg.master_port : g_cfg.port;
+    int kprobe_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : (base_port + 12);
+    /* base_port + 12 = master_port + 12 = 5160 + 12 = 5172 */
 
     fprintf(stderr, "kprobe rdma: slave listener starting on port %d\n", kprobe_port);
 
@@ -600,8 +604,8 @@ out:
  * ============================================================ */
 int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     struct sockaddr_in addr;
-    int kprobe_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : (port + 1);
-    kprobe_port += 10;
+    (void)port;  /* 不依赖 peer ephemeral port，使用已知的 master port */
+    int kprobe_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : (g_cfg.port + 12);
 
     fprintf(stderr, "kprobe rdma: connecting to slave MR listener %s:%d\n",
         host, kprobe_port);

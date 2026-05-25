@@ -53,6 +53,8 @@ kv_config_t g_cfg = {
     .sentinel_down_after_ms = 5000,
     .sentinel_failover_timeout_ms = 10000,
     .sentinel_quorum = 1,
+    .kprobe_enabled = 0,
+    .repl_kprobe_obj_path = "build/replication/bpf/repl_kprobe.bpf.o",
 };
 conn_t *g_replicas = NULL;
 pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -153,6 +155,7 @@ static int parse_repl_transport_backend(const char *s) {
     if (!strcasecmp(s, "rdma")) return 0;
     if (!strcasecmp(s, "ebpf")) return 0;
     if (!strcasecmp(s, "sockmap")) return 0;
+    if (!strcasecmp(s, "kprobe-rdma")) return 0;
     return -1;
 }
 
@@ -279,6 +282,12 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--sentinel-quorum") && i + 1 < argc) {
             g_cfg.sentinel_quorum = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--kprobe-enabled")) {
+            g_cfg.kprobe_enabled = 1;
+        }
+        else if (!strcmp(argv[i], "--repl-kprobe-obj-path") && i + 1 < argc) {
+            snprintf(g_cfg.repl_kprobe_obj_path, sizeof(g_cfg.repl_kprobe_obj_path), "%s", argv[++i]);
+        }
         else return -1;
     }
     return 0;
@@ -370,6 +379,8 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "sentinel_down_after_ms")) g_cfg.sentinel_down_after_ms = atoi(value);
     else if (!strcmp(key, "sentinel_failover_timeout_ms")) g_cfg.sentinel_failover_timeout_ms = atoi(value);
     else if (!strcmp(key, "sentinel_quorum")) g_cfg.sentinel_quorum = atoi(value);
+    else if (!strcmp(key, "kprobe_enabled")) g_cfg.kprobe_enabled = (!strcasecmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "yes"));
+    else if (!strcmp(key, "repl_kprobe_obj_path")) snprintf(g_cfg.repl_kprobe_obj_path, sizeof(g_cfg.repl_kprobe_obj_path), "%s", value);
     else return -1;
     return 0;
 }
@@ -993,6 +1004,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             /* kprobe+RDMA 捕获：设置捕获目标 fd */
             repl_capture_set_target_fd(c->fd);
         }
+        if (c && (!strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")
+                || !strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma"))) {
+            c->repl_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
+            /* kprobe 透明拦截，fd 注册在主进程初始化时已完成 */
+            fprintf(stderr, "repl: replica transport set to kprobe-rdma\n");
+        }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
@@ -1021,13 +1038,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "INFO")) {
-        char info[8192];
+        char info[12288];
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
+        kvs_repl_kprobe_stats_t kprobe_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         unsigned long long cap_count = 0, cap_bytes = 0, cap_rdma_fail = 0;
         repl_capture_get_stats(&cap_count, &cap_bytes, &cap_rdma_fail);
         repl_ebpf_get_stats(&ebpf_stats);
+        repl_kprobe_rdma_get_stats(&kprobe_stats);
 
         unsigned long long max_replica_applied = 0;
         unsigned long long max_replica_durable = 0;
@@ -1102,11 +1121,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "ebpf_role_unknown:%llu\n"
             "ebpf_role_master:%llu\n"
             "ebpf_role_slave:%llu\n"
-            "capture_initialized:%d\n"
-            "capture_target_fd:%d\n"
-            "capture_count:%llu\n"
-            "capture_bytes:%llu\n"
-            "capture_rdma_fail:%llu\n"
+            "kprobe_initialized:%d\n"
+            "kprobe_rdma_connected:%d\n"
+            "kprobe_hits:%llu\n"
+            "kprobe_bytes:%llu\n"
+            "kprobe_ringbuf_events:%llu\n"
+            "kprobe_ringbuf_bytes:%llu\n"
+            "kprobe_rdma_writes:%llu\n"
+            "kprobe_rdma_errors:%llu\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -1174,9 +1196,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             ebpf_stats.role_unknown,
             ebpf_stats.role_master,
             ebpf_stats.role_slave,
-            repl_capture_is_initialized(),
-            repl_capture_get_target_fd(),
-            cap_count, cap_bytes, cap_rdma_fail,
+            kprobe_stats.kprobe_initialized,
+            kprobe_stats.rdma_connected,
+            kprobe_stats.kprobe_hits,
+            kprobe_stats.kprobe_bytes,
+            kprobe_stats.total_events,
+            kprobe_stats.total_bytes,
+            kprobe_stats.rdma_writes,
+            kprobe_stats.rdma_errors,
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
@@ -2051,6 +2078,19 @@ int main(int argc, char **argv) {
     /* 注册 kprobe+RDMA 捕获的回调函数 */
     repl_ebpf_set_rdma_send_fn(repl_rdma_send_from_ebpf);
 #endif
+
+    /* kprobe+RDMA 增量同步初始化 */
+    if (g_cfg.kprobe_enabled &&
+        !strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
+        if (g_cfg.role == ROLE_MASTER) {
+            if (repl_kprobe_rdma_master_init() != 0) {
+                fprintf(stderr, "kprobe rdma master init failed, disabling\n");
+                g_cfg.kprobe_enabled = 0;
+            }
+        } else if (g_cfg.role == ROLE_SLAVE) {
+            repl_kprobe_rdma_slave_init();
+        }
+    }
 
     if (!strcmp(g_cfg.net_backend, "reactor")) {
         return reactor_start();

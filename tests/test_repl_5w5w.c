@@ -532,10 +532,11 @@ static int run_test(void) {
     banner("Phase 2: 等待 Slave 连接");
 
     printf("  请启动 Slave (另一终端):\n");
-    printf("    %s --port %d --role slave --master-host %s --master-port %d \\\n",
+    printf("    sudo %s --port %d --role slave --master-host %s --master-port %d \\\n",
            "./kvstore", g_opt.slave_port, g_opt.master_host, g_opt.master_port);
-    printf("        --repl-fullsync-transport rdma --repl-realtime-transport ebpf\n");
-    printf("\n  %sMaster 端 kprobe+RDMA 已就绪, 等待 Slave 连接...%s\n", ANSI_YELLOW, ANSI_RESET);
+    printf("        --repl-fullsync-transport rdma --repl-realtime-transport kprobe-rdma\n");
+    printf("    (或 --repl-realtime-transport ebpf 使用 eBPF sockmap)\n");
+    printf("\n  等待 Slave 连接...\n");
 
     int slave_ready = 0;
     struct timeval fs_begin;
@@ -805,7 +806,7 @@ static int run_test(void) {
     /* ═══════════════════════════════════════════
      * Phase 5: 监控增量同步进度
      * ═══════════════════════════════════════════ */
-    banner("Phase 5: 增量同步 (eBPF) — 实时监控");
+    banner("Phase 5: 增量同步 — 实时监控");
 
     printf("  增量同步进度:\n\n");
 
@@ -1092,11 +1093,25 @@ static void print_usage(const char *prog) {
     printf("║  启动顺序: Master → 本脚本 → Slave (等提示再启动)         ║\n");
     printf("╚══════════════════════════════════════════════════════════════╝\n");
     printf("\n");
-    printf("方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，推荐）\n");
-    printf("  增量数据经 kprobe 捕获 → ring buffer → RDMA pipeline → Slave\n");
-    printf("  TCP 路径保持不变，数据同时走 TCP 和 RDMA，Slave 端通过 offset 去重\n");
-    printf("  回退链: kprobe+RDMA → eBPF sockmap → TCP\n");
+    printf("方式一: RDMA 全量 + kprobe+RDMA WRITE 增量（双虚拟机，推荐）\n");
+    printf("  # 终端 1 (VM1, 先启动):\n");
+    printf("  sudo ./kvstore --port %d --role master \\\n", g_opt.master_port);
+    printf("      --repl-fullsync-transport rdma \\\n");
+    printf("      --repl-realtime-transport kprobe-rdma \\\n");
+    printf("      --rdma-dev siw0 --kprobe-enabled 1\n");
     printf("\n");
+    printf("  # 终端 2 (任意机器):\n");
+    printf("  %s --master-host <MASTER_IP> --master-port %d \\\n", prog, g_opt.master_port);
+    printf("      --slave-host <SLAVE_IP> --slave-port %d \\\n", g_opt.slave_port);
+    printf("      --pre %d --post %d\n", g_opt.pre_count, g_opt.post_count);
+    printf("\n");
+    printf("  # 终端 3 (VM2, 等\"等待 Slave 连接...\"提示后启动):\n");
+    printf("  sudo ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
+    printf("      --master-host <MASTER_IP> --master-port %d \\\n", g_opt.master_port);
+    printf("      --repl-fullsync-transport rdma \\\n");
+    printf("      --repl-realtime-transport kprobe-rdma\n");
+    printf("\n");
+    printf("方式二: RDMA 全量 + eBPF 增量（双虚拟机）\n");
     printf("  # 终端 1 (VM1, 先启动):\n");
     printf("  sudo ./kvstore --port %d --role master \\\n", g_opt.master_port);
     printf("      --repl-fullsync-transport rdma \\\n");

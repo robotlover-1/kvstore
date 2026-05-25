@@ -2,9 +2,15 @@ CC=gcc
 CLANG?=clang
 ENABLE_RDMA?=1
 ENABLE_EBPF?=1
+ENABLE_KPROBE_RDMA?=1
 BPF_CFLAGS?=-O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu
-CFLAGS=-Wall -Wextra -O2 -I./include -I./NtyCo/core -I./liburing/src/include $(if $(filter 1,$(ENABLE_RDMA)),-DKVS_ENABLE_RDMA=1,-DKVS_ENABLE_RDMA=0) $(if $(filter 1,$(ENABLE_EBPF)),-DKVS_ENABLE_EBPF=1,-DKVS_ENABLE_EBPF=0)
-LDFLAGS=-lpthread -ldl -L./NtyCo -lntyco -L./liburing/src -luring -ldl $(if $(filter 1,$(ENABLE_RDMA)),-lrdmacm -libverbs,) $(if $(filter 1,$(ENABLE_EBPF)),-lbpf -lelf -lz,)
+BPF_KPROBE_CFLAGS?=-O2 -g -target bpf -D__TARGET_ARCH_x86 -I./include
+# kprobe-rdma 依赖 RDMA
+ifeq ($(ENABLE_KPROBE_RDMA),1)
+ENABLE_RDMA ?= 1
+endif
+CFLAGS=-Wall -Wextra -O2 -I./include -I./NtyCo/core -I./liburing/src/include $(if $(filter 1,$(ENABLE_RDMA)),-DKVS_ENABLE_RDMA=1,-DKVS_ENABLE_RDMA=0) $(if $(filter 1,$(ENABLE_EBPF)),-DKVS_ENABLE_EBPF=1,-DKVS_ENABLE_EBPF=0) $(if $(filter 1,$(ENABLE_KPROBE_RDMA)),-DKVS_ENABLE_KPROBE_RDMA=1,-DKVS_ENABLE_KPROBE_RDMA=0)
+LDFLAGS=-lpthread -ldl -L./NtyCo -lntyco -L./liburing/src -luring -ldl $(if $(filter 1,$(ENABLE_RDMA)),-lrdmacm -libverbs,) $(if $(filter 1,$(ENABLE_EBPF)),-lbpf -lelf -lz,) $(if $(filter 1,$(ENABLE_KPROBE_RDMA)),-lbpf -lelf -lz,)
 
 SRC_DIR=src
 INC_DIR=include/kvstore
@@ -88,19 +94,20 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/persistence/kvs_persist.c \
      $(SRC_DIR)/replication/kvs_repl.c \
      $(SRC_DIR)/replication/kvs_repl_ebpf.c \
+     $(SRC_DIR)/replication/kvs_repl_kprobe.c \
      $(SRC_DIR)/replication/kvs_sentinel.c \
      $(SRC_DIR)/utils/hash.c
 
 OBJS=$(patsubst $(SRC_DIR)/%.c, build/%.o, $(SRCS))
 BPF_SRCS=$(SRC_DIR)/replication/bpf/repl_sockmap.bpf.c \
-         $(SRC_DIR)/replication/bpf/repl_realtime_capture.bpf.c \
-         $(SRC_DIR)/replication/bpf/repl_realtime_capture.bpf.c
+          $(SRC_DIR)/replication/bpf/repl_kprobe.bpf.c
 BPF_OBJS=$(patsubst $(SRC_DIR)/%.bpf.c, build/%.bpf.o, $(BPF_SRCS))
 KVS_BPF_OBJS=$(if $(filter 1,$(ENABLE_EBPF)),$(BPF_OBJS),)
+KVS_KPROBE_BPF_OBJS=$(if $(filter 1,$(ENABLE_KPROBE_RDMA)),build/replication/bpf/repl_kprobe.bpf.o,)
 
 all: build_dir kvstore
 
-kvstore: $(KVS_BPF_OBJS) $(OBJS)
+kvstore: $(KVS_BPF_OBJS) $(KVS_KPROBE_BPF_OBJS) $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LDFLAGS)
 
 build/replication/kvs_repl_ebpf.o: $(SRC_DIR)/replication/kvs_repl_ebpf.c $(INC_DIR)/kvstore.h

@@ -1,5 +1,6 @@
 
 #include "kvstore/kvstore.h"
+#include "kvstore/replication/repl_kprobe.h"
 #include <signal.h>
 #include <ctype.h>
 #include <strings.h>
@@ -1040,6 +1041,21 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         repl_slave_finish_fullsync();
         return 0;
     }
+    if (!strcmp(cmd, "KPROBEMR")) {
+        /* Slave 侧收到 KPROBEMR 请求：返回 MR 信息 */
+        fprintf(stderr, "kprobe rdma: KPROBEMR received, sending MR info...\n");
+        char resp[384];
+        int rn = repl_kprobe_rdma_get_mr_text(resp, sizeof(resp));
+        if (rn > 0 && c) {
+            queue_bytes(c, (unsigned char *)resp, (size_t)rn);
+            fprintf(stderr, "kprobe rdma: KPROBEMR response sent (%d bytes)\n", rn);
+        } else {
+            const char *err = "-ERR KPROBERDMA MR not ready\r\n";
+            fprintf(stderr, "kprobe rdma: MR not ready!\n");
+            if (c) queue_bytes(c, (unsigned char *)err, strlen(err));
+        }
+        return 0;
+    }
     if (!strcmp(cmd, "INFO")) {
         char info[12288];
         char recover[1024] = {0};
@@ -1409,6 +1425,25 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
 
+    /* KPROBEMR — kprobe-rdma MR 信息请求（Master→Slave）
+     * Slave 返回 +KPROBERDMA <rkey> <addr> <size> <slot_count> <slot_cap>\r\n */
+    if (!strcmp(cmd, "KPROBEMR")) {
+#if KVS_ENABLE_KPROBE_RDMA
+        if (from_replication && g_cfg.role == ROLE_SLAVE) {
+            /* 尝试获取已注册的 MR 信息（由 kprobe-rdma listener 注册） */
+            char mr_buf[256];
+            int mr_n = 0;
+            /* 直接调用获取 MR 信息的函数 */
+            mr_n = repl_kprobe_rdma_get_mr_text(mr_buf, sizeof(mr_buf));
+            if (mr_n > 0 && c) {
+                queue_bytes(c, (unsigned char *)mr_buf, (size_t)mr_n);
+            }
+        }
+#endif
+        goto out;
+        return 0;
+    }
+
     if (!strcmp(cmd, "DOCSET") && argc == 4) {
         int drc = kvs_doc_set(&global_doc, argv[1], argv[2], argv[3]);
         if (drc == 0) {
@@ -1649,14 +1684,14 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             size_t line_start = pos + 1;
             while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
             if (pos + 1 >= *len) break;
-            if (from_replication && pos > line_start) {
-                size_t line_len = pos - line_start;
-                char *line = (char *)kvs_malloc(line_len + 1);
-                if (line) {
-                    memcpy(line, buf + line_start, line_len);
-                    line[line_len] = '\0';
-                    char *argv[8] = {0};
-                    int argc = split_inline_argv(line, argv, 8);
+            size_t line_len = pos - line_start;
+            char *line = (char *)kvs_malloc(line_len + 1);
+            if (line) {
+                memcpy(line, buf + line_start, line_len);
+                line[line_len] = '\0';
+                char *argv[8] = {0};
+                int argc = split_inline_argv(line, argv, 8);
+                if (from_replication) {
                     if (argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
                         unsigned long long fullsync_target = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : 0;
                         repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), (unsigned long long)strtoull(argv[2], NULL, 10), 1, fullsync_target);
@@ -1670,8 +1705,21 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         repl_slave_send_ack();
                         repl_rdma_log("slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu", argv[1], continue_start, durable_start, continue_end);
                     }
-                    kvs_free(line);
                 }
+                /* +KPROBERDMA 在 from_replication=0 （master 侧）或 =1（slave 侧）都需要处理 */
+                if (argc >= 6 && !strcmp(argv[0], "KPROBERDMA")) {
+                    unsigned long rkey = (unsigned long)strtoull(argv[1], NULL, 10);
+                    unsigned long addr = (unsigned long)strtoull(argv[2], NULL, 10);
+                    fprintf(stderr, "kprobe rdma: +KPROBERDMA received (role=%s) rkey=%lu addr=0x%lx\n",
+                        g_cfg.role == ROLE_MASTER ? "master" : "slave", rkey, addr);
+                    if (g_cfg.role == ROLE_MASTER) {
+                        repl_kprobe_rdma_parse_mr_info_direct(rkey, addr,
+                            (size_t)strtoull(argv[3], NULL, 10),
+                            (size_t)strtoull(argv[4], NULL, 10),
+                            (size_t)strtoull(argv[5], NULL, 10));
+                    }
+                }
+                kvs_free(line);
             }
             pos += 2;
             continue;

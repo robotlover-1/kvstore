@@ -19,8 +19,10 @@ typedef struct __attribute__((packed)) kprobe_rdma_ringbuf_s {
  *   [4 bytes: payload_len (uint32_t)]
  *   [payload_len bytes: RESP 协议数据] */
 
-/* ---- 外部变量 ---- */
-extern int g_slave_fd;  /* slave 线程的 TCP 控制连接 fd */
+/* ---- 外部变量（KPROBEMR 处理需要） ---- */
+extern kprobe_rdma_ringbuf_t *g_slave_ringbuf;
+struct ibv_mr;  /* 前向声明 */
+extern struct ibv_mr *g_slave_ringbuf_mr;
 
 /* ---- 函数声明 ---- */
 
@@ -42,6 +44,13 @@ int repl_kprobe_rdma_slave_accept(struct ibv_pd *pd,
 
 /* 从 TCP 响应中解析 Slave MR 信息 */
 int repl_kprobe_rdma_parse_mr_info(const char *resp);
+
+/* 直接设置 Slave MR 信息（由 reactor 的 +KPROBERDMA 处理调用） */
+int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
+    size_t total_size, size_t slot_count, size_t slot_capacity);
+
+/* 获取当前 MR 信息文本格式（用于 KPROBEMR 响应） */
+int repl_kprobe_rdma_get_mr_text(char *buf, size_t cap);
 
 /* 清理 */
 void repl_kprobe_rdma_cleanup(void);

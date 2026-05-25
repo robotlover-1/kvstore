@@ -79,8 +79,8 @@ static struct {
 } g_rdma_kprobe;
 
 /* ---- Slave 侧环形缓冲区（仅在 Slave 进程使用） ---- */
-static kprobe_rdma_ringbuf_t *g_slave_ringbuf = NULL;
-static struct ibv_mr *g_slave_ringbuf_mr = NULL;
+kprobe_rdma_ringbuf_t *g_slave_ringbuf = NULL;
+struct ibv_mr *g_slave_ringbuf_mr = NULL;
 static pthread_t g_slave_poll_tid;
 static int g_slave_poll_started = 0;
 static pthread_t g_master_forward_tid;
@@ -456,7 +456,6 @@ static void *kprobe_rdma_slave_listener(void *arg) {
     struct rdma_cm_id *listen_id = NULL;
     struct rdma_cm_id *child_id = NULL;
     struct rdma_event_channel *ec = NULL;
-    char resp_buf[256];
 
     /* kprobe-rdma 端口: 基于 master 端口计算，双方一致
      * slave 使用 g_cfg.master_port（已知 master 端口） */
@@ -551,21 +550,8 @@ static void *kprobe_rdma_slave_listener(void *arg) {
         rdma_ack_cm_event(event);
 
         fprintf(stderr, "kprobe rdma: slave listener accepted, MR ready "
-            "rkey=%u addr=%lu\n",
+            "rkey=%u addr=%lu (waiting for KPROBEMR request)\n",
             g_slave_ringbuf_mr->rkey, (unsigned long)g_slave_ringbuf);
-
-        /* 通过 TCP 控制通道发送 +KPROBERDMA 响应 */
-        int n = snprintf(resp_buf, sizeof(resp_buf),
-            "+KPROBERDMA %u %lu %zu %zu %zu\r\n",
-            g_slave_ringbuf_mr->rkey,
-            (unsigned long)g_slave_ringbuf,
-            (size_t)KPROBE_RDMA_RINGBUF_SIZE,
-            (size_t)KPROBE_RDMA_SLOT_COUNT,
-            (size_t)KPROBE_RDMA_SLOT_CAPACITY);
-        if (n > 0 && g_slave_fd >= 0) {
-            send(g_slave_fd, resp_buf, (size_t)n, 0);
-            fprintf(stderr, "kprobe rdma: +KPROBERDMA sent via TCP\n");
-        }
 
         /* 启动轮询线程 */
         if (!g_slave_poll_started) {
@@ -690,28 +676,18 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     g_rdma_kprobe.connected = 1;
     fprintf(stderr, "kprobe rdma: master QP connected to slave\n");
 
-    /* 从 TCP 读取 +KPROBERDMA 响应 */
+    /* MR 信息通过主 reactor 的 +KPROBERDMA 命令处理，
+     * 后台线程只需确保 QP 已连接。发送 KPROBEMR 请求触发
+     * slave 注册 MR 并返回 +KPROBERDMA 响应。 */
     {
-        char buf[256];
-        size_t pos = 0;
-        long long deadline = kvs_now_ms() + 5000;
-        while (pos < sizeof(buf) - 1 && kvs_now_ms() < deadline) {
-            ssize_t r = recv(tcp_fd, buf + pos, sizeof(buf) - 1 - pos, 0);
-            if (r <= 0) { usleep(10000); continue; }
-            pos += (size_t)r;
-            buf[pos] = '\0';
-            if (strstr(buf, "\r\n")) break;
-        }
-        buf[pos] = '\0';
-
-        if (repl_kprobe_rdma_parse_mr_info(buf) != 0) {
-            fprintf(stderr, "kprobe rdma: failed to parse MR info from: %s\n", buf);
-            g_rdma_kprobe.connected = 0;
-            return -1;
-        }
+        const char req[] = "KPROBEMR\r\n";
+        send(tcp_fd, req, strlen(req), 0);
+        fprintf(stderr, "kprobe rdma: KPROBEMR request sent, MR info will be "
+            "processed by reactor\n");
     }
 
-    fprintf(stderr, "kprobe rdma: MR info ready for RDMA WRITE\n");
+    /* 注意: +KPROBERDMA 响应由 reactor 的事件循环读取并解析，
+     * 无需在此等待。后台线程的使命到此完成。 */
     return 0;
 }
 
@@ -966,6 +942,35 @@ void repl_kprobe_rdma_cleanup(void) {
     fprintf(stderr, "kprobe rdma: cleaned up\n");
 }
 
+/* 获取当前 MR 信息文本格式（用于 KPROBEMR 响应） */
+int repl_kprobe_rdma_get_mr_text(char *buf, size_t cap) {
+    if (!buf || cap < 64) return -1;
+    if (!g_slave_ringbuf_mr || !g_slave_ringbuf) {
+        return snprintf(buf, cap, "+KPROBERDMA 0 0 0 0 0\r\n");
+    }
+    return snprintf(buf, cap, "+KPROBERDMA %u %lu %zu %zu %zu\r\n",
+        g_slave_ringbuf_mr->rkey,
+        (unsigned long)g_slave_ringbuf,
+        (size_t)KPROBE_RDMA_RINGBUF_SIZE,
+        (size_t)KPROBE_RDMA_SLOT_COUNT,
+        (size_t)KPROBE_RDMA_SLOT_CAPACITY);
+}
+
+/* 直接设置 Slave MR 信息 */
+int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
+    size_t total_size, size_t slot_count, size_t slot_capacity)
+{
+    (void)total_size;
+    g_slave_mr.rkey = rkey;
+    g_slave_mr.remote_data_base = addr + 16;
+    g_slave_mr.remote_head_addr = addr;
+    g_slave_mr.slot_count = slot_count;
+    g_slave_mr.slot_capacity = slot_capacity;
+    fprintf(stderr, "kprobe rdma: MR info updated via reactor - rkey=%u addr=0x%lx\n",
+        rkey, (unsigned long)addr);
+    return 0;
+}
+
 /* 获取统计信息 */
 int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *stats) {
     if (!stats) return -1;
@@ -1008,7 +1013,43 @@ int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *s)
     { if (s) memset(s, 0, sizeof(*s)); return 0; }
 int repl_kprobe_rdma_set_pid(pid_t p) { (void)p; return -1; }
 int repl_kprobe_rdma_parse_mr_info(const char *r) { (void)r; return -1; }
+int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rk, uint64_t a, size_t ts, size_t sc, size_t sca)
+    { (void)rk; (void)a; (void)ts; (void)sc; (void)sca; return -1; }
+int repl_kprobe_rdma_get_mr_text(char *b, size_t c)
+    { if (b && c > 0) b[0]='\0'; return -1; }
 int repl_kprobe_rdma_enqueue(const unsigned char *d, size_t l)
     { (void)d; (void)l; return -1; }
+
+/* 从命令参数直接解析 MR 信息（由 reactor 的 +KPROBERDMA 处理调用） */
+int repl_kprobe_rdma_parse_mr_info_direct(unsigned long rkey,
+    unsigned long addr, size_t size, size_t slot_count, size_t slot_cap)
+{
+    g_slave_mr.rkey = (uint32_t)rkey;
+    g_slave_mr.remote_data_base = addr + 16;
+    g_slave_mr.remote_head_addr = addr;
+    g_slave_mr.slot_count = slot_count;
+    g_slave_mr.slot_capacity = slot_cap;
+    fprintf(stderr, "kprobe rdma: MR info from reactor - rkey=%u "
+        "data_base=0x%lx slots=%zu cap=%zu\n",
+        g_slave_mr.rkey, (unsigned long)g_slave_mr.remote_data_base,
+        g_slave_mr.slot_count, g_slave_mr.slot_capacity);
+    return 0;
+}
+
+/* 获取当前 MR 信息的 RESP 格式文本（供 KPROBEMR 命令处理使用） */
+int repl_kprobe_rdma_get_mr_text(char *buf, size_t cap) {
+    if (!buf || cap < 128) return -1;
+    if (g_slave_ringbuf_mr) {
+        return snprintf(buf, cap,
+            "+KPROBERDMA %u %lu %zu %zu %zu\r\n",
+            g_slave_ringbuf_mr->rkey,
+            (unsigned long)g_slave_ringbuf,
+            (size_t)KPROBE_RDMA_RINGBUF_SIZE,
+            (size_t)KPROBE_RDMA_SLOT_COUNT,
+            (size_t)KPROBE_RDMA_SLOT_CAPACITY);
+    }
+    fprintf(stderr, "kprobe rdma: get_mr_text called but MR not registered\n");
+    return -1;
+}
 
 #endif /* KVS_ENABLE_KPROBE_RDMA */

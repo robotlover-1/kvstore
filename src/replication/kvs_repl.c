@@ -1360,8 +1360,11 @@ typedef struct kprobe_mr_connect_arg_s {
 
 static void *kprobe_mr_connect_thread(void *arg) {
     kprobe_mr_connect_arg_t *a = (kprobe_mr_connect_arg_t *)arg;
-    repl_kprobe_rdma_connect_mr(a->host, 0, a->tcp_fd);
-    /* 连接完成后关闭 TCP fd 的副本（调用方关闭原始 fd） */
+    fprintf(stderr, "kprobe rdma: [DBG] MR connect thread started for %s\n",
+        a->host);
+    int rc = repl_kprobe_rdma_connect_mr(a->host, 0, a->tcp_fd);
+    fprintf(stderr, "kprobe rdma: [DBG] MR connect thread DONE rc=%d (0=OK)\n",
+        rc);
     close(a->tcp_fd);
     kvs_free(a);
     return NULL;

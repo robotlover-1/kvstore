@@ -1408,31 +1408,20 @@ static int repl_transport_kprobe_rdma_connect_slave(const char *host, int port) 
     int tcp_fd = repl_kprobe_rdma_establish(host, port);
     if (tcp_fd < 0) return -1;
 
-    /* 后台启动 RDMA fullsync QP 连接（用于全量同步）
-     * 与 kprobe-rdma QP 独立，复用现有 RDMA 全量同步逻辑 */
+    /* 同步建立 RDMA fullsync QP（用于全量同步）。
+     * 必须等 RDMA QP 就绪后再发送 REPLSYNC，否则 master 收 REPLSYNC 后
+     * 尝试通过 RDMA 发全量数据时会因 g_repl_rdma_ctx.connected==0 退回 TCP。 */
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(repl_fullsync_transport_name(), "rdma")) {
-        repl_rdma_bg_connect_arg_t *rdma_arg =
-            (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
-        if (rdma_arg) {
-            snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
-            rdma_arg->port = port;
-            pthread_t rdma_tid;
-            if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
-                kvs_free(rdma_arg);
-            } else {
-                pthread_detach(rdma_tid);
-            }
+        fprintf(stderr, "repl kprobe-rdma: establishing RDMA fullsync QP...\n");
+        int rdma_rc = repl_transport_rdma_connect_slave(host, port);
+        if (rdma_rc == 1) {
+            fprintf(stderr, "repl kprobe-rdma: RDMA fullsync QP ready (connected=%d)\n",
+                g_repl_rdma_ctx.connected);
+        } else {
+            fprintf(stderr, "repl kprobe-rdma: RDMA fullsync QP failed (rc=%d), "
+                "fullsync will fallback to TCP\n", rdma_rc);
         }
-        /* 等一小段时间让 RDMA fullsync 连接建立 */
-        for (int wait = 0; wait < 100; wait++) {
-            if (g_repl_rdma_ctx.connected) break;
-            usleep(50000); /* 50ms × 100 = 5s max */
-        }
-        if (g_repl_rdma_ctx.connected)
-            fprintf(stderr, "repl kprobe-rdma: RDMA fullsync QP ready\n");
-        else
-            fprintf(stderr, "repl kprobe-rdma: RDMA fullsync QP not ready, will fallback to TCP for fullsync\n");
     }
 #endif
     return tcp_fd;

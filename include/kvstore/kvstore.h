@@ -561,11 +561,15 @@ typedef struct {
 int repl_kprobe_rdma_master_init(void);
 int repl_kprobe_rdma_slave_init(void);
 int repl_kprobe_rdma_establish(const char *host, int port);
+int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd);
 int repl_kprobe_rdma_slave_accept(struct ibv_pd *pd, char *resp, size_t resp_cap);
 void repl_kprobe_rdma_cleanup(void);
 int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *stats);
 int repl_kprobe_rdma_set_pid(pid_t pid);
 int repl_kprobe_rdma_parse_mr_info(const char *resp);
+int repl_kprobe_rdma_get_mr_text(char *buf, size_t cap);
+int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
+    size_t total_size, size_t slot_count, size_t slot_capacity);
 int repl_kprobe_rdma_enqueue(const unsigned char *data, size_t len);
 
 const char *repl_master_link_state_name(void);

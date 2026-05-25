@@ -1702,19 +1702,31 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             size_t line_start = pos + 1;
             while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
             if (pos + 1 >= *len) break;
-            size_t line_len = pos - line_start;
-            char *line = (char *)kvs_malloc(line_len + 1);
-            if (line) {
-                memcpy(line, buf + line_start, line_len);
-                line[line_len] = '\0';
-                char *argv[8] = {0};
-                int argc = split_inline_argv(line, argv, 8);
-                if (from_replication) {
-                    if (argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
+            if (pos > line_start) {
+                size_t line_len = pos - line_start;
+                char *line = (char *)kvs_malloc(line_len + 1);
+                if (line) {
+                    memcpy(line, buf + line_start, line_len);
+                    line[line_len] = '\0';
+                    char *argv[8] = {0};
+                    int argc = split_inline_argv(line, argv, 8);
+                    /* +KPROBERDMA 在 master 侧也需要处理 */
+                    if (argc >= 6 && !strcmp(argv[0], "KPROBERDMA")) {
+                        unsigned long rkey = (unsigned long)strtoull(argv[1], NULL, 10);
+                        unsigned long addr = (unsigned long)strtoull(argv[2], NULL, 10);
+                        fprintf(stderr, "kprobe rdma: +KPROBERDMA received (role=%s) rkey=%lu addr=0x%lx\n",
+                            g_cfg.role == ROLE_MASTER ? "master" : "slave", rkey, addr);
+                        if (g_cfg.role == ROLE_MASTER) {
+                            repl_kprobe_rdma_parse_mr_info_direct(rkey, addr,
+                                (size_t)strtoull(argv[3], NULL, 10),
+                                (size_t)strtoull(argv[4], NULL, 10),
+                                (size_t)strtoull(argv[5], NULL, 10));
+                        }
+                    } else if (from_replication && argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
                         unsigned long long fullsync_target = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : 0;
                         repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), (unsigned long long)strtoull(argv[2], NULL, 10), 1, fullsync_target);
                         repl_rdma_log("slave_parse - FULLRESYNC replid=%s offset=%s target=%s", argv[1], argv[2], argc >= 4 ? argv[3] : "0");
-                    } else if (argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
+                    } else if (from_replication && argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
                         unsigned long long continue_end = (unsigned long long)strtoull(argv[2], NULL, 10);
                         unsigned long long continue_start = repl_slave_offset();
                         unsigned long long durable_start = repl_slave_durable_offset();

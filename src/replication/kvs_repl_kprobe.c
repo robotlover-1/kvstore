@@ -724,7 +724,17 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     param.rnr_retry_count = 7;
 
     if (rdma_connect(g_rdma_kprobe.id, &param) != 0) {
-        fprintf(stderr, "kprobe rdma: [ERR] connect_mr - rdma_connect failed\n");
+        fprintf(stderr, "kprobe rdma: [ERR] connect_mr - rdma_connect failed"
+            " errno=%d (%s)\n", errno, strerror(errno));
+        /* 尝试读取错误事件 */
+        {   struct rdma_cm_event *e = NULL;
+            if (rdma_get_cm_event(g_rdma_kprobe.ec, &e) == 0) {
+                fprintf(stderr, "kprobe rdma: [ERR] cm_event after connect fail:"
+                    " event=%d (%s) status=%d\n",
+                    e->event, rdma_event_str(e->event), e->status);
+                rdma_ack_cm_event(e);
+            }
+        }
         return -1;
     }
     fprintf(stderr, "kprobe rdma: [DBG] connect_mr - rdma_connect issued, waiting ESTABLISHED\n");

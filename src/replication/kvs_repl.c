@@ -1521,8 +1521,9 @@ static const repl_transport_ops_t *repl_transport_ops(void) {
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
     if (use_rdma_fullsync && use_kprobe_realtime) {
         /* Hybrid: RDMA for fullsync, kprobe+RDMA WRITE for realtime.
-         * The main transport is kprobe-rdma (TCP control + RDMA WRITE data). */
-        if (g_repl_transport_kprobe_rdma_ops.supported && g_cfg.kprobe_enabled)
+         * The main transport is kprobe-rdma (TCP control + RDMA WRITE data).
+         * 不检查 g_cfg.kprobe_enabled — slave 不需要加载 BPF。 */
+        if (g_repl_transport_kprobe_rdma_ops.supported)
             return &g_repl_transport_kprobe_rdma_ops;
         return &g_repl_transport_tcp_ops;
     }

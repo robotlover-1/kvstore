@@ -438,137 +438,276 @@ static void *kprobe_rdma_slave_poll(void *arg) {
 
 /* ============================================================
  * RDMA QP 管理
+ * kprobe-rdma QP 连接统一由 repl_kprobe_rdma_connect_mr() 处理
  * ============================================================ */
 
-/* Master 侧: 建立 RDMA QP，连接 Slave 的 kprobe-rdma listener */
-static int kprobe_rdma_qp_connect(const char *host, int port) {
+/* ============================================================
+ * Slave 侧 kprobe-rdma listener 线程
+ *
+ * 监听 port+10，接受 Master 的 kprobe-rdma QP 连接。
+ * 连接建立后注册 MR（带 REMOTE_WRITE），通过 TCP 控制通道
+ * 发送 +KPROBERDMA 响应告知 Master MR 信息。
+ *
+ * Master 获取 MR 信息后即可通过 RDMA WRITE 直接写入
+ * Slave 的 MR 环形缓冲区。
+ * ============================================================ */
+static void *kprobe_rdma_slave_listener(void *arg) {
+    (void)arg;
+    struct rdma_cm_id *listen_id = NULL;
+    struct rdma_cm_id *child_id = NULL;
+    struct rdma_event_channel *ec = NULL;
+    char resp_buf[256];
+
+    int kprobe_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : (g_cfg.port + 1);
+    kprobe_port += 10;  /* kprobe-rdma 专用端口偏移 */
+
+    fprintf(stderr, "kprobe rdma: slave listener starting on port %d\n", kprobe_port);
+
+    ec = rdma_create_event_channel();
+    if (!ec) { fprintf(stderr, "kprobe rdma: listener ec create failed\n"); goto out; }
+
+    if (rdma_create_id(ec, &listen_id, NULL, RDMA_PS_TCP) != 0)
+        { fprintf(stderr, "kprobe rdma: listener create_id failed\n"); goto out; }
+
     struct sockaddr_in addr;
-    int rdma_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : port + 1;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)kprobe_port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (rdma_bind_addr(listen_id, (struct sockaddr *)&addr) != 0)
+        { fprintf(stderr, "kprobe rdma: listener bind failed\n"); goto out; }
+
+    if (rdma_listen(listen_id, 1) != 0)
+        { fprintf(stderr, "kprobe rdma: listener listen failed\n"); goto out; }
+
+    fprintf(stderr, "kprobe rdma: slave listener ready on port %d\n", kprobe_port);
+
+    while (g_kprobe_running) {
+        struct rdma_cm_event *event = NULL;
+        if (rdma_get_cm_event(ec, &event) != 0) break;
+        if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+            rdma_ack_cm_event(event);
+            continue;
+        }
+
+        child_id = event->id;
+        rdma_ack_cm_event(event);
+
+        /* 创建 PD + CQ + QP */
+        struct ibv_pd *pd = ibv_alloc_pd(child_id->verbs);
+        if (!pd) { fprintf(stderr, "kprobe rdma: listener alloc_pd failed\n"); break; }
+
+        struct ibv_cq *cq = ibv_create_cq(child_id->verbs, 16, NULL, NULL, 0);
+        if (!cq) { ibv_dealloc_pd(pd); break; }
+
+        struct ibv_qp_init_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.send_cq = cq;
+        attr.recv_cq = cq;
+        attr.qp_type = IBV_QPT_RC;
+        attr.cap.max_send_wr = 16;
+        attr.cap.max_recv_wr = 16;
+        attr.cap.max_send_sge = 1;
+        attr.cap.max_recv_sge = 1;
+        if (rdma_create_qp(child_id, pd, &attr) != 0)
+            { ibv_destroy_cq(cq); ibv_dealloc_pd(pd); break; }
+
+        /* 注册 MR */
+        g_slave_ringbuf = (kprobe_rdma_ringbuf_t *)
+            kvs_malloc(KPROBE_RDMA_RINGBUF_SIZE);
+        if (!g_slave_ringbuf) break;
+        memset(g_slave_ringbuf, 0, KPROBE_RDMA_RINGBUF_SIZE);
+
+        g_slave_ringbuf_mr = ibv_reg_mr(pd, g_slave_ringbuf,
+            KPROBE_RDMA_RINGBUF_SIZE,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!g_slave_ringbuf_mr) { kvs_free(g_slave_ringbuf); break; }
+
+        g_slave_ringbuf->producer_head = 0;
+        g_slave_ringbuf->consumer_tail = 0;
+
+        /* Accept */
+        struct rdma_conn_param param;
+        memset(&param, 0, sizeof(param));
+        param.responder_resources = 1;
+        param.initiator_depth = 1;
+        param.rnr_retry_count = 3;
+
+        if (rdma_accept(child_id, &param) != 0)
+            { ibv_dereg_mr(g_slave_ringbuf_mr); kvs_free(g_slave_ringbuf); break; }
+
+        /* 等待 ESTABLISHED */
+        if (rdma_get_cm_event(ec, &event) != 0) break;
+        if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
+            rdma_ack_cm_event(event);
+            ibv_dereg_mr(g_slave_ringbuf_mr); kvs_free(g_slave_ringbuf);
+            break;
+        }
+        rdma_ack_cm_event(event);
+
+        fprintf(stderr, "kprobe rdma: slave listener accepted, MR ready "
+            "rkey=%u addr=%lu\n",
+            g_slave_ringbuf_mr->rkey, (unsigned long)g_slave_ringbuf);
+
+        /* 通过 TCP 控制通道发送 +KPROBERDMA 响应 */
+        int n = snprintf(resp_buf, sizeof(resp_buf),
+            "+KPROBERDMA %u %lu %zu %zu %zu\r\n",
+            g_slave_ringbuf_mr->rkey,
+            (unsigned long)g_slave_ringbuf,
+            (size_t)KPROBE_RDMA_RINGBUF_SIZE,
+            (size_t)KPROBE_RDMA_SLOT_COUNT,
+            (size_t)KPROBE_RDMA_SLOT_CAPACITY);
+        if (n > 0 && g_slave_fd >= 0) {
+            send(g_slave_fd, resp_buf, (size_t)n, 0);
+            fprintf(stderr, "kprobe rdma: +KPROBERDMA sent via TCP\n");
+        }
+
+        /* 启动轮询线程 */
+        if (!g_slave_poll_started) {
+            pthread_create(&g_slave_poll_tid, NULL,
+                kprobe_rdma_slave_poll, NULL);
+            pthread_detach(g_slave_poll_tid);
+            g_slave_poll_started = 1;
+        }
+
+        /* 等待连接断开 */
+        while (g_kprobe_running) {
+            if (rdma_get_cm_event(ec, &event) != 0) break;
+            if (event->event == RDMA_CM_EVENT_DISCONNECTED ||
+                event->event == RDMA_CM_EVENT_TIMEWAIT_EXIT) {
+                rdma_ack_cm_event(event);
+                break;
+            }
+            rdma_ack_cm_event(event);
+        }
+        break;  /* 单次连接后退出，等待重新连接 */
+    }
+
+out:
+    if (child_id) rdma_destroy_id(child_id);
+    if (listen_id) rdma_destroy_id(listen_id);
+    if (ec) rdma_destroy_event_channel(ec);
+    fprintf(stderr, "kprobe rdma: slave listener exiting\n");
+    return NULL;
+}
+
+/* ============================================================
+ * Master 侧: 连接 Slave 的 kprobe-rdma listener，交换 MR 信息
+ *
+ * 在 Slave 发送 +KPROBERDMA 响应后调用。
+ * 解析 MR 信息并存储到 g_slave_mr，供 RDMA WRITE 使用。
+ * ============================================================ */
+int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
+    struct sockaddr_in addr;
+    int kprobe_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : (port + 1);
+    kprobe_port += 10;
+
+    fprintf(stderr, "kprobe rdma: connecting to slave MR listener %s:%d\n",
+        host, kprobe_port);
+
+    /* 复用 g_rdma_kprobe 上下文 */
+    if (g_rdma_kprobe.ec) {
+        rdma_destroy_event_channel(g_rdma_kprobe.ec);
+        g_rdma_kprobe.ec = NULL;
+    }
+    g_rdma_kprobe.ec = rdma_create_event_channel();
+    if (!g_rdma_kprobe.ec) return -1;
+
+    if (g_rdma_kprobe.id) { rdma_destroy_id(g_rdma_kprobe.id); g_rdma_kprobe.id = NULL; }
+    if (rdma_create_id(g_rdma_kprobe.ec, &g_rdma_kprobe.id, NULL, RDMA_PS_TCP) != 0)
+        return -1;
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)(rdma_port + 10)); /* kprobe-rdma 专用端口 */
-    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-        fprintf(stderr, "kprobe rdma: invalid address %s\n", host);
+    addr.sin_port = htons((uint16_t)kprobe_port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) return -1;
+
+    if (rdma_resolve_addr(g_rdma_kprobe.id, NULL, (struct sockaddr *)&addr, 1000) != 0)
         return -1;
+    {   struct rdma_cm_event *e = NULL;
+        if (rdma_get_cm_event(g_rdma_kprobe.ec, &e) != 0) return -1;
+        if (e->event != RDMA_CM_EVENT_ADDR_RESOLVED) { rdma_ack_cm_event(e); return -1; }
+        rdma_ack_cm_event(e);
     }
 
-    /* 创建事件通道 */
-    g_rdma_kprobe.ec = rdma_create_event_channel();
-    if (!g_rdma_kprobe.ec) {
-        fprintf(stderr, "kprobe rdma: failed to create event channel\n");
-        return -1;
+    if (rdma_resolve_route(g_rdma_kprobe.id, 1000) != 0) return -1;
+    {   struct rdma_cm_event *e = NULL;
+        if (rdma_get_cm_event(g_rdma_kprobe.ec, &e) != 0) return -1;
+        if (e->event != RDMA_CM_EVENT_ROUTE_RESOLVED) { rdma_ack_cm_event(e); return -1; }
+        rdma_ack_cm_event(e);
     }
 
-    /* 创建 CM ID */
-    if (rdma_create_id(g_rdma_kprobe.ec, &g_rdma_kprobe.id, NULL, RDMA_PS_TCP) != 0) {
-        fprintf(stderr, "kprobe rdma: failed to create cm id\n");
-        return -1;
-    }
-
-    /* 地址解析 */
-    if (rdma_resolve_addr(g_rdma_kprobe.id, NULL, (struct sockaddr *)&addr, 1000) != 0) {
-        fprintf(stderr, "kprobe rdma: resolve addr failed\n");
-        return -1;
-    }
-
-    /* 等待地址解析完成 */
-    {
-        struct rdma_cm_event *event = NULL;
-        if (rdma_get_cm_event(g_rdma_kprobe.ec, &event) != 0) return -1;
-        if (event->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
-            rdma_ack_cm_event(event);
-            return -1;
-        }
-        rdma_ack_cm_event(event);
-    }
-
-    /* 路由解析 */
-    if (rdma_resolve_route(g_rdma_kprobe.id, 1000) != 0) {
-        fprintf(stderr, "kprobe rdma: resolve route failed\n");
-        return -1;
-    }
-    {
-        struct rdma_cm_event *event = NULL;
-        if (rdma_get_cm_event(g_rdma_kprobe.ec, &event) != 0) return -1;
-        if (event->event != RDMA_CM_EVENT_ROUTE_RESOLVED) {
-            rdma_ack_cm_event(event);
-            return -1;
-        }
-        rdma_ack_cm_event(event);
-    }
-
-    /* 分配 PD */
+    /* PD、CQ、QP */
+    if (g_rdma_kprobe.pd) { ibv_dealloc_pd(g_rdma_kprobe.pd); g_rdma_kprobe.pd = NULL; }
     g_rdma_kprobe.pd = ibv_alloc_pd(g_rdma_kprobe.id->verbs);
-    if (!g_rdma_kprobe.pd) {
-        fprintf(stderr, "kprobe rdma: alloc pd failed\n");
-        return -1;
-    }
+    if (!g_rdma_kprobe.pd) return -1;
 
-    /* 创建 CQ（comp_chan 为 NULL，使用同步 poll） */
-    g_rdma_kprobe.cq = ibv_create_cq(g_rdma_kprobe.id->verbs, 64, NULL, NULL, 0);
-    if (!g_rdma_kprobe.cq) {
-        fprintf(stderr, "kprobe rdma: create cq failed\n");
-        return -1;
-    }
+    if (g_rdma_kprobe.cq) { ibv_destroy_cq(g_rdma_kprobe.cq); g_rdma_kprobe.cq = NULL; }
+    g_rdma_kprobe.cq = ibv_create_cq(g_rdma_kprobe.id->verbs, 16, NULL, NULL, 0);
+    if (!g_rdma_kprobe.cq) return -1;
 
-    /* 创建 QP */
-    {
-        struct ibv_qp_init_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.send_cq = g_rdma_kprobe.cq;
-        attr.recv_cq = g_rdma_kprobe.cq;
-        attr.qp_type = IBV_QPT_RC;
-        attr.cap.max_send_wr = 64;
-        attr.cap.max_recv_wr = 64;
-        attr.cap.max_send_sge = 1;
-        attr.cap.max_recv_sge = 1;
-        if (rdma_create_qp(g_rdma_kprobe.id, g_rdma_kprobe.pd, &attr) != 0) {
-            fprintf(stderr, "kprobe rdma: create qp failed\n");
-            return -1;
-        }
-    }
+    struct ibv_qp_init_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.send_cq = g_rdma_kprobe.cq;
+    attr.recv_cq = g_rdma_kprobe.cq;
+    attr.qp_type = IBV_QPT_RC;
+    attr.cap.max_send_wr = 16;
+    attr.cap.max_recv_wr = 16;
+    attr.cap.max_send_sge = 1;
+    attr.cap.max_recv_sge = 1;
+    if (g_rdma_kprobe.id->qp) rdma_destroy_qp(g_rdma_kprobe.id);
+    if (rdma_create_qp(g_rdma_kprobe.id, g_rdma_kprobe.pd, &attr) != 0) return -1;
 
-    /* 注册 WRITE slot MR */
+    /* 注册 WRITE slots MR */
     for (int i = 0; i < KVS_RDMA_WRITE_SLOTS; i++) {
+        if (g_wr_slots[i].mr) { ibv_dereg_mr(g_wr_slots[i].mr); g_wr_slots[i].mr = NULL; }
         g_wr_slots[i].mr = ibv_reg_mr(g_rdma_kprobe.pd,
             g_wr_slots[i].buf, KVS_RDMA_WRITE_SLOT_SIZE,
             IBV_ACCESS_LOCAL_WRITE);
-        if (!g_wr_slots[i].mr) {
-            fprintf(stderr, "kprobe rdma: reg mr slot %d failed\n", i);
-            return -1;
-        }
+        if (!g_wr_slots[i].mr) return -1;
     }
 
-    /* 连接 */
-    {
-        struct rdma_conn_param param;
-        memset(&param, 0, sizeof(param));
-        param.initiator_depth = 1;
-        param.responder_resources = 1;
-        param.retry_count = 7;
-        param.rnr_retry_count = 7;
+    /* Connect */
+    struct rdma_conn_param param;
+    memset(&param, 0, sizeof(param));
+    param.initiator_depth = 1;
+    param.responder_resources = 1;
+    param.retry_count = 7;
+    param.rnr_retry_count = 7;
 
-        if (rdma_connect(g_rdma_kprobe.id, &param) != 0) {
-            fprintf(stderr, "kprobe rdma: connect failed\n");
-            return -1;
-        }
-    }
-
-    /* 等待 ESTABLISHED */
-    {
-        struct rdma_cm_event *event = NULL;
-        if (rdma_get_cm_event(g_rdma_kprobe.ec, &event) != 0) return -1;
-        if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
-            fprintf(stderr, "kprobe rdma: unexpected event %d\n", event->event);
-            rdma_ack_cm_event(event);
-            return -1;
-        }
-        rdma_ack_cm_event(event);
+    if (rdma_connect(g_rdma_kprobe.id, &param) != 0) return -1;
+    {   struct rdma_cm_event *e = NULL;
+        if (rdma_get_cm_event(g_rdma_kprobe.ec, &e) != 0) return -1;
+        if (e->event != RDMA_CM_EVENT_ESTABLISHED) { rdma_ack_cm_event(e); return -1; }
+        rdma_ack_cm_event(e);
     }
 
     g_rdma_kprobe.connected = 1;
-    fprintf(stderr, "kprobe rdma: QP connected\n");
+    fprintf(stderr, "kprobe rdma: master QP connected to slave\n");
+
+    /* 从 TCP 读取 +KPROBERDMA 响应 */
+    {
+        char buf[256];
+        size_t pos = 0;
+        long long deadline = kvs_now_ms() + 5000;
+        while (pos < sizeof(buf) - 1 && kvs_now_ms() < deadline) {
+            ssize_t r = recv(tcp_fd, buf + pos, sizeof(buf) - 1 - pos, 0);
+            if (r <= 0) { usleep(10000); continue; }
+            pos += (size_t)r;
+            buf[pos] = '\0';
+            if (strstr(buf, "\r\n")) break;
+        }
+        buf[pos] = '\0';
+
+        if (repl_kprobe_rdma_parse_mr_info(buf) != 0) {
+            fprintf(stderr, "kprobe rdma: failed to parse MR info from: %s\n", buf);
+            g_rdma_kprobe.connected = 0;
+            return -1;
+        }
+    }
+
+    fprintf(stderr, "kprobe rdma: MR info ready for RDMA WRITE\n");
     return 0;
 }
 
@@ -667,13 +806,22 @@ int repl_kprobe_rdma_master_init(void) {
 /* Slave 侧初始化 */
 int repl_kprobe_rdma_slave_init(void) {
     g_kprobe_running = 1;
+    /* 启动 kprobe-rdma listener 线程（监听 port+10 等待 Master 连接） */
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, kprobe_rdma_slave_listener, NULL) == 0) {
+        pthread_detach(tid);
+        fprintf(stderr, "kprobe rdma: slave listener thread started\n");
+    } else {
+        fprintf(stderr, "kprobe rdma: failed to start slave listener\n");
+    }
     return 0;
 }
 
 /* kprobe+RDMA 建立连接
  *
- * 实际需要返回一个 TCP socket fd，供 slave 线程用于控制消息
- * （REPLSYNC、REPLACK 等）。数据通过独立的 RDMA QP + WRITE 传输。
+ * 建立 TCP 控制连接用于 REPLSYNC/REPLACK。
+ * kprobe-rdma QP 由 Master 端主动连接 Slave 的 listener。
+ * RDMA fullsync QP 由背景线程建立。
  *
  * 返回: TCP fd（成功）, -1（失败） */
 int repl_kprobe_rdma_establish(const char *host, int port) {
@@ -708,17 +856,9 @@ int repl_kprobe_rdma_establish(const char *host, int port) {
         return -1;
     }
 
-    /* 2. 建立 RDMA QP（用于 RDMA WRITE 数据通道）
-     * 注意: kprobe-rdma QP 需要 slave 端有 listener。如果 slave 尚未准备好
-     * （如初次连接），QP 连接可能失败。这里不阻塞主流程——TCP 控制通道和
-     * RDMA fullsync QP（由背景线程建立）仍然可独立工作。 */
-    if (kprobe_rdma_qp_connect(host, port) != 0) {
-        fprintf(stderr, "kprobe rdma: kprobe-rdma QP connect failed"
-            " (slave listener may not be ready), TCP control channel OK\n");
-        /* 非致命: TCP 和 fullsync RDMA 仍然可用 */
-    }
-
-    /* 3. 启动转发线程 */
+    /* 2. 启动转发线程（轮询 BPF ringbuf，通过 RDMA WRITE 发送）
+     *    kprobe-rdma QP 连接由 Master 端在首次 broadcast 时 lazily 建立 */
+    g_kprobe_running = 1;
     g_kprobe_running = 1;
     if (!g_master_forward_started) {
         if (pthread_create(&g_master_forward_tid, NULL,

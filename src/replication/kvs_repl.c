@@ -56,7 +56,7 @@ static int g_slave_port = 0;
 static int g_slave_conf_gen = 0;
 static int g_master_link_up = 0;
 static int g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
-static int g_slave_fd = -1;
+int g_slave_fd = -1;
 static long long g_master_last_io_ms = 0;
 static int g_slave_thread_started = 0;
 static int g_rdma_master_listener_started = 0;
@@ -1353,11 +1353,28 @@ static const repl_transport_ops_t g_repl_transport_rdma_ops = {
 };
 
 /* kprobe+RDMA WRITE transport ops — kprobe 透明拦截 TCP send，
- * 用户态转发模块通过 RDMA WRITE 发送。send() 不应被直接调用。 */
+ * 用户态转发模块通过 RDMA WRITE 发送。send() 返回 -1 触发 TCP fallback，
+ * 同时 lazily 连接 slave 的 kprobe-rdma listener 以获取 MR 信息。 */
 static int repl_transport_kprobe_rdma_send(conn_t *c, const unsigned char *buf, size_t len) {
-    (void)c; (void)buf; (void)len;
-    /* kprobe 透明拦截，此函数不应被调用。如被调用表示回退到 TCP */
-    return -1;
+    (void)buf; (void)len;
+    /* 首次 broadcast 时懒连接 slave 的 kprobe-rdma listener */
+    if (c && c->fd >= 0 && KVS_ENABLE_KPROBE_RDMA) {
+        static int mr_connect_attempted = 0;
+        if (!mr_connect_attempted) {
+            mr_connect_attempted = 1;
+            struct sockaddr_in peer;
+            socklen_t peer_len = sizeof(peer);
+            if (getpeername(c->fd, (struct sockaddr *)&peer, &peer_len) == 0) {
+                char host[64];
+                inet_ntop(AF_INET, &peer.sin_addr, host, sizeof(host));
+                fprintf(stderr, "kprobe rdma: lazy connecting to slave MR listener %s\n", host);
+                repl_kprobe_rdma_connect_mr(host, ntohs(peer.sin_port), c->fd);
+            } else {
+                fprintf(stderr, "kprobe rdma: getpeername failed, errno=%d\n", errno);
+            }
+        }
+    }
+    return -1;  /* 触发 TCP fallback，kprobe 在内核态透明拦截 */
 }
 
 static int repl_transport_kprobe_rdma_connect_slave(const char *host, int port) {

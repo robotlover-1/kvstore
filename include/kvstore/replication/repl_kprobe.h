@@ -19,20 +19,29 @@ typedef struct __attribute__((packed)) kprobe_rdma_ringbuf_s {
  *   [4 bytes: payload_len (uint32_t)]
  *   [payload_len bytes: RESP 协议数据] */
 
+/* ---- 外部变量 ---- */
+extern int g_slave_fd;  /* slave 线程的 TCP 控制连接 fd */
+
 /* ---- 函数声明 ---- */
 
 /* Master 侧初始化: 加载 BPF + 分配 WRITE slots */
 int repl_kprobe_rdma_master_init(void);
 
-/* Slave 侧初始化 */
+/* Slave 侧初始化: 启动 kprobe-rdma listener */
 int repl_kprobe_rdma_slave_init(void);
 
-/* Master 侧建立 RDMA QP + 交换 MR 信息 */
+/* 建立 TCP 控制连接 + 触发后台 RDMA fullsync QP */
 int repl_kprobe_rdma_establish(const char *host, int port);
+
+/* Master 侧: 连接 slave 的 kprobe-rdma listener 并交换 MR 信息 */
+int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd);
 
 /* Slave 侧注册 MR + 返回握手响应 */
 int repl_kprobe_rdma_slave_accept(struct ibv_pd *pd,
     char *resp, size_t resp_cap);
+
+/* 从 TCP 响应中解析 Slave MR 信息 */
+int repl_kprobe_rdma_parse_mr_info(const char *resp);
 
 /* 清理 */
 void repl_kprobe_rdma_cleanup(void);

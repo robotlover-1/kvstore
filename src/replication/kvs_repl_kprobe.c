@@ -224,15 +224,23 @@ retry:
     pthread_mutex_lock(&g_kprobe_rdma_lock);
     if (g_rdma_kprobe.cq) {
         struct ibv_wc wc;
+        int polled = 0;
         while (ibv_poll_cq(g_rdma_kprobe.cq, 1, &wc) > 0) {
+            polled++;
             if (wc.status == IBV_WC_SUCCESS) {
                 int slot = (int)(wc.wr_id & 0xFFFF);
                 if (slot < KVS_RDMA_WRITE_SLOTS) {
                     g_wr_slots[slot].in_flight = 0;
                     g_wr_in_flight--;
                 }
+            } else {
+                fprintf(stderr, "kprobe rdma: [DBG] wr_slot_acquire CQ error status=%d wr_id=0x%lx opcode=%d\n",
+                    wc.status, (unsigned long)wc.wr_id, wc.opcode);
             }
         }
+        if (polled > 0)
+            fprintf(stderr, "kprobe rdma: [DBG] wr_slot_acquire polled %d completions, in_flight now %d\n",
+                polled, g_wr_in_flight);
     }
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
     if (timeout_ms > 0 && kvs_now_ms() >= deadline) return -1;
@@ -265,6 +273,10 @@ static int wr_submit_data(int slot, size_t len) {
     pthread_mutex_lock(&g_kprobe_rdma_lock);
     int rc = ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
+    fprintf(stderr, "kprobe rdma: [DBG] wr_submit_data slot=%d len=%zu remote_addr=0x%lx rkey=%u rc=%d\n",
+        slot, len, (unsigned long)wr.wr.rdma.remote_addr, wr.wr.rdma.rkey, rc);
+    if (rc != 0) fprintf(stderr, "kprobe rdma: [DBG] wr_submit_data FAILED rc=%d errno=%d (%s)\n",
+        rc, errno, strerror(errno));
     return rc;
 }
 
@@ -293,6 +305,8 @@ static int wr_submit_head(int slot) {
     pthread_mutex_lock(&g_kprobe_rdma_lock);
     int rc = ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
+    fprintf(stderr, "kprobe rdma: [DBG] wr_submit_head slot=%d remote_addr=0x%lx rkey=%u rc=%d\n",
+        slot, (unsigned long)wr.wr.rdma.remote_addr, wr.wr.rdma.rkey, rc);
     return rc;
 }
 
@@ -324,8 +338,13 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
     if (payload_len + 4 > KVS_RDMA_WRITE_SLOT_SIZE) {
         g_wr_slots[slot].in_flight = 0;
         g_rdma_errors++;
+        fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb payload too large %u > %d\n",
+            payload_len + 4, KVS_RDMA_WRITE_SLOT_SIZE);
         return 0;
     }
+
+    fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb event slot=%d payload_len=%u total_events=%llu\n",
+        slot, payload_len, g_total_events + 1);
 
     /* 构造: [4B len][payload] */
     uint32_t net_len = payload_len;
@@ -350,6 +369,8 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
     g_wr_in_flight++;
     g_wr_producer_seq++;
     g_rdma_writes++;
+    fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb DONE slot=%d seq=%d in_flight=%d\n",
+        slot, g_wr_producer_seq, g_wr_in_flight);
     return 0;
 }
 
@@ -360,12 +381,20 @@ static void *kprobe_rdma_forward_thread(void *arg) {
     (void)arg;
     fprintf(stderr, "kprobe rdma: forward thread started\n");
 
+    fprintf(stderr, "kprobe rdma: forward thread running, ringbuf=%p\n",
+        (void*)g_kprobe_ringbuf);
+    int poll_count = 0;
     while (g_kprobe_running && g_rdma_kprobe.connected) {
         if (g_kprobe_ringbuf) {
             int err = ring_buffer__poll(g_kprobe_ringbuf,
                 KVS_KPROBE_RINGBUF_POLL_MS);
-            if (err < 0) {
-                /* -EAGAIN 是正常的，继续 */
+            if (err > 0) {
+                poll_count += err;
+                fprintf(stderr, "kprobe rdma: [DBG] ringbuf poll got %d events (total=%d)\n",
+                    err, poll_count);
+            } else if (err < 0) {
+                if (err != -EAGAIN)
+                    fprintf(stderr, "kprobe rdma: [DBG] ringbuf poll err=%d\n", err);
                 usleep(1000);
             }
         } else {
@@ -392,7 +421,9 @@ static void *kprobe_rdma_slave_poll(void *arg) {
     unsigned char stream_buf[BUFFER_CAP];
     size_t stream_len = 0;
 
-    fprintf(stderr, "kprobe rdma: slave poll thread started\n");
+    fprintf(stderr, "kprobe rdma: slave poll thread started, ringbuf=%p slots=%zu cap=%zu\n",
+        (void*)rb, (size_t)KPROBE_RDMA_SLOT_COUNT, (size_t)KPROBE_RDMA_SLOT_CAPACITY);
+    int empty_loops = 0;
 
     while (g_kprobe_running) {
         /* 读内存屏障 — 保证看到 Master 的最新写入 */
@@ -401,9 +432,18 @@ static void *kprobe_rdma_slave_poll(void *arg) {
         uint64_t tail = rb->consumer_tail;
 
         if (tail == head) {
+            empty_loops++;
+            if (empty_loops % 1000 == 1)
+                fprintf(stderr, "kprobe rdma: [DBG] slave poll empty (head=tail=%lu)\n",
+                    (unsigned long)head);
             usleep(KVS_KPROBE_RDMA_POLL_US);
             continue;
         }
+
+        empty_loops = 0;
+        fprintf(stderr, "kprobe rdma: [DBG] slave poll data head=%lu tail=%lu diff=%lu\n",
+            (unsigned long)head, (unsigned long)tail,
+            (unsigned long)(head - tail));
 
         /* 消费所有未处理槽位 */
         while (tail != head) {
@@ -413,6 +453,8 @@ static void *kprobe_rdma_slave_poll(void *arg) {
             uint32_t slot_len;
             memcpy(&slot_len, rb->slots + off, 4);
             if (slot_len == 0 || slot_len > KPROBE_RDMA_SLOT_CAPACITY - 4) {
+                fprintf(stderr, "kprobe rdma: [DBG] slave poll bad slot_len=%u at idx=%zu\n",
+                    slot_len, idx);
                 tail++;
                 continue;
             }
@@ -424,6 +466,8 @@ static void *kprobe_rdma_slave_poll(void *arg) {
                 stream_len = 0;
             memcpy(stream_buf + stream_len, slot_data, slot_len);
             stream_len += slot_len;
+            fprintf(stderr, "kprobe rdma: [DBG] slave poll consuming slot_len=%u stream_len=%zu\n",
+                slot_len, stream_len);
             parse_resp_stream(NULL, stream_buf, &stream_len, 1);
 
             tail++;
@@ -1068,8 +1112,11 @@ int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
     g_slave_mr.remote_head_addr = addr;
     g_slave_mr.slot_count = slot_count;
     g_slave_mr.slot_capacity = slot_capacity;
-    fprintf(stderr, "kprobe rdma: MR info updated via reactor - rkey=%u addr=0x%lx\n",
-        rkey, (unsigned long)addr);
+    fprintf(stderr, "kprobe rdma: MR info updated - rkey=%u addr=0x%lx data_base=0x%lx head_addr=0x%lx slots=%zu cap=%zu\n",
+        rkey, (unsigned long)addr,
+        (unsigned long)g_slave_mr.remote_data_base,
+        (unsigned long)g_slave_mr.remote_head_addr,
+        slot_count, slot_capacity);
     return 0;
 }
 

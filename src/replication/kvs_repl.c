@@ -2261,8 +2261,140 @@ static void *slave_thread(void *arg) {
             continue;
         }
 
-        /* ---- Hybrid dual-transport: RDMA for fullsync + eBPF for realtime ---- */
+        /* ---- Hybrid dual-transport: RDMA for fullsync + kprobe-rdma for realtime ---- */
         int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma") && KVS_ENABLE_RDMA;
+        int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
+
+        if (use_rdma_fullsync && use_kprobe_realtime) {
+            int tcp_fd = repl_transport_tcp_connect_slave(host, port);
+            if (tcp_fd < 0) {
+                repl_set_link_state(0);
+                rdma_fail_streak++;
+                repl_slave_retry_pause(rdma_fail_streak);
+                continue;
+            }
+
+            /* 后台启动 RDMA fullsync QP 连接 */
+#if KVS_ENABLE_RDMA
+            repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
+            if (rdma_arg) {
+                snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
+                rdma_arg->port = port;
+                pthread_t rdma_tid;
+                if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
+                    kvs_free(rdma_arg);
+                } else {
+                    pthread_detach(rdma_tid);
+                }
+            }
+#endif
+            g_slave_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
+            repl_transport_mark_active("kprobe-rdma");
+            rdma_fail_streak = 0;
+
+            g_slave_fd = tcp_fd;
+            repl_set_link_state(1);
+            unsigned char buf[BUFFER_CAP * 4 + 4096];
+            size_t blen = 0;
+            int replsync_sent = 0;
+            long long rdma_wait_start = kvs_now_ms();
+
+            for (;;) {
+                if (slave_should_reconnect(gen)) break;
+
+                /* 延迟 REPLSYNC 直到 RDMA fullsync QP 就绪或超时（5s） */
+                if (!replsync_sent) {
+                    int rdma_ready = 0;
+#if KVS_ENABLE_RDMA
+                    rdma_ready = g_repl_rdma_ctx.connected;
+#endif
+                    if (rdma_ready || (kvs_now_ms() - rdma_wait_start) > 5000) {
+                        unsigned char cmd[256];
+                        char offbuf[32], durablebuf[32];
+                        snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
+                        snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
+                        size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                            g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                        if (send(tcp_fd, cmd, n, 0) < 0) break;
+                        replsync_sent = 1;
+                        repl_transport_mark_active(rdma_ready ? "rdma+kprobe" : "kprobe-rdma");
+#if KVS_ENABLE_RDMA
+                        if (rdma_ready) fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP, fullsync will use RDMA\n");
+                        else fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP, RDMA not ready, fullsync will fallback to TCP\n");
+#endif
+                        continue;
+                    }
+                    usleep(50000);
+                    continue;
+                }
+
+                int had_new_data = 0;
+
+                /* TCP recv 控制消息（全量数据通过 RDMA arrival 通知触达） */
+                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
+                if (r > 0) {
+                    blen += (size_t)r;
+                    had_new_data = 1;
+                    parse_resp_stream(NULL, buf, &blen, 1);
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
+                } else if (r == 0) {
+                    break;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
+                }
+
+                if (blen > 0) {
+                    parse_resp_stream(NULL, buf, &blen, 1);
+                }
+
+                /* 也轮询 RDMA 全量数据 */
+#if KVS_ENABLE_RDMA
+                if (g_repl_rdma_ctx.connected) {
+                    int recv_slot = -1;
+                    size_t rdma_blen = 0;
+                    if (repl_rdma_wait_cq_recv_completion(100, &recv_slot, &rdma_blen) == 0
+                        && recv_slot >= 0 && rdma_blen > 0) {
+                        unsigned char *payload;
+                        if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
+                            rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
+                        payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
+                        if (payload) {
+                            if (repl_rdma_repost_recv(recv_slot) == 0) {
+                                if (blen + rdma_blen <= sizeof(buf)) {
+                                    memcpy(buf + blen, payload, rdma_blen);
+                                    blen += rdma_blen;
+                                    had_new_data = 1;
+                                } else {
+                                    fprintf(stderr, "kprobe rdma: slave buffer overflow blen=%zu rdma=%zu\n",
+                                        blen, rdma_blen);
+                                }
+                            }
+                            kvs_free(payload);
+                        }
+                    }
+                }
+#endif
+
+                if (had_new_data && blen > 0) {
+                    parse_resp_stream(NULL, buf, &blen, 1);
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
+                } else if (had_new_data) {
+                    repl_slave_ack_heartbeat();
+                    repl_set_link_state(1);
+                }
+            }
+
+            g_slave_fd = -1;
+            repl_transport_tcp_disconnect_slave(tcp_fd);
+            g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+            repl_set_link_state(0);
+            sleep(1);
+            continue;
+        }
+
+        /* ---- Hybrid dual-transport: RDMA for fullsync + eBPF for realtime ---- */
         int use_ebpf_realtime = repl_realtime_should_use_ebpf();
 
         /* If using dual transport, always establish TCP as the primary link.

@@ -320,57 +320,20 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
 
     __u32 payload_len;
     memcpy(&payload_len, data, 4);
-    if (payload_len == 0 || payload_len + 4 > size)
+    if (payload_len == 0) {
+        /* payload_len==0 表示通知模式（数据不可用），忽略 */
+        return 0;
+    }
+    if (payload_len + 4 > size)
         return 0;
 
-    unsigned char *payload = (unsigned char *)data + 4;
-
+    /* BPF 抓取到真实数据 —— 仅更新统计，不重复 RDMA WRITE
+     * send 路径 (repl_transport_kprobe_rdma_send) 已直接做 RDMA WRITE */
     g_total_events++;
     g_total_bytes += payload_len;
-
-    int slot;
-    if (wr_slot_acquire(5000, &slot) != 0) {
-        g_rdma_errors++;
-        fprintf(stderr, "kprobe rdma: no available WRITE slot, dropping\n");
-        return -1;  /* 暂停 ringbuf 回调 */
-    }
-
-    if (payload_len + 4 > KVS_RDMA_WRITE_SLOT_SIZE) {
-        g_wr_slots[slot].in_flight = 0;
-        g_rdma_errors++;
-        fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb payload too large %u > %d\n",
-            payload_len + 4, KVS_RDMA_WRITE_SLOT_SIZE);
-        return 0;
-    }
-
-    fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb event slot=%d payload_len=%u total_events=%llu\n",
-        slot, payload_len, g_total_events + 1);
-
-    /* 构造: [4B len][payload] */
-    uint32_t net_len = payload_len;
-    memcpy(g_wr_slots[slot].buf, &net_len, 4);
-    memcpy(g_wr_slots[slot].buf + 4, payload, payload_len);
-
-    /* Step 1: RDMA WRITE 数据到 Slave slot */
-    if (wr_submit_data(slot, (size_t)payload_len + 4) != 0) {
-        g_wr_slots[slot].in_flight = 0;
-        g_rdma_errors++;
-        fprintf(stderr, "kprobe rdma: WRITE data failed\n");
-        return -1;
-    }
-
-    /* Step 2: RDMA WRITE 更新 producer_head */
-    if (wr_submit_head(slot) != 0) {
-        g_rdma_errors++;
-        fprintf(stderr, "kprobe rdma: WRITE head failed\n");
-        return -1;
-    }
-
-    g_wr_in_flight++;
-    g_wr_producer_seq++;
-    g_rdma_writes++;
-    fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb DONE slot=%d seq=%d in_flight=%d\n",
-        slot, g_wr_producer_seq, g_wr_in_flight);
+    if (g_total_events % 1000 == 1)
+        fprintf(stderr, "kprobe rdma: [DBG] ringbuf_cb stats events=%llu bytes=%llu\n",
+            g_total_events, g_total_bytes);
     return 0;
 }
 

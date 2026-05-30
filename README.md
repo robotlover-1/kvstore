@@ -182,6 +182,517 @@ kvstore/
 
 ---
 
+## 实现原理
+
+### 网络模型
+
+三种 I/O 模型通过 `--net` 或 `net_backend` 配置，编译时通过 `#include` 选择性启用。
+
+#### Reactor (epoll) — 默认
+
+基于 epoll 的事件驱动单线程模型。所有连接共享一个 epoll fd。
+
+**核心数据结构**:
+```c
+// reactor.c 中每个连接一个 conn_t
+typedef struct conn_s {
+    int fd;
+    unsigned char *inbuf;    // 读缓冲区 (动态增长)
+    size_t in_len;
+    queue *out_queue;        // 写队列 (queue_bytes 追加)
+    // ...
+} conn_t;
+```
+
+**事件循环**:
+```
+epoll_wait()
+  ├─ EPOLLIN  → on_read(c)
+  │               └─ read(fd, inbuf) → parse_resp_stream(c, inbuf, &in_len, 0)
+  │                                     └─ handle_parsed_command(c, argc, argv, raw, rawlen, 0)
+  │                                           ├─ 写命令 → 执行引擎 → queue_bytes(c, resp)
+  │                                           └─ 写命令 + 主角色 → repl_broadcast(raw, rawlen)
+  └─ EPOLLOUT → on_write(c)
+                  └─ send(fd, out_queue) → 写完则关闭 EPOLLOUT
+```
+
+**核心特性**:
+- 单线程无锁，所有操作顺序执行
+- `queue_bytes(c, buf, len)` 将响应追加到连接的写队列，`on_write` 负责实际 send
+- 复制时 `repl_broadcast()` 遍历 replica 链表调用 `queue_bytes`
+
+**核心文件**: `src/core/reactor.c`
+
+#### Proactor (io_uring)
+
+基于 Linux io_uring 的异步 I/O 模型。提交 SQE (Submission Queue Entry) 后立即返回，完成后从 CQ (Completion Queue) 获取结果。
+
+```c
+// 提交读请求
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd, buf, len, offset);
+io_uring_submit(&ring);
+
+// 等待完成
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);
+// cqe->res 包含实际读到的字节数
+```
+
+**核心文件**: `src/core/proactor.c`
+
+#### NtyCo 协程
+
+基于 NtyCo 协程库，将异步 I/O 以同步方式编写，每连接一个协程。
+
+```
+nty_co_create(func, arg)  → 创建协程
+  func() {
+    read(fd, buf, len)    → 内部调用 nty_co_yield() 让出 CPU
+  }
+nty_co_run()              → 调度所有就绪协程
+```
+
+**协程切换**: 通过 `setjmp`/`longjmp` 保存和恢复栈上下文，每次 `yield` 切换到调度器，调度器选择下一个就绪协程 `resume`。
+
+**核心文件**: `src/core/ntyco.c`、`NtyCo/core/`
+
+---
+
+### 协议层 — RESP 编解码
+
+RESP (Redis Serialization Protocol) 是 kvstore 的通信协议。
+
+**解析入口**: `parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication)`
+
+```
+buf 中可能包含多条命令，循环解析:
+  while (pos < *len) {
+    if (buf[pos] == '+') → 简单字符串: +OK\r\n
+    if (buf[pos] == '*') → 数组: *3\r\n$3\r\nSET\r\n...
+    if (其他)            → 内联命令: SET key value
+    handle_parsed_command(c, argc, argv, raw, rawlen, from_replication)
+  }
+```
+
+**`from_replication` 标志**:
+- `=0`: 来自客户端，写命令触发 `repl_broadcast()` 广播给所有 slave
+- `=1`: 来自主节点复制，写命令**不**广播，仅应用并调用 `repl_slave_note_applied(rawlen)` 更新 offset
+
+**命令分发**: `handle_parsed_command()` 根据命令前缀路由到不同引擎:
+
+```c
+if (!strcmp(cmd, "SET"))    → engine = KVS_ENGINE_ARRAY
+if (!strcmp(cmd, "HSET"))   → engine = KVS_ENGINE_HASH
+if (!strcmp(cmd, "RSET"))   → engine = KVS_ENGINE_RBTREE
+if (!strcmp(cmd, "XSET"))   → engine = KVS_ENGINE_SKIPTABLE
+if (!strcmp(cmd, "DOCSET")) → engine = KVS_ENGINE_DOC
+```
+
+**核心文件**: `src/main/kvstore.c`
+
+---
+
+### 存储引擎
+
+5 种引擎通过命令前缀自动路由，每种引擎实现 `set`/`get`/`del`/`exist`/`mod` 五个接口。
+
+#### Array (数组)
+
+```c
+// 静态数组，线性扫描
+typedef struct { char key[64]; char value[256]; } array_entry_t;
+static array_entry_t global_array[KVS_ARRAY_SIZE];  // 默认 100000
+static int global_array_count = 0;
+
+// SET: 线性查找已有 key → 找到则覆盖，否则写入第一个空位
+for (int i = 0; i < KVS_ARRAY_SIZE; i++)
+    if (!global_array.table[i].key || strcmp(...) == 0) { ... }
+```
+
+#### Hash (哈希表)
+
+```c
+// FNV-1a 哈希 + 链地址法
+#define KVS_HASH_SLOTS 65536
+typedef struct hashnode_s {
+    char *key, *value;
+    struct hashnode_s *next;
+} hashnode_t;
+static hashnode_t **global_hash_nodes;  // 指针数组
+
+// HSET: hash(key) → slot → 遍历链表 → 找到更新/未找到插入
+uint32_t h = kvs_hash_fnv1a(key);
+hashnode_t *n = global_hash_nodes[h % max_slots];
+while (n) { if (!strcmp(n->key, key)) { ... } n = n->next; }
+```
+
+#### RBTree (红黑树)
+
+```c
+// 自平衡二叉搜索树，中序遍历有序
+typedef struct rbtree_node {
+    int color;  // RED=0 / BLACK=1
+    char key[64];
+    void *value;
+    struct rbtree_node *left, *right, *parent;
+} rbtree_node_t;
+
+// RSET: 插入节点 → rbtree_insert(&root, node, nil)
+// 再平衡: 左旋/右旋/颜色翻转 → 保证 5 条红黑树性质
+```
+
+#### SkipTable (跳表)
+
+```c
+// 多层索引链表，概率平衡
+#define KVS_SKIPTABLE_MAX_LEVEL 32
+typedef struct kvs_skiptable_node {
+    char *key, *value;
+    struct kvs_skiptable_node **forward;  // 每层指向下一个节点
+    int level;
+} kvs_skiptable_node_t;
+
+// XSET: 随机层数 → 从最高层向下找插入位置 → 更新各层指针
+```
+
+#### Doc (文档型)
+
+```c
+// key → Hash( field → value )
+// DOCSET key field value: 先找 key → 找到则在其 field 哈希表中插入
+// DOCGET key field: 先找 key → 再找 field
+```
+
+**核心文件**: `src/storage/kvs_array.c`、`kvs_hash.c`、`kvs_rbtree.c`、`kvs_skiptable.c`、`kvs_doc.c`
+
+---
+
+### 内存管理
+
+三种后端通过 `--mem` 或 `mem_backend` 配置，`kvs_malloc`/`kvs_free`/`kvs_realloc` 统一接口：
+
+#### libc
+```c
+void *kvs_malloc(size_t s) { return malloc(s); }
+void kvs_free(void *p)     { free(p); }
+```
+
+#### jemalloc
+```c
+// 通过 LD_PRELOAD 在进程启动时注入
+// LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so ./kvstore
+// 多 arena 设计减少多线程锁竞争
+```
+
+#### custom (自研)
+```c
+// slab 分类 + mmap 预分配
+#define SLAB_CLASSES {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
+// kvs_malloc(60) → 从 64B slab 分配
+// 每个 slab 用位图管理空闲块
+// 内存不足时 mmap 新申请 1MB 块
+// 支持 MEMSTAT 命令查看各 slab 使用率
+```
+
+**核心文件**: `src/memory/kvs_mem.c`
+
+---
+
+### 持久化
+
+#### 全量 Dump (KVSD)
+
+**保存流程**:
+```
+kvs_save()
+  └─ snapshot_all_sink(&sink)     ← 遍历 5 个引擎
+       ├─ snapshot_array_sink()   → emit_cmd3_sink("SET", key, value)
+       ├─ snapshot_rbtree_sink()  → emit_cmd3_sink("RSET", key, value)
+       ├─ snapshot_hash_sink()    → emit_cmd3_sink("HSET", key, value)
+       ├─ snapshot_skiptable_sink() → emit_cmd3_sink("XSET", key, value)
+       └─ snapshot_doc_sink()     → emit_cmd4_sink("DOCSET", key, field, value)
+  └─ 写入临时文件 → fflush → fsync → rename → 完成
+```
+
+所有 KV 序列化为 RESP 命令文本（`SET key value\r\n`、`HSET key value\r\n`），即 dump 文件 = RESP 命令序列。
+
+**恢复流程**:
+```c
+kvs_load()
+  ├─ mmap(dump_fd, ...)            ← 优先 mmap
+  │   └─ parse_resp_stream(NULL, mapped, &len, 1)  ← 直接解析
+  └─ mmap 失败 → read + parse      ← 回退路径
+```
+
+mmap 恢复优势：内核按需加载页，大文件无需全部读入内存。
+
+#### 增量 AOF
+
+每条写命令以 RESP 协议追加到 AOF 文件：
+
+```c
+// kvstore.c handle_parsed_command():
+if (from_replication && is_write_cmd(cmd)) {
+    persist_append_raw(raw, rawlen);  // 写入 AOF
+    repl_slave_note_durable(rawlen);  // 记录 durable offset
+}
+```
+
+**同步策略**:
+- `appendfsync always`: 每条命令后 `fsync`，最安全但最慢
+- `appendfsync everysec`: 每秒 `fsync`，可能丢 1 秒数据
+
+**AOF 重写 (BGREWRITEAOF)**:
+```
+将当前内存快照写为新 AOF → fsync → rename 替换旧 AOF
+与 SAVE 类似，但输出格式是 RESP 协议命令序列
+```
+
+**核心文件**: `src/persistence/kvs_persist.c`
+
+---
+
+### 主从复制
+
+整个复制系统设计为**双通道模式**：全量同步和增量同步可独立配置传输层。
+
+```
+--repl-fullsync-transport rdma    ← 全量走 RDMA
+--repl-realtime-transport ebpf    ← 增量走 eBPF sockmap
+```
+
+#### 复制协议 (REPLSYNC)
+
+```
+Slave → Master:
+  REPLSYNC <replid> <offset> <durable_offset>
+
+Master 响应:
+  +FULLRESYNC <replid> <offset> <size>\r\n  ← 全量同步
+  [snapshot data: SET/RSET/HSET/XSET...]
+  +REPLDONE\r\n                              ← 全量结束
+
+  或 (部分同步):
+  +CONTINUE <replid> <offset>\r\n            ← 增量续传
+  [backlog data: 从 offset 开始的增量命令]
+```
+
+#### Offset 跟踪
+
+```c
+// Master 侧: 每条广播的命令累加原始字节数
+void repl_note_broadcast(size_t bytes) {
+    g_master_repl_offset += (unsigned long long)bytes;
+}
+
+// Slave 侧: 每条应用的命令累加
+void repl_slave_note_applied(size_t rawlen) {
+    g_slave_repl_applied_offset += (unsigned long long)rawlen;
+}
+```
+
+`repl_offset` 本质是 RESP 原始字节流的累计偏移量，用于**断线重连后的精确续传**。
+
+#### Backlog 环形缓冲区
+
+```c
+static repl_backlog_t g_repl_backlog = {
+    .buf = circular buffer (1MB),
+    .head, .histlen,           // 环形队列指针
+    .start_offset, .end_offset // 对应的 offset 范围
+};
+
+repl_broadcast() → repl_backlog_feed(raw, rawlen)
+                → 写入环形缓冲区，更新 end_offset
+```
+
+Slave 重连时发送 `offset`，Master 检查 `offset >= start_offset` 则可部分同步，直接发送 backlog 中的增量数据。
+
+#### 全量同步 (queue_snapshot)
+
+```
+queue_snapshot(c)
+  ├─ kvs_snapshot_to_fp(tmp_file)    ← 写临时文件
+  ├─ 第一遍: 计算 total_bytes         ← FULLRESYNC header 需要
+  ├─ 发送: +FULLRESYNC <replid> <offset> <total>\r\n
+  ├─ 第二遍: 按 chunk_cap 分片发送
+  │    └─ repl_send_chunked(c, buf, r)
+  │         └─ repl_fullsync_send(c, buf, chunk)
+  │              └─ repl_rdma_try_send(buf, len)   ← RDMA SEND
+  │                 或 repl_transport_tcp_send()    ← TCP fallback
+  └─ 发送: +REPLDONE\r\n
+```
+
+#### RDMA 全量同步 (Pipeline 架构)
+
+**四层 Pipeline 设计**:
+
+```c
+#define KVS_RDMA_PIPELINE_DEPTH  4   // 4 个 send_slot 交替使用
+#define KVS_RDMA_CQ_BATCH        8   // 批量 poll
+
+// send_slot: 预注册的 RDMA 缓冲区
+repl_rdma_send_slot_t send_slots[4];
+// 每个 slot 有独立 buf + MR，可同时有 4 个 outstanding SEND WR
+
+repl_rdma_try_send(buf, len):
+  ① slot = acquire_send_slot()       // 获取空闲 slot（忙等最多 5s）
+  ② memcpy(send_slots[slot].buf, buf, len)  // 拷贝数据
+  ③ ibv_post_send(qp, &wr, &bad_wr)  // 提交 SEND WR 到 SQ
+                                      // wr_id = slot | PIPELINE_FLAG
+  ④ return 0  // 非阻塞返回
+```
+
+**CQ 轮询线程** (后台独立线程):
+```c
+repl_rdma_cq_poll_thread():
+  while (running) {
+    ibv_get_cq_event(comp_chan, &ev_cq, &ev_ctx)  // 阻塞等待事件
+    ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch)   // 批量 poll
+    for each wc:
+      if (SEND completion): release_send_slot()     // 释放 slot
+      if (RECV completion): pending_recv_push()     // 入队
+    ibv_req_notify_cq(cq, 0)                        // re-arm
+    ibv_poll_cq(...)                                // drain
+  }
+```
+
+**接收端** (Slave):
+```c
+recv_slots[32]      ← 32 个预注册的接收缓冲区，提前 ibv_post_recv
+pending_recv_slots  ← 环形队列，存已完成的 recv_slot 索引
+
+slave loop:
+  repl_rdma_wait_cq_recv_completion(100ms, &slot, &len)
+    → 从 pending_recv 队列取出 slot
+    → repl_rdma_dup_recv_payload(slot, len)  // 拷贝数据
+    → repl_rdma_repost_recv(slot)            // 重新 post recv
+    → parse_resp_stream(NULL, buf, &blen, 1) // 解析执行
+```
+
+**自适应深度调节**:
+```c
+repl_rdma_adjust_pipeline_depth():
+  if (in_flight <= depth/2 && depth < 4) → depth++  // 加深度
+  if (in_flight >= depth  && depth > 2) → depth--   // 减深度
+```
+
+#### eBPF 实时同步 (sockmap)
+
+**BPF 程序** (`repl_sockmap.bpf.c`):
+```c
+SEC("sk_msg")
+int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
+    int key = 0;
+    // 从 role_map 查当前角色: 1=master, 0=slave
+    int *role = bpf_map_lookup_elem(&role_map, &key);
+    if (!role || *role != 1) return SK_PASS;  // 仅 master 转发
+    
+    // 从 sock_map 查 slave fd
+    int *slave_fd = bpf_map_lookup_elem(&sock_map, &key);
+    if (!slave_fd) return SK_PASS;
+    
+    // 重定向到 slave socket
+    return bpf_msg_redirect_map(&sock_map, key, BPF_F_INGRESS);
+}
+```
+
+**数据路径**:
+```
+redis-cli → Master TCP → reactor on_read → handle_parsed_command
+  → repl_broadcast(raw, rawlen)
+    → queue_bytes(c_slave, raw, rawlen)     // 写入 slave 连接的写队列
+      → reactor on_write(c_slave)
+        → send(c_slave_fd, ...)
+          → 内核 BPF sk_msg 拦截
+            → bpf_msg_redirect_map(sock_map, 0, 0)
+              → 直接写入 Slave TCP socket
+```
+
+#### kprobe+RDMA 增量同步
+
+**BPF kprobe** (`repl_kprobe.bpf.c`):
+```c
+SEC("kprobe/__sys_sendto")
+int kprobe__sys_sendto(struct pt_regs *ctx) {
+    // 捕获 sendto 系统调用的数据
+    size_t len = (size_t)PT_REGS_PARM3(ctx);  // buf 长度
+    // 数据写入 ring buffer
+    bpf_ringbuf_output(&ringbuf, buf, len, 0);
+}
+```
+
+**用户态路径**:
+```
+kprobe BPF → ring buffer → 用户态回调
+  → repl_capture_ringbuf_cb(data, len)
+    → repl_rdma_incr_write(buf, len)     // RDMA WRITE 到 Slave MR
+                                         // (one-sided, 无需 recv WR)
+Slave: 轮询线程(1ms) ← 读共享 MR 的 head 指针
+       → 有新数据 → memcpy → parse_resp_stream()
+```
+
+**核心文件**: `src/replication/kvs_repl.c`、`kvs_repl_ebpf.c`、`kvs_repl_kprobe.c`、`bpf/`
+
+---
+
+### TTL 过期系统
+
+**数据流**:
+```
+EXPIRE key 10
+  → handle_parsed_command()
+    → kvs_expire_set(&global_expire, engine, key, now + 10)
+      → 更新过期哈希表: expire_table[hash(key)] = expire_time
+      → 更新过期最小堆: expire_heap.push({expire_time, engine, key})
+
+TTL key
+  → kvs_expire_ttl(&global_expire, engine, key)
+    → 查 expire_table → 返回 (expire_time - now) 或 -1/-2
+```
+
+**过期检查**:
+```c
+// 定时任务 (kvs_expire.c):
+void kvs_expire_check(kvs_expire_t *exp) {
+    while (!min_heap_empty(&exp->heap) && min_heap_top(&exp->heap).time <= now) {
+        pop min_heap → 惰性检查 expire_table
+        if 已过期 → kvs_engine_del(engine, key)  // 主动删除
+    }
+}
+
+// 访问时惰性删除:
+if (key_past_expire(key)) return KEY_NOT_FOUND;  // GET/DEL 时检查
+```
+
+**核心文件**: `src/expire/kvs_expire.c`
+
+---
+
+### 配置与命令行系统
+
+`kvstore.conf` 是 key=value 格式的配置文件，支持 `#` 注释。
+
+```c
+// 配置解析链:
+命令行参数 → parse_config_file(kvstore.conf) → 程序默认值
+// 优先级: 命令行 > 配置文件 > 默认值
+
+// 解析入口 (kvstore.c):
+static int parse_config_kv(const char *key, const char *value) {
+    if (!strcmp(key, "port")) g_cfg.port = atoi(value);
+    else if (!strcmp(key, "role")) ...;
+    else if (!strcmp(key, "rdma_dev")) ...;
+    else if (!strcmp(key, "kprobe_enabled")) ...;
+    // 共约 40 个配置项
+}
+```
+
+**核心文件**: `src/main/kvstore.c` (parse_config_kv)
+
+---
+
 ## 命令参考
 
 ### 基本键值

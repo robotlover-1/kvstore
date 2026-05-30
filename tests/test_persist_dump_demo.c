@@ -9,12 +9,14 @@
  *   make test_persist_dump_demo
  *
  * 用法:
- *   # 终端 1: 启动 kvstore
- *   ./kvstore --port 5170 --role master --appendfsync always \
- *       --dump kvstore.dump --aof kvstore.aof
+ *   # 终端 1: 启动 kvstore（在项目根目录下执行）
+ *   ./kvstore --port 5170 --role master --appendfsync always
  *
- *   # 终端 2: 运行全量持久化演示
+ *   # 终端 2: 运行全量持久化演示（可从项目根目录或 tests/ 目录运行）
+ *   # 从项目根目录:
  *   ./test_persist_dump_demo --port 5170 --count 100000
+ *   # 从 tests/ 目录:
+ *   cd tests && ../test_persist_dump_demo --port 5170 --count 100000
  *
  *   程序写入数据后会提示你停止并重启 kvstore，然后自动验证数据恢复。
  */
@@ -236,11 +238,15 @@ static void wait_kvstore_down(double poll_interval) {
     }
 }
 
-/* 获取文件大小 */
+/* 获取文件大小（自动尝试当前目录和父目录） */
 static long long file_size(const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    return (long long)st.st_size;
+    if (stat(path, &st) == 0) return (long long)st.st_size;
+    /* 尝试父目录（兼容从 tests/ 子目录运行） */
+    char parent[512];
+    snprintf(parent, sizeof(parent), "../%s", path);
+    if (stat(parent, &st) == 0) return (long long)st.st_size;
+    return -1;
 }
 
 static const char *fmt_bytes(long long bytes) {
@@ -384,6 +390,8 @@ int main(int argc, char **argv) {
 
     if (dump_sz <= 0) {
         fprintf(stderr, ANSI_RED "  ERROR: dump 文件不存在或为空\n" ANSI_RESET);
+        fprintf(stderr, "  提示: 请在项目根目录运行本测试 (./test_persist_dump_demo ...)\n");
+        fprintf(stderr, "  或确认 kvstore 的 --dump-path 与测试期望的路径一致\n");
         return 1;
     }
 

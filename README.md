@@ -852,6 +852,7 @@ make test_persist_aof_demo     # → ./test_persist_aof_demo
 make test_uring_persist        # → ./test_uring_persist
 make test_mmap_recover         # → ./test_mmap_recover
 make test_repl_basic           # → ./test_repl_basic
+make test_mass_ttl             # → ./test_mass_ttl
 
 # 或手动编译
 gcc -I./include -o test_kvstore tests/test_kvstore.c
@@ -902,18 +903,20 @@ redis-cli -p 5000 INFO
 运行: tests/test_repl_5w5w [选项]
 ```
 
-测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF) → 验证 Slave 最终 10w 条数据一致性。
+测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA Pipeline) → 再写 5w 条增量 → 监控增量同步(kprobe+RDMA WRITE) → Phase 5.5 验证 kprobe 捕获统计 → 验证 Slave 最终 10w 条数据一致性。
 
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
 
 ```bash
-# ── 方式一: RDMA 全量 + eBPF 增量（双虚拟机）──
+# ── 方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，推荐）──
+# 数据路径: 全量(RDMA Pipeline SEND) + 增量(kprobe 拦截 TCP send →
+#           BPF ring buffer → 用户态回调 → RDMA WRITE → Slave MR)
 
 # 终端 1 (VM1, 先启动 Master):
 sudo ./kvstore --port 5160 --role master \
     --repl-fullsync-transport rdma \
-    --repl-realtime-transport ebpf \
-    --rdma-dev siw0 --rdma-recv-slots 64
+    --repl-realtime-transport kprobe-rdma \
+    --rdma-dev siw0 --rdma-recv-slots 64 --kprobe-enabled 1
 
 # 终端 2 (任意机器, Master 启动后运行):
 ./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
@@ -921,15 +924,34 @@ sudo ./kvstore --port 5160 --role master \
     --pre 50000 --post 50000
 
 # 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
-# 先清理旧数据文件，避免上次测试残留影响
-rm -f kvstore.dump kvstore.aof
+sudo ./kvstore --port 5161 --role slave \
+    --master-host 192.168.233.128 --master-port 5160 \
+    --repl-fullsync-transport rdma \
+    --repl-realtime-transport kprobe-rdma
+
+
+# ── 方式二: RDMA 全量 + eBPF 增量（双虚拟机，kprobe 不可用时回退）──
+# 数据路径: 全量(RDMA) + 增量(eBPF sockmap: sk_msg → bpf_msg_redirect_map)
+
+# 终端 1 (VM1, 先启动 Master):
+sudo ./kvstore --port 5160 --role master \
+    --repl-fullsync-transport rdma \
+    --repl-realtime-transport ebpf \
+    --rdma-dev siw0 --rdma-recv-slots 64 --ebpf-enabled 1
+
+# 终端 2 (任意机器):
+./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
+    --slave-host 192.168.233.129 --slave-port 5161 \
+    --pre 50000 --post 50000
+
+# 终端 3 (VM2, 看到提示后再启动 Slave):
 sudo ./kvstore --port 5161 --role slave \
     --master-host 192.168.233.128 --master-port 5160 \
     --repl-fullsync-transport rdma \
     --repl-realtime-transport ebpf
 
 
-# ── 方式二: TCP 全量（单机，无 RDMA/eBPF）──
+# ── 方式三: TCP 全量 + TCP 增量（单机，无 RDMA/eBPF）──
 
 # 终端 1 (先启动 Master):
 ./kvstore --port 5160 --role master \
@@ -941,12 +963,38 @@ sudo ./kvstore --port 5161 --role slave \
     --pre 50000 --post 50000
 
 # 终端 3 (看到提示后再启动 Slave):
-# 先清理旧数据文件，避免上次测试残留影响
-rm -f kvstore.dump kvstore.aof
 ./kvstore --port 5161 --role slave \
     --master-host 127.0.0.1 --master-port 5160 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
+
+**验证**: 测试通过后，确认主从数据一致（key 为 6 位零填充）：
+```bash
+# 在 Master 上查询预存数据
+redis-cli -p 5160 HGET pre:k:000000
+"v0"
+redis-cli -p 5160 HGET pre:k:049999
+"v49999"
+
+# 在 Slave 上查询（应与 Master 完全一致）
+redis-cli -p 5161 HGET pre:k:000000
+"v0"
+redis-cli -p 5161 HGET pre:k:049999
+"v49999"
+
+# 增量数据
+redis-cli -p 5160 HGET post:k:000000
+"v50000"
+redis-cli -p 5161 HGET post:k:000000
+"v50000"
+
+# 查看复制状态和 kprobe 捕获统计
+redis-cli -p 5160 INFO | grep -E "repl|capture"
+```
+
+**kprobe+RDMA 验证**（Phase 5.5）:
+测试会自动从 Master 的 INFO 读取 `capture_initialized`、`capture_count`、`capture_rdma_fail` 字段。
+若 `capture_count > 0` 且 `capture_rdma_fail == 0`，表示 kprobe 成功捕获了增量数据并通过 RDMA WRITE 发送到 Slave。
 
 选项说明：
 
@@ -961,33 +1009,6 @@ rm -f kvstore.dump kvstore.aof
 | `--batch SIZE` | 1000 | 每批写入量 |
 | `--poll MS` | 500 | 轮询间隔毫秒 |
 
-**验证**: 测试通过后，确认主从数据一致：
-```bash
-# 在 Master 上查询
-redis-cli -p 5160 HGET h:pre:50000
-"hv:50000"
-redis-cli -p 5160 HGET h:post:50000
-"hv_post:50000"
-redis-cli -p 5160 GET a:pre:512
-"av:512"
-redis-cli -p 5160 RGET r:pre:500
-"rv:500"
-redis-cli -p 5160 XGET x:pre:999
-"xv:999"
-
-# 在 Slave 上查询（结果应与 Master 完全一致）
-redis-cli -p 5161 HGET h:pre:50000
-"hv:50000"
-redis-cli -p 5161 HGET h:post:50000
-"hv_post:50000"
-redis-cli -p 5161 GET a:pre:512
-"av:512"
-redis-cli -p 5161 RGET r:pre:500
-"rv:500"
-redis-cli -p 5161 XGET x:pre:999
-"xv:999"
-```
-
 ---
 
 #### `test_persist_dump_demo` — 全量持久化演示
@@ -997,31 +1018,24 @@ redis-cli -p 5161 XGET x:pre:999
 运行: ./test_persist_dump_demo [选项]
 ```
 
-交互式流程：连接 kvstore → 写入 count 条数据 → 提示用户执行 `SAVE` → 提示用户停止并重启 kvstore → 自动验证数据从 dump 文件恢复。
+交互式流程：连接 kvstore → 写入 count 条 HSET 数据 → 自动 SAVE → 提示停止并重启 → 自动验证数据从 dump 恢复。
 
 ```bash
-# 终端 1: 启动 kvstore（必须 --appendfsync always 确保数据可恢复）
-./kvstore --port 5170 --role master --appendfsync always \
-    --dump kvstore.dump --aof kvstore.aof
+# 终端 1: 启动 kvstore
+./kvstore --port 5170 --role master --appendfsync always
 
 # 终端 2: 运行全量持久化演示
 ./test_persist_dump_demo --port 5170 --count 100000
-
-# 程序会写入数据，然后提示你:
-#   >>> Please execute SAVE in kvstore (redis-cli SAVE or nc ...)
-# 在终端 1 执行 SAVE 后，程序继续提示:
-#   >>> Please stop kvstore (Ctrl+C) and restart it
-# 停止并重启 kvstore，程序自动检测重连并验证数据恢复
 ```
 
-**验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
+**验证**: SAVE 后，用 redis-cli 确认数据：
 ```bash
-redis-cli -p 5170 SAVE
-+OK
-redis-cli -p 5170 HGET bench:key:1
-"value:1"
-redis-cli -p 5170 HGET bench:key:50000
-"value:50000"
+redis-cli -p 5170 HGET persist:dump:000000
+"v0"
+redis-cli -p 5170 HGET persist:dump:050000
+"v50000"
+redis-cli -p 5170 HGET persist:dump:099999
+"v99999"
 ```
 
 选项说明：
@@ -1042,37 +1056,27 @@ redis-cli -p 5170 HGET bench:key:50000
 运行: ./test_persist_aof_demo [选项]
 ```
 
-交互式流程：连接 kvstore → 写入 count 条数据（**不执行 SAVE**）→ 提示用户停止并重启 kvstore → 自动验证数据从 AOF 文件恢复。
+交互式流程：连接 kvstore → 写入 count 条 HSET 数据（**不执行 SAVE**）→ 提示停止并重启 → 自动验证数据从 AOF 恢复。
 
 > **重要**: kvstore 必须使用 `--appendfsync always`，确保每条写入即时落盘。
 > 使用 `--appendfsync everysec` 时，停止前需等最多 1 秒落盘，可能导致数据丢失。
 
 ```bash
 # 终端 1: 启动 kvstore（必须 --appendfsync always）
-./kvstore --port 5170 --role master --appendfsync always \
-    --dump kvstore.dump --aof kvstore.aof
+./kvstore --port 5170 --role master --appendfsync always
 
 # 终端 2: 运行增量持久化演示
 ./test_persist_aof_demo --port 5170 --count 100000
-
-# 程序写入数据后提示:
-#   >>> Please stop kvstore (Ctrl+C) and restart it
-# 停止并重启 kvstore，程序自动验证 AOF 恢复（注意: 不执行 SAVE，数据仅靠 AOF）
 ```
 
-**验证**: AOF 恢复后，确认重启前后的数据一致：
+**验证**: 重启后，确认 AOF 恢复的数据：
 ```bash
-# 重启前验证
-redis-cli -p 5170 HGET bench:key:1
-"value:1"
-redis-cli -p 5170 HGET bench:key:50000
-"value:50000"
-
-# 停止并重启 kvstore 后，再次验证（数据应仍在）
-redis-cli -p 5170 HGET bench:key:1
-"value:1"
-redis-cli -p 5170 HGET bench:key:50000
-"value:50000"
+redis-cli -p 5170 HGET persist:aof:000000
+"v0"
+redis-cli -p 5170 HGET persist:aof:050000
+"v50000"
+redis-cli -p 5170 HGET persist:aof:099999
+"v99999"
 redis-cli -p 5170 PING
 +PONG
 ```
@@ -1141,46 +1145,45 @@ redis-cli -p 5180 INFO | grep mem
 运行: ./test_mmap_recover [选项]
 ```
 
-自动管理 kvstore 进程生命周期，验证启动时通过 mmap 恢复 dump 文件的正确性与性能。
-支持指定存储引擎（array/hash/rbtree/skiptable）。
+验证 kvstore 启动时通过 mmap 恢复 dump 文件的正确性与性能，支持指定存储引擎。
 
-流程：自动启动 kvstore → 按指定引擎写入 N 条数据 → SAVE → 停止 → 重启并计时 → 从 INFO 读取恢复统计（mmap 尝试次数/成功次数/回退次数/耗时）→ 验证数据一致性。
+流程：连接 kvstore → 按指定引擎写入 N 条数据（key: `mmap:key:%d`） → SAVE → 停止 → 重启 → 从 INFO 读取恢复统计 → 验证数据。
 
 ```bash
-# 终端 1: 启动 kvstore（先启动）
+# 终端 1: 启动 kvstore
 ./kvstore --port 5190 --role master --appendfsync always
 
 # 终端 2: 运行测试（hash 引擎, 10000 条）
 ./test_mmap_recover --port 5190 --engine hash --count 10000
 
-# 程序写入数据后提示:
-#   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
-# 停止并重启 kvstore，程序自动验证数据恢复并显示 mmap 统计
-
 # 使用其他引擎
 ./test_mmap_recover --port 5190 --engine rbtree --count 5000
-./test_mmap_recover --port 5190 --engine array --count 10000   # 自动限制 1024
+./test_mmap_recover --port 5190 --engine skiptable --count 10000
+./test_mmap_recover --port 5190 --engine array --count 1024   # array 上限 1024
 ```
 
 **验证**: 测试完成后，确认各引擎数据恢复正确：
 ```bash
-# Hash 引擎（--engine hash）
-redis-cli -p 5190 HGET mmap:key:10000
-"value:10000"
+# Hash 引擎（默认）
 redis-cli -p 5190 HGET mmap:key:1
 "value:1"
+redis-cli -p 5190 HGET mmap:key:10000
+"value:10000"
 
-# RBTREE 引擎（--engine rbtree）
-redis-cli -p 5190 RGET mmap:key:5000
-"value:5000"
+# RBTREE 引擎 → RSET/RGET
+redis-cli -p 5190 RGET mmap:key:1
+"value:1"
 
-# Skiptable 引擎（--engine skiptable）
-redis-cli -p 5190 XGET mmap:key:5000
-"value:5000"
+# Skiptable 引擎 → XSET/XGET
+redis-cli -p 5190 XGET mmap:key:1
+"value:1"
 
-# Array 引擎（--engine array，上限 1024）
-redis-cli -p 5190 GET mmap:key:1024
-"value:1024"
+# Array 引擎 → SET/GET
+redis-cli -p 5190 GET mmap:key:1
+"value:1"
+
+# 查看 mmap 恢复统计
+redis-cli -p 5190 INFO | grep recover
 ```
 
 选项说明：
@@ -1191,6 +1194,46 @@ redis-cli -p 5190 GET mmap:key:1024
 | `--port PORT` | 5190 | kvstore 端口 |
 | `--count N` | 10000 | 写入数据量（array 引擎上限 1024） |
 | `--engine NAME` | hash | 引擎: array/hash/rbtree/skiptable |
+| `--batch N` | 1000 | 每批写入量 |
+
+---
+
+#### `test_mass_ttl` — 大量数据到期测试
+
+```
+编译: make test_mass_ttl            # → ./test_mass_ttl
+运行: ./test_mass_ttl [选项]
+```
+
+写入 N 个 key 并设置 TTL 过期时间，轮询监控过期状态，支持手动 TTL 检查。
+
+流程：连接 kvstore → SET 写入 count 条数据（key: `expire:k:%06d`） → EXPIRE 设置过期 → 轮询抽样 key 的 TTL → 自动验证所有 key 过期。
+
+```bash
+# 终端 1: 启动 kvstore
+./kvstore --port 5200 --role master
+
+# 终端 2: 运行测试
+./test_mass_ttl --port 5200 --count 10000 --ttl 10
+```
+
+**验证**: 测试运行期间，在另一终端用 redis-cli 手动检查：
+```bash
+redis-cli -p 5200 TTL expire:k:000000     # :N=还有N秒, :-2=已过期
+redis-cli -p 5200 TTL expire:k:005000
+redis-cli -p 5200 TTL expire:k:009999
+redis-cli -p 5200 GET  expire:k:000000     # 过期后返回 (nil)
+redis-cli -p 5200 EXISTS expire:k:000000   # 过期后返回 :0
+```
+
+选项说明：
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--host HOST` | 127.0.0.1 | kvstore 地址 |
+| `--port PORT` | 5200 | kvstore 端口 |
+| `--count N` | 10000 | 写入 key 数量 |
+| `--ttl SECONDS` | 10 | 过期时间秒 |
 | `--batch N` | 1000 | 每批写入量 |
 
 ---

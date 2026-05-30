@@ -11,11 +11,13 @@
  *
  * 用法:
  *   # 终端 1: 启动 kvstore (必须 --appendfsync always 确保 AOF 及时落盘)
- *   ./kvstore --port 5170 --role master --appendfsync always \
- *       --dump kvstore.dump --aof kvstore.aof
+ *   ./kvstore --port 5170 --role master --appendfsync always
  *
- *   # 终端 2: 运行增量持久化演示
+ *   # 终端 2: 运行增量持久化演示（可从项目根目录或 tests/ 目录运行）
+ *   # 从项目根目录:
  *   ./test_persist_aof_demo --port 5170 --count 100000
+ *   # 从 tests/ 目录:
+ *   cd tests && ../test_persist_aof_demo --port 5170 --count 100000
  *
  *   注意: 本演示不执行 SAVE，数据仅保存在 AOF 文件中。
  *   重启后 kvstore 从 AOF 回放写入命令来恢复数据。
@@ -236,10 +238,15 @@ static void wait_kvstore_down(double poll_interval) {
     }
 }
 
+/* 获取文件大小（自动尝试当前目录和父目录） */
 static long long file_size(const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    return (long long)st.st_size;
+    if (stat(path, &st) == 0) return (long long)st.st_size;
+    /* 尝试父目录（兼容从 tests/ 子目录运行） */
+    char parent[512];
+    snprintf(parent, sizeof(parent), "../%s", path);
+    if (stat(parent, &st) == 0) return (long long)st.st_size;
+    return -1;
 }
 
 static const char *fmt_bytes(long long bytes) {
@@ -369,7 +376,9 @@ int main(int argc, char **argv) {
 
     if (aof_sz <= 0) {
         fprintf(stderr, ANSI_RED "  ERROR: AOF 文件不存在或为空\n" ANSI_RESET);
-        fprintf(stderr, "  请确认 kvstore 使用 --appendfsync always 启动\n");
+        fprintf(stderr, "  提示: 请在项目根目录运行本测试 (./test_persist_aof_demo ...)\n");
+        fprintf(stderr, "  或确认 kvstore 的 --aof-path 与测试期望的路径一致\n");
+        fprintf(stderr, "  并确认 kvstore 使用 --appendfsync always 启动\n");
         return 1;
     }
 

@@ -1913,6 +1913,18 @@ int repl_rdma_is_connected(void) {
 #endif
 }
 
+/* 从 eBPF/kprobe capture 回调发送数据的 RDMA 入口 */
+int repl_rdma_send_from_ebpf(const unsigned char *buf, size_t len) {
+#if KVS_ENABLE_RDMA
+    if (!buf || len == 0) return 0;
+    if (!g_repl_rdma_ctx.connected) return -1;
+    return repl_rdma_try_send(buf, len);
+#else
+    (void)buf; (void)len;
+    return -1;
+#endif
+}
+
 unsigned long long repl_rdma_disconnect_count(void) {
     return g_rdma_disconnect_count;
 }

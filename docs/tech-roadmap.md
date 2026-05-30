@@ -1765,3 +1765,72 @@ make check-repl-rdma-stress \
 | 哈希工具 | `src/utils/hash.c` | 旧版哈希表实现（基于字符数组，未在 kvstore 中使用） |
 | 头文件 | `include/kvstore/kvstore.h` | `conn_t`, `kv_config_t`, `repl_rdma_ctx_t`, `kvs_repl_ebpf_stats_t`, `kvs_expire_table_t` 等全部类型定义 |
 | 头文件 | `include/kvstore/server.h` | `conn` 结构体（`kvs_stream_t` 未定义，当前未使用的遗留代码） |
+
+### 6.7 kprobe + RDMA 增量同步
+
+**目标**：通过 kprobe 透明拦截 TCP send 路径，将增量 RESP 数据通过 BPF ringbuf
+传递到用户态，再由 RDMA WRITE（单边操作）直接写入 Slave 预置 MR 环形缓冲区，
+实现低延迟的增量数据加速。
+
+**核心架构**：
+
+```
+Master                                Slave
+  │                                     │
+  ├─ TCP send (保底) ────────────────► ─┤
+  │  (kprobe 在此拦截)                  │
+  │    ↓                                │
+  │  BPF ringbuf                        │
+  │    ↓                                │
+  │  kprobe_ringbuf_cb()                │
+  │    ↓                                │
+  │  RDMA WRITE ────────────────────► ──┤
+  │    (数据 + producer_head)           │ → poll 线程消费
+  │                                     │ → parse 写入引擎
+```
+
+**三层数据读取策略**（BPF 程序 `repl_kprobe.bpf.c`）：
+
+| 步骤 | 操作 | helper |
+|------|------|--------|
+| 1 | 读 `msg + 40` 处的 iov 指针 | `bpf_probe_read_kernel` |
+| 2 | 读 `iov[0]` iovec 结构体 | `bpf_probe_read_kernel` |
+| 3 | 读 `iov->iov_base` 用户数据 | `bpf_probe_read_user` |
+
+**关键发现**：kernel 5.15 的 `iov_iter` 布局与通常假设不同 ——
+`iov` 在 offset 24（非 8），`iov_offset` 在 offset 8（非 24）。
+
+**独立 QP 设计**：
+
+| QP | 端口 | 用途 |
+|----|------|------|
+| `g_repl_rdma_ctx` | `base_port + 1` (5161) | RDMA SEND/RECV 全量同步 |
+| `g_rdma_kprobe` | `base_port + 12` (5172) | RDMA WRITE 增量同步 |
+
+**MR 交换协议**（通过 TCP 控制通道）：
+
+```
+Master → Slave: KPROBEMR\r\n
+Slave  → Master: +KPROBERDMA <rkey> <addr> <total_size> <slot_count> <slot_cap>\r\n
+```
+
+**配置方式**：
+```conf
+repl_fullsync_transport=rdma      # 全量同步走 RDMA
+repl_realtime_transport=kprobe-rdma  # 增量同步走 kprobe+RDMA
+```
+
+**启动命令**：
+```bash
+sudo ./kvstore --port 5160 --role master \
+  --repl-fullsync-transport rdma \
+  --repl-realtime-transport kprobe-rdma \
+  --rdma-dev siw0 --kprobe-enabled
+```
+
+**详细文档**：
+- [`docs/kprobe-rdma-incrsync-implementation.md`](./kprobe-rdma-incrsync-implementation.md)
+- [`docs/kprobe-rdma-debug-diagnosis.md`](./kprobe-rdma-debug-diagnosis.md)
+
+---
+

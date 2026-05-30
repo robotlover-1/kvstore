@@ -17,7 +17,7 @@
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 /* ---- 兼容性定义 ---- */
 #ifndef BPF_MAP_TYPE_RINGBUF
@@ -29,40 +29,21 @@
 #define KVS_KPROBE_ENTRY_HDR_SZ   4
 #define KVS_KPROBE_ENTRY_MAX_LEN  500  /* 单次最大数据长度 */
 
-/* 手动定义 pt_regs（bpf target 下系统头文件不可用）
- * x86_64 寄存器命名: r15, r14, ..., rdi, rsi, rdx, rcx, rax, ... */
+/* 手动定义 pt_regs — 字段名必须与 kernel 5.15 BTF 完全一致
+ * 否则 BPF CO-RE 加载时重定位失败。
+ * 不使用 bpf_tracing.h 的 PT_REGS_PARM 宏，直接访问寄存器。 */
 struct pt_regs {
     unsigned long r15;    unsigned long r14;
     unsigned long r13;    unsigned long r12;
-    unsigned long rbp;    unsigned long rbx;
+    unsigned long bp;     unsigned long bx;
     unsigned long r11;    unsigned long r10;
     unsigned long r9;     unsigned long r8;
-    unsigned long rax;    unsigned long rcx;
-    unsigned long rdx;    unsigned long rsi;
-    unsigned long rdi;    unsigned long orig_rax;
-    unsigned long rip;    unsigned long cs;
-    unsigned long rflags; unsigned long rsp;
+    unsigned long ax;     unsigned long cx;
+    unsigned long dx;     unsigned long si;
+    unsigned long di;     unsigned long orig_ax;
+    unsigned long ip;     unsigned long cs;
+    unsigned long flags;  unsigned long sp;
     unsigned long ss;
-};
-
-/* 手动定义 msghdr/iovec，避免依赖系统头文件 */
-struct bpf_iovec {
-    __u64 iov_base;   /* void __user * */
-    __u64 iov_len;    /* __kernel_size_t */
-};
-
-/* 只定义我们需要的字段 */
-struct bpf_msghdr {
-    __u64 msg_name;       /* void * */
-    int    msg_namelen;
-    int    msg_flags;
-    /* msg_iter 从 offset 16 开始:
-     *   iter_type(1) + copy_mc(1) + no_refault(1) + data_source(1) + __pad(1) = 5B
-     *   padding 3B
-     *   iov(8B) at offset 8 within iov_iter
-     *   nr_segs(8B) at offset 16 within iov_iter
-     * 所以 iov_ptr 在 msg+24, nr_segs 在 msg+32 */
-    __u64 __padding[2];   /* 占位到 offset 16 */
 };
 
 /* ---- BPF Maps ---- */
@@ -105,74 +86,53 @@ struct {
 #define KVS_KPROBE_STAT_DATA_OVR 3  /* 数据超过单次上限 */
 #define KVS_KPROBE_STAT_READ_ERR 4  /* probe_read 失败 */
 
-/* ringbuf entry 格式: [4B payload_len][payload_len bytes payload]
- * payload_len == 0 表示仅通知（无实际数据） */
-#define KVS_KPROBE_ENTRY_HDR_SZ   4
-#define KVS_KPROBE_ENTRY_MAX_LEN  500  /* 单次最大数据长度 */
-
-/*
- * 从 tcp_sendmsg 的 msg 参数中读取用户态数据。
- *
- * struct msghdr 在 kernel 5.15 x86_64 的典型布局:
- *   offset 0:  msg_name     (void*, 8B)
- *   offset 8:  msg_namelen  (int, 4B)
- *   offset 12: msg_flags    (unsigned int, 4B)
- *   offset 16: msg_iter     (struct iov_iter)
- *
- * struct iov_iter:
- *   offset 0:  iter_type+copy_mc+no_refault+data_source(+__pad) (5B)
- *   offset 5-7: padding (3B)
- *   offset 8:  iov  (const struct iovec*, 8B)
- *   offset 16: nr_segs (unsigned long, 8B)
- *
- * struct iovec:
- *   offset 0: iov_base (void*, 8B)
- *   offset 8: iov_len  (size_t, 8B)
- *
- * 所以 iov 指针在 msg + 16 + 8 = msg + 24 处
- */
-
 /* 从 userspace 的 iovec 数组中读取数据拼接到 buf
- * 返回总数据长度（<= max_len），0 表示失败 */
-static __always_inline int read_msg_data(const struct bpf_msghdr *msg,
+ * 返回总数据长度（<= max_len），0 表示失败。
+ *
+ * 布局确认（通过 BTF + 探测）:
+ *   msghdr: msg_name(8)+msg_namelen(4)+pad(4)+msg_iter(16)
+ *   iov_iter: iter_type(1)+nofault(1)+data_source(1)+pad(5)=8B
+ *             iov_offset(8)+count(8)+iov(8)+nr_segs(8)=40B
+ *   iov 在 msg+16+24=msg+40, nr_segs 在 msg+16+32=msg+48 */
+static __always_inline int read_msg_data(unsigned long msg_ptr,
     unsigned char *buf, int max_len)
 {
-    /* 1. 读取 iov 指针 (msg + 24) */
-    const struct bpf_iovec *iov = 0;
-    if (bpf_probe_read_user(&iov, sizeof(iov), (const void *)msg + 24) != 0)
+    /* 1. 读取 iov 指针 */
+    const struct { unsigned long b; unsigned long l; } *iov = 0;
+    if (bpf_probe_read_kernel(&iov, sizeof(iov),
+            (const void *)(msg_ptr + 40)) != 0)
         return 0;
     if (!iov) return 0;
 
-    /* 2. 读取 nr_segs (msg + 32) */
+    /* 2. 读取 nr_segs */
     unsigned long nr_segs = 0;
-    if (bpf_probe_read_user(&nr_segs, sizeof(nr_segs), (const void *)msg + 32) != 0)
+    if (bpf_probe_read_kernel(&nr_segs, sizeof(nr_segs),
+            (const void *)(msg_ptr + 48)) != 0)
         return 0;
     if (nr_segs == 0) return 0;
 
-    /* 3. 遍历 iovec 读取数据 */
-    int total = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        if (i >= nr_segs || total >= max_len) break;
+    /* 3. 读取第一个 iovec */
+    struct { unsigned long b; unsigned long l; } vec;
+    if (bpf_probe_read_kernel(&vec, sizeof(vec), &iov[0]) != 0)
+        return 0;
+    if (!vec.b || vec.l == 0)
+        return 0;
 
-        struct bpf_iovec vec;
-        if (bpf_probe_read_user(&vec, sizeof(vec), &iov[i]) != 0) break;
-        if (!vec.iov_base || vec.iov_len == 0) continue;
+    /* 4. 限制大小不超过 max_len */
+    unsigned long long safe_len = vec.l;
+    if (safe_len > (unsigned long long)max_len)
+        safe_len = (unsigned long long)max_len;
+    if (safe_len == 0) return 0;
 
-        int chunk = vec.iov_len;
-        if (total + chunk > max_len)
-            chunk = max_len - total;
-
-        if (bpf_probe_read_user(buf + total, chunk, (const void *)(unsigned long)vec.iov_base) != 0) {
-            /* 记录读错误统计 */
-            __u64 *st = bpf_map_lookup_elem(&kprobe_stats,
-                &(__u32){KVS_KPROBE_STAT_READ_ERR});
-            if (st) __sync_fetch_and_add(st, 1);
-            break;
-        }
-        total += chunk;
+    /* 5. 从用户空间读取实际数据 */
+    if (bpf_probe_read_user(buf, (__u32)safe_len,
+            (const void *)(unsigned long)vec.b) != 0) {
+        __u64 *st = bpf_map_lookup_elem(&kprobe_stats,
+            &(__u32){KVS_KPROBE_STAT_READ_ERR});
+        if (st) __sync_fetch_and_add(st, 1);
+        return 0;
     }
-    return total;
+    return (int)safe_len;
 }
 
 SEC("kprobe/tcp_sendmsg")
@@ -197,8 +157,8 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 3. 获取数据长度 */
-    __u32 size = (__u32)PT_REGS_PARM3(ctx);
+    /* 3. 获取数据长度：dx = tcp_sendmsg 的 size 参数 (x86_64) */
+    __u32 size = (__u32)ctx->dx;
     if (size == 0) return 0;
     if (size > KVS_KPROBE_ENTRY_MAX_LEN) {
         stat = bpf_map_lookup_elem(&kprobe_stats,
@@ -207,19 +167,20 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         size = KVS_KPROBE_ENTRY_MAX_LEN;
     }
 
-    /* 4. 从 msg 参数中读取数据 — 使用 per-CPU 数组避免栈溢出 */
+    /* 4. 从 msg 参数中读取数据 */
     __u32 map_key = 0;
     unsigned char(*entry)[KVS_KPROBE_ENTRY_HDR_SZ + KVS_KPROBE_ENTRY_MAX_LEN];
     entry = bpf_map_lookup_elem(&kprobe_tmpbuf, &map_key);
     if (!entry) return 0;
 
-    const struct bpf_msghdr *msg = (const struct bpf_msghdr *)PT_REGS_PARM2(ctx);
+    /* si = tcp_sendmsg 的 msg 参数 (x86_64) */
+    unsigned long msg_ptr = (unsigned long)ctx->si;
 
     /* 先写 4 字节长度头（初始为 0，读取成功后再更新） */
     __u32 payload_len = 0;
     __builtin_memcpy(*entry, &payload_len, 4);
 
-    int data_len = read_msg_data(msg, (*entry) + 4, KVS_KPROBE_ENTRY_MAX_LEN);
+    int data_len = read_msg_data(msg_ptr, (*entry) + 4, KVS_KPROBE_ENTRY_MAX_LEN);
     if (data_len <= 0) {
         /* 读数据失败，退化为通知模式 */
         payload_len = 0;

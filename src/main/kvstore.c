@@ -1,9 +1,11 @@
 
 #include "kvstore/kvstore.h"
-#include "kvstore/replication/repl_kprobe.h"
 #include <signal.h>
 #include <ctype.h>
 #include <strings.h>
+
+/* kvs_repl.c 中的 static 变量，KPROBEMR 响应需要 */
+extern int g_slave_fd;
 
 #define KVS_DEFAULT_CONFIG_PATH "kvstore.conf"
 
@@ -220,9 +222,6 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ebpf-redirect-key") && i + 1 < argc) {
             g_cfg.ebpf_redirect_key = atoi(argv[++i]);
         }
-        else if (!strcmp(argv[i], "--ebpf-enabled")) {
-            g_cfg.ebpf_enabled = 1;
-        }
         else if (!strcmp(argv[i], "--ebpf-forward")) {
             g_cfg.ebpf_forward = 1;
         }
@@ -285,9 +284,6 @@ static int parse_args(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--kprobe-enabled")) {
             g_cfg.kprobe_enabled = 1;
-            /* 兼容 --kprobe-enabled 1 的写法 */
-            if (i + 1 < argc && (!strcmp(argv[i+1], "1") || !strcasecmp(argv[i+1], "true") || !strcasecmp(argv[i+1], "yes")))
-                ++i;
         }
         else if (!strcmp(argv[i], "--repl-kprobe-obj-path") && i + 1 < argc) {
             snprintf(g_cfg.repl_kprobe_obj_path, sizeof(g_cfg.repl_kprobe_obj_path), "%s", argv[++i]);
@@ -932,13 +928,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!resp) return -1;
 
     (void)argl;
-    /* 日志: 记录每个收到的命令（便于调试 kprobe-rdma 的 KPROBEMR 交换） */
-    if (argc > 0 && argv[0] && (!strcmp(argv[0], "KPROBEMR") || !strcmp(argv[0], "KPROBERDMA"))) {
-        fprintf(stderr, "kprobe rdma: [CMD] %s from_replication=%d role=%s\n",
-            argv[0], from_replication,
-            g_cfg.role == ROLE_MASTER ? "master" : "slave");
-    }
-
     if (argc <= 0) {
         rc_ret = -1;
         goto out;
@@ -1012,8 +1001,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (repl_ebpf_register_fd(c->fd, 1) != 0) {
                 fprintf(stderr, "repl ebpf: fd registration failed on master replica link, using tcp-compatible path\n");
             }
-            /* kprobe+RDMA 捕获：设置捕获目标 fd */
-            repl_capture_set_target_fd(c->fd);
         }
         if (c && (!strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")
                 || !strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma"))) {
@@ -1052,25 +1039,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         /* Slave 侧收到 KPROBEMR 请求：返回 MR 信息 */
         fprintf(stderr, "kprobe rdma: KPROBEMR received, sending MR info...\n");
         char resp[384];
-        /* 重试等待 MR 就绪（listener 线程可能尚未完成注册） */
-        int rn = -1;
-        for (int retry = 0; retry < 50; retry++) {
-            rn = repl_kprobe_rdma_get_mr_text(resp, sizeof(resp));
-            if (rn > 0 && strstr(resp, "0 0 0 0 0") == NULL) {
-                fprintf(stderr, "kprobe rdma: MR ready after %d retries, rkey=%s\n",
-                    retry, resp + 12);  /* skip "+KPROBERDMA " */
-                break;
+        int rn = repl_kprobe_rdma_get_mr_text(resp, sizeof(resp));
+        if (rn > 0) {
+            if (c) {
+                queue_bytes(c, (unsigned char *)resp, (size_t)rn);
+            } else if (g_slave_fd >= 0) {
+                send(g_slave_fd, resp, (size_t)rn, MSG_NOSIGNAL);
             }
-            usleep(10000);  /* 10ms */
-        }
-        if (rn > 0 && c) {
-            queue_bytes(c, (unsigned char *)resp, (size_t)rn);
             fprintf(stderr, "kprobe rdma: KPROBEMR response sent (%d bytes): %s",
                 rn, resp);
-        } else {
-            const char *err = "-ERR KPROBERDMA MR not ready\r\n";
-            fprintf(stderr, "kprobe rdma: MR not ready after retries!\n");
-            if (c) queue_bytes(c, (unsigned char *)err, strlen(err));
         }
         return 0;
     }
@@ -1080,8 +1057,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
-        unsigned long long cap_count = 0, cap_bytes = 0, cap_rdma_fail = 0;
-        repl_capture_get_stats(&cap_count, &cap_bytes, &cap_rdma_fail);
         repl_ebpf_get_stats(&ebpf_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
 
@@ -1443,25 +1418,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
 
-    /* KPROBEMR — kprobe-rdma MR 信息请求（Master→Slave）
-     * Slave 返回 +KPROBERDMA <rkey> <addr> <size> <slot_count> <slot_cap>\r\n */
-    if (!strcmp(cmd, "KPROBEMR")) {
-#if KVS_ENABLE_KPROBE_RDMA
-        if (from_replication && g_cfg.role == ROLE_SLAVE) {
-            /* 尝试获取已注册的 MR 信息（由 kprobe-rdma listener 注册） */
-            char mr_buf[256];
-            int mr_n = 0;
-            /* 直接调用获取 MR 信息的函数 */
-            mr_n = repl_kprobe_rdma_get_mr_text(mr_buf, sizeof(mr_buf));
-            if (mr_n > 0 && c) {
-                queue_bytes(c, (unsigned char *)mr_buf, (size_t)mr_n);
-            }
-        }
-#endif
-        goto out;
-        return 0;
-    }
-
     if (!strcmp(cmd, "DOCSET") && argc == 4) {
         int drc = kvs_doc_set(&global_doc, argv[1], argv[2], argv[3]);
         if (drc == 0) {
@@ -1735,21 +1691,8 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         repl_slave_send_ack();
                         repl_rdma_log("slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu", argv[1], continue_start, durable_start, continue_end);
                     }
+                    kvs_free(line);
                 }
-                /* +KPROBERDMA 在 from_replication=0 （master 侧）或 =1（slave 侧）都需要处理 */
-                if (argc >= 6 && !strcmp(argv[0], "KPROBERDMA")) {
-                    unsigned long rkey = (unsigned long)strtoull(argv[1], NULL, 10);
-                    unsigned long addr = (unsigned long)strtoull(argv[2], NULL, 10);
-                    fprintf(stderr, "kprobe rdma: +KPROBERDMA received (role=%s) rkey=%lu addr=0x%lx\n",
-                        g_cfg.role == ROLE_MASTER ? "master" : "slave", rkey, addr);
-                    if (g_cfg.role == ROLE_MASTER) {
-                        repl_kprobe_rdma_parse_mr_info_direct(rkey, addr,
-                            (size_t)strtoull(argv[3], NULL, 10),
-                            (size_t)strtoull(argv[4], NULL, 10),
-                            (size_t)strtoull(argv[5], NULL, 10));
-                    }
-                }
-                kvs_free(line);
             }
             pos += 2;
             continue;
@@ -2108,7 +2051,7 @@ int kvs_dump_to_fd(int fd) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf|kprobe-rdma] [--repl-fullsync-transport rdma] [--repl-realtime-transport ebpf|kprobe-rdma] [--ebpf-enabled] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore] [--ebpf-redirect --ebpf-redirect-key 0] [--ebpf-forward] [--kprobe-enabled] [--repl-kprobe-obj-path build/replication/bpf/repl_kprobe.bpf.o] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--repl-fullsync-transport rdma] [--repl-realtime-transport ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore] [--ebpf-redirect --ebpf-redirect-key 0] [--ebpf-forward] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {
@@ -2141,11 +2084,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
                 /* Non-fatal: continue with TCP fallback */
             }
-            /* 加载 kprobe 捕获 BPF 程序（加载 BPF + 启动消费者线程）
-             * target_fd 将在 slave 连接时通过 repl_capture_set_target_fd() 设置 */
-            if (repl_capture_init(-1) != 0) {
-                fprintf(stderr, "repl capture: kprobe BPF init failed (non-fatal, using regular path)\n");
-            }
         }
     }
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") ||
@@ -2155,25 +2093,16 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-#if KVS_ENABLE_RDMA
-    /* 注册 kprobe+RDMA 捕获的回调函数 */
-    repl_ebpf_set_rdma_send_fn(repl_rdma_send_from_ebpf);
-#endif
 
     /* kprobe+RDMA 增量同步初始化 */
-    if (!strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
+    if (g_cfg.kprobe_enabled &&
+        !strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
         if (g_cfg.role == ROLE_MASTER) {
-            if (g_cfg.kprobe_enabled) {
-                if (repl_kprobe_rdma_master_init() != 0) {
-                    fprintf(stderr, "kprobe rdma master init failed, disabling\n");
-                    g_cfg.kprobe_enabled = 0;
-                }
-            } else {
-                fprintf(stderr, "kprobe rdma: master kprobe disabled (use --kprobe-enabled)\n");
+            if (repl_kprobe_rdma_master_init() != 0) {
+                fprintf(stderr, "kprobe rdma master init failed, disabling\n");
+                g_cfg.kprobe_enabled = 0;
             }
         } else if (g_cfg.role == ROLE_SLAVE) {
-            /* Slave 侧不需要加载 BPF，但需要启动 kprobe-rdma listener */
-            fprintf(stderr, "kprobe rdma: slave init (starting listener)\n");
             repl_kprobe_rdma_slave_init();
         }
     }

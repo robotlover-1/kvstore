@@ -189,18 +189,8 @@ check-mmap-recover-c: $(TEST_MMAP_RECOVER_BIN)
 check-repl-basic: $(TEST_REPL_BASIC_BIN)
 	./$(TEST_REPL_BASIC_BIN) --master-port $(REPL_MASTER_PORT) --slave-port $(REPL_SLAVE_PORT) --count $(PRELOAD_COUNT) --repl-transport $(REPL_TRANSPORT)
 
-# ---- 大量数据到期测试 ----
-TEST_MASS_TTL_SRC=tests/test_mass_ttl.c
-TEST_MASS_TTL_BIN=test_mass_ttl
-
-$(TEST_MASS_TTL_BIN): $(TEST_MASS_TTL_SRC)
-	$(CC) $(CFLAGS) -o $@ $<
-
-check-mass-ttl-c: $(TEST_MASS_TTL_BIN)
-	./$(TEST_MASS_TTL_BIN) --port 5200 --count 10000 --ttl 10
-
 clean:
-	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN) $(TEST_URING_PERSIST_BIN) $(TEST_MMAP_RECOVER_BIN) $(TEST_REPL_BASIC_BIN) $(TEST_MASS_TTL_BIN)
+	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN) $(TEST_URING_PERSIST_BIN) $(TEST_MMAP_RECOVER_BIN) $(TEST_REPL_BASIC_BIN)
 	rm -f kvstore-master.dump kvstore-master.aof kvstore-slave.dump kvstore-slave.aof
 
 check-resp:
@@ -316,4 +306,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-mass-ttl-c check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic tools/ebpf/repl_ebpf_daemon test_mass_ttl
+.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic tools/ebpf/repl_ebpf_daemon

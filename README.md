@@ -7,6 +7,7 @@
 [![Build](https://img.shields.io/badge/build-4%20configs-brightgreen)]()
 [![RDMA](https://img.shields.io/badge/RDMA-supported-orange)]()
 [![eBPF](https://img.shields.io/badge/eBPF-supported-blueviolet)]()
+[![kprobe+RDMA](https://img.shields.io/badge/kprobe--RDMA-supported-success)]()
 
 kvstore 是一个用 **C 语言** 实现的类 Redis 键值存储系统，面向学习和研究。
 
@@ -174,522 +175,12 @@ kvstore/
 | 主从复制                     | ✅ 完成   | FULLRESYNC + partial resync + backlog              |
 | RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用 |
 | eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速       |
+| kprobe+RDMA 增量同步        | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR |
 | TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                              |
 | 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                          |
 | 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                            |
 | 哨兵模式                     | ⚠️ 基础 | 框架已有，自动故障转移待完善                       |
 | 自动快照                     | ✅ 完成   | 按时间+变化数规则触发                              |
-
----
-
-## 实现原理
-
-### 网络模型
-
-三种 I/O 模型通过 `--net` 或 `net_backend` 配置，编译时通过 `#include` 选择性启用。
-
-#### Reactor (epoll) — 默认
-
-基于 epoll 的事件驱动单线程模型。所有连接共享一个 epoll fd。
-
-**核心数据结构**:
-```c
-// reactor.c 中每个连接一个 conn_t
-typedef struct conn_s {
-    int fd;
-    unsigned char *inbuf;    // 读缓冲区 (动态增长)
-    size_t in_len;
-    queue *out_queue;        // 写队列 (queue_bytes 追加)
-    // ...
-} conn_t;
-```
-
-**事件循环**:
-```
-epoll_wait()
-  ├─ EPOLLIN  → on_read(c)
-  │               └─ read(fd, inbuf) → parse_resp_stream(c, inbuf, &in_len, 0)
-  │                                     └─ handle_parsed_command(c, argc, argv, raw, rawlen, 0)
-  │                                           ├─ 写命令 → 执行引擎 → queue_bytes(c, resp)
-  │                                           └─ 写命令 + 主角色 → repl_broadcast(raw, rawlen)
-  └─ EPOLLOUT → on_write(c)
-                  └─ send(fd, out_queue) → 写完则关闭 EPOLLOUT
-```
-
-**核心特性**:
-- 单线程无锁，所有操作顺序执行
-- `queue_bytes(c, buf, len)` 将响应追加到连接的写队列，`on_write` 负责实际 send
-- 复制时 `repl_broadcast()` 遍历 replica 链表调用 `queue_bytes`
-
-**核心文件**: `src/core/reactor.c`
-
-#### Proactor (io_uring)
-
-基于 Linux io_uring 的异步 I/O 模型。提交 SQE (Submission Queue Entry) 后立即返回，完成后从 CQ (Completion Queue) 获取结果。
-
-```c
-// 提交读请求
-struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-io_uring_prep_read(sqe, fd, buf, len, offset);
-io_uring_submit(&ring);
-
-// 等待完成
-struct io_uring_cqe *cqe;
-io_uring_wait_cqe(&ring, &cqe);
-// cqe->res 包含实际读到的字节数
-```
-
-**核心文件**: `src/core/proactor.c`
-
-#### NtyCo 协程
-
-基于 NtyCo 协程库，将异步 I/O 以同步方式编写，每连接一个协程。
-
-```
-nty_co_create(func, arg)  → 创建协程
-  func() {
-    read(fd, buf, len)    → 内部调用 nty_co_yield() 让出 CPU
-  }
-nty_co_run()              → 调度所有就绪协程
-```
-
-**协程切换**: 通过 `setjmp`/`longjmp` 保存和恢复栈上下文，每次 `yield` 切换到调度器，调度器选择下一个就绪协程 `resume`。
-
-**核心文件**: `src/core/ntyco.c`、`NtyCo/core/`
-
----
-
-### 协议层 — RESP 编解码
-
-RESP (Redis Serialization Protocol) 是 kvstore 的通信协议。
-
-**解析入口**: `parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication)`
-
-```
-buf 中可能包含多条命令，循环解析:
-  while (pos < *len) {
-    if (buf[pos] == '+') → 简单字符串: +OK\r\n
-    if (buf[pos] == '*') → 数组: *3\r\n$3\r\nSET\r\n...
-    if (其他)            → 内联命令: SET key value
-    handle_parsed_command(c, argc, argv, raw, rawlen, from_replication)
-  }
-```
-
-**`from_replication` 标志**:
-- `=0`: 来自客户端，写命令触发 `repl_broadcast()` 广播给所有 slave
-- `=1`: 来自主节点复制，写命令**不**广播，仅应用并调用 `repl_slave_note_applied(rawlen)` 更新 offset
-
-**命令分发**: `handle_parsed_command()` 根据命令前缀路由到不同引擎:
-
-```c
-if (!strcmp(cmd, "SET"))    → engine = KVS_ENGINE_ARRAY
-if (!strcmp(cmd, "HSET"))   → engine = KVS_ENGINE_HASH
-if (!strcmp(cmd, "RSET"))   → engine = KVS_ENGINE_RBTREE
-if (!strcmp(cmd, "XSET"))   → engine = KVS_ENGINE_SKIPTABLE
-if (!strcmp(cmd, "DOCSET")) → engine = KVS_ENGINE_DOC
-```
-
-**核心文件**: `src/main/kvstore.c`
-
----
-
-### 存储引擎
-
-5 种引擎通过命令前缀自动路由，每种引擎实现 `set`/`get`/`del`/`exist`/`mod` 五个接口。
-
-#### Array (数组)
-
-```c
-// 静态数组，线性扫描
-typedef struct { char key[64]; char value[256]; } array_entry_t;
-static array_entry_t global_array[KVS_ARRAY_SIZE];  // 默认 100000
-static int global_array_count = 0;
-
-// SET: 线性查找已有 key → 找到则覆盖，否则写入第一个空位
-for (int i = 0; i < KVS_ARRAY_SIZE; i++)
-    if (!global_array.table[i].key || strcmp(...) == 0) { ... }
-```
-
-#### Hash (哈希表)
-
-```c
-// FNV-1a 哈希 + 链地址法
-#define KVS_HASH_SLOTS 65536
-typedef struct hashnode_s {
-    char *key, *value;
-    struct hashnode_s *next;
-} hashnode_t;
-static hashnode_t **global_hash_nodes;  // 指针数组
-
-// HSET: hash(key) → slot → 遍历链表 → 找到更新/未找到插入
-uint32_t h = kvs_hash_fnv1a(key);
-hashnode_t *n = global_hash_nodes[h % max_slots];
-while (n) { if (!strcmp(n->key, key)) { ... } n = n->next; }
-```
-
-#### RBTree (红黑树)
-
-```c
-// 自平衡二叉搜索树，中序遍历有序
-typedef struct rbtree_node {
-    int color;  // RED=0 / BLACK=1
-    char key[64];
-    void *value;
-    struct rbtree_node *left, *right, *parent;
-} rbtree_node_t;
-
-// RSET: 插入节点 → rbtree_insert(&root, node, nil)
-// 再平衡: 左旋/右旋/颜色翻转 → 保证 5 条红黑树性质
-```
-
-#### SkipTable (跳表)
-
-```c
-// 多层索引链表，概率平衡
-#define KVS_SKIPTABLE_MAX_LEVEL 32
-typedef struct kvs_skiptable_node {
-    char *key, *value;
-    struct kvs_skiptable_node **forward;  // 每层指向下一个节点
-    int level;
-} kvs_skiptable_node_t;
-
-// XSET: 随机层数 → 从最高层向下找插入位置 → 更新各层指针
-```
-
-#### Doc (文档型)
-
-```c
-// key → Hash( field → value )
-// DOCSET key field value: 先找 key → 找到则在其 field 哈希表中插入
-// DOCGET key field: 先找 key → 再找 field
-```
-
-**核心文件**: `src/storage/kvs_array.c`、`kvs_hash.c`、`kvs_rbtree.c`、`kvs_skiptable.c`、`kvs_doc.c`
-
----
-
-### 内存管理
-
-三种后端通过 `--mem` 或 `mem_backend` 配置，`kvs_malloc`/`kvs_free`/`kvs_realloc` 统一接口：
-
-#### libc
-```c
-void *kvs_malloc(size_t s) { return malloc(s); }
-void kvs_free(void *p)     { free(p); }
-```
-
-#### jemalloc
-```c
-// 通过 LD_PRELOAD 在进程启动时注入
-// LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so ./kvstore
-// 多 arena 设计减少多线程锁竞争
-```
-
-#### custom (自研)
-```c
-// slab 分类 + mmap 预分配
-#define SLAB_CLASSES {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
-// kvs_malloc(60) → 从 64B slab 分配
-// 每个 slab 用位图管理空闲块
-// 内存不足时 mmap 新申请 1MB 块
-// 支持 MEMSTAT 命令查看各 slab 使用率
-```
-
-**核心文件**: `src/memory/kvs_mem.c`
-
----
-
-### 持久化
-
-#### 全量 Dump (KVSD)
-
-**保存流程**:
-```
-kvs_save()
-  └─ snapshot_all_sink(&sink)     ← 遍历 5 个引擎
-       ├─ snapshot_array_sink()   → emit_cmd3_sink("SET", key, value)
-       ├─ snapshot_rbtree_sink()  → emit_cmd3_sink("RSET", key, value)
-       ├─ snapshot_hash_sink()    → emit_cmd3_sink("HSET", key, value)
-       ├─ snapshot_skiptable_sink() → emit_cmd3_sink("XSET", key, value)
-       └─ snapshot_doc_sink()     → emit_cmd4_sink("DOCSET", key, field, value)
-  └─ 写入临时文件 → fflush → fsync → rename → 完成
-```
-
-所有 KV 序列化为 RESP 命令文本（`SET key value\r\n`、`HSET key value\r\n`），即 dump 文件 = RESP 命令序列。
-
-**恢复流程**:
-```c
-kvs_load()
-  ├─ mmap(dump_fd, ...)            ← 优先 mmap
-  │   └─ parse_resp_stream(NULL, mapped, &len, 1)  ← 直接解析
-  └─ mmap 失败 → read + parse      ← 回退路径
-```
-
-mmap 恢复优势：内核按需加载页，大文件无需全部读入内存。
-
-#### 增量 AOF
-
-每条写命令以 RESP 协议追加到 AOF 文件：
-
-```c
-// kvstore.c handle_parsed_command():
-if (from_replication && is_write_cmd(cmd)) {
-    persist_append_raw(raw, rawlen);  // 写入 AOF
-    repl_slave_note_durable(rawlen);  // 记录 durable offset
-}
-```
-
-**同步策略**:
-- `appendfsync always`: 每条命令后 `fsync`，最安全但最慢
-- `appendfsync everysec`: 每秒 `fsync`，可能丢 1 秒数据
-
-**AOF 重写 (BGREWRITEAOF)**:
-```
-将当前内存快照写为新 AOF → fsync → rename 替换旧 AOF
-与 SAVE 类似，但输出格式是 RESP 协议命令序列
-```
-
-**核心文件**: `src/persistence/kvs_persist.c`
-
----
-
-### 主从复制
-
-整个复制系统设计为**双通道模式**：全量同步和增量同步可独立配置传输层。
-
-```
---repl-fullsync-transport rdma    ← 全量走 RDMA
---repl-realtime-transport ebpf    ← 增量走 eBPF sockmap
-```
-
-#### 复制协议 (REPLSYNC)
-
-```
-Slave → Master:
-  REPLSYNC <replid> <offset> <durable_offset>
-
-Master 响应:
-  +FULLRESYNC <replid> <offset> <size>\r\n  ← 全量同步
-  [snapshot data: SET/RSET/HSET/XSET...]
-  +REPLDONE\r\n                              ← 全量结束
-
-  或 (部分同步):
-  +CONTINUE <replid> <offset>\r\n            ← 增量续传
-  [backlog data: 从 offset 开始的增量命令]
-```
-
-#### Offset 跟踪
-
-```c
-// Master 侧: 每条广播的命令累加原始字节数
-void repl_note_broadcast(size_t bytes) {
-    g_master_repl_offset += (unsigned long long)bytes;
-}
-
-// Slave 侧: 每条应用的命令累加
-void repl_slave_note_applied(size_t rawlen) {
-    g_slave_repl_applied_offset += (unsigned long long)rawlen;
-}
-```
-
-`repl_offset` 本质是 RESP 原始字节流的累计偏移量，用于**断线重连后的精确续传**。
-
-#### Backlog 环形缓冲区
-
-```c
-static repl_backlog_t g_repl_backlog = {
-    .buf = circular buffer (1MB),
-    .head, .histlen,           // 环形队列指针
-    .start_offset, .end_offset // 对应的 offset 范围
-};
-
-repl_broadcast() → repl_backlog_feed(raw, rawlen)
-                → 写入环形缓冲区，更新 end_offset
-```
-
-Slave 重连时发送 `offset`，Master 检查 `offset >= start_offset` 则可部分同步，直接发送 backlog 中的增量数据。
-
-#### 全量同步 (queue_snapshot)
-
-```
-queue_snapshot(c)
-  ├─ kvs_snapshot_to_fp(tmp_file)    ← 写临时文件
-  ├─ 第一遍: 计算 total_bytes         ← FULLRESYNC header 需要
-  ├─ 发送: +FULLRESYNC <replid> <offset> <total>\r\n
-  ├─ 第二遍: 按 chunk_cap 分片发送
-  │    └─ repl_send_chunked(c, buf, r)
-  │         └─ repl_fullsync_send(c, buf, chunk)
-  │              └─ repl_rdma_try_send(buf, len)   ← RDMA SEND
-  │                 或 repl_transport_tcp_send()    ← TCP fallback
-  └─ 发送: +REPLDONE\r\n
-```
-
-#### RDMA 全量同步 (Pipeline 架构)
-
-**四层 Pipeline 设计**:
-
-```c
-#define KVS_RDMA_PIPELINE_DEPTH  4   // 4 个 send_slot 交替使用
-#define KVS_RDMA_CQ_BATCH        8   // 批量 poll
-
-// send_slot: 预注册的 RDMA 缓冲区
-repl_rdma_send_slot_t send_slots[4];
-// 每个 slot 有独立 buf + MR，可同时有 4 个 outstanding SEND WR
-
-repl_rdma_try_send(buf, len):
-  ① slot = acquire_send_slot()       // 获取空闲 slot（忙等最多 5s）
-  ② memcpy(send_slots[slot].buf, buf, len)  // 拷贝数据
-  ③ ibv_post_send(qp, &wr, &bad_wr)  // 提交 SEND WR 到 SQ
-                                      // wr_id = slot | PIPELINE_FLAG
-  ④ return 0  // 非阻塞返回
-```
-
-**CQ 轮询线程** (后台独立线程):
-```c
-repl_rdma_cq_poll_thread():
-  while (running) {
-    ibv_get_cq_event(comp_chan, &ev_cq, &ev_ctx)  // 阻塞等待事件
-    ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch)   // 批量 poll
-    for each wc:
-      if (SEND completion): release_send_slot()     // 释放 slot
-      if (RECV completion): pending_recv_push()     // 入队
-    ibv_req_notify_cq(cq, 0)                        // re-arm
-    ibv_poll_cq(...)                                // drain
-  }
-```
-
-**接收端** (Slave):
-```c
-recv_slots[32]      ← 32 个预注册的接收缓冲区，提前 ibv_post_recv
-pending_recv_slots  ← 环形队列，存已完成的 recv_slot 索引
-
-slave loop:
-  repl_rdma_wait_cq_recv_completion(100ms, &slot, &len)
-    → 从 pending_recv 队列取出 slot
-    → repl_rdma_dup_recv_payload(slot, len)  // 拷贝数据
-    → repl_rdma_repost_recv(slot)            // 重新 post recv
-    → parse_resp_stream(NULL, buf, &blen, 1) // 解析执行
-```
-
-**自适应深度调节**:
-```c
-repl_rdma_adjust_pipeline_depth():
-  if (in_flight <= depth/2 && depth < 4) → depth++  // 加深度
-  if (in_flight >= depth  && depth > 2) → depth--   // 减深度
-```
-
-#### eBPF 实时同步 (sockmap)
-
-**BPF 程序** (`repl_sockmap.bpf.c`):
-```c
-SEC("sk_msg")
-int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
-    int key = 0;
-    // 从 role_map 查当前角色: 1=master, 0=slave
-    int *role = bpf_map_lookup_elem(&role_map, &key);
-    if (!role || *role != 1) return SK_PASS;  // 仅 master 转发
-    
-    // 从 sock_map 查 slave fd
-    int *slave_fd = bpf_map_lookup_elem(&sock_map, &key);
-    if (!slave_fd) return SK_PASS;
-    
-    // 重定向到 slave socket
-    return bpf_msg_redirect_map(&sock_map, key, BPF_F_INGRESS);
-}
-```
-
-**数据路径**:
-```
-redis-cli → Master TCP → reactor on_read → handle_parsed_command
-  → repl_broadcast(raw, rawlen)
-    → queue_bytes(c_slave, raw, rawlen)     // 写入 slave 连接的写队列
-      → reactor on_write(c_slave)
-        → send(c_slave_fd, ...)
-          → 内核 BPF sk_msg 拦截
-            → bpf_msg_redirect_map(sock_map, 0, 0)
-              → 直接写入 Slave TCP socket
-```
-
-#### kprobe+RDMA 增量同步
-
-**BPF kprobe** (`repl_kprobe.bpf.c`):
-```c
-SEC("kprobe/__sys_sendto")
-int kprobe__sys_sendto(struct pt_regs *ctx) {
-    // 捕获 sendto 系统调用的数据
-    size_t len = (size_t)PT_REGS_PARM3(ctx);  // buf 长度
-    // 数据写入 ring buffer
-    bpf_ringbuf_output(&ringbuf, buf, len, 0);
-}
-```
-
-**用户态路径**:
-```
-kprobe BPF → ring buffer → 用户态回调
-  → repl_capture_ringbuf_cb(data, len)
-    → repl_rdma_incr_write(buf, len)     // RDMA WRITE 到 Slave MR
-                                         // (one-sided, 无需 recv WR)
-Slave: 轮询线程(1ms) ← 读共享 MR 的 head 指针
-       → 有新数据 → memcpy → parse_resp_stream()
-```
-
-**核心文件**: `src/replication/kvs_repl.c`、`kvs_repl_ebpf.c`、`kvs_repl_kprobe.c`、`bpf/`
-
----
-
-### TTL 过期系统
-
-**数据流**:
-```
-EXPIRE key 10
-  → handle_parsed_command()
-    → kvs_expire_set(&global_expire, engine, key, now + 10)
-      → 更新过期哈希表: expire_table[hash(key)] = expire_time
-      → 更新过期最小堆: expire_heap.push({expire_time, engine, key})
-
-TTL key
-  → kvs_expire_ttl(&global_expire, engine, key)
-    → 查 expire_table → 返回 (expire_time - now) 或 -1/-2
-```
-
-**过期检查**:
-```c
-// 定时任务 (kvs_expire.c):
-void kvs_expire_check(kvs_expire_t *exp) {
-    while (!min_heap_empty(&exp->heap) && min_heap_top(&exp->heap).time <= now) {
-        pop min_heap → 惰性检查 expire_table
-        if 已过期 → kvs_engine_del(engine, key)  // 主动删除
-    }
-}
-
-// 访问时惰性删除:
-if (key_past_expire(key)) return KEY_NOT_FOUND;  // GET/DEL 时检查
-```
-
-**核心文件**: `src/expire/kvs_expire.c`
-
----
-
-### 配置与命令行系统
-
-`kvstore.conf` 是 key=value 格式的配置文件，支持 `#` 注释。
-
-```c
-// 配置解析链:
-命令行参数 → parse_config_file(kvstore.conf) → 程序默认值
-// 优先级: 命令行 > 配置文件 > 默认值
-
-// 解析入口 (kvstore.c):
-static int parse_config_kv(const char *key, const char *value) {
-    if (!strcmp(key, "port")) g_cfg.port = atoi(value);
-    else if (!strcmp(key, "role")) ...;
-    else if (!strcmp(key, "rdma_dev")) ...;
-    else if (!strcmp(key, "kprobe_enabled")) ...;
-    // 共约 40 个配置项
-}
-```
-
-**核心文件**: `src/main/kvstore.c` (parse_config_kv)
 
 ---
 
@@ -852,7 +343,6 @@ make test_persist_aof_demo     # → ./test_persist_aof_demo
 make test_uring_persist        # → ./test_uring_persist
 make test_mmap_recover         # → ./test_mmap_recover
 make test_repl_basic           # → ./test_repl_basic
-make test_mass_ttl             # → ./test_mass_ttl
 
 # 或手动编译
 gcc -I./include -o test_kvstore tests/test_kvstore.c
@@ -903,20 +393,18 @@ redis-cli -p 5000 INFO
 运行: tests/test_repl_5w5w [选项]
 ```
 
-测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA Pipeline) → 再写 5w 条增量 → 监控增量同步(kprobe+RDMA WRITE) → Phase 5.5 验证 kprobe 捕获统计 → 验证 Slave 最终 10w 条数据一致性。
+测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF) → 验证 Slave 最终 10w 条数据一致性。
 
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
 
 ```bash
-# ── 方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，推荐）──
-# 数据路径: 全量(RDMA Pipeline SEND) + 增量(kprobe 拦截 TCP send →
-#           BPF ring buffer → 用户态回调 → RDMA WRITE → Slave MR)
+# ── 方式一: RDMA 全量 + eBPF 增量（双虚拟机）──
 
 # 终端 1 (VM1, 先启动 Master):
 sudo ./kvstore --port 5160 --role master \
     --repl-fullsync-transport rdma \
-    --repl-realtime-transport kprobe-rdma \
-    --rdma-dev siw0 --rdma-recv-slots 64 --kprobe-enabled 1
+    --repl-realtime-transport ebpf \
+    --rdma-dev siw0 --rdma-recv-slots 64
 
 # 终端 2 (任意机器, Master 启动后运行):
 ./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
@@ -924,34 +412,15 @@ sudo ./kvstore --port 5160 --role master \
     --pre 50000 --post 50000
 
 # 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
-sudo ./kvstore --port 5161 --role slave \
-    --master-host 192.168.233.128 --master-port 5160 \
-    --repl-fullsync-transport rdma \
-    --repl-realtime-transport kprobe-rdma
-
-
-# ── 方式二: RDMA 全量 + eBPF 增量（双虚拟机，kprobe 不可用时回退）──
-# 数据路径: 全量(RDMA) + 增量(eBPF sockmap: sk_msg → bpf_msg_redirect_map)
-
-# 终端 1 (VM1, 先启动 Master):
-sudo ./kvstore --port 5160 --role master \
-    --repl-fullsync-transport rdma \
-    --repl-realtime-transport ebpf \
-    --rdma-dev siw0 --rdma-recv-slots 64 --ebpf-enabled 1
-
-# 终端 2 (任意机器):
-./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
-    --slave-host 192.168.233.129 --slave-port 5161 \
-    --pre 50000 --post 50000
-
-# 终端 3 (VM2, 看到提示后再启动 Slave):
+# 先清理旧数据文件，避免上次测试残留影响
+rm -f kvstore.dump kvstore.aof
 sudo ./kvstore --port 5161 --role slave \
     --master-host 192.168.233.128 --master-port 5160 \
     --repl-fullsync-transport rdma \
     --repl-realtime-transport ebpf
 
 
-# ── 方式三: TCP 全量 + TCP 增量（单机，无 RDMA/eBPF）──
+# ── 方式二: TCP 全量（单机，无 RDMA/eBPF）──
 
 # 终端 1 (先启动 Master):
 ./kvstore --port 5160 --role master \
@@ -963,38 +432,12 @@ sudo ./kvstore --port 5161 --role slave \
     --pre 50000 --post 50000
 
 # 终端 3 (看到提示后再启动 Slave):
+# 先清理旧数据文件，避免上次测试残留影响
+rm -f kvstore.dump kvstore.aof
 ./kvstore --port 5161 --role slave \
     --master-host 127.0.0.1 --master-port 5160 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
-
-**验证**: 测试通过后，确认主从数据一致（key 为 6 位零填充）：
-```bash
-# 在 Master 上查询预存数据
-redis-cli -p 5160 HGET pre:k:000000
-"v0"
-redis-cli -p 5160 HGET pre:k:049999
-"v49999"
-
-# 在 Slave 上查询（应与 Master 完全一致）
-redis-cli -p 5161 HGET pre:k:000000
-"v0"
-redis-cli -p 5161 HGET pre:k:049999
-"v49999"
-
-# 增量数据
-redis-cli -p 5160 HGET post:k:000000
-"v50000"
-redis-cli -p 5161 HGET post:k:000000
-"v50000"
-
-# 查看复制状态和 kprobe 捕获统计
-redis-cli -p 5160 INFO | grep -E "repl|capture"
-```
-
-**kprobe+RDMA 验证**（Phase 5.5）:
-测试会自动从 Master 的 INFO 读取 `capture_initialized`、`capture_count`、`capture_rdma_fail` 字段。
-若 `capture_count > 0` 且 `capture_rdma_fail == 0`，表示 kprobe 成功捕获了增量数据并通过 RDMA WRITE 发送到 Slave。
 
 选项说明：
 
@@ -1009,6 +452,33 @@ redis-cli -p 5160 INFO | grep -E "repl|capture"
 | `--batch SIZE` | 1000 | 每批写入量 |
 | `--poll MS` | 500 | 轮询间隔毫秒 |
 
+**验证**: 测试通过后，确认主从数据一致：
+```bash
+# 在 Master 上查询
+redis-cli -p 5160 HGET h:pre:50000
+"hv:50000"
+redis-cli -p 5160 HGET h:post:50000
+"hv_post:50000"
+redis-cli -p 5160 GET a:pre:512
+"av:512"
+redis-cli -p 5160 RGET r:pre:500
+"rv:500"
+redis-cli -p 5160 XGET x:pre:999
+"xv:999"
+
+# 在 Slave 上查询（结果应与 Master 完全一致）
+redis-cli -p 5161 HGET h:pre:50000
+"hv:50000"
+redis-cli -p 5161 HGET h:post:50000
+"hv_post:50000"
+redis-cli -p 5161 GET a:pre:512
+"av:512"
+redis-cli -p 5161 RGET r:pre:500
+"rv:500"
+redis-cli -p 5161 XGET x:pre:999
+"xv:999"
+```
+
 ---
 
 #### `test_persist_dump_demo` — 全量持久化演示
@@ -1018,24 +488,31 @@ redis-cli -p 5160 INFO | grep -E "repl|capture"
 运行: ./test_persist_dump_demo [选项]
 ```
 
-交互式流程：连接 kvstore → 写入 count 条 HSET 数据 → 自动 SAVE → 提示停止并重启 → 自动验证数据从 dump 恢复。
+交互式流程：连接 kvstore → 写入 count 条数据 → 提示用户执行 `SAVE` → 提示用户停止并重启 kvstore → 自动验证数据从 dump 文件恢复。
 
 ```bash
-# 终端 1: 启动 kvstore
-./kvstore --port 5170 --role master --appendfsync always
+# 终端 1: 启动 kvstore（必须 --appendfsync always 确保数据可恢复）
+./kvstore --port 5170 --role master --appendfsync always \
+    --dump kvstore.dump --aof kvstore.aof
 
 # 终端 2: 运行全量持久化演示
 ./test_persist_dump_demo --port 5170 --count 100000
+
+# 程序会写入数据，然后提示你:
+#   >>> Please execute SAVE in kvstore (redis-cli SAVE or nc ...)
+# 在终端 1 执行 SAVE 后，程序继续提示:
+#   >>> Please stop kvstore (Ctrl+C) and restart it
+# 停止并重启 kvstore，程序自动检测重连并验证数据恢复
 ```
 
-**验证**: SAVE 后，用 redis-cli 确认数据：
+**验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
 ```bash
-redis-cli -p 5170 HGET persist:dump:000000
-"v0"
-redis-cli -p 5170 HGET persist:dump:050000
-"v50000"
-redis-cli -p 5170 HGET persist:dump:099999
-"v99999"
+redis-cli -p 5170 SAVE
++OK
+redis-cli -p 5170 HGET bench:key:1
+"value:1"
+redis-cli -p 5170 HGET bench:key:50000
+"value:50000"
 ```
 
 选项说明：
@@ -1056,27 +533,37 @@ redis-cli -p 5170 HGET persist:dump:099999
 运行: ./test_persist_aof_demo [选项]
 ```
 
-交互式流程：连接 kvstore → 写入 count 条 HSET 数据（**不执行 SAVE**）→ 提示停止并重启 → 自动验证数据从 AOF 恢复。
+交互式流程：连接 kvstore → 写入 count 条数据（**不执行 SAVE**）→ 提示用户停止并重启 kvstore → 自动验证数据从 AOF 文件恢复。
 
 > **重要**: kvstore 必须使用 `--appendfsync always`，确保每条写入即时落盘。
 > 使用 `--appendfsync everysec` 时，停止前需等最多 1 秒落盘，可能导致数据丢失。
 
 ```bash
 # 终端 1: 启动 kvstore（必须 --appendfsync always）
-./kvstore --port 5170 --role master --appendfsync always
+./kvstore --port 5170 --role master --appendfsync always \
+    --dump kvstore.dump --aof kvstore.aof
 
 # 终端 2: 运行增量持久化演示
 ./test_persist_aof_demo --port 5170 --count 100000
+
+# 程序写入数据后提示:
+#   >>> Please stop kvstore (Ctrl+C) and restart it
+# 停止并重启 kvstore，程序自动验证 AOF 恢复（注意: 不执行 SAVE，数据仅靠 AOF）
 ```
 
-**验证**: 重启后，确认 AOF 恢复的数据：
+**验证**: AOF 恢复后，确认重启前后的数据一致：
 ```bash
-redis-cli -p 5170 HGET persist:aof:000000
-"v0"
-redis-cli -p 5170 HGET persist:aof:050000
-"v50000"
-redis-cli -p 5170 HGET persist:aof:099999
-"v99999"
+# 重启前验证
+redis-cli -p 5170 HGET bench:key:1
+"value:1"
+redis-cli -p 5170 HGET bench:key:50000
+"value:50000"
+
+# 停止并重启 kvstore 后，再次验证（数据应仍在）
+redis-cli -p 5170 HGET bench:key:1
+"value:1"
+redis-cli -p 5170 HGET bench:key:50000
+"value:50000"
 redis-cli -p 5170 PING
 +PONG
 ```
@@ -1145,45 +632,46 @@ redis-cli -p 5180 INFO | grep mem
 运行: ./test_mmap_recover [选项]
 ```
 
-验证 kvstore 启动时通过 mmap 恢复 dump 文件的正确性与性能，支持指定存储引擎。
+自动管理 kvstore 进程生命周期，验证启动时通过 mmap 恢复 dump 文件的正确性与性能。
+支持指定存储引擎（array/hash/rbtree/skiptable）。
 
-流程：连接 kvstore → 按指定引擎写入 N 条数据（key: `mmap:key:%d`） → SAVE → 停止 → 重启 → 从 INFO 读取恢复统计 → 验证数据。
+流程：自动启动 kvstore → 按指定引擎写入 N 条数据 → SAVE → 停止 → 重启并计时 → 从 INFO 读取恢复统计（mmap 尝试次数/成功次数/回退次数/耗时）→ 验证数据一致性。
 
 ```bash
-# 终端 1: 启动 kvstore
+# 终端 1: 启动 kvstore（先启动）
 ./kvstore --port 5190 --role master --appendfsync always
 
 # 终端 2: 运行测试（hash 引擎, 10000 条）
 ./test_mmap_recover --port 5190 --engine hash --count 10000
 
+# 程序写入数据后提示:
+#   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
+# 停止并重启 kvstore，程序自动验证数据恢复并显示 mmap 统计
+
 # 使用其他引擎
 ./test_mmap_recover --port 5190 --engine rbtree --count 5000
-./test_mmap_recover --port 5190 --engine skiptable --count 10000
-./test_mmap_recover --port 5190 --engine array --count 1024   # array 上限 1024
+./test_mmap_recover --port 5190 --engine array --count 10000   # 自动限制 1024
 ```
 
 **验证**: 测试完成后，确认各引擎数据恢复正确：
 ```bash
-# Hash 引擎（默认）
-redis-cli -p 5190 HGET mmap:key:1
-"value:1"
+# Hash 引擎（--engine hash）
 redis-cli -p 5190 HGET mmap:key:10000
 "value:10000"
-
-# RBTREE 引擎 → RSET/RGET
-redis-cli -p 5190 RGET mmap:key:1
+redis-cli -p 5190 HGET mmap:key:1
 "value:1"
 
-# Skiptable 引擎 → XSET/XGET
-redis-cli -p 5190 XGET mmap:key:1
-"value:1"
+# RBTREE 引擎（--engine rbtree）
+redis-cli -p 5190 RGET mmap:key:5000
+"value:5000"
 
-# Array 引擎 → SET/GET
-redis-cli -p 5190 GET mmap:key:1
-"value:1"
+# Skiptable 引擎（--engine skiptable）
+redis-cli -p 5190 XGET mmap:key:5000
+"value:5000"
 
-# 查看 mmap 恢复统计
-redis-cli -p 5190 INFO | grep recover
+# Array 引擎（--engine array，上限 1024）
+redis-cli -p 5190 GET mmap:key:1024
+"value:1024"
 ```
 
 选项说明：
@@ -1194,46 +682,6 @@ redis-cli -p 5190 INFO | grep recover
 | `--port PORT` | 5190 | kvstore 端口 |
 | `--count N` | 10000 | 写入数据量（array 引擎上限 1024） |
 | `--engine NAME` | hash | 引擎: array/hash/rbtree/skiptable |
-| `--batch N` | 1000 | 每批写入量 |
-
----
-
-#### `test_mass_ttl` — 大量数据到期测试
-
-```
-编译: make test_mass_ttl            # → ./test_mass_ttl
-运行: ./test_mass_ttl [选项]
-```
-
-写入 N 个 key 并设置 TTL 过期时间，轮询监控过期状态，支持手动 TTL 检查。
-
-流程：连接 kvstore → SET 写入 count 条数据（key: `expire:k:%06d`） → EXPIRE 设置过期 → 轮询抽样 key 的 TTL → 自动验证所有 key 过期。
-
-```bash
-# 终端 1: 启动 kvstore
-./kvstore --port 5200 --role master
-
-# 终端 2: 运行测试
-./test_mass_ttl --port 5200 --count 10000 --ttl 10
-```
-
-**验证**: 测试运行期间，在另一终端用 redis-cli 手动检查：
-```bash
-redis-cli -p 5200 TTL expire:k:000000     # :N=还有N秒, :-2=已过期
-redis-cli -p 5200 TTL expire:k:005000
-redis-cli -p 5200 TTL expire:k:009999
-redis-cli -p 5200 GET  expire:k:000000     # 过期后返回 (nil)
-redis-cli -p 5200 EXISTS expire:k:000000   # 过期后返回 :0
-```
-
-选项说明：
-
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--host HOST` | 127.0.0.1 | kvstore 地址 |
-| `--port PORT` | 5200 | kvstore 端口 |
-| `--count N` | 10000 | 写入 key 数量 |
-| `--ttl SECONDS` | 10 | 过期时间秒 |
 | `--batch N` | 1000 | 每批写入量 |
 
 ---

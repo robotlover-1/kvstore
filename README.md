@@ -324,18 +324,87 @@ kvstore/
 
 ### 存储引擎 — 五种数据结构
 
-kvstore 实现了五种存储引擎，通过**命令前缀**切换：
+kvstore 实现了五种存储引擎，通过**命令前缀**切换。所有引擎共享同一套 TTL 过期系统和复制层。
 
-- **Array** (`SET key val`): 动态数组+线性查找 O(n)。最简单，适合小数据量学习
-- **Hash** (`HSET key val`): 链地址哈希表 + **FNV-1a 非加密哈希** O(1) avg。通用场景
-- **RBTREE** (`RSET key val`): **红黑树** O(log n)，通过左旋/右旋保持平衡
-- **Skiptable** (`XSET key val`): **跳表** O(log n) avg，通过概率层数（50% 概率提升层数）实现平衡
-- **Doc** (`DOCSET key field val`): 文档型 value，字段级别哈希存储
+#### Array 引擎 (`SET` / `GET` / `DEL`)
 
-**同时实现红黑树和跳表的原因**：两者都是有序结构但实现思路完全不同——红黑树通过旋转保持平衡，跳表通过概率层数实现平衡。
+- **数据结构**：固定大小线性数组（`KVS_ARRAY_SIZE=1024`），每个 slot 包含 `(key, value)` 指针
+- **查找**：线性扫描 O(n)，n ≤ 1024
+- **限制**：最多 1024 个 key，满了返回 `-ERR operation failed`
+
+```
+table = [slot0, slot1, ..., slot1023]
+          │       │
+     (key,val)  NULL
+```
+
+源码: `src/storage/kvs_array.c`
+
+#### Hash 引擎 (`HSET` / `HGET` / `HDEL`)
+
+- **数据结构**：链地址哈希表，`MAX_TABLE_SIZE=1024` 个桶，**FNV-1a 非加密哈希**
+- **查找**：O(1) avg，冲突通过链表解决
+- **与 Array 的区别**：链地址法无固定容量限制
+
+```
+hash(key) → idx
+buckets[idx] → node → node → NULL   (链地址法)
+```
+
+源码: `src/storage/kvs_hash.c`
+
+#### RBTREE 引擎 (`RSET` / `RGET` / `RDEL`)
+
+- **数据结构**：**红黑树**，节点颜色标记红/黑，插入后通过左旋/右旋/变色保持平衡
+- **查找**：O(log n)，中序遍历可得有序序列
+- **特点**：通过 5 条红黑树性质保证平衡性
+
+源码: `src/storage/kvs_rbtree.c`
+
+#### Skiptable 引擎 (`XSET` / `XGET` / `XDEL`)
+
+- **数据结构**：**跳表**，多层链表，每层以 50% 概率提升层数（最高 16 层）
+- **查找**：O(log n) avg，从最高层开始逐层向下
+- **与 RBTREE 的对比**：红黑树通过旋转保持平衡，跳表通过概率层数实现平衡；跳表实现更简单，但红黑树最坏情况有保证
+
+```
+head
+  │  ┌─────────────────────────────────┐
+  ├──┤  L3: 10 ──────────────→ 90      │
+  ├──┤  L2: 10 ─────→ 50 ───→ 90      │
+  └──┤  L1: 10 → 30 → 50 → 70 → 90    │
+     └─────────────────────────────────┘
+```
+
+源码: `src/storage/kvs_skiptable.c`
+
+#### Doc 引擎 (`DOCSET` / `DOCGET` / `DOCDEL`)
+
+- **数据结构**：文档型 value，按 `key` 哈希找到文档，文档内部再按 `field` 哈希存储
+- **两层哈希**：外层 `key → doc`，内层 `field → value`
+- **用途**：一个 key 下存储多个字段，类似 Redis Hash
+
+```
+key → doc { fields[0] → (f1,v1) → (f2,v2)
+            fields[1] → (f3,v3) → NULL }
+```
+
+源码: `src/storage/kvs_doc.c`
+
+#### 命令前缀路由
+
+```
+cmd[0] == 'R' → RBTREE 引擎
+cmd[0] == 'H' → Hash 引擎
+cmd[0] == 'X' → Skiptable 引擎
+其他         → Array 引擎
+```
+
+`handle_parsed_command()` 根据前缀路由，`strip_prefix()` 去掉前缀后执行统一的操作名（如 `HSET` → HASH 引擎执行 `SET`）。
 
 ### 网络模型 — 三种 I/O 模型
 
+三种模型的目的不是为了生产冗余，而是**对比学习**——同一套业务逻辑用三种 I/O 模型实现。
 
 | 模型         | 底层       | 核心思想                                                                          |
 | ------------ | ---------- | --------------------------------------------------------------------------------- |
@@ -343,37 +412,119 @@ kvstore 实现了五种存储引擎，通过**命令前缀**切换：
 | **Proactor** | io_uring   | "操作完成通知"。提交 SQE 后立即返回，从 CQ 取结果。避免就绪通知→阻塞读的两步开销 |
 | **NtyCo**    | 协程       | 同步写法，异步执行。`recv` 被 hook 为 `epoll_ctl` → `yield` → `resume`          |
 
-**目的不是为了生产冗余，而是对比学习**——同一套业务逻辑用三种 I/O 模型实现。
+#### Reactor（默认）
+
+```
+epoll_wait(100ms)
+  ├── 可读事件 → on_read() → parse_resp_stream() → handle_parsed_command()
+  ├── 可写事件 → on_write() → 发送响应
+  └── expire 定时器 (每 100ms) → kvs_active_expire_cycle(adaptive_budget)
+                                   → persist_autosnap_cron()
+```
+
+- 每个连接有独立的读缓冲区和写缓冲区（`conn_t.in_buf / out_buf`）
+- `on_read()` 读出数据到 `in_buf`，`parse_resp_stream()` 解析 RESP 协议
+- 写操作通过 `queue_bytes()` 入队到 `out_buf`，`on_write()` 发送
+
+源码: `src/core/reactor.c`
+
+#### Proactor (io_uring)
+
+- 提交读 SQE 后立即返回，CQ 完成事件触发处理
+- 无需 epoll 就绪通知→阻塞 read 的两步开销
+- 同样用于 AOF 持久化写入
+
+源码: `src/core/proactor.c`
+
+#### NtyCo (协程)
+
+- 基于 `NtyCo` 协程库，hook 系统调用
+- `recv()` 被 hook 为 `epoll_ctl(ADD)` → `yield` → 事件就绪后 `resume`
+- 以同步写法实现异步并发
+
+源码: `src/core/ntyco.c`
 
 ### 持久化 — dump + AOF
 
-**全量 Dump (KVSD 二进制格式)**：
+#### 全量 Dump (KVSD 二进制格式)
 
 ```
 [4B key_len][key][4B value_len][value]
+[4B key_len][key][4B value_len][value]
+...
 ```
 
-- 恢复优先使用 **mmap**（0 次内核→用户拷贝），失败回退到 fread
-- 支持 SAVE（同步）/ BGSAVE（fork 子进程）
+- 每个 key-value 对以 `4B 长度 + 数据` 交替存储
+- **恢复优先使用 mmap**：mmap 文件后直接遍历，0 次内核→用户拷贝
+- **mmap 失败回退**到 `fread()` 逐条读取
+- 支持 `SAVE`（同步，主线程阻塞写）和 `BGSAVE`（fork 子进程，不阻塞主线程）
+- `SAVE` 将 `global_expire` 中未到期的 key 也 snapshot 到 dump，恢复后 TTL 重建
 
-**增量 AOF (RESP 命令格式)**：
+源码: `src/persistence/kvs_persist.c`
+
+#### 增量 AOF (RESP 命令格式)
 
 ```
 *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+*2\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n
 ```
 
-- 写入优先使用 **io_uring** 异步 pwrite，回退到同步 pwrite
-- fsync 策略：`always`（每条命令 fsync）/ `everysec`（每秒 fsync）
-- BGREWRITEAOF：fork 子进程重写 AOF，重写期间新命令通过缓冲区转发
+- 每条写命令后调用 `persist_append_raw()` 写入 AOF
+- **写入**：优先用 **io_uring** 异步 pwrite（不阻塞），回退到同步 pwrite
+- **fsync 策略**：
+  - `always`：每条写命令后 fsync，最安全但最慢
+  - `everysec`：每秒 fsync 一次，平衡性能与安全
+- **BGREWRITEAOF**：fork 子进程重写 AOF，重写期间新命令通过 `g_aof_rewrite_buf` 缓冲区转发
 
-**恢复顺序**：先恢复 dump（全量二进制，快），再重放 AOF（增量 RESP，补全最后状态）。
+#### 恢复顺序
+
+1. **先恢复 dump**：二进制格式，读取快
+2. **再重放 AOF**：RESP 命令格式，补全最后状态的增量写操作
+
+如果 AOF 恢复过程中发生错误，通过 `g_aof_recover_errors` 记录但不中断。
+
+#### io_uring 写入管道
+
+```
+persist_append_raw()
+  → 尝试 io_uring (IORING_OP_WRITE)
+     → SQE 提交到 SQ
+     → 后台线程消耗 CQ
+  → io_uring 不可用时回退:
+     → pwrite(fd, buf, len, offset)
+```
+
+源码: `src/persistence/`
 
 ### 主从复制 — 四种传输路径
 
-采用类 Redis 的 RESP-based 复制协议（REPLSYNC / FULLRESYNC / CONTINUE / REPLACK）。
+复制协议基于 RESP 协议扩展，通过 `repl_transport_ops_t` **策略模式**切换传输层。
 
-四种传输层通过 `repl_transport_ops_t` **策略模式**切换：
+#### 复制握手流程
 
+```
+Master                              Slave
+  │                                    │
+  │  ← REPLSYNC <replid> <offset>      │  Slave 发起同步请求
+  │                                    │
+  │  检查 backlog 是否能部分同步        │
+  │  ├─ 能 → +CONTINUE <replid> <off>  │  增量同步
+  │  └─ 不能 → +FULLRESYNC <id> <off>  │  全量同步
+  │              [dump 数据]            │
+  │             *1\r\n$7\r\nREPLDONE   │
+  │                                    │
+  │  后续: repl_broadcast() 广播写命令   │
+  │    ← REPLACK <applied> <durable>    │  Slave 定期 ACK
+```
+
+| 状态         | 含义                         |
+| ------------ | ---------------------------- |
+| `repl_offset`| Master 侧累计写入字节数      |
+| `repl_applied_offset_ack` | Slave 已应用的偏移量         |
+| `repl_durable_offset_ack` | Slave 已持久化的偏移量       |
+| `backlog`    | 1MB 环形缓冲，存储最近的写命令 |
+
+#### 四种传输方式
 
 | 传输方式              | 类型      | 数据路径                                                         | 优势                       |
 | --------------------- | --------- | ---------------------------------------------------------------- | -------------------------- |
@@ -382,25 +533,191 @@ kvstore 实现了五种存储引擎，通过**命令前缀**切换：
 | **eBPF sockmap**      | 内核转发  | send →`sk_msg` hook → `bpf_msg_redirect_map`                   | 内核态转发，避免来回拷贝   |
 | **kprobe+RDMA WRITE** | 单边 RDMA | kprobe 拦截 → ringbuf →`ibv_post_send(RDMA_WRITE)` → Slave MR | Slave CPU 零参与，最低延迟 |
 
-**kprobe+RDMA WRITE 原理**：
+#### 复制传输策略模式
 
-1. BPF 程序 `kprobe/tcp_sendmsg` 在 send 路径上拦截数据
-2. 通过 `bpf_ringbuf_output` 推送到 BPF ringbuf（1MB）
-3. 用户态 `ring_buffer__poll()` 消费 ringbuf，触发 `kprobe_ringbuf_cb()`
-4. 回调做两次 RDMA WRITE：先写数据到 Slave MR slot，再更新 `producer_head` 通知 Slave
-5. Slave 轮询线程消费 MR 环形缓冲区，送 `parse_resp_stream()` 解析
+```c
+typedef struct {
+    const char *name;
+    int  (*init)(conn_t *c);
+    int  (*send)(conn_t *c, const unsigned char *buf, size_t len);
+    void (*cleanup)(conn_t *c);
+} repl_transport_ops_t;
+```
 
-**TCP 保底**：`repl_transport_kprobe_rdma_send()` 始终返回 -1，数据仍通过 TCP 发送。
-Slave 通过 `repl_offset` 去重，RDMA 路径丢失的数据由 TCP 补上。
+`repl_realtime_send()` 根据 `c->repl_transport_kind` 调用对应的 `send` 函数指针。
+
+#### TCP 传输
+
+- `repl_tcp_send()`：直接 `write(c->fd, buf, len)`
+- 失败时标记 `c->repl_draining = 1`，移除副本连接
+
+#### RDMA SEND/RECV（全量同步）
+
+- Master 分配 `rdma_send_wr` 执行 `ibv_post_send`
+- Slave 预置 RECV WR，CQ 事件驱动读取
+- 两个独立的 QP：`g_repl_rdma_ctx`（全量，port+1）和 `g_rdma_kprobe`（增量，port+12）
+
+#### eBPF sockmap
+
+- BPF 程序挂载到 `sk_msg` hook 点
+- `bpf_msg_redirect_map()` 将数据直接重定向到 slave socket fd
+- 避免用户态→内核态→用户态的来回拷贝
+
+#### kprobe+RDMA WRITE（增量同步，核心特性）
+
+**数据路径**：
+
+```
+repl_broadcast() → tcp_sendmsg() → kprobe/tcp_sendmsg (BPF)
+                                        ↓
+                                  BPF ringbuf
+                                        ↓
+                              ring_buffer__poll() 消费
+                                        ↓
+                            kprobe_ringbuf_cb() 回调
+                                        ↓
+                         ibv_post_send(RDMA_WRITE)
+                        ┌───────────────┴───────────────┐
+                        ↓                               ↓
+                  写数据到 Slave MR slot       更新 producer_head
+                        ↓                               ↓
+                   Slave 轮询线程 ──────→ parse_resp_stream()
+```
+
+**BPF 侧**（`src/replication/bpf/repl_kprobe.bpf.c`）：
+
+```
+SEC("kprobe/tcp_sendmsg")
+int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
+    // 1. PID 过滤（只拦截本进程）
+    // 2. 从参数 msg 读取 iov_iter（msg+40, kernel 5.15）
+    // 3. 遍历 iovec，bpf_probe_read_user 读数据
+    // 4. 通过 per-CPU 数组暂存（突破 512B 栈限制）
+    // 5. bpf_ringbuf_output 推送至用户态
+}
+```
+
+**RDMA WRITE 流水线**：4 个 slot 的 Pipeline，每个 slot 有独立的 MR 缓冲区。
+写入时先写数据 slot，再更新 producer_head slot，Slave 通过 `producer_head != consumer_head` 判断有数据。
+
+**TCP 保底**：`repl_transport_kprobe_rdma_send()` 始终返回 -1，数据仍然通过 TCP 发送。
+Slave 通过 `repl_offset` 去重：被 RDMA 路径先送达的数据，TCP 路径到达时跳过。
 
 ### TTL 过期 — 哈希索引 + 最小堆
 
-- **哈希表**提供 O(1) 查找（SET/DEL 时快速找到过期记录）
-- **最小堆**提供 O(1) 取最快要过期的 key（`kvs_active_expire_cycle` 每次从堆顶取）
-- 每次事件循环调用 `kvs_active_expire_cycle(budget=20)`，分散 CPU 开销
+kvstore 的 TTL 系统使用**哈希索引 + 最小堆**双结构，结合**主动扫描 + 惰性删除**两种策略。
+
+#### 数据结构
+
+```
+kvs_expire_table_t
+  ├── buckets[8192]       ← 哈希表（FNV-1a），key→节点映射，O(1) 查找
+  ├── heap[]              ← 最小堆，按 expire_at_ms 升序排列
+  │   heap[0] = 最快到期的 key
+  │   heap[i] ≤ heap[2i+1], heap[2i+2]
+  ├── heap_size           ← 堆中元素个数
+  ├── count               ← 总节点数 = 有 TTL 的 key 数
+  └── size                ← 哈希表桶数（固定 8192）
+```
+
+#### 核心操作
+
+| 操作 | 函数 | 流程 |
+|---|---|---|
+| **EXPIRE key 10** | `kvs_expire_set()` | 计算 `expire_at = now + 10000ms` → 插入哈希表 → 入堆 `heap_sift_up` |
+| **TTL key** | `kvs_expire_ttl()` | 哈希表找到节点 → `(expire_at - now) / 1000` |
+| **PERSIST key** | `kvs_expire_del()` | 哈希表删除 → `heap_remove_at` → `heap_sift_down/sift_up` |
+| **更新 TTL** | `kvs_expire_set()` 已存在时 | 更新 `expire_at_ms` → `heap_update`（同时 sift_up 和 sift_down） |
+
+#### 过期删除策略
+
+**策略一：主动过期（事件循环）**
+
+```c
+// Reactor 每 100ms 调用一次
+if (now - g_last_expire >= 100) {
+    int budget = expire_cycle_budget();
+    kvs_active_expire_cycle(budget);
+    g_last_expire = now;
+}
+```
+
+```c
+int kvs_active_expire_cycle(int budget) {
+    while (removed < budget && heap_size > 0) {
+        node = heap[0];                    // O(1) 取堆顶
+        if (node->expire_at_ms > now) break; // 堆顶还没到期 = 全部没到期
+        engine_del(node->engine, node->key); // 从存储引擎删除
+        expire_free_node(&global_expire, node); // 从哈希表+堆删除
+        removed++;
+    }
+}
+```
+
+**自适应 budget**（`src/core/reactor.c`）：
+
+```c
+// 根据当前 TTL 节点数动态调整每轮预算
+count ≥ 1,000,000 → budget = 4096
+count ≥ 300,000   → budget = 2048
+count ≥ 100,000   → budget = 1024
+count ≥ 30,000    → budget = 512
+count ≥ 10,000    → budget = 256
+count ≥ 1,000     → budget = 128
+else              → budget = 32
+```
+
+**策略二：惰性删除（每次命令执行前）**
+
+```c
+// 每次 GET/SET/DEL/EXIST 等操作前调用
+static int try_expire(int engine, char *key) {
+    if (kvs_expire_is_expired(&global_expire, engine, key)) {
+        engine_del(engine, key);               // 从引擎删除
+        kvs_expire_del(&global_expire, engine, key); // 从 TTL 表删除
+        return 1;  // 已过期
+    }
+    return 0;
+}
+```
+
+**注意**：当前主动过期和惰性删除都只删除本机数据，**不会将 DEL 广播给 slave**。这是与 Redis 的重要差异——Redis 在 master 过期 key 后会生成 `DEL key` 命令复制到 slave，而本项目 slave 依赖自身的事件循环扫描过期。
+
+#### 完整流程示例
+
+```
+SET expire:k:000000 value (无 TTL)
+EXPIRE expire:k:000000 10
+  → kvs_expire_set(): expire_at = now + 10000ms
+  → 插入 buckets[hash("expire:k:000000")] 链表
+  → heap_push → heap_sift_up
+
+... 持续写入 10000 个 key ...
+
+// 10 秒后，reactor 事件循环触发：
+kvs_active_expire_cycle(budget=256)
+  → heap[0] 的 expire_at_ms ≤ now
+  → engine_del(HASH, "expire:k:000000")
+  → expire_free_node()
+  → heap_sift_down(新堆顶)
+  → ... 继续处理最多 256 个 ...
+```
+
+#### heap 操作示例
+
+```
+插入 expire_at=5000:         插入 expire_at=3000:
+heap = [1000, 2000, 5000]   heap = [1000, 2000, 5000]
+                                   ↑ sift_up
+                          heap = [1000, 3000, 5000, 2000]
+
+删除堆顶 1000:
+                          heap = [2000, 3000, 5000]
+                                   ↑ sift_down
+                          heap = [2000, 3000, 5000]  (已有序)
+```
 
 ### 内存管理 — 三种后端
-
 
 | 后端         | 实现                         | 适用场景         |
 | ------------ | ---------------------------- | ---------------- |
@@ -408,18 +725,54 @@ Slave 通过 `repl_offset` 去重，RDMA 路径丢失的数据由 TCP 补上。
 | **jemalloc** | `LD_PRELOAD` 加载            | 生产级，碎片少   |
 | **custom**   | slab(≤1024B) + mmap(>1024B) | 研究学习，可观测 |
 
-**Custom slab 设计**：8 个 class（32/64/128/256/384/512/768/1024 字节），每个 class 维护 free_list。
-大块直接 mmap。通过 `INFO` 暴露完整分配统计。
+#### Custom slab 设计
+
+```
+slab 分配器
+  ├── class[0]:  32 字节, page_count, free_list → chunk → chunk
+  ├── class[1]:  64 字节, ...
+  ├── class[2]: 128 字节
+  ├── class[3]: 256 字节
+  ├── class[4]: 384 字节
+  ├── class[5]: 512 字节
+  ├── class[6]: 768 字节
+  └── class[7]: 1024 字节
+大块 (>1024B): mmap 直接分配
+```
+
+每个 class 从 mmap 申请大页（默认 1MB），切分成等大小 chunk，通过 free_list 管理。
+`INFO` 命令暴露完整的分配统计：alloc/calloc/realloc/free 次数、各 class 使用量、内部碎片率。
+
+源码: `src/memory/`
+
+### TTL 过期时间记录 in AOF
+
+写命令（SET/MSET/DEL/EXPIRE 等）会以原始 RESP 格式写入 AOF 文件：
+```
+*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+*3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n
+```
+恢复时重放 AOF，重新执行 EXPIRE 命令重建 TTL 堆。
 
 ### 自动化快照 (AutoSnapshot)
 
-配置格式 `sec:changes,sec:changes,...`（如 `60:10,300:100`），
-在事件循环中检查：如果距离上次快照≥sec 且脏 key 数≥changes，自动触发 BGSAVE。
+配置格式 `sec:changes,sec:changes,...`（如 `60:10,300:100`），支持多条规则：
+
+```c
+// 事件循环中检查
+if (距离上次快照 ≥ sec && 自上次快照以来的写入次数 ≥ changes)
+    persist_bgsave_start();  // fork 子进程执行 BGSAVE
+```
+
+- 规则通过 `--autosnap "60:1000,300:10"` 或 `SNAPRULE 60 1000` 命令设置
+- `SNAPRULES` 查看当前规则，`SNAPRULECLEAR` 清除所有规则
+- 每个规则独立计时
 
 ### 哨兵模式
 
-基础框架实现，支持 `SENTINEL` 命令和主节点故障检测。
-自动故障转移待完善。
+- 基础框架实现，支持 `SENTINEL` 系列命令
+- 主节点故障检测：心跳超时检测（`sentinel_down_after_ms`）
+- 故障转移待完善，当前主要作为框架研究
 
 ### 快速验证
 

@@ -63,7 +63,7 @@
  *   Phase 3:   监控全量同步进度 (RDMA)
  *   Phase 4:   全量完成后，再存数据到 Master (增量)
  *   Phase 5:   监控增量同步进度 (kprobe+RDMA / eBPF sockmap / TCP)
- *   Phase 5.5: 验证 kprobe+RDMA 捕获是否生效 (capture_initialized, count>0)
+ *   Phase 5.5: 验证 kprobe+RDMA 捕获是否生效 (kprobe_initialized=1, rdma_writes>0)
  *   Phase 6:   验证 Slave 数据一致性
  */
 #include <stdio.h>
@@ -322,25 +322,30 @@ static char *info_field(const char *info_resp, const char *field);
 static int check_capture_active(const char *host, int port) {
     char *info = get_info(host, port);
     if (!info) return -1;
-    char *init = info_field(info, "capture_initialized");
-    char *count = info_field(info, "capture_count");
-    char *fail = info_field(info, "capture_rdma_fail");
+    /* 实际 INFO 字段: kprobe_initialized, kprobe_ringbuf_events,
+     * kprobe_rdma_writes, kprobe_rdma_errors, kprobe_rdma_connected */
+    char *init   = info_field(info, "kprobe_initialized");
+    char *writes = info_field(info, "kprobe_rdma_writes");
+    char *errors = info_field(info, "kprobe_rdma_errors");
+    char *conn   = info_field(info, "kprobe_rdma_connected");
     int ret = -1;
-    if (init && count) {
+    if (init) {
         int initialized = atoi(init);
-        unsigned long long cnt = strtoull(count, NULL, 10);
-        unsigned long long fl = fail ? strtoull(fail, NULL, 10) : 0;
-        if (initialized && cnt > 0 && fl == 0) {
+        unsigned long long wr = writes ? strtoull(writes, NULL, 10) : 0;
+        unsigned long long er = errors ? strtoull(errors, NULL, 10) : 0;
+        int connected = conn ? atoi(conn) : 0;
+        if (initialized && connected && wr > 0 && er == 0) {
             ret = 1;  /* kprobe+RDMA 正常工作 */
-        } else if (initialized) {
-            ret = 0;  /* 已初始化但尚无数据或失败 */
+        } else if (initialized && connected) {
+            ret = 0;  /* 已连接但尚无写入数据 */
         } else {
-            ret = -1; /* 未初始化 */
+            ret = -1; /* 未初始化或未连接 */
         }
     }
     free(init);
-    free(count);
-    free(fail);
+    free(writes);
+    free(errors);
+    free(conn);
     free(info);
     return ret;
 }
@@ -936,31 +941,43 @@ static int run_test(void) {
     int cap_status = check_capture_active(g_opt.master_host, g_opt.master_port);
 
     if (cap_status == 1) {
-        /* 获取详细统计 */
+        /* 获取详细统计（使用实际 INFO 字段名） */
         char *info_cap = get_info(g_opt.master_host, g_opt.master_port);
-        char *cap_cnt = info_cap ? info_field(info_cap, "capture_count") : NULL;
-        char *cap_byt = info_cap ? info_field(info_cap, "capture_bytes") : NULL;
-        char *cap_fd  = info_cap ? info_field(info_cap, "capture_target_fd") : NULL;
+        char *hits   = info_cap ? info_field(info_cap, "kprobe_hits") : NULL;
+        char *events = info_cap ? info_field(info_cap, "kprobe_ringbuf_events") : NULL;
+        char *writes = info_cap ? info_field(info_cap, "kprobe_rdma_writes") : NULL;
+        char *errors = info_cap ? info_field(info_cap, "kprobe_rdma_errors") : NULL;
+        char *conn   = info_cap ? info_field(info_cap, "kprobe_rdma_connected") : NULL;
         printf("  %s✓ kprobe+RDMA 工作正常%s\n", ANSI_GREEN, ANSI_RESET);
-        printf("    capture_target_fd=%s  capture_count=%s  capture_bytes=%s\n",
-               cap_fd ? cap_fd : "?", cap_cnt ? cap_cnt : "?", cap_byt ? cap_byt : "?");
-        free(cap_fd);
-        free(cap_cnt);
-        free(cap_byt);
+        printf("    kprobe_rdma_connected=%s  kprobe_hits=%s  ringbuf_events=%s\n"
+               "    kprobe_rdma_writes=%s  kprobe_rdma_errors=%s\n",
+               conn ? conn : "?", hits ? hits : "?", events ? events : "?",
+               writes ? writes : "?", errors ? errors : "?");
+        free(hits); free(events); free(writes); free(errors); free(conn);
         free(info_cap);
         test_pass("kprobe+RDMA 捕获生效: 增量数据经 BPF ring buffer → RDMA 发送");
     } else if (cap_status == 0) {
-        printf("  %s⚠ kprobe+RDMA 已初始化但尚无捕获数据%s\n", ANSI_YELLOW, ANSI_RESET);
+        char *info_cap = get_info(g_opt.master_host, g_opt.master_port);
+        char *writes = info_cap ? info_field(info_cap, "kprobe_rdma_writes") : NULL;
+        char *errors = info_cap ? info_field(info_cap, "kprobe_rdma_errors") : NULL;
+        printf("  %s⚠ kprobe+RDMA 已连接但尚无 RDMA WRITE 数据%s\n", ANSI_YELLOW, ANSI_RESET);
+        printf("    kprobe_rdma_writes=%s  kprobe_rdma_errors=%s\n",
+               writes ? writes : "?", errors ? errors : "?");
         printf("  可能原因: 增量同步刚完成，统计尚未刷新\n");
+        free(writes); free(errors); free(info_cap);
         test_pass("kprobe+RDMA 已初始化 (可能数据量小未触发捕获)");
     } else {
         char *info_cap = get_info(g_opt.master_host, g_opt.master_port);
         char *tport = info_cap ? info_field(info_cap, "repl_transport_active") : NULL;
+        char *init  = info_cap ? info_field(info_cap, "kprobe_initialized") : NULL;
+        char *conn  = info_cap ? info_field(info_cap, "kprobe_rdma_connected") : NULL;
         printf("  %s✗ kprobe+RDMA 未生效%s\n", ANSI_RED, ANSI_RESET);
         printf("  当前传输层: %s\n", tport ? tport : "?");
-        printf("  可能原因: ebpf_enabled=0, kprobe_events 不可写, 或 eBPF 未加载\n");
+        printf("  kprobe_initialized=%s  kprobe_rdma_connected=%s\n",
+               init ? init : "?", conn ? conn : "?");
+        printf("  可能原因: BPF 未加载（需 root 权限）、RDMA QP 未连接\n");
         printf("  数据已通过 TCP fallback 正常同步\n");
-        free(tport);
+        free(tport); free(init); free(conn);
         free(info_cap);
         test_fail("kprobe+RDMA 未生效，增量同步走 TCP fallback");
     }

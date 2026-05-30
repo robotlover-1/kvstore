@@ -166,21 +166,21 @@ kvstore/
 ### 功能矩阵
 
 
-| 功能                         | 状态      | 说明                                               |
-| ---------------------------- | --------- | -------------------------------------------------- |
-| RESP 协议                    | ✅ 完成   | 完整解析与响应                                     |
-| 全量持久化 (dump)            | ✅ 完成   | 二进制`KVSD` 格式，优先 mmap 恢复                  |
-| 增量持久化 (AOF)             | ✅ 完成   | RESP 命令格式，优先 io_uring 写入                  |
-| SAVE / BGSAVE / BGREWRITEAOF | ✅ 完成   | 支持同步/异步持久化                                |
-| 主从复制                     | ✅ 完成   | FULLRESYNC + partial resync + backlog              |
-| RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用 |
-| eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速       |
-| kprobe+RDMA 增量同步        | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR |
-| TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                              |
-| 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                          |
-| 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                            |
-| 哨兵模式                     | ⚠️ 基础 | 框架已有，自动故障转移待完善                       |
-| 自动快照                     | ✅ 完成   | 按时间+变化数规则触发                              |
+| 功能                         | 状态      | 说明                                                              |
+| ---------------------------- | --------- | ----------------------------------------------------------------- |
+| RESP 协议                    | ✅ 完成   | 完整解析与响应                                                    |
+| 全量持久化 (dump)            | ✅ 完成   | 二进制`KVSD` 格式，优先 mmap 恢复                                 |
+| 增量持久化 (AOF)             | ✅ 完成   | RESP 命令格式，优先 io_uring 写入                                 |
+| SAVE / BGSAVE / BGREWRITEAOF | ✅ 完成   | 支持同步/异步持久化                                               |
+| 主从复制                     | ✅ 完成   | FULLRESYNC + partial resync + backlog                             |
+| RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用                |
+| eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速                      |
+| kprobe+RDMA 增量同步         | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR |
+| TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                                             |
+| 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                                         |
+| 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                                           |
+| 哨兵模式                     | ⚠️ 基础 | 框架已有，自动故障转移待完善                                      |
+| 自动快照                     | ✅ 完成   | 按时间+变化数规则触发                                             |
 
 ---
 
@@ -309,17 +309,117 @@ kvstore/
 
 ## 文档索引
 
-| 文档 | 说明 |
-|------|------|
-| [`docs/tech-roadmap.md`](docs/tech-roadmap.md) | ⭐ **技术路线与实现详解** — 新手必读，覆盖所有模块的架构、流程图、代码 |
-| [`docs/rdma-fullsync-implementation.md`](docs/rdma-fullsync-implementation.md) | RDMA 全量复制的代码级实现分析 |
-| [`docs/plan.md`](docs/plan.md) | 项目演进规划（各阶段目标） |
-| [`docs/iteration-summary.md`](docs/iteration-summary.md) | 迭代总结（含 RDMA 稳定性修复记录） |
-| [`docs/examples/kvs_skiptable.c`](docs/examples/kvs_skiptable.c) | Skiptable 引擎 API 使用示例 |
+
+| 文档                                                                           | 说明                                                                   |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| [`docs/tech-roadmap.md`](docs/tech-roadmap.md)                                 | ⭐**技术路线与实现详解** — 新手必读，覆盖所有模块的架构、流程图、代码 |
+| [`docs/rdma-fullsync-implementation.md`](docs/rdma-fullsync-implementation.md) | RDMA 全量复制的代码级实现分析                                          |
+| [`docs/plan.md`](docs/plan.md)                                                 | 项目演进规划（各阶段目标）                                             |
+| [`docs/iteration-summary.md`](docs/iteration-summary.md)                       | 迭代总结（含 RDMA 稳定性修复记录）                                     |
+| [`docs/examples/kvs_skiptable.c`](docs/examples/kvs_skiptable.c)               | Skiptable 引擎 API 使用示例                                            |
 
 ---
 
-## 测试体系
+## 实现原理
+
+### 存储引擎 — 五种数据结构
+
+kvstore 实现了五种存储引擎，通过**命令前缀**切换：
+
+- **Array** (`SET key val`): 动态数组+线性查找 O(n)。最简单，适合小数据量学习
+- **Hash** (`HSET key val`): 链地址哈希表 + **FNV-1a 非加密哈希** O(1) avg。通用场景
+- **RBTREE** (`RSET key val`): **红黑树** O(log n)，通过左旋/右旋保持平衡
+- **Skiptable** (`XSET key val`): **跳表** O(log n) avg，通过概率层数（50% 概率提升层数）实现平衡
+- **Doc** (`DOCSET key field val`): 文档型 value，字段级别哈希存储
+
+**同时实现红黑树和跳表的原因**：两者都是有序结构但实现思路完全不同——红黑树通过旋转保持平衡，跳表通过概率层数实现平衡。
+
+### 网络模型 — 三种 I/O 模型
+
+
+| 模型         | 底层       | 核心思想                                                                          |
+| ------------ | ---------- | --------------------------------------------------------------------------------- |
+| **Reactor**  | epoll (LT) | 事件驱动，"就绪通知"。`epoll_wait` → 可读/可写回调。单线程事件循环               |
+| **Proactor** | io_uring   | "操作完成通知"。提交 SQE 后立即返回，从 CQ 取结果。避免就绪通知→阻塞读的两步开销 |
+| **NtyCo**    | 协程       | 同步写法，异步执行。`recv` 被 hook 为 `epoll_ctl` → `yield` → `resume`          |
+
+**目的不是为了生产冗余，而是对比学习**——同一套业务逻辑用三种 I/O 模型实现。
+
+### 持久化 — dump + AOF
+
+**全量 Dump (KVSD 二进制格式)**：
+
+```
+[4B key_len][key][4B value_len][value]
+```
+
+- 恢复优先使用 **mmap**（0 次内核→用户拷贝），失败回退到 fread
+- 支持 SAVE（同步）/ BGSAVE（fork 子进程）
+
+**增量 AOF (RESP 命令格式)**：
+
+```
+*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+```
+
+- 写入优先使用 **io_uring** 异步 pwrite，回退到同步 pwrite
+- fsync 策略：`always`（每条命令 fsync）/ `everysec`（每秒 fsync）
+- BGREWRITEAOF：fork 子进程重写 AOF，重写期间新命令通过缓冲区转发
+
+**恢复顺序**：先恢复 dump（全量二进制，快），再重放 AOF（增量 RESP，补全最后状态）。
+
+### 主从复制 — 四种传输路径
+
+采用类 Redis 的 RESP-based 复制协议（REPLSYNC / FULLRESYNC / CONTINUE / REPLACK）。
+
+四种传输层通过 `repl_transport_ops_t` **策略模式**切换：
+
+
+| 传输方式              | 类型      | 数据路径                                                         | 优势                       |
+| --------------------- | --------- | ---------------------------------------------------------------- | -------------------------- |
+| **TCP**               | 传统网络  | 用户态 send → 内核 TCP → 网卡                                  | 通用，无需额外依赖         |
+| **RDMA SEND/RECV**    | 双边 RDMA | `ibv_post_send` → RNIC → Slave CQ                              | 全量零拷贝，高吞吐         |
+| **eBPF sockmap**      | 内核转发  | send →`sk_msg` hook → `bpf_msg_redirect_map`                   | 内核态转发，避免来回拷贝   |
+| **kprobe+RDMA WRITE** | 单边 RDMA | kprobe 拦截 → ringbuf →`ibv_post_send(RDMA_WRITE)` → Slave MR | Slave CPU 零参与，最低延迟 |
+
+**kprobe+RDMA WRITE 原理**：
+
+1. BPF 程序 `kprobe/tcp_sendmsg` 在 send 路径上拦截数据
+2. 通过 `bpf_ringbuf_output` 推送到 BPF ringbuf（1MB）
+3. 用户态 `ring_buffer__poll()` 消费 ringbuf，触发 `kprobe_ringbuf_cb()`
+4. 回调做两次 RDMA WRITE：先写数据到 Slave MR slot，再更新 `producer_head` 通知 Slave
+5. Slave 轮询线程消费 MR 环形缓冲区，送 `parse_resp_stream()` 解析
+
+**TCP 保底**：`repl_transport_kprobe_rdma_send()` 始终返回 -1，数据仍通过 TCP 发送。
+Slave 通过 `repl_offset` 去重，RDMA 路径丢失的数据由 TCP 补上。
+
+### TTL 过期 — 哈希索引 + 最小堆
+
+- **哈希表**提供 O(1) 查找（SET/DEL 时快速找到过期记录）
+- **最小堆**提供 O(1) 取最快要过期的 key（`kvs_active_expire_cycle` 每次从堆顶取）
+- 每次事件循环调用 `kvs_active_expire_cycle(budget=20)`，分散 CPU 开销
+
+### 内存管理 — 三种后端
+
+
+| 后端         | 实现                         | 适用场景         |
+| ------------ | ---------------------------- | ---------------- |
+| **libc**     | `malloc()/free()`            | 开发调试         |
+| **jemalloc** | `LD_PRELOAD` 加载            | 生产级，碎片少   |
+| **custom**   | slab(≤1024B) + mmap(>1024B) | 研究学习，可观测 |
+
+**Custom slab 设计**：8 个 class（32/64/128/256/384/512/768/1024 字节），每个 class 维护 free_list。
+大块直接 mmap。通过 `INFO` 暴露完整分配统计。
+
+### 自动化快照 (AutoSnapshot)
+
+配置格式 `sec:changes,sec:changes,...`（如 `60:10,300:100`），
+在事件循环中检查：如果距离上次快照≥sec 且脏 key 数≥changes，自动触发 BGSAVE。
+
+### 哨兵模式
+
+基础框架实现，支持 `SENTINEL` 命令和主节点故障检测。
+自动故障转移待完善。
 
 ### 快速验证
 
@@ -334,6 +434,7 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 这些 C 测试程序**不依赖 hiredis 等第三方库**，直接通过 TCP socket 构造 RESP 协议报文，可在任何 Linux 环境下编译运行。
 
 编译方式：
+
 ```bash
 # 通过 Makefile
 make test_kvstore              # → ./test_kvstore
@@ -373,6 +474,7 @@ make check-kvstore TEST_PORT=5000
 ```
 
 **验证**: 测试通过后，用 redis-cli 确认数据正确：
+
 ```bash
 redis-cli -p 5000 PING
 +PONG
@@ -393,18 +495,20 @@ redis-cli -p 5000 INFO
 运行: tests/test_repl_5w5w [选项]
 ```
 
-测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF) → 验证 Slave 最终 10w 条数据一致性。
+测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(kprobe+RDMA) → 验证 Slave 最终 10w 条数据一致性。
 
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
 
 ```bash
-# ── 方式一: RDMA 全量 + eBPF 增量（双虚拟机）──
 
-# 终端 1 (VM1, 先启动 Master):
+# ── 方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）──
+
+# 终端 1 (VM1, 先启动 Master, 需 root 加载 BPF):
 sudo ./kvstore --port 5160 --role master \
     --repl-fullsync-transport rdma \
-    --repl-realtime-transport ebpf \
-    --rdma-dev siw0 --rdma-recv-slots 64
+    --repl-realtime-transport kprobe-rdma \
+    --rdma-dev siw0 --rdma-recv-slots 64 \
+    --kprobe-enabled
 
 # 终端 2 (任意机器, Master 启动后运行):
 ./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
@@ -412,15 +516,15 @@ sudo ./kvstore --port 5160 --role master \
     --pre 50000 --post 50000
 
 # 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
-# 先清理旧数据文件，避免上次测试残留影响
 rm -f kvstore.dump kvstore.aof
 sudo ./kvstore --port 5161 --role slave \
     --master-host 192.168.233.128 --master-port 5160 \
     --repl-fullsync-transport rdma \
-    --repl-realtime-transport ebpf
+    --repl-realtime-transport kprobe-rdma \
+    --rdma-dev siw0 \
+    --kprobe-enabled
 
-
-# ── 方式二: TCP 全量（单机，无 RDMA/eBPF）──
+# ── 方式二: TCP 全量 + TCP 增量（单机，无需 root）──
 
 # 终端 1 (先启动 Master):
 ./kvstore --port 5160 --role master \
@@ -432,7 +536,6 @@ sudo ./kvstore --port 5161 --role slave \
     --pre 50000 --post 50000
 
 # 终端 3 (看到提示后再启动 Slave):
-# 先清理旧数据文件，避免上次测试残留影响
 rm -f kvstore.dump kvstore.aof
 ./kvstore --port 5161 --role slave \
     --master-host 127.0.0.1 --master-port 5160 \
@@ -441,42 +544,44 @@ rm -f kvstore.dump kvstore.aof
 
 选项说明：
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--master-host HOST` | 127.0.0.1 | Master 地址 |
-| `--master-port PORT` | 5160 | Master 端口 |
-| `--slave-host HOST` | 127.0.0.1 | Slave 地址 |
-| `--slave-port PORT` | 5161 | Slave 端口 |
-| `--pre COUNT` | 50000 | 全量同步前预存数据量 |
-| `--post COUNT` | 50000 | 全量同步后增量数据量 |
-| `--batch SIZE` | 1000 | 每批写入量 |
-| `--poll MS` | 500 | 轮询间隔毫秒 |
+
+| 选项                 | 默认值    | 说明                 |
+| -------------------- | --------- | -------------------- |
+| `--master-host HOST` | 127.0.0.1 | Master 地址          |
+| `--master-port PORT` | 5160      | Master 端口          |
+| `--slave-host HOST`  | 127.0.0.1 | Slave 地址           |
+| `--slave-port PORT`  | 5161      | Slave 端口           |
+| `--pre COUNT`        | 50000     | 全量同步前预存数据量 |
+| `--post COUNT`       | 50000     | 全量同步后增量数据量 |
+| `--batch SIZE`       | 1000      | 每批写入量           |
+| `--poll MS`          | 500       | 轮询间隔毫秒         |
+
+**kprobe+RDMA 验证**: 测试 Phase 5.5 自动通过 `INFO` 命令检查以下字段确认 kprobe+RDMA 路径是否生效：
+
+
+| INFO 字段               | 预期 | 含义                                    |
+| ----------------------- | ---- | --------------------------------------- |
+| `kprobe_initialized`    | 1    | BPF 程序已加载并 attach 到`tcp_sendmsg` |
+| `kprobe_rdma_connected` | 1    | RDMA QP 已建立连接                      |
+| `kprobe_rdma_writes`    | > 0  | RDMA WRITE 成功次数                     |
+| `kprobe_rdma_errors`    | 0    | RDMA WRITE 错误次数                     |
+
+如果 `kprobe_rdma_writes > 0` 且 `errors == 0`，说明增量数据确实经过了 **kprobe → ringbuf → RDMA WRITE** 路径，而非仅走 TCP 保底。
 
 **验证**: 测试通过后，确认主从数据一致：
+
 ```bash
 # 在 Master 上查询
-redis-cli -p 5160 HGET h:pre:50000
-"hv:50000"
-redis-cli -p 5160 HGET h:post:50000
-"hv_post:50000"
-redis-cli -p 5160 GET a:pre:512
-"av:512"
-redis-cli -p 5160 RGET r:pre:500
-"rv:500"
-redis-cli -p 5160 XGET x:pre:999
-"xv:999"
+redis-cli -p 5160 HGET pre:k:000000
+"v0"
+redis-cli -p 5160 HGET post:k:000000
+"v50000"
 
 # 在 Slave 上查询（结果应与 Master 完全一致）
-redis-cli -p 5161 HGET h:pre:50000
-"hv:50000"
-redis-cli -p 5161 HGET h:post:50000
-"hv_post:50000"
-redis-cli -p 5161 GET a:pre:512
-"av:512"
-redis-cli -p 5161 RGET r:pre:500
-"rv:500"
-redis-cli -p 5161 XGET x:pre:999
-"xv:999"
+redis-cli -p 5161 HGET pre:k:000000
+"v0"
+redis-cli -p 5161 HGET post:k:000000
+"v50000"
 ```
 
 ---
@@ -506,6 +611,7 @@ redis-cli -p 5161 XGET x:pre:999
 ```
 
 **验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
+
 ```bash
 redis-cli -p 5170 SAVE
 +OK
@@ -517,12 +623,13 @@ redis-cli -p 5170 HGET bench:key:50000
 
 选项说明：
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
+
+| 选项          | 默认值    | 说明         |
+| ------------- | --------- | ------------ |
 | `--host HOST` | 127.0.0.1 | kvstore 地址 |
-| `--port PORT` | 5170 | kvstore 端口 |
-| `--count N` | 50000 | 写入数据量 |
-| `--batch N` | 1000 | 每批写入量 |
+| `--port PORT` | 5170      | kvstore 端口 |
+| `--count N`   | 50000     | 写入数据量   |
+| `--batch N`   | 1000      | 每批写入量   |
 
 ---
 
@@ -552,6 +659,7 @@ redis-cli -p 5170 HGET bench:key:50000
 ```
 
 **验证**: AOF 恢复后，确认重启前后的数据一致：
+
 ```bash
 # 重启前验证
 redis-cli -p 5170 HGET bench:key:1
@@ -570,12 +678,13 @@ redis-cli -p 5170 PING
 
 选项说明：
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
+
+| 选项          | 默认值    | 说明         |
+| ------------- | --------- | ------------ |
 | `--host HOST` | 127.0.0.1 | kvstore 地址 |
-| `--port PORT` | 5170 | kvstore 端口 |
-| `--count N` | 50000 | 写入数据量 |
-| `--batch N` | 1000 | 每批写入量 |
+| `--port PORT` | 5170      | kvstore 端口 |
+| `--count N`   | 50000     | 写入数据量   |
+| `--batch N`   | 1000      | 每批写入量   |
 
 ---
 
@@ -603,6 +712,7 @@ redis-cli -p 5170 PING
 ```
 
 **验证**: 测试完成后，用 redis-cli 手动确认：
+
 ```bash
 redis-cli -p 5180 HGET uring:key:1
 "value:1"
@@ -616,12 +726,52 @@ redis-cli -p 5180 INFO | grep mem
 
 选项说明：
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
+
+| 选项          | 默认值    | 说明         |
+| ------------- | --------- | ------------ |
 | `--host HOST` | 127.0.0.1 | kvstore 地址 |
-| `--port PORT` | 5180 | kvstore 端口 |
-| `--count N` | 10000 | 写入数据量 |
-| `--batch N` | 1000 | 每批写入量 |
+| `--port PORT` | 5180      | kvstore 端口 |
+| `--count N`   | 10000     | 写入数据量   |
+| `--batch N`   | 1000      | 每批写入量   |
+
+---
+
+#### `test_mass_ttl` — 大量数据到期测试
+
+```
+编译: make test_mass_ttl             # → tests/test_mass_ttl
+运行: tests/test_mass_ttl [选项]
+```
+
+设置 10000 个 key 并设置 10 秒过期时间，轮询抽样检查 TTL 状态，
+验证 kvstore 在海量 TTL key 下的过期扫描正确性。
+
+> **注意**: 本测试使用 `HSET`/`HEXPIRE`（HASH 引擎），因为默认 ARRAY 引擎
+> (`KVS_ARRAY_SIZE=1024`) 最多只能存 1024 个 key。HASH 引擎使用链地址法，
+> 无此限制。
+
+```bash
+# 终端 1: 启动 kvstore
+./kvstore --port 5200 --role master
+
+# 终端 2: 运行测试
+./test_mass_ttl --port 5200 --count 10000 --ttl 10
+
+# 终端 3: 手动检查 TTL（可选）
+redis-cli -p 5200 HTTL expire:k:000000
+redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
+```
+
+选项说明：
+
+
+| 选项          | 默认值    | 说明         |
+| ------------- | --------- | ------------ |
+| `--host HOST` | 127.0.0.1 | kvstore 地址 |
+| `--port PORT` | 5200      | kvstore 端口 |
+| `--count N`   | 10000     | 设置 key 数  |
+| `--ttl SEC`   | 10        | 过期时间(秒) |
+| `--batch N`   | 1000      | 每批写入量   |
 
 ---
 
@@ -654,6 +804,7 @@ redis-cli -p 5180 INFO | grep mem
 ```
 
 **验证**: 测试完成后，确认各引擎数据恢复正确：
+
 ```bash
 # Hash 引擎（--engine hash）
 redis-cli -p 5190 HGET mmap:key:10000
@@ -676,13 +827,14 @@ redis-cli -p 5190 GET mmap:key:1024
 
 选项说明：
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--host HOST` | 127.0.0.1 | kvstore 地址 |
-| `--port PORT` | 5190 | kvstore 端口 |
-| `--count N` | 10000 | 写入数据量（array 引擎上限 1024） |
-| `--engine NAME` | hash | 引擎: array/hash/rbtree/skiptable |
-| `--batch N` | 1000 | 每批写入量 |
+
+| 选项            | 默认值    | 说明                              |
+| --------------- | --------- | --------------------------------- |
+| `--host HOST`   | 127.0.0.1 | kvstore 地址                      |
+| `--port PORT`   | 5190      | kvstore 端口                      |
+| `--count N`     | 10000     | 写入数据量（array 引擎上限 1024） |
+| `--engine NAME` | hash      | 引擎: array/hash/rbtree/skiptable |
+| `--batch N`     | 1000      | 每批写入量                        |
 
 ---
 
@@ -739,6 +891,7 @@ rm -f kvstore.dump kvstore.aof
 ```
 
 **验证**: 测试通过后，用 redis-cli 确认主从数据完全一致：
+
 ```bash
 # 在 Master 上查询
 redis-cli -p 6380 HGET h:pre:5000
@@ -776,72 +929,75 @@ redis-cli -p 6381 SET should_fail x
 ```
 
 两种验证方法：
+
 - **全量同步验证**: 查询 `h:pre:*`（预存 5000 条）— 确认 Slave 有全部预存数据
 - **增量同步验证**: 查询 `h:post:*`（全量完成后写入 1000 条）— 确认增量数据也同步到了 Slave
 - **跨引擎验证**: 分别用 `GET`/`HGET`/`RGET`/`XGET` 确认 Array/Hash/RBTREE/Skiptable 四个引擎的数据都一致
 
 选项说明：
 
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--master-host HOST` | 127.0.0.1 | Master 地址 |
-| `--slave-host HOST` | 127.0.0.1 | Slave 地址 |
-| `--master-port PORT` | 6379 | Master 端口 |
-| `--slave-port PORT` | 6380 | Slave 端口 |
-| `--count N` | 5000 | 预存/增量数据量 |
-| `--batch N` | 500 | 每批写入量 |
-| `--poll MS` | 500 | 轮询间隔毫秒 |
+
+| 选项                 | 默认值    | 说明            |
+| -------------------- | --------- | --------------- |
+| `--master-host HOST` | 127.0.0.1 | Master 地址     |
+| `--slave-host HOST`  | 127.0.0.1 | Slave 地址      |
+| `--master-port PORT` | 6379      | Master 端口     |
+| `--slave-port PORT`  | 6380      | Slave 端口      |
+| `--count N`          | 5000      | 预存/增量数据量 |
+| `--batch N`          | 500       | 每批写入量      |
+| `--poll MS`          | 500       | 轮询间隔毫秒    |
 
 ---
 
 #### 辅助文件
 
-| 文件 | 说明 |
-|------|------|
-| **testcase.c** | 测试框架工具库，提供 `send_msg()` / `recv_msg()` / `testcase()` / `connect_tcpserver()` 等 RESP 协议测试辅助函数，作为其他 C 测试的依赖引用 |
-| **test.c** | （空文件，预留） |
+
+| 文件           | 说明                                                                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **testcase.c** | 测试框架工具库，提供`send_msg()` / `recv_msg()` / `testcase()` / `connect_tcpserver()` 等 RESP 协议测试辅助函数，作为其他 C 测试的依赖引用 |
+| **test.c**     | （空文件，预留）                                                                                                                           |
 
 ### 全部测试目标
 
 
-| 命令                               | 数据量        | 说明                                                          | 产物路径                            |
-| ---------------------------------- | ------------- | ------------------------------------------------------------- | ----------------------------------- |
-| `make check-all`                   | 全部          | **一键运行全部测试**（自动探测 RDMA/eBPF 环境，跳过不可用项） | —                                  |
-| `make check-all-quick`             | 小+1w         | 快速全套（跳过 RDMA/eBPF/复制/10w demo）                      | —                                  |
-| `make check`                       | 小            | 基础功能全套                                                  | —                                  |
-| `make check-resp`                  | —            | RESP 协议测试                                                 | —                                  |
-| `make check-ttl`                   | —            | TTL 过期测试                                                  | —                                  |
-| `make check-persist`               | —            | 持久化基本测试                                                | —                                  |
-| `make check-doc`                   | —            | 文档对象测试                                                  | —                                  |
-| `make check-kvstore`               | 小            | C 客户端综合测试（`tests/test_kvstore.c`）                    | —                                  |
-| `make check-bulk-1w`               | **1w**        | 批量 1w 级全套回归（HSET/HGET/TTL/SAVE+恢复/DOC）             | —                                  |
-| `make check-10w`                   | **1w~**       | 10w 级大容量功能测试                                          | —                                  |
-| `make check-mass-ttl`              | 1w            | 海量 TTL 压测                                                 | —                                  |
-| `make check-uring-persist`         | 1w            | io_uring 持久化验证（Python 脚本）                            | `artifacts/persist/uring-bench/`    |
-| `make check-uring-persist-c`       | 1w            | io_uring 持久化验证（C 程序，自动管理进程）                   | `artifacts/persist/uring-bench/`    |
-| `make check-mmap-recover`          | 1w            | mmap 恢复验证（Python 脚本）                                  | `artifacts/persist/mmap-recover/`   |
-| `make check-mmap-recover-c`        | 1w            | mmap 恢复验证（C 程序，支持指定引擎，自动管理进程）           | `artifacts/persist/mmap-recover/`   |
-| `make check-repl`                  | 5k            | 主从复制基本验证（shell 脚本）                                | —                                  |
-| `make check-repl-basic`            | 5k            | 主从复制基本验证（C 程序，自动管理 Master/Slave 进程）        | —                                  |
-| `make test_repl_5w5w`<br>（仅编译） | **5w+5w**     | 5w+5w 主从同步 C 测试（`tests/test_repl_5w5w.c`）<br>编译后手动运行：`tests/test_repl_5w5w --master-host H ...` | —                                  |
-| `make check-repl-metrics`          | 5w+5k         | 复制指标基线                                                  | `artifacts/repl/metrics/`           |
-| `make check-repl-profile`          | 5w+5k         | 复制 profiling                                                | `artifacts/repl/profile/`           |
-| `make check-repl-ebpf`             | 5w+5k         | eBPF 实时同步 profiling                                       | `artifacts/repl/profile/`           |
-| `make check-repl-ebpf-env`         | —            | eBPF 环境探测                                                 | —                                  |
-| `make check-repl-ebpf-sync`        | 64            | eBPF sockmap 同步验证                                         | `artifacts/repl/ebpf-sync/`         |
-| `make check-repl-ebpf-sync-required` | 64          | eBPF 同步验证（要求 eBPF 可用）                               | `artifacts/repl/ebpf-sync/`         |
-| `make check-repl-ebpf-redirect`    | 64            | eBPF ingress 重定向验证                                       | `artifacts/repl/ebpf-sync/`         |
-| `make check-repl-rdma-unsupported` | 小            | RDMA 不可用时的优雅降级测试                                   | —                                  |
-| `make check-repl-rdma-smoke`       | 小            | RDMA 冒烟测试                                                 | `artifacts/repl/rdma-smoke/`        |
-| `make check-repl-rdma-stress`      | 中            | RDMA 压力测试（重启轮次 + 尾写验证）                          | `artifacts/repl/rdma-stress/`       |
-| `make check-repl-rdma-soak`        | 中            | RDMA 长时浸泡（可配小时级）                                   | `artifacts/repl/rdma-stress/`       |
-| `make check-repl-rdma-long-soak`   | 中            | RDMA 超长浸泡（默认 1800s）                                   | `artifacts/repl/rdma-stress/`       |
-| `make check-repl-rdma-fallback`    | 小            | RDMA 强制降级到 TCP 验证                                      | —                                  |
-| `make check-demo-full-dump`        | **10w**       | 全量持久化演示                                                | `artifacts/persist/full-dump-demo/` |
-| `make check-demo-incr-aof`         | **10w**       | 增量持久化演示                                                | `artifacts/persist/incr-aof-demo/`  |
-| `make check-demo-repl-sync`        | **5w+5w=10w** | 主从同步演示（可配 RDMA+eBPF 混合传输）                       | `artifacts/repl/sync-demo/`         |
-| `make check-rdma-standalone-probe` | —            | RDMA 环境探测                                                 | `artifacts/rdma/probe/`             |
-| `make check-rdma-pingpong-smoke`   | —            | RDMA pingpong 测试                                            | `artifacts/rdma/pingpong/`          |
+| 命令                                 | 数据量        | 说明                                                                                                            | 产物路径                            |
+| ------------------------------------ | ------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `make check-all`                     | 全部          | **一键运行全部测试**（自动探测 RDMA/eBPF 环境，跳过不可用项）                                                   | —                                  |
+| `make check-all-quick`               | 小+1w         | 快速全套（跳过 RDMA/eBPF/复制/10w demo）                                                                        | —                                  |
+| `make check`                         | 小            | 基础功能全套                                                                                                    | —                                  |
+| `make check-resp`                    | —            | RESP 协议测试                                                                                                   | —                                  |
+| `make check-ttl`                     | —            | TTL 过期测试                                                                                                    | —                                  |
+| `make check-persist`                 | —            | 持久化基本测试                                                                                                  | —                                  |
+| `make check-doc`                     | —            | 文档对象测试                                                                                                    | —                                  |
+| `make check-kvstore`                 | 小            | C 客户端综合测试（`tests/test_kvstore.c`）                                                                      | —                                  |
+| `make check-bulk-1w`                 | **1w**        | 批量 1w 级全套回归（HSET/HGET/TTL/SAVE+恢复/DOC）                                                               | —                                  |
+| `make check-10w`                     | **1w~**       | 10w 级大容量功能测试                                                                                            | —                                  |
+| `make check-mass-ttl`                | 1w            | 海量 TTL 压测                                                                                                   | —                                  |
+| `make check-uring-persist`           | 1w            | io_uring 持久化验证（Python 脚本）                                                                              | `artifacts/persist/uring-bench/`    |
+| `make check-uring-persist-c`         | 1w            | io_uring 持久化验证（C 程序，自动管理进程）                                                                     | `artifacts/persist/uring-bench/`    |
+| `make check-mmap-recover`            | 1w            | mmap 恢复验证（Python 脚本）                                                                                    | `artifacts/persist/mmap-recover/`   |
+| `make check-mmap-recover-c`          | 1w            | mmap 恢复验证（C 程序，支持指定引擎，自动管理进程）                                                             | `artifacts/persist/mmap-recover/`   |
+| `make check-repl`                    | 5k            | 主从复制基本验证（shell 脚本）                                                                                  | —                                  |
+| `make check-repl-basic`              | 5k            | 主从复制基本验证（C 程序，自动管理 Master/Slave 进程）                                                          | —                                  |
+| `make test_repl_5w5w`<br>（仅编译）  | **5w+5w**     | 5w+5w 主从同步 C 测试（`tests/test_repl_5w5w.c`）<br>编译后手动运行：`tests/test_repl_5w5w --master-host H ...` | —                                  |
+| `make check-repl-metrics`            | 5w+5k         | 复制指标基线                                                                                                    | `artifacts/repl/metrics/`           |
+| `make check-repl-profile`            | 5w+5k         | 复制 profiling                                                                                                  | `artifacts/repl/profile/`           |
+| `make check-repl-ebpf`               | 5w+5k         | eBPF 实时同步 profiling                                                                                         | `artifacts/repl/profile/`           |
+| `make check-repl-ebpf-env`           | —            | eBPF 环境探测                                                                                                   | —                                  |
+| `make check-repl-ebpf-sync`          | 64            | eBPF sockmap 同步验证                                                                                           | `artifacts/repl/ebpf-sync/`         |
+| `make check-repl-ebpf-sync-required` | 64            | eBPF 同步验证（要求 eBPF 可用）                                                                                 | `artifacts/repl/ebpf-sync/`         |
+| `make check-repl-ebpf-redirect`      | 64            | eBPF ingress 重定向验证                                                                                         | `artifacts/repl/ebpf-sync/`         |
+| `make check-repl-rdma-unsupported`   | 小            | RDMA 不可用时的优雅降级测试                                                                                     | —                                  |
+| `make check-repl-rdma-smoke`         | 小            | RDMA 冒烟测试                                                                                                   | `artifacts/repl/rdma-smoke/`        |
+| `make check-repl-rdma-stress`        | 中            | RDMA 压力测试（重启轮次 + 尾写验证）                                                                            | `artifacts/repl/rdma-stress/`       |
+| `make check-repl-rdma-soak`          | 中            | RDMA 长时浸泡（可配小时级）                                                                                     | `artifacts/repl/rdma-stress/`       |
+| `make check-repl-rdma-long-soak`     | 中            | RDMA 超长浸泡（默认 1800s）                                                                                     | `artifacts/repl/rdma-stress/`       |
+| `make check-repl-rdma-fallback`      | 小            | RDMA 强制降级到 TCP 验证                                                                                        | —                                  |
+| `make check-demo-full-dump`          | **10w**       | 全量持久化演示                                                                                                  | `artifacts/persist/full-dump-demo/` |
+| `make check-demo-incr-aof`           | **10w**       | 增量持久化演示                                                                                                  | `artifacts/persist/incr-aof-demo/`  |
+| `make check-demo-repl-sync`          | **5w+5w=10w** | 主从同步演示（可配 RDMA+eBPF 混合传输）                                                                         | `artifacts/repl/sync-demo/`         |
+| `make check-rdma-standalone-probe`   | —            | RDMA 环境探测                                                                                                   | `artifacts/rdma/probe/`             |
+| `make check-rdma-pingpong-smoke`     | —            | RDMA pingpong 测试                                                                                              | `artifacts/rdma/pingpong/`          |
 
 > **注意**：若之前使用 `sudo make check-demo-repl-sync` 运行过，`artifacts/repl/sync-demo/` 下的文件属主为 root，再次运行时需先 `sudo rm -rf artifacts/repl/sync-demo` 清理，否则会报 `PermissionError`。
 
@@ -849,16 +1005,18 @@ redis-cli -p 6381 SET should_fail x
 
 以下脚本位于 `tools/` 目录下，可直接运行，未绑定 Makefile 目标：
 
-| 脚本 | 位置 | 说明 |
-|------|------|------|
-| `test_master_slave_multi_engine_nc.sh` | `tools/tests/` | 多引擎主从复制 nc 测试（手动指定 host/port） |
-| `test_kv.sh` | `tools/tests/` | kvstore 基本功能测试 |
-| `run_save_bgsave_perf_test.sh` | `tools/persist/` | SAVE/BGSAVE 性能测试 |
-| `repl_ebpf_session.py` | `tools/repl/` | eBPF 复制会话管理（交互式调试） |
-| `run_repl_rdma_unsupported.py` | `tools/repl/` | RDMA 不可用场景模拟测试 |
-| `repl_ebpf_daemon.c` | `tools/ebpf/` | eBPF 独立守护进程（需编译） |
+
+| 脚本                                   | 位置             | 说明                                         |
+| -------------------------------------- | ---------------- | -------------------------------------------- |
+| `test_master_slave_multi_engine_nc.sh` | `tools/tests/`   | 多引擎主从复制 nc 测试（手动指定 host/port） |
+| `test_kv.sh`                           | `tools/tests/`   | kvstore 基本功能测试                         |
+| `run_save_bgsave_perf_test.sh`         | `tools/persist/` | SAVE/BGSAVE 性能测试                         |
+| `repl_ebpf_session.py`                 | `tools/repl/`    | eBPF 复制会话管理（交互式调试）              |
+| `run_repl_rdma_unsupported.py`         | `tools/repl/`    | RDMA 不可用场景模拟测试                      |
+| `repl_ebpf_daemon.c`                   | `tools/ebpf/`    | eBPF 独立守护进程（需编译）                  |
 
 示例：
+
 ```bash
 # 多引擎主从测试
 bash tools/tests/test_master_slave_multi_engine_nc.sh 127.0.0.1 5000
@@ -929,23 +1087,23 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 所有测试脚本的输出统一存放在 `artifacts/` 目录下，按测试类型分子目录。
 
 
-| 测试场景            | 产物目录                            | 典型内容                |
-| ------------------- | ----------------------------------- | ----------------------- |
-| 全量持久化 10w 演示 | `artifacts/persist/full-dump-demo/` | dump 文件、验证日志     |
-| 增量持久化 10w 演示 | `artifacts/persist/incr-aof-demo/`  | AOF 文件、验证日志      |
-| io_uring 持久化验证 | `artifacts/persist/uring-bench/`    | 耗时报告、恢复日志      |
-| mmap 恢复验证       | `artifacts/persist/mmap-recover/`   | 恢复时间报告            |
-| 复制指标基线        | `artifacts/repl/metrics/`           | INFO 快照、CPU/RSS 摘要 |
-| 复制 profiling      | `artifacts/repl/profile/`           | perf 数据、调用栈       |
-| 主从同步 10w 演示   | `artifacts/repl/sync-demo/`         | 同步一致性报告          |
-| eBPF 同步测试          | `artifacts/repl/ebpf-sync/`           | eBPF 日志、验证报告           |
-| eBPF 同步测试(ingress) | `artifacts/repl/ebpf-sync/`           | ingress 重定向验证报告        |
-| RDMA 冒烟测试          | `artifacts/repl/rdma-smoke/`          | RDMA 全量同步状态报告         |
-| RDMA 压力/浸泡测试     | `artifacts/repl/rdma-stress/`         | 状态报告、fullsync 日志、重启日志 |
-| RDMA 手动测试          | `artifacts/repl/rdma-manual/`         | 手动 RDMA 测试日志            |
-| RDMA 环境探测          | `artifacts/rdma/probe/`               | 环境可用性报告                |
-| RDMA pingpong       | `artifacts/rdma/pingpong/`          | 延迟/吞吐报告           |
-| 基准测试            | `artifacts/bench/`                  | CSV 数据、图表          |
+| 测试场景               | 产物目录                            | 典型内容                          |
+| ---------------------- | ----------------------------------- | --------------------------------- |
+| 全量持久化 10w 演示    | `artifacts/persist/full-dump-demo/` | dump 文件、验证日志               |
+| 增量持久化 10w 演示    | `artifacts/persist/incr-aof-demo/`  | AOF 文件、验证日志                |
+| io_uring 持久化验证    | `artifacts/persist/uring-bench/`    | 耗时报告、恢复日志                |
+| mmap 恢复验证          | `artifacts/persist/mmap-recover/`   | 恢复时间报告                      |
+| 复制指标基线           | `artifacts/repl/metrics/`           | INFO 快照、CPU/RSS 摘要           |
+| 复制 profiling         | `artifacts/repl/profile/`           | perf 数据、调用栈                 |
+| 主从同步 10w 演示      | `artifacts/repl/sync-demo/`         | 同步一致性报告                    |
+| eBPF 同步测试          | `artifacts/repl/ebpf-sync/`         | eBPF 日志、验证报告               |
+| eBPF 同步测试(ingress) | `artifacts/repl/ebpf-sync/`         | ingress 重定向验证报告            |
+| RDMA 冒烟测试          | `artifacts/repl/rdma-smoke/`        | RDMA 全量同步状态报告             |
+| RDMA 压力/浸泡测试     | `artifacts/repl/rdma-stress/`       | 状态报告、fullsync 日志、重启日志 |
+| RDMA 手动测试          | `artifacts/repl/rdma-manual/`       | 手动 RDMA 测试日志                |
+| RDMA 环境探测          | `artifacts/rdma/probe/`             | 环境可用性报告                    |
+| RDMA pingpong          | `artifacts/rdma/pingpong/`          | 延迟/吞吐报告                     |
+| 基准测试               | `artifacts/bench/`                  | CSV 数据、图表                    |
 
 > 此外，`testdata/` 存放手工编写的静态测试数据（样例 AOF、dump 文件、测试用配置文件），不会被脚本覆盖。
 
@@ -954,22 +1112,23 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 ## 性能基准
 
 > **测试环境**：Intel Core Ultra 7 155H (4 vCPU) / 7.7GiB RAM / Ubuntu 20.04.6 / Linux 5.15.0-139 / KVM 虚拟机
-> 
+>
 > **测试方法**：`python3 tools/bench/bench_mem_backend.py`，每轮 200 次预热，`HSET` 命令写入
 
 ### 基准数据 (HSET, 50k~100k ops)
 
+
 | 后端     | ops    | value 大小 | 耗时(s) | QPS  | VmRSS(KB) |
-|----------|--------|-----------|---------|------|-----------|
-| libc     | 50000  | 128B      | 25.66   | 1949 | 16716     |
-| jemalloc | 50000  | 128B      | 25.27   | 1978 | 20208     |
-| custom   | 50000  | 128B      | 25.90   | 1931 | 26080     |
-| libc     | 50000  | 4KB       | 29.07   | 1720 | 211332    |
-| jemalloc | 50000  | 4KB       | 28.30   | 1767 | 264920    |
-| custom   | 50000  | 4KB       | 29.67   | 1685 | 413856    |
-| libc     | 100000 | 128B      | 50.95   | 1963 | 28416     |
-| jemalloc | 100000 | 128B      | 50.79   | 1969 | 32524     |
-| custom   | 100000 | 128B      | 51.78   | 1931 | 46792     |
+| -------- | ------ | ---------- | ------- | ---- | --------- |
+| libc     | 50000  | 128B       | 25.66   | 1949 | 16716     |
+| jemalloc | 50000  | 128B       | 25.27   | 1978 | 20208     |
+| custom   | 50000  | 128B       | 25.90   | 1931 | 26080     |
+| libc     | 50000  | 4KB        | 29.07   | 1720 | 211332    |
+| jemalloc | 50000  | 4KB        | 28.30   | 1767 | 264920    |
+| custom   | 50000  | 4KB        | 29.67   | 1685 | 413856    |
+| libc     | 100000 | 128B       | 50.95   | 1963 | 28416     |
+| jemalloc | 100000 | 128B       | 50.79   | 1969 | 32524     |
+| custom   | 100000 | 128B       | 51.78   | 1931 | 46792     |
 
 > 完整数据：`benchmarks/data/bench_fresh.csv`
 

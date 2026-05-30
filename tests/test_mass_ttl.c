@@ -4,6 +4,9 @@
  * 设置 10000 个 key 并设置 10 秒过期时间，然后进入交互模式，
  * 你可以在另一个终端手动查看 TTL。测试程序会轮询抽样 key 的 TTL 状态。
  *
+ * 注意: 本测试使用 HSET/HEXPIRE（HASH 引擎），因为默认 ARRAY 引擎
+ *       最多只能存 1024 个 key。HASH 引擎使用链地址法，无此限制。
+ *
  * 编译:
  *   make test_mass_ttl
  *
@@ -15,10 +18,10 @@
  *   ./test_mass_ttl [选项]
  *
  *   # 终端 3: 手动检查 TTL（在本测试等待期间）
- *   redis-cli -p 5200 TTL expire:k:000000
- *   redis-cli -p 5200 TTL expire:k:005000
- *   redis-cli -p 5200 TTL expire:k:009999
- *   redis-cli -p 5200 GET  expire:k:000000   # 10s 后应返回 (nil)
+ *   redis-cli -p 5200 HTTL expire:k:000000
+ *   redis-cli -p 5200 HTTL expire:k:005000
+ *   redis-cli -p 5200 HTTL expire:k:009999
+ *   redis-cli -p 5200 HGET  expire:k:000000   # 10s 后应返回 (nil)
  *
  * 选项:
  *   --host HOST       kvstore 地址 (默认 127.0.0.1)
@@ -229,15 +232,15 @@ int main(int argc, char **argv) {
             char key[MAX_KEY_LEN], val[MAX_KEY_LEN];
             snprintf(key, sizeof(key), "expire:k:%06d", i);
             snprintf(val, sizeof(val), "value:%06d", i);
-            char *r = cmd(fd, "SET", key, val, NULL);
+            char *r = cmd(fd, "HSET", key, val, NULL);
             if (!r || strcmp(r, "+OK\r\n") != 0) {
-                fprintf(stderr, "SET 失败 at %d: %s\n", i, r ? r : "(无响应)");
+                fprintf(stderr, "HSET 失败 at %d: %s\n", i, r ? r : "(无响应)");
                 free(r); close(fd); return 1;
             }
             free(r);
-            r = cmd(fd, "EXPIRE", key, ttl_str, NULL);
-            if (!r || strcmp(r, ":1\r\n") != 0) {
-                fprintf(stderr, "EXPIRE 失败 at %d: %s\n", i, r ? r : "(无响应)");
+            r = cmd(fd, "HEXPIRE", key, ttl_str, NULL);
+            if (!r || (strcmp(r, ":1\r\n") != 0 && strcmp(r, "+OK\r\n") != 0)) {
+                fprintf(stderr, "HEXPIRE 失败 at %d: %s", i, r ? r : "(无响应)\n");
                 free(r); close(fd); return 1;
             }
             free(r);
@@ -276,10 +279,10 @@ int main(int argc, char **argv) {
     printf("================================================\n" ANSI_RESET);
     printf("\n");
     printf("  在另一个终端手动检查 TTL:\n\n");
-    printf("    redis-cli -p %d TTL expire:k:000000\n", g_opt.port);
-    printf("    redis-cli -p %d TTL expire:k:005000\n", g_opt.port);
-    printf("    redis-cli -p %d TTL expire:k:009999\n", g_opt.port);
-    printf("    redis-cli -p %d GET  expire:k:000000\n", g_opt.port);
+    printf("    redis-cli -p %d HTTL expire:k:000000\n", g_opt.port);
+    printf("    redis-cli -p %d HTTL expire:k:005000\n", g_opt.port);
+    printf("    redis-cli -p %d HTTL expire:k:009999\n", g_opt.port);
+    printf("    redis-cli -p %d HGET  expire:k:000000\n", g_opt.port);
     printf("\n");
     printf("  TTL 返回值:\n");
     printf("    :N   = 还有 N 秒\n");
@@ -307,7 +310,7 @@ int main(int argc, char **argv) {
             if (ttl_samples[si] >= g_opt.count) continue;
             char key[MAX_KEY_LEN];
             snprintf(key, sizeof(key), "expire:k:%06d", ttl_samples[si]);
-            char *r = cmd(fd, "TTL", key, NULL);
+            char *r = cmd(fd, "HTTL", key, NULL);
             if (r && r[0] == ':') {
                 int ttl_val = atoi(r + 1);
                 if (ttl_val == -2)
@@ -328,7 +331,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < g_opt.count; i++) {
                 char key[MAX_KEY_LEN];
                 snprintf(key, sizeof(key), "expire:k:%06d", i);
-                char *r = cmd(fd, "EXISTS", key, NULL);
+                char *r = cmd(fd, "HEXIST", key, NULL);
                 if (r && r[0] == ':' && atoi(r + 1) == 1) exists++;
                 free(r);
             }

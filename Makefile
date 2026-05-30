@@ -180,6 +180,13 @@ $(TEST_MMAP_RECOVER_BIN): $(TEST_MMAP_RECOVER_SRC)
 $(TEST_REPL_BASIC_BIN): $(TEST_REPL_BASIC_SRC)
 	$(CC) $(CFLAGS) -o $@ $<
 
+# ---- 大量 TTL 测试 ----
+TEST_MASS_TTL_SRC=tests/test_mass_ttl.c
+TEST_MASS_TTL_BIN=test_mass_ttl
+
+$(TEST_MASS_TTL_BIN): $(TEST_MASS_TTL_SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
 check-uring-persist-c: $(TEST_URING_PERSIST_BIN)
 	./$(TEST_URING_PERSIST_BIN) --port $(URING_PERSIST_PORT) --count $(URING_PERSIST_COUNT) --appendfsync $(URING_PERSIST_APPEND_FSYNC)
 
@@ -190,7 +197,7 @@ check-repl-basic: $(TEST_REPL_BASIC_BIN)
 	./$(TEST_REPL_BASIC_BIN) --master-port $(REPL_MASTER_PORT) --slave-port $(REPL_SLAVE_PORT) --count $(PRELOAD_COUNT) --repl-transport $(REPL_TRANSPORT)
 
 clean:
-	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN) $(TEST_URING_PERSIST_BIN) $(TEST_MMAP_RECOVER_BIN) $(TEST_REPL_BASIC_BIN)
+	rm -rf build kvstore kvstore.dump kvstore.aof $(TEST_KVSTORE_BIN) $(TEST_REPL_5W5W_BIN) $(EBPF_DAEMON_BIN) $(TEST_PERSIST_DUMP_BIN) $(TEST_PERSIST_AOF_BIN) $(TEST_URING_PERSIST_BIN) $(TEST_MMAP_RECOVER_BIN) $(TEST_REPL_BASIC_BIN) $(TEST_MASS_TTL_BIN)
 	rm -f kvstore-master.dump kvstore-master.aof kvstore-slave.dump kvstore-slave.aof
 
 check-resp:

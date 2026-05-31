@@ -232,13 +232,13 @@ retry:
                     g_wr_in_flight--;
                 }
             } else {
-                fprintf(stderr, "kprobe rdma: [DBG] wr_slot_acquire CQ error status=%d wr_id=0x%lx opcode=%d\n",
+                fprintf(stderr, "kprobe rdma: wr_slot_acquire CQ error status=%d wr_id=0x%lx opcode=%d\n",
                     wc.status, (unsigned long)wc.wr_id, wc.opcode);
             }
         }
-        if (polled > 0)
-            fprintf(stderr, "kprobe rdma: [DBG] wr_slot_acquire polled %d completions, in_flight now %d\n",
-                polled, g_wr_in_flight);
+        if (polled > 0) {
+            /* 可在此处添加周期性统计日志 */
+        }
     }
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
     if (timeout_ms > 0 && kvs_now_ms() >= deadline) return -1;
@@ -271,9 +271,7 @@ static int wr_submit_data(int slot, size_t len) {
     pthread_mutex_lock(&g_kprobe_rdma_lock);
     int rc = ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
-    fprintf(stderr, "kprobe rdma: [DBG] wr_submit_data slot=%d len=%zu remote_addr=0x%lx rkey=%u rc=%d\n",
-        slot, len, (unsigned long)wr.wr.rdma.remote_addr, wr.wr.rdma.rkey, rc);
-    if (rc != 0) fprintf(stderr, "kprobe rdma: [DBG] wr_submit_data FAILED rc=%d errno=%d (%s)\n",
+    if (rc != 0) fprintf(stderr, "kprobe rdma: wr_submit_data FAILED rc=%d errno=%d (%s)\n",
         rc, errno, strerror(errno));
     return rc;
 }
@@ -303,8 +301,8 @@ static int wr_submit_head(int slot) {
     pthread_mutex_lock(&g_kprobe_rdma_lock);
     int rc = ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
-    fprintf(stderr, "kprobe rdma: [DBG] wr_submit_head slot=%d remote_addr=0x%lx rkey=%u rc=%d\n",
-        slot, (unsigned long)wr.wr.rdma.remote_addr, wr.wr.rdma.rkey, rc);
+    if (rc != 0) fprintf(stderr, "kprobe rdma: wr_submit_head FAILED rc=%d errno=%d (%s)\n",
+        rc, errno, strerror(errno));
     return rc;
 }
 
@@ -330,7 +328,7 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
     /* MR 未就绪时跳过 RDMA WRITE（KPROBEMR 还没交换完） */
     if (g_slave_mr.rkey == 0 || !g_rdma_kprobe.connected) {
         if (g_total_events % 1000 == 1)
-            fprintf(stderr, "kprobe rdma: [DBG] MR not ready, skip (events=%llu)\n",
+            fprintf(stderr, "kprobe rdma: MR not ready, skip (events=%llu)\n",
                 g_total_events);
         return 0;
     }
@@ -390,11 +388,9 @@ static void *kprobe_rdma_forward_thread(void *arg) {
                 KVS_KPROBE_RINGBUF_POLL_MS);
             if (err > 0) {
                 poll_count += err;
-                fprintf(stderr, "kprobe rdma: [DBG] ringbuf poll got %d events (total=%d)\n",
-                    err, poll_count);
             } else if (err < 0) {
                 if (err != -EAGAIN)
-                    fprintf(stderr, "kprobe rdma: [DBG] ringbuf poll err=%d\n", err);
+                    fprintf(stderr, "kprobe rdma: ringbuf poll err=%d\n", err);
                 usleep(1000);
             }
         } else {
@@ -433,17 +429,14 @@ static void *kprobe_rdma_slave_poll(void *arg) {
 
         if (tail == head) {
             empty_loops++;
-            if (empty_loops % 1000 == 1)
-                fprintf(stderr, "kprobe rdma: [DBG] slave poll empty (head=tail=%lu)\n",
+            if (empty_loops == 1)
+                fprintf(stderr, "kprobe rdma: slave poll idle (head=tail=%lu)\n",
                     (unsigned long)head);
             usleep(KVS_KPROBE_RDMA_POLL_US);
             continue;
         }
 
         empty_loops = 0;
-        fprintf(stderr, "kprobe rdma: [DBG] slave poll data head=%lu tail=%lu diff=%lu\n",
-            (unsigned long)head, (unsigned long)tail,
-            (unsigned long)(head - tail));
 
         /* 消费所有未处理槽位 */
         while (tail != head) {
@@ -453,7 +446,7 @@ static void *kprobe_rdma_slave_poll(void *arg) {
             uint32_t slot_len;
             memcpy(&slot_len, rb->slots + off, 4);
             if (slot_len == 0 || slot_len > KPROBE_RDMA_SLOT_CAPACITY - 4) {
-                fprintf(stderr, "kprobe rdma: [DBG] slave poll bad slot_len=%u at idx=%zu\n",
+                fprintf(stderr, "kprobe rdma: slave poll bad slot_len=%u at idx=%zu\n",
                     slot_len, idx);
                 tail++;
                 continue;
@@ -466,8 +459,6 @@ static void *kprobe_rdma_slave_poll(void *arg) {
                 stream_len = 0;
             memcpy(stream_buf + stream_len, slot_data, slot_len);
             stream_len += slot_len;
-            fprintf(stderr, "kprobe rdma: [DBG] slave poll consuming slot_len=%u stream_len=%zu\n",
-                slot_len, stream_len);
             parse_resp_stream(NULL, stream_buf, &stream_len, 1);
 
             tail++;
@@ -624,7 +615,7 @@ static int kprobe_rdma_qp_connect(const char *host, int port) {
 int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
     if (!host || port <= 0) return -1;
 
-    fprintf(stderr, "kprobe rdma: [DBG] connect_mr begin host=%s port=%d tcp_fd=%d\n",
+    fprintf(stderr, "kprobe rdma: connect_mr begin host=%s port=%d tcp_fd=%d\n",
         host, port, tcp_fd);
 
     /* 1. 建立 RDMA QP 到 Slave listener */
@@ -651,7 +642,7 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
 
     const char req[] = "KPROBEMR\r\n";
     ssize_t sent = send(tcp_fd, req, strlen(req), MSG_NOSIGNAL);
-    fprintf(stderr, "kprobe rdma: [DBG] KPROBEMR sent to slave via tcp_fd=%d, "
+    fprintf(stderr, "kprobe rdma: KPROBEMR sent to slave via tcp_fd=%d, "
         "sent=%zd/%zu (errno=%d)\n", tcp_fd, sent, strlen(req), errno);
 
     close(tcp_fd);

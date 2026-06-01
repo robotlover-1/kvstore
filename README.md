@@ -494,6 +494,29 @@ cmd[0] == 'X' → Skiptable 引擎
 
 `handle_parsed_command()` 根据前缀路由，`strip_prefix()` 去掉前缀后执行统一的操作名（如 `HSET` → HASH 引擎执行 `SET`）。
 
+#### 测试验证
+
+```mermaid
+graph LR
+    subgraph 测试流程
+        A[启动 kvstore] --> B[运行 test_kvstore]
+        B --> C[SET/GET/DEL 测试 Array]
+        B --> D[HSET/HGET/HDEL 测试 Hash]
+        B --> E[RSET/RGET/RDEL 测试 RBTREE]
+        B --> F[XSET/XGET/XDEL 测试 Skiptable]
+        B --> G[DOCSET/DOCGET 测试 Doc]
+        C & D & E & F & G --> H[PASS/FAIL 报告]
+    end
+```
+
+```bash
+# 测试全部五种引擎
+./test_kvstore 127.0.0.1 5000
+
+# 或通过 Makefile
+make check-kvstore TEST_PORT=5000
+```
+
 ### 网络模型 — 三种 I/O 模型
 
 三种模型的目的不是为了生产冗余，而是**对比学习**——同一套业务逻辑用三种 I/O 模型实现。
@@ -536,6 +559,24 @@ epoll_wait(100ms)
 - 以同步写法实现异步并发
 
 源码: `src/core/ntyco.c`
+
+#### 测试验证
+
+```bash
+# 默认 Reactor（epoll）
+./kvstore --port 5000 --net reactor
+redis-cli -p 5000 PING
+
+# Proactor（io_uring）
+./kvstore --port 5001 --net proactor
+redis-cli -p 5001 SET k v
+
+# NtyCo（协程）
+./kvstore --port 5002 --net ntyco
+redis-cli -p 5002 GET k
+```
+
+三种模型对外暴露完全相同的 RESP 协议接口，客户端无需修改。
 
 ### 持久化 — dump + AOF
 
@@ -588,6 +629,39 @@ persist_append_raw()
 ```
 
 源码: `src/persistence/`
+
+#### 测试验证
+
+```mermaid
+sequenceDiagram
+    participant T as test_persist_dump_demo
+    participant K as kvstore
+    participant D as kvstore.dump
+
+    T->>K: HSET persist:dump:00000 ~ N
+    T->>K: SAVE
+    K->>D: 写入 KVSD 二进制格式
+    T->>T: 提示用户停止 kvstore
+    T->>T: 等待 kvstore 断开
+    T->>T: 提示用户重启 kvstore
+    T->>T: 等待 kvstore 就绪
+    K->>D: mmap 读取 dump 恢复数据
+    T->>K: HGET persist:dump:00000
+    K-->>T: v0
+    T->>T: 验证 N 条全部正确恢复
+```
+
+```bash
+# 终端 1: 启动 kvstore
+./kvstore --port 5170 --role master --appendfsync always
+
+# 终端 2: 运行全量持久化演示
+./test_persist_dump_demo --port 5170 --count 100000
+# 程序会写入 → SAVE → 提示停 kvstore → 提示重启 → 自动验证
+
+# AOF 重写验证
+redis-cli -p 5170 BGREWRITEAOF
+```
 
 ### 主从复制 — 四种传输路径
 
@@ -725,6 +799,51 @@ int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
 **TCP 保底**：`repl_transport_kprobe_rdma_send()` 始终返回 -1，数据仍然通过 TCP 发送。
 Slave 通过 `repl_offset` 去重：被 RDMA 路径先送达的数据，TCP 路径到达时跳过。
 
+#### 测试验证
+
+```mermaid
+sequenceDiagram
+    participant T as test_repl_5w5w
+    participant M as Master
+    participant S as Slave
+
+    Note over T: Phase 1: 预存 5w 数据
+    T->>M: HSET pre:k:00000 ~ 49999
+    Note over T: Phase 2: 启动 Slave 全量同步
+    T->>S: (通过脚本启动 slave)
+    M->>S: REPLSYNC → FULLRESYNC → snapshot → REPLDONE
+    Note over T: Phase 3: 再写 5w 增量
+    T->>M: HSET post:k:00000 ~ 49999
+    M->>S: repl_broadcast → kprobe+RDMA / TCP
+    Note over T: Phase 4: 验证 10w 数据
+    T->>S: HGET pre:k:00000 ... HGET post:k:49999
+    S-->>T: 10w 条全部一致 ✓
+```
+
+```bash
+# TCP 复制（单机快速验证）
+./kvstore --port 5160 --role master
+./kvstore --port 5161 --role slave --master-host 127.0.0.1 --master-port 5160
+tests/test_repl_5w5w --master-port 5160 --slave-port 5161 --pre 100 --post 100
+
+# RDMA + kprobe 复制（双机，需 root）
+# VM1 Master:
+sudo ./kvstore --port 5160 --role master \
+    --repl-fullsync-transport rdma \
+    --repl-realtime-transport kprobe-rdma \
+    --rdma-dev siw0 --kprobe-enabled
+# VM2 Slave:
+sudo ./kvstore --port 5161 --role slave \
+    --master-host 192.168.233.128 --master-port 5160 \
+    --repl-fullsync-transport rdma \
+    --repl-realtime-transport kprobe-rdma \
+    --rdma-dev siw0 --kprobe-enabled
+# 运行测试:
+tests/test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
+    --slave-host 192.168.233.129 --slave-port 5161 \
+    --pre 50000 --post 50000
+```
+
 ### TTL 过期 — 哈希索引 + 最小堆
 
 kvstore 的 TTL 系统使用**哈希索引 + 最小堆**双结构，结合**主动扫描 + 惰性删除**两种策略。
@@ -840,6 +959,33 @@ heap = [1000, 2000, 5000]   heap = [1000, 2000, 5000]
                           heap = [2000, 3000, 5000]  (已有序)
 ```
 
+#### 测试验证
+
+```mermaid
+graph LR
+    subgraph 测试流程
+        A[启动 kvstore] --> B[test_mass_ttl]
+        B --> C[写入 10000 HSET + HEXPIRE 10s]
+        C --> D[轮询抽样 TTL 倒计时]
+        D --> E{TTL+5s 到？}
+        E -->|是| F[检查全部 key 是否过期]
+        F --> G[打印结果 PASS/FAIL]
+        E -->|否| D
+    end
+```
+
+```bash
+# 终端 1: 启动 kvstore
+./kvstore --port 5200 --role master
+
+# 终端 2: 运行大量 TTL 测试
+./test_mass_ttl --port 5200 --count 10000 --ttl 10
+
+# 终端 3: 手动检查 TTL（可选）
+redis-cli -p 5200 HTTL expire:k:000000
+redis-cli -p 5200 HGET expire:k:000000
+```
+
 ### 内存管理 — 三种后端
 
 
@@ -869,6 +1015,22 @@ slab 分配器
 
 源码: `src/memory/`
 
+#### 测试验证
+
+```bash
+# libc 后端
+./kvstore --port 5000 --mem libc
+redis-cli -p 5000 MEMSTAT
+
+# jemalloc（需 LD_PRELOAD）
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so ./kvstore --port 5001 --mem jemalloc
+redis-cli -p 5001 MEMSTAT
+
+# custom slab（自研）
+./kvstore --port 5002 --mem custom
+redis-cli -p 5002 MEMSTAT  # 查看 slab class 分配统计
+```
+
 ### TTL 过期时间记录 in AOF
 
 写命令（SET/MSET/DEL/EXPIRE 等）会以原始 RESP 格式写入 AOF 文件：
@@ -893,6 +1055,22 @@ if (距离上次快照 ≥ sec && 自上次快照以来的写入次数 ≥ chang
 - 规则通过 `--autosnap "60:1000,300:10"` 或 `SNAPRULE 60 1000` 命令设置
 - `SNAPRULES` 查看当前规则，`SNAPRULECLEAR` 清除所有规则
 - 每个规则独立计时
+
+#### 测试验证
+
+```bash
+# 配置自动快照规则：60秒内 1000 次写入则触发 BGSAVE
+redis-cli -p 5000 SNAPRULE 60 1000
+redis-cli -p 5000 SNAPRULES        # 查看规则
+redis-cli -p 5000 SNAPRULECLEAR    # 清除所有规则
+
+# 手动触发 SAVE
+redis-cli -p 5000 SAVE
+
+# 手动触发 BGSAVE（非阻塞）
+redis-cli -p 5000 BGSAVE
+redis-cli -p 5000 INFO | grep bgsave  # 查看 BGSAVE 状态
+```
 
 ### 哨兵模式
 

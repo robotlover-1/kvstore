@@ -1069,10 +1069,31 @@ redis-cli -p 5170 INFO | grep -E "(aof|dump|bgsave|dirty)"
 redis-cli -p 5170 BGREWRITEAOF
 ```
 
-### 主从复制 — 四种传输路径
+### 主从复制 — 四种传输路径详解
 
 kvstore 的复制系统采用类 Redis 的 RESP-based 复制协议，
-通过 `repl_transport_ops_t` **策略模式**支持四种传输层切换。
+通过 `repl_transport_ops_t` **策略模式**支持四种传输层切换：
+TCP（通用保底）、RDMA SEND/RECV（全量高速）、eBPF sockmap（内核态转发）、kprobe+RDMA WRITE（单边最低延迟）。
+
+#### 传输策略模式
+
+```c
+// 策略模式定义：每种传输方式实现这组函数指针
+typedef struct repl_transport_ops_s {
+    const char *name;
+    int (*send)(conn_t *c, const unsigned char *buf, size_t len);
+    int (*connect_slave)(const char *host, int port);
+    void (*disconnect_slave)(int fd);
+} repl_transport_ops_t;
+
+// 运行时根据配置选择传输方式
+int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len) {
+    ops = repl_transport_ops_for_context(KVS_REPL_SEND_REALTIME);
+    int rc = ops->send(c, buf, len);
+    if (rc == 0) return 0;
+    return repl_transport_tcp_send(c, buf, len);  // TCP 保底
+}
+```
 
 #### 复制握手流程
 
@@ -1085,7 +1106,6 @@ sequenceDiagram
     S->>M: TCP connect
     S->>M: REPLSYNC <replid> <offset>
     M->>M: backlog_can_continue?
-
     alt 部分同步成功
         M->>S: +CONTINUE <replid> <end_offset>
         M->>S: backlog[offset..end_offset]
@@ -1098,7 +1118,6 @@ sequenceDiagram
         M->>S: REPLDONE
         Note over S: repl_slave_finish_fullsync()
     end
-
     Note over M,S: 增量阶段
     loop 每条写命令
         M->>M: repl_broadcast(raw)
@@ -1107,82 +1126,347 @@ sequenceDiagram
     end
 ```
 
-#### 全量同步（queue_snapshot）
+---
 
+#### 1. TCP 传输（通用保底）
+
+**数据路径**：
+```
+repl_broadcast()
+  → repl_realtime_send()
+    → repl_transport_tcp_send(c, buf, len)
+      → queue_bytes(c, buf, len)        // 入队到 conn_t.out_buf
+        → reactor on_write()            // epoll 可写事件
+          → write(c->fd, buf, len)      // 系统调用
+```
+
+**实现**：
 ```c
-static int queue_snapshot(conn_t *c) {
-    unsigned long long base = repl_master_offset();
+// 最简实现：直接写入 socket
+static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t len) {
+    return queue_bytes(c, buf, len);  // 放入写缓冲区，reactor 负责发送
+}
 
-    // ① 生成临时 dump 文件
-    kvs_snapshot_to_fp(tmp_fp);   // 遍历所有引擎，写 KVSD 格式
-
-    // ② 发 FULLRESYNC 头
-    snprintf(hdr, "+FULLRESYNC %s %llu %zu\r\n", id, base, total);
-
-    // ③ 分块发 snapshot 数据
-    while ((r = fread(buf, 1, buf_size, fp)) > 0)
-        repl_send_chunked(c, buf, r);
-
-    // ④ REPLDONE
-    resp_build_cmd1(buf, "REPLDONE");
-    repl_send_chunked(c, buf, done);
-
-    // ⑤ gap 回放
-    c->repl_fullsync_pending = 0;
-    if (repl_master_offset() > base)
-        repl_backlog_write_range(c, base);
+static int repl_transport_tcp_connect_slave(const char *host, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+    return fd;
 }
 ```
 
-#### 增量同步（repl_broadcast）
+**特点**：
+- 不依赖任何特殊硬件（无需 RDMA 网卡、无需 BPF）
+- 单机测试时走 loopback，双机走物理网卡
+- 失败处理：发送失败标记 `c->repl_draining = 1`，从 replica 链表移除
 
+---
+
+#### 2. RDMA SEND/RECV（全量高速传输）
+
+**架构**：独立 QP，端口为 TCP 端口 + 1
+
+```
+┌─ Master ─────────────────────┐     ┌─ Slave ──────────────────────┐
+│ g_repl_rdma_ctx              │     │                              │
+│  ├── ec: event_channel       │     │  listener_thread:            │
+│  ├── id: rdma_cm_id          │     │  ① rdma_bind_addr(port+1)   │
+│  ├── pd: 保护域              │     │  ② rdma_listen()            │
+│  ├── cq: 完成队列            │     │  ③ rdma_get_cm_event()      │
+│  ├── comp_chan: 通知通道     │     │    → CONNECT_REQUEST         │
+│  └── send_slots[4]: pipeline │     │  ④ ibv_alloc_pd + create_cq │
+│                              │     │  ⑤ rdma_create_qp           │
+│  connector:                  │     │  ⑥ ibv_reg_mr + ibv_post_recv│
+│  ① rdma_resolve_addr()      │     │  ⑦ rdma_accept()            │
+│  ② rdma_resolve_route()     │     │  ⑧ rdma_get_cm_event()      │
+│  ③ ibv_alloc_pd             │     │    → ESTABLISHED             │
+│  ④ ibv_create_cq(comp_chan) │     │  ⑨ 启动 CQ 轮询线程         │
+│  ⑤ rdma_create_qp           │     └──────────────────────────────┘
+│  ⑥ ibv_reg_mr + ibv_post_recv│
+│  ⑦ rdma_connect() → ESTABLISHED│
+│  ⑧ 启动 CQ 轮询线程         │
+└──────────────────────────────┘
+```
+
+**CQ 轮询线程**（事件驱动）：
 ```c
-void repl_broadcast(const unsigned char *raw, size_t rawlen) {
-    repl_backlog_feed(raw, rawlen);       // → 1MB backlog
-    repl_note_broadcast(rawlen);          // → +offset
-    for (每个 slave) {
-        if (c->repl_fullsync_pending) continue;  // 全量中跳过
-        repl_realtime_send(c, raw, rawlen);       // 策略模式发送
+static void *repl_rdma_cq_poll_thread(void *arg) {
+    while (cq_poll_thread_running && connected) {
+        ibv_get_cq_event(comp_chan, &ev_cq, &ev_ctx);  // 阻塞等事件
+        ibv_ack_cq_events(cq, 1);
+
+        // 批量 poll completions
+        int n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
+        for (int i = 0; i < n; i++)
+            repl_rdma_cq_process_wc(&wc_batch[i]);  // 回收 send/recv slot
+
+        // re-arm → drain 确认
+        ibv_req_notify_cq(cq, 0);
+        n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
+        if (n > 0) continue;  // 有数据，继续处理
+        // 无数据，回到 ibv_get_cq_event 阻塞
     }
 }
 ```
 
-#### 四种传输方式详解
-
-| 传输方式 | 类型 | 数据路径 | 优势 |
-|---|---|---|---|
-| **TCP** | 传统 | send → 内核 TCP | 通用保底 |
-| **RDMA SEND** | 双边 | `ibv_post_send` → CQ | 全量零拷贝 |
-| **eBPF sockmap** | 内核转发 | send → `sk_msg` → `bpf_msg_redirect_map` | 内核态转发 |
-| **kprobe+RDMA WRITE** | 单边 | kprobe → ringbuf → `ibv_post_send(RDMA_WRITE)` | Slave CPU 零参与 |
-
-**kprobe+RDMA WRITE 数据路径**：
-
+**Pipeline 4 槽异步发送**：
 ```c
-// BPF kprobe: 拦截 tcp_sendmsg
-SEC("kprobe/tcp_sendmsg")
-int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
-    if (pid != filter_pid) return 0;
-    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
-    bpf_probe_read_kernel(&iov, 8, msg + 40);  // kernel 5.15
-    bpf_probe_read_user(buf, 504, iov->iov_base);
-    bpf_ringbuf_output(ringbuf, buf, len, 0);
-}
+static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
+    // 获取空闲 send slot（最多等 5s）
+    slot = repl_rdma_acquire_send_slot(5000);
 
-// 用户态: ringbuf → RDMA WRITE
-static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
-    if (g_slave_mr.rkey == 0) return 0;  // MR 未就绪, 跳过
-    wr_submit_data(slot, payload_len + 4);   // RDMA WRITE data
-    wr_submit_head(slot);                    // RDMA WRITE head
-}
+    memcpy(g_repl_rdma_ctx.send_slots[slot].buf, buf, len);
 
-// TCP 保底: send()始终返回 -1 → reactor 走 TCP
-// Slave 侧通过 repl_offset 去重
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uint64_t)slot | PIPELINE_WR_ID_FLAG;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    ibv_post_send(qp, &wr, &bad_wr);  // 非阻塞，立即返回
+    // CQ 线程异步处理 completion，释放 slot
+    return 0;
+}
 ```
 
-#### Slave 实现
+**自适应 Pipeline 深度**：根据 `in_flight` 数量动态调整 `send_pipeline_depth`（2~4），
+利用率低时增加深度，饱和时减少。
+
+---
+
+#### 3. eBPF sockmap（内核态增量转发）
+
+**原理**：将 slave 的 TCP socket fd 注册到 BPF sock_map 中，
+Master 的 `send()` 系统调用触发 `sk_msg` BPF 程序，
+后者调用 `bpf_msg_redirect_map()` 将数据直接重定向到 slave 的 socket。
+
+**数据路径**：
+```
+repl_broadcast()
+  → repl_realtime_send()
+    → repl_transport_ebpf_send()
+      → queue_bytes() → reactor on_write()
+        → send(c->fd) ← 内核触发 sk_msg BPF 程序
+          → bpf_msg_redirect_map(sock_map, redirect_key)
+            → 数据直接注入 slave TCP socket 的接收队列
+```
+
+**fd 注册**：
+```c
+int repl_ebpf_register_fd(int fd, int is_master) {
+    // 将 fd 加入 sock_map
+    int key = fd;  // 或 redirect_key
+    bpf_map_update_elem(sock_map_fd, &key, &fd, BPF_ANY);
+
+    // 记录角色（master/slave）
+    int role = is_master ? ROLE_MASTER : ROLE_SLAVE;
+    bpf_map_update_elem(role_map_fd, &key, &role, BPF_ANY);
+}
+```
+
+**BPF 程序**（`src/replication/bpf/repl_sockmap.bpf.c`）：
+```c
+SEC("sk_msg")
+int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
+    int key = msg->key;  // 从 sk_msg_md 获取 socket 标识
+    // 重定向到 sock_map 中对应的 slave fd
+    bpf_msg_redirect_map(msg, &sock_map, key, BPF_F_INGRESS);
+    return SK_PASS;
+}
+```
+
+**特点**：
+- 数据在内核态完成转发，无需经过用户态→内核态的来回拷贝
+- 不感知全量同步状态——`repl_broadcast` 在 `repl_fullsync_pending=1` 时
+  不会调用 send，eBPF 程序不会被触发
+- 降级：`repl_ebpf_register_fd()` 失败时自动使用 TCP 路径
+
+---
+
+#### 4. kprobe+RDMA WRITE（单边最低延迟增量同步）
+
+**核心思想**：利用 kprobe 拦截 master 的 `tcp_sendmsg` 系统调用，
+通过 BPF ringbuf 将数据传递到用户态，再通过 RDMA WRITE（单边操作）
+直接写入 slave 预注册的 MR（Memory Region），slave CPU 零参与。
+
+**架构图**：
+
+```
+┌─ Master ──────────────────────────────────────────────────┐
+│                                                             │
+│  repl_broadcast()                                           │
+│       │                                                     │
+│       ├──→ tcp_sendmsg() ──→ [kprobe/tcp_sendmsg] ← BPF    │
+│       │                          │                          │
+│       │                    BPF ringbuf (1MB)                │
+│       │                          │                          │
+│       │               ring_buffer__poll()  ← forward_thread │
+│       │                          │                          │
+│       │               kprobe_ringbuf_cb()                   │
+│       │                          │                          │
+│       │         ┌────────────────┴───────────────┐          │
+│       │     RDMA WRITE(data)            RDMA WRITE(head)    │
+│       │         │                               │          │
+│       └──→ TCP send（保底）                     │          │
+│                                                  │          │
+└──────────────────────────────────────────────────┼──────────┘
+                                                   │
+┌─ Slave ──────────────────────────────────────────┼──────────┐
+│                                                   ▼          │
+│  MR Ring Buffer (shm)                                       │
+│  ┌──────┬──────┬──────┬──────┐                              │
+│  │slot 0│slot 1│ ...  │slot N│  ← RDMA WRITE 写入          │
+│  └──────┴──────┴──────┴──────┘                              │
+│  producer_head ← Master 更新                                │
+│  consumer_tail ← Slave 本地                                 │
+│       │                                                     │
+│  slave_poll 线程:                                            │
+│   while (producer_head != consumer_tail)                    │
+│       解析 slot 数据 → parse_resp_stream()                  │
+│       consumer_tail++                                       │
+│                                                              │
+│  TCP 接收（并行）：                                          │
+│   read(fd) → parse_resp_stream() → repl_offset 去重        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**BPF 侧实现**：
+```c
+// src/replication/bpf/repl_kprobe.bpf.c
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);  // 1MB
+} ringbuf SEC(".maps");
+
+// per-CPU 暂存数组（突破 BPF 栈 512B 限制）
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, unsigned char[504]);
+} scratch SEC(".maps");
+
+SEC("kprobe/tcp_sendmsg")
+int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
+    pid_t pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != filter_pid) return 0;  // PID 过滤
+
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    struct iovec *iov;
+    int nr_segs;
+    size_t len;
+
+    // kernel 5.15: iov @ msg+40, nr_segs @ msg+48
+    bpf_probe_read_kernel(&iov, 8, (void*)msg + 40);
+    bpf_probe_read_kernel(&nr_segs, 4, (void*)msg + 48);
+
+    for (int i = 0; i < nr_segs && i < 1; i++) {
+        void *base;
+        bpf_probe_read_kernel(&base, 8, &iov[i].iov_base);
+        bpf_probe_read_kernel(&len, 8, &iov[i].iov_len);
+
+        // iov_base 指向用户空间数据
+        int chunk = len < 500 ? len : 500;
+        __u32 zero = 0;
+        unsigned char *tmp = bpf_map_lookup_elem(&scratch, &zero);
+        if (!tmp) return 0;
+        bpf_probe_read_user(tmp, chunk, base);
+
+        bpf_ringbuf_output(&ringbuf, tmp, chunk + 4, 0);
+    }
+    return 0;
+}
+```
+
+**用户态转发**：
+```c
+// ringbuf 回调 → RDMA WRITE
+static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
+    // MR 未就绪时跳过（KPROBEMR 还没交换完）
+    if (g_slave_mr.rkey == 0 || !g_rdma_kprobe.connected)
+        return 0;
+
+    // Step 1: RDMA WRITE 数据到 Slave MR slot
+    wr_submit_data(slot, payload_len + 4);
+
+    // Step 2: RDMA WRITE 更新 producer_head
+    wr_submit_head(slot);
+
+    g_rdma_writes++;
+    return 0;
+}
+
+// RDMA WRITE 发送
+static int wr_submit_data(int slot, size_t len) {
+    struct ibv_send_wr wr = {0};
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
+    wr.wr.rdma.remote_addr = g_slave_mr.remote_data_base + slot_off;
+    wr.wr.rdma.rkey = g_slave_mr.rkey;
+    return ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
+}
+```
+
+**Slave 轮询消费**：
+```c
+static void *kprobe_rdma_slave_poll(void *arg) {
+    while (g_kprobe_running) {
+        __sync_synchronize();  // 内存屏障
+        head = rb->producer_head;
+        tail = rb->consumer_tail;
+
+        if (tail == head) {
+            usleep(KVS_KPROBE_RDMA_POLL_US);  // 空闲等待
+            continue;
+        }
+
+        while (tail != head) {
+            idx = tail % KPROBE_RDMA_SLOT_COUNT;
+            slot_len = *(uint32_t*)(rb->slots + off);
+
+            // 数据送入 RESP 解析流
+            memcpy(stream_buf + stream_len, slot_data, slot_len);
+            parse_resp_stream(NULL, stream_buf, &stream_len, 1);
+
+            tail++;
+        }
+        rb->consumer_tail = tail;
+        __sync_synchronize();
+    }
+}
+```
+
+**MR 信息交换**：
+```c
+// Master 发送 KPROBEMR 请求
+// Slave 回复 +KPROBERDMA <rkey> <addr> <size> <slots> <cap>
+// Master 解析并设置 g_slave_mr
+
+// Slave 侧 MR 注册（带 REMOTE_WRITE 权限）
+g_slave_ringbuf = kvs_calloc(KPROBE_RDMA_RINGBUF_SIZE);
+g_slave_ringbuf_mr = ibv_reg_mr(pd, g_slave_ringbuf,
+    KPROBE_RDMA_RINGBUF_SIZE,
+    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+```
+
+**TCP 保底 + 去重**：
+```c
+// kprobe-rdma send 始终返回 -1，数据仍通过 TCP 发送
+static int repl_transport_kprobe_rdma_send(conn_t *c, ...) {
+    // 首次调用时后台启动 MR 连接线程
+    pthread_create(&tid, NULL, kprobe_mr_connect_thread, a);
+    return -1;  // → reactor 走 TCP send
+}
+
+// Slave 通过 repl_offset 去重
+// RDMA 路径先送达的数据，TCP 路径到达时跳过
+// （handle_parsed_command 中 from_replication 相同，幂等执行）
+```
+
+---
+
+#### 5. Slave 侧统一实现
 
 ```c
+// slave_thread — 后台独立线程
 static void *slave_thread(void *arg) {
     while (1) {
         fd = tcp_connect(master_host, master_port);
@@ -1190,8 +1474,8 @@ static void *slave_thread(void *arg) {
 
         while (1) {
             r = read(fd, buf, sizeof(buf));
-            parse_resp_stream(NULL, buf, &len, 1);  // from_replication=1
-            repl_slave_ack_heartbeat();              // 每秒 REPLACK
+            parse_resp_stream(NULL, buf, &len, 1);
+            repl_slave_ack_heartbeat();  // 每秒 REPLACK
         }
     }
 }

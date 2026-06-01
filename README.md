@@ -714,95 +714,300 @@ redis-cli -p 5002 GET k
 
 ### 持久化 — dump + AOF
 
-#### 全量 Dump (KVSD 二进制格式)
+kvstore 的持久化采用 **全量 dump（二进制快照）+ 增量 AOF（命令日志）** 双机制。
+恢复时先加载 dump（快），再重放 AOF（补全），兼顾启动速度和数据完整性。
+
+#### 全量 Dump — KVSD 二进制格式
+
+**保存流程**：
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as kvstore
+    participant F as kvstore.dump
+
+    C->>K: SAVE (同步)
+    K->>K: kvs_snapshot_to_fp(fp)
+    Note over K: 遍历所有存储引擎
+    K->>F: [4B klen][key][4B vlen][value]
+    K->>F: [4B klen][key][4B vlen][value]
+    K->>F: ...
+    K-->>C: +OK
+
+    Note over C,K: BGSAVE (异步，fork 子进程)
+    C->>K: BGSAVE
+    K->>K: fork()
+    Note over K: 子进程执行 kvs_snapshot_to_fp
+    Note over K: 父进程继续服务
+    K-->>C: +Background saving started
+```
+
+**二进制格式**：
 
 ```
-[4B key_len][key][4B value_len][value]
-[4B key_len][key][4B value_len][value]
+[4B key_len][key数据][4B value_len][value数据]
+[4B key_len][key数据][4B value_len][value数据]
 ...
 ```
 
-- 每个 key-value 对以 `4B 长度 + 数据` 交替存储
-- **恢复优先使用 mmap**：mmap 文件后直接遍历，0 次内核→用户拷贝
-- **mmap 失败回退**到 `fread()` 逐条读取
-- 支持 `SAVE`（同步，主线程阻塞写）和 `BGSAVE`（fork 子进程，不阻塞主线程）
-- `SAVE` 将 `global_expire` 中未到期的 key 也 snapshot 到 dump，恢复后 TTL 重建
+每个 key-value 对用 4 字节长度前缀 + 数据交替存储，解析时按长度读取，**不以任何字符作为分隔符**，因此 key/value 中可包含空格、换行等任意字符。
 
-源码: `src/persistence/kvs_persist.c`
-
-#### 增量 AOF (RESP 命令格式)
-
-```
-*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
-*2\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n
-```
-
-- 每条写命令后调用 `persist_append_raw()` 写入 AOF
-- **写入**：优先用 **io_uring** 异步 pwrite（不阻塞），回退到同步 pwrite
-- **fsync 策略**：
-  - `always`：每条写命令后 fsync，最安全但最慢
-  - `everysec`：每秒 fsync 一次，平衡性能与安全
-- **BGREWRITEAOF**：fork 子进程重写 AOF，重写期间新命令通过 `g_aof_rewrite_buf` 缓冲区转发
-
-#### 恢复顺序
-
-1. **先恢复 dump**：二进制格式，读取快
-2. **再重放 AOF**：RESP 命令格式，补全最后状态的增量写操作
-
-如果 AOF 恢复过程中发生错误，通过 `g_aof_recover_errors` 记录但不中断。
-
-**io_uring 写入实现**:
+**保存实现**：
 
 ```c
-// src/persistence/kvs_persist.c
-static struct io_uring g_persist_uring;  // 全局 io_uring 实例
-
-static int persist_write_fd_uring(int fd, const unsigned char *buf, size_t len, off_t *offset) {
-    if (persist_uring_init_once() != 0) return -1;  // 首次调用时 init
-    size_t written = 0;
-    while (written < len) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_persist_uring);
-        size_t chunk = len - written;
-        io_uring_prep_write(sqe, fd, buf + written, chunk, offset ? *offset : -1);
-        // 提交 SQE 并等待 CQE 完成
-        io_uring_submit_and_wait(&g_persist_uring, 1);
-        io_uring_wait_cqe(&g_persist_uring, &cqe);
-        written += cqe->res;  // 实际写入字节数
-        io_uring_cqe_seen(&g_persist_uring, cqe);
-    }
+// src/main/kvstore.c — kvs_snapshot_to_fp (遍历所有引擎)
+int kvs_snapshot_to_fp(FILE *fp) {
+    // 遍历 Array 引擎
+    for (int i = 0; i < KVS_ARRAY_SIZE; i++)
+        if (global_array.table[i].key)
+            emit_kv(fp, global_array.table[i].key, global_array.table[i].value);
+    // 遍历 Hash 引擎（链地址法）
+    for (int i = 0; i < global_hash.max_slots; i++)
+        for (hashnode_t *n = global_hash.nodes[i]; n; n = n->next)
+            emit_kv(fp, n->key, n->value);
+    // 遍历 RBTREE（中序遍历，保持有序）
+    rbtree_inorder_walk(global_rbtree.root, fp);
+    // 遍历 Skiptable（底层链表有序）
+    for (kvs_sknode_t *n = global_skiptable.head->next[0]; n; n = n->next[0])
+        emit_kv(fp, n->key, n->value);
+    // 遍历 Doc 引擎
+    for (int i = 0; i < global_doc.size; i++)
+        for (kvs_doc_t *d = global_doc.buckets[i]; d; d = d->next)
+            for (int b = 0; b < d->bucket_count; b++)
+                for (kvs_doc_field_t *f = d->fields[b]; f; f = f->next)
+                    emit_doc_kv(fp, d->key, f->name, f->value);
     return 0;
 }
 
-int persist_append_raw(const unsigned char *buf, size_t len) {
-    off = g_aof_write_offset;
-    // 优先 io_uring，失败回退同步 pwrite
-    if (persist_write_fd_uring(g_aof_fd, buf, len, &off) != 0)
-        persist_write_fd_sync(g_aof_fd, buf, len, &off);
-    g_aof_write_offset = off;
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS)
-        persist_fsync_fd_uring(g_aof_fd);  // 或回退 fsync()
+// 持久化入口
+int persist_save_dump(void) {
+    // SAVE: 直接写
+    int fd = open(g_cfg.dump_path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    kvs_dump_to_fd(fd);       // 遍历引擎，写入 KVSD 格式
+    persist_fsync_fd(fd);     // fsync 刷盘
+    close(fd);
+    return 0;
+}
+
+int persist_bgsave_start(void) {
+    // BGSAVE: fork 子进程
+    pid_t pid = fork();
+    if (pid == 0) {                // 子进程
+        persist_save_dump();       // 写 dump
+        _exit(0);
+    }
+    g_bgsave_pid = pid;            // 父进程记录 PID
     return 0;
 }
 ```
 
-**mmap 恢复实现**:
+**恢复流程（mmap 零拷贝）**：
+
+```mermaid
+sequenceDiagram
+    participant K as kvstore 启动
+    participant D as kvstore.dump
+    participant M as mmap 映射
+
+    K->>K: persist_recover()
+    K->>D: open + fstat
+    K->>M: mmap(fd, size)
+    Note over K: 0 次内核→用户拷贝
+    loop 遍历 mmap 内存
+        K->>K: memcpy(&klen, mapped+pos, 4)
+        K->>K: memcpy(key, mapped+pos, klen)
+        K->>K: memcpy(&vlen, mapped+pos, 4)
+        K->>K: memcpy(value, mapped+pos, vlen)
+        K->>K: kvs_hash_set(key, value)
+    end
+    K->>D: munmap + close
+```
 
 ```c
 static int replay_dump_file(const char *path) {
     int fd = open(path, O_RDONLY);
-    mapped = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
-    while (pos + 4 <= size) {
-        memcpy(&klen, mapped + pos, 4);  pos += 4;
-        key = mapped + pos;              pos += klen;
-        memcpy(&vlen, mapped + pos, 4);  pos += 4;
-        value = mapped + pos;            pos += vlen;
+    struct stat st;
+    fstat(fd, &st);
+
+    // 优先 mmap（0 拷贝）
+    unsigned char *mapped = mmap(NULL, st.st_size,
+        PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        // mmap 失败，回退到 fread
+        return replay_file_fread(path);
+    }
+
+    size_t pos = 0;
+    while (pos + 4 <= (size_t)st.st_size) {
+        uint32_t klen, vlen;
+        memcpy(&klen, mapped + pos, 4);  pos += 4;  // key 长度
+        char *key = (char*)mapped + pos;  pos += klen; // key
+        memcpy(&vlen, mapped + pos, 4);  pos += 4;  // value 长度
+        char *value = (char*)mapped + pos; pos += vlen; // value
+
+        // 直接写入 Hash 引擎
         kvs_hash_set(&global_hash, key, value);
     }
-    munmap(mapped, size);
+    munmap(mapped, st.st_size);
+    close(fd);
 }
 ```
 
-源码: `src/persistence/`
+#### 增量 AOF — RESP 命令格式
+
+**写入流程**：
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as kvstore
+    participant A as kvstore.aof
+
+    C->>K: SET key value
+    K->>K: handle_parsed_command()
+    K->>K: engine_set(key, value)     ← 写入内存
+    K->>K: persist_append_raw(raw)    ← 追加到 AOF
+    Note over K: raw 是原始 RESP 命令
+    K->>A: io_uring_prep_write(SET)\nor pwrite(SET)\n
+    alt fsync=always
+        K->>A: io_uring_prep_fsync()
+        Note over K: 每条命令后刷盘
+    else fsync=everysec
+        Note over K: 每秒批量 fsync
+    end
+    K-->>C: +OK
+```
+
+**AOF 文件内容示例**：
+
+```
+*3\r\n$3\r\nSET\r\n$3\r\nk1\r\n$2\r\nv1\r\n
+*3\r\n$6\r\nEXPIRE\r\n$2\r\nk1\r\n$2\r\n10\r\n
+*2\r\n$3\r\nDEL\r\n$2\r\nk1\r\n
+```
+
+每条写命令以原始 RESP 协议格式追加，恢复时直接重放。
+
+**写入实现（io_uring 优先）**：
+
+```c
+// src/persistence/kvs_persist.c
+static struct io_uring g_persist_uring;    // 全局 uring 实例（64 SQE）
+
+int persist_init(void) {
+    // 以追加模式打开 AOF 文件
+    g_aof_fd = open(g_cfg.aof_path, O_WRONLY|O_CREAT|O_APPEND, 0644);
+    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
+    return 0;
+}
+
+int persist_append_raw(const unsigned char *buf, size_t len) {
+    off_t off = g_aof_write_offset;
+
+    // ① 优先 io_uring 异步写入
+    if (persist_write_fd_uring(g_aof_fd, buf, len, &off) != 0)
+        // ② 回退同步 pwrite
+        persist_write_fd_sync(g_aof_fd, buf, len, &off);
+
+    g_aof_write_offset = off;
+    g_aof_dirty = 1;
+
+    // fsync 策略
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
+        if (persist_fsync_fd_uring(g_aof_fd) != 0)
+            fsync(g_aof_fd);  // 回退
+    }
+    return 0;
+}
+
+// io_uring 写入核心
+static int persist_write_fd_uring(int fd, const unsigned char *buf,
+                                  size_t len, off_t *offset) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_persist_uring);
+    io_uring_prep_write(sqe, fd, buf, len, offset ? *offset : -1);
+    io_uring_submit_and_wait(&g_persist_uring, 1);   // 提交 SQE
+    struct io_uring_cqe *cqe;
+    io_uring_wait_cqe(&g_persist_uring, &cqe);        // 等 CQE
+    int ret = cqe->res;                                // 写入结果
+    io_uring_cqe_seen(&g_persist_uring, cqe);
+    return ret < 0 ? -1 : 0;
+}
+```
+
+#### BGREWRITEAOF — AOF 重写
+
+AOF 文件随时间增长，BGREWRITEAOF 通过 fork 子进程将当前内存数据重写为新 AOF：
+
+```
+fork 子进程
+  ├── 子进程: 遍历引擎 → 写临时 AOF 文件 → 原子 rename 替换
+  └── 父进程: 继续服务，新命令通过 g_rewrite_buf 链表缓存
+                  → 子进程完成后，父进程将缓存追加到新 AOF
+```
+
+```c
+int persist_bgrewriteaof_start(void) {
+    pid_t pid = fork();
+    if (pid == 0) {  // 子进程
+        char tmp[512];
+        snprintf(tmp, sizeof(tmp), "%s.rewrite.tmp.%ld", g_cfg.aof_path, (long)getpid());
+        rewrite_aof_to(tmp);    // 遍历引擎写 RESP 命令
+        rename(tmp, g_cfg.aof_path);  // 原子替换
+        _exit(0);
+    }
+    g_bgrewrite_pid = pid;  // 父进程
+    return 0;
+}
+```
+
+#### 恢复完整流程
+
+```mermaid
+sequenceDiagram
+    participant K as kvstore 启动
+    participant D as kvstore.dump
+    participant A as kvstore.aof
+
+    K->>K: persist_recover()
+    Note over K: g_persist_recovering = 1
+
+    K->>D: replay_dump_file(dump_path)
+    Note over D: mmap → 遍历 KVSD 二进制
+    Note over K: 全量数据恢复 ✓
+
+    K->>A: replay_file(aof_path)
+    Note over A: mmap → parse_resp_stream → 重放命令
+    Note over K: 增量命令恢复 ✓
+
+    K->>A: ftruncate(aof_fd, 0)
+    Note over K: AOF 截断，防止跨 session 累积
+
+    K->>K: g_persist_recovering = 0
+    Note over K: 恢复完成，开始服务
+```
+
+```c
+// src/persistence/kvs_persist.c
+int persist_recover(void) {
+    g_persist_recovering = 1;   // 标记恢复中，禁止写 slave
+
+    // ① 先恢复 dump（全量二进制快照）
+    replay_dump_file(g_cfg.dump_path);
+
+    // ② 再重放 AOF（增量 RESP 命令）
+    replay_file(g_cfg.aof_path);  // 内部调用 replay_file_mmap
+
+    // ③ 截断 AOF，防止跨 session 无限累积
+    ftruncate(g_aof_fd, 0);
+    g_aof_write_offset = 0;
+
+    g_persist_recovering = 0;
+    return 0;
+}
+```
+
+**mmap 失败回退**：当 mmap 不可用时（如文件过大、内核限制），自动回退到 `replay_file_fread()`，逐块 fread 解析。
 
 #### 测试验证
 
@@ -811,13 +1016,40 @@ sequenceDiagram
     participant T as test_persist_dump_demo
     participant K as kvstore
     participant D as kvstore.dump
+    participant A as kvstore.aof
 
-    T->>K: HSET persist:dump:00000 ~ N
+    Note over T: 写入阶段
+    T->>K: 写入 N 条 HSET 数据
+    Note over K: 同时写入 AOF（io_uring）
     T->>K: SAVE
-    K->>D: 写入 KVSD 二进制格式
+    K->>D: 写入 KVSD 二进制
+
+    Note over T: 停止/重启阶段
     T->>T: 提示用户停止 kvstore
-    T->>T: 等待 kvstore 断开
+    T->>T: 等待断开
     T->>T: 提示用户重启 kvstore
+    K->>K: 启动 → persist_recover()
+    K->>D: mmap 读取 dump
+    K->>A: mmap 重放 AOF
+    Note over K: 数据恢复完成
+
+    Note over T: 验证阶段
+    T->>K: HGET 逐条验证
+    K-->>T: 全部一致 ✓
+```
+
+```bash
+# 全量持久化测试
+./kvstore --port 5170 --role master --appendfsync always
+./test_persist_dump_demo --port 5170 --count 100000
+
+# AOF 重写测试
+redis-cli -p 5170 BGREWRITEAOF
+redis-cli -p 5170 INFO | grep aof_rewrite
+
+# 持久化状态查看
+redis-cli -p 5170 INFO | grep -E "(aof|dump|bgsave|dirty)"
+```
     T->>T: 等待 kvstore 就绪
     K->>D: mmap 读取 dump 恢复数据
     T->>K: HGET persist:dump:00000

@@ -1071,7 +1071,8 @@ redis-cli -p 5170 BGREWRITEAOF
 
 ### 主从复制 — 四种传输路径
 
-复制协议基于 RESP 协议扩展，通过 `repl_transport_ops_t` **策略模式**切换传输层。
+kvstore 的复制系统采用类 Redis 的 RESP-based 复制协议，
+通过 `repl_transport_ops_t` **策略模式**支持四种传输层切换。
 
 #### 复制握手流程
 
@@ -1080,171 +1081,149 @@ sequenceDiagram
     participant M as Master
     participant S as Slave
 
+    Note over S: slave_thread 启动
+    S->>M: TCP connect
     S->>M: REPLSYNC <replid> <offset>
     M->>M: backlog_can_continue?
-    alt 可以部分同步
-        M->>S: +CONTINUE <replid> <offset>
-        M->>S: backlog 数据 (从 offset 开始)
+
+    alt 部分同步成功
+        M->>S: +CONTINUE <replid> <end_offset>
+        M->>S: backlog[offset..end_offset]
     else 需要全量同步
         M->>S: +FULLRESYNC <replid> <offset> <bytes>
-        M->>M: kvs_snapshot_to_fp()
-        loop 分块发送 snapshot
-            M->>S: [KVSD 二进制数据块]
+        M->>M: queue_snapshot()
+        loop 分块 snapshot
+            M->>S: [KVSD 二进制]
         end
         M->>S: REPLDONE
         Note over S: repl_slave_finish_fullsync()
     end
-    Note over M,S: 增量同步阶段
+
+    Note over M,S: 增量阶段
     loop 每条写命令
         M->>M: repl_broadcast(raw)
-        M->>S: [增量 RESP 命令]
-        S-->>M: REPLACK <applied> <durable>
+        M--)S: [TCP/ebpf/kprobe-RDMA]
+        S-->>M: REPLACK (每秒)
     end
 ```
 
-```
-Master                              Slave
-  │                                    │
-  │  ← REPLSYNC <replid> <offset>      │  Slave 发起同步请求
-  │                                    │
-  │  检查 backlog 是否能部分同步        │
-  │  ├─ 能 → +CONTINUE <replid> <off>  │  增量同步
-  │  └─ 不能 → +FULLRESYNC <id> <off>  │  全量同步
-  │              [dump 数据]            │
-  │             *1\r\n$7\r\nREPLDONE   │
-  │                                    │
-  │  后续: repl_broadcast() 广播写命令   │
-  │    ← REPLACK <applied> <durable>    │  Slave 定期 ACK
-```
-
-
-| 状态                      | 含义                           |
-| ------------------------- | ------------------------------ |
-| `repl_offset`             | Master 侧累计写入字节数        |
-| `repl_applied_offset_ack` | Slave 已应用的偏移量           |
-| `repl_durable_offset_ack` | Slave 已持久化的偏移量         |
-| `backlog`                 | 1MB 环形缓冲，存储最近的写命令 |
-
-#### 四种传输方式
-
-
-| 传输方式              | 类型      | 数据路径                                                         | 优势                       |
-| --------------------- | --------- | ---------------------------------------------------------------- | -------------------------- |
-| **TCP**               | 传统网络  | 用户态 send → 内核 TCP → 网卡                                  | 通用，无需额外依赖         |
-| **RDMA SEND/RECV**    | 双边 RDMA | `ibv_post_send` → RNIC → Slave CQ                              | 全量零拷贝，高吞吐         |
-| **eBPF sockmap**      | 内核转发  | send →`sk_msg` hook → `bpf_msg_redirect_map`                   | 内核态转发，避免来回拷贝   |
-| **kprobe+RDMA WRITE** | 单边 RDMA | kprobe 拦截 → ringbuf →`ibv_post_send(RDMA_WRITE)` → Slave MR | Slave CPU 零参与，最低延迟 |
-
-#### 复制传输策略模式
+#### 全量同步（queue_snapshot）
 
 ```c
-typedef struct {
-    const char *name;
-    int  (*init)(conn_t *c);
-    int  (*send)(conn_t *c, const unsigned char *buf, size_t len);
-    void (*cleanup)(conn_t *c);
-} repl_transport_ops_t;
-```
+static int queue_snapshot(conn_t *c) {
+    unsigned long long base = repl_master_offset();
 
-`repl_realtime_send()` 根据 `c->repl_transport_kind` 调用对应的 `send` 函数指针。
+    // ① 生成临时 dump 文件
+    kvs_snapshot_to_fp(tmp_fp);   // 遍历所有引擎，写 KVSD 格式
 
-#### TCP 传输
+    // ② 发 FULLRESYNC 头
+    snprintf(hdr, "+FULLRESYNC %s %llu %zu\r\n", id, base, total);
 
-- `repl_tcp_send()`：直接 `write(c->fd, buf, len)`
-- 失败时标记 `c->repl_draining = 1`，移除副本连接
+    // ③ 分块发 snapshot 数据
+    while ((r = fread(buf, 1, buf_size, fp)) > 0)
+        repl_send_chunked(c, buf, r);
 
-#### RDMA SEND/RECV（全量同步）
+    // ④ REPLDONE
+    resp_build_cmd1(buf, "REPLDONE");
+    repl_send_chunked(c, buf, done);
 
-- Master 分配 `rdma_send_wr` 执行 `ibv_post_send`
-- Slave 预置 RECV WR，CQ 事件驱动读取
-- 两个独立的 QP：`g_repl_rdma_ctx`（全量，port+1）和 `g_rdma_kprobe`（增量，port+12）
-
-#### eBPF sockmap
-
-- BPF 程序挂载到 `sk_msg` hook 点
-- `bpf_msg_redirect_map()` 将数据直接重定向到 slave socket fd
-- 避免用户态→内核态→用户态的来回拷贝
-
-#### kprobe+RDMA WRITE（增量同步，核心特性）
-
-**数据路径**：
-
-```
-repl_broadcast() → tcp_sendmsg() → kprobe/tcp_sendmsg (BPF)
-                                        ↓
-                                  BPF ringbuf
-                                        ↓
-                              ring_buffer__poll() 消费
-                                        ↓
-                            kprobe_ringbuf_cb() 回调
-                                        ↓
-                         ibv_post_send(RDMA_WRITE)
-                        ┌───────────────┴───────────────┐
-                        ↓                               ↓
-                  写数据到 Slave MR slot       更新 producer_head
-                        ↓                               ↓
-                   Slave 轮询线程 ──────→ parse_resp_stream()
-```
-
-**BPF 侧**（`src/replication/bpf/repl_kprobe.bpf.c`）：
-
-```
-SEC("kprobe/tcp_sendmsg")
-int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
-    // 1. PID 过滤（只拦截本进程）
-    // 2. 从参数 msg 读取 iov_iter（msg+40, kernel 5.15）
-    // 3. 遍历 iovec，bpf_probe_read_user 读数据
-    // 4. 通过 per-CPU 数组暂存（突破 512B 栈限制）
-    // 5. bpf_ringbuf_output 推送至用户态
+    // ⑤ gap 回放
+    c->repl_fullsync_pending = 0;
+    if (repl_master_offset() > base)
+        repl_backlog_write_range(c, base);
 }
 ```
 
-**RDMA WRITE 流水线**：4 个 slot 的 Pipeline，每个 slot 有独立的 MR 缓冲区。
-写入时先写数据 slot，再更新 producer_head slot，Slave 通过 `producer_head != consumer_head` 判断有数据。
+#### 增量同步（repl_broadcast）
 
-**TCP 保底**：`repl_transport_kprobe_rdma_send()` 始终返回 -1，数据仍然通过 TCP 发送。
-Slave 通过 `repl_offset` 去重：被 RDMA 路径先送达的数据，TCP 路径到达时跳过。
+```c
+void repl_broadcast(const unsigned char *raw, size_t rawlen) {
+    repl_backlog_feed(raw, rawlen);       // → 1MB backlog
+    repl_note_broadcast(rawlen);          // → +offset
+    for (每个 slave) {
+        if (c->repl_fullsync_pending) continue;  // 全量中跳过
+        repl_realtime_send(c, raw, rawlen);       // 策略模式发送
+    }
+}
+```
+
+#### 四种传输方式详解
+
+| 传输方式 | 类型 | 数据路径 | 优势 |
+|---|---|---|---|
+| **TCP** | 传统 | send → 内核 TCP | 通用保底 |
+| **RDMA SEND** | 双边 | `ibv_post_send` → CQ | 全量零拷贝 |
+| **eBPF sockmap** | 内核转发 | send → `sk_msg` → `bpf_msg_redirect_map` | 内核态转发 |
+| **kprobe+RDMA WRITE** | 单边 | kprobe → ringbuf → `ibv_post_send(RDMA_WRITE)` | Slave CPU 零参与 |
+
+**kprobe+RDMA WRITE 数据路径**：
+
+```c
+// BPF kprobe: 拦截 tcp_sendmsg
+SEC("kprobe/tcp_sendmsg")
+int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
+    if (pid != filter_pid) return 0;
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    bpf_probe_read_kernel(&iov, 8, msg + 40);  // kernel 5.15
+    bpf_probe_read_user(buf, 504, iov->iov_base);
+    bpf_ringbuf_output(ringbuf, buf, len, 0);
+}
+
+// 用户态: ringbuf → RDMA WRITE
+static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
+    if (g_slave_mr.rkey == 0) return 0;  // MR 未就绪, 跳过
+    wr_submit_data(slot, payload_len + 4);   // RDMA WRITE data
+    wr_submit_head(slot);                    // RDMA WRITE head
+}
+
+// TCP 保底: send()始终返回 -1 → reactor 走 TCP
+// Slave 侧通过 repl_offset 去重
+```
+
+#### Slave 实现
+
+```c
+static void *slave_thread(void *arg) {
+    while (1) {
+        fd = tcp_connect(master_host, master_port);
+        send(fd, "REPLSYNC %s %llu", replid, offset);
+
+        while (1) {
+            r = read(fd, buf, sizeof(buf));
+            parse_resp_stream(NULL, buf, &len, 1);  // from_replication=1
+            repl_slave_ack_heartbeat();              // 每秒 REPLACK
+        }
+    }
+}
+
+// FULLRESYNC → REPLDONE 处理:
+//   +FULLRESYNC → g_slave_loading_fullsync = 1
+//   数据命令 → 正常执行，offset 递增
+//   REPLDONE → repl_slave_finish_fullsync()
+//            → 保存 dump → g_slave_loading_fullsync = 0
+```
 
 #### 测试验证
 
-```mermaid
-sequenceDiagram
-    participant T as test_repl_5w5w
-    participant M as Master
-    participant S as Slave
-
-    Note over T: Phase 1: 预存 5w 数据
-    T->>M: HSET pre:k:00000 ~ 49999
-    Note over T: Phase 2: 启动 Slave 全量同步
-    T->>S: (通过脚本启动 slave)
-    M->>S: REPLSYNC → FULLRESYNC → snapshot → REPLDONE
-    Note over T: Phase 3: 再写 5w 增量
-    T->>M: HSET post:k:00000 ~ 49999
-    M->>S: repl_broadcast → kprobe+RDMA / TCP
-    Note over T: Phase 4: 验证 10w 数据
-    T->>S: HGET pre:k:00000 ... HGET post:k:49999
-    S-->>T: 10w 条全部一致 ✓
-```
-
 ```bash
-# TCP 复制（单机快速验证）
+# TCP 单机快速验证
 ./kvstore --port 5160 --role master
 ./kvstore --port 5161 --role slave --master-host 127.0.0.1 --master-port 5160
 tests/test_repl_5w5w --master-port 5160 --slave-port 5161 --pre 100 --post 100
 
-# RDMA + kprobe 复制（双机，需 root）
-# VM1 Master:
+# RDMA + kprobe 双机（VM1 master, VM2 slave）
+# Master:
 sudo ./kvstore --port 5160 --role master \
     --repl-fullsync-transport rdma \
     --repl-realtime-transport kprobe-rdma \
     --rdma-dev siw0 --kprobe-enabled
-# VM2 Slave:
+# Slave:
 sudo ./kvstore --port 5161 --role slave \
     --master-host 192.168.233.128 --master-port 5160 \
     --repl-fullsync-transport rdma \
     --repl-realtime-transport kprobe-rdma \
     --rdma-dev siw0 --kprobe-enabled
-# 运行测试:
+# 测试:
 tests/test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
     --slave-host 192.168.233.129 --slave-port 5161 \
     --pre 50000 --post 50000

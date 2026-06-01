@@ -432,6 +432,23 @@ table = [slot0, slot1, ..., slot1023]
 
 源码: `src/storage/kvs_array.c`
 
+**核心实现**:
+
+```c
+int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
+    if (find_slot(inst, key) >= 0) return 1;   // 已存在
+    for (int i = 0; i < KVS_ARRAY_SIZE; i++) {  // 线性扫描找空位
+        if (!inst->table[i].key) {               // 空 slot
+            inst->table[i].key = strdup(key);
+            inst->table[i].value = strdup(value);
+            inst->total++;
+            return 0;  // 成功
+        }
+    }
+    return -1;  // 数组满了
+}
+```
+
 #### Hash 引擎 (`HSET` / `HGET` / `HDEL`)
 
 - **数据结构**：链地址哈希表，`MAX_TABLE_SIZE=1024` 个桶，**FNV-1a 非加密哈希**
@@ -444,6 +461,25 @@ buckets[idx] → node → node → NULL   (链地址法)
 ```
 
 源码: `src/storage/kvs_hash.c`
+
+**核心实现**:
+
+```c
+int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
+    int idx = _hash(key, hash->max_slots);  // FNV-1a 哈希
+    hashnode_t *node = hash->nodes[idx];
+    while (node) {  // 遍历冲突链
+        if (strcmp(node->key, key) == 0) return 1;  // 已存在
+        node = node->next;
+    }
+    // 头插法插入新节点
+    hashnode_t *new = _create_node(key, value);
+    new->next = hash->nodes[idx];
+    hash->nodes[idx] = new;
+    hash->count++;
+    return 0;
+}
+```
 
 #### RBTREE 引擎 (`RSET` / `RGET` / `RDEL`)
 
@@ -494,6 +530,33 @@ cmd[0] == 'X' → Skiptable 引擎
 
 `handle_parsed_command()` 根据前缀路由，`strip_prefix()` 去掉前缀后执行统一的操作名（如 `HSET` → HASH 引擎执行 `SET`）。
 
+**RESP 协议解析核心**:
+
+```c
+// src/main/kvstore.c — parse_resp_stream
+int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
+    size_t pos = 0;
+    while (pos < *len) {
+        if (buf[pos] == '+') {           // 简单字符串: +OK\r\n
+            // 提取行内容，处理 KPROBERDMA / FULLRESYNC / CONTINUE
+        } else if (buf[pos] == '*') {    // 数组: *3\r\n$3\r\nSET\r\n...
+            int argc = atoi(buf + pos + 1);  // 解析参数个数
+            // 逐个解析 bulk string: $len\r\ndata\r\n
+            for (int i = 0; i < argc; i++) {
+                if (buf[pos] != '$') break;          // 不是 bulk
+                long blen = strtol(buf + pos + 1);    // bulk 长度
+                argv[i] = malloc(blen + 1);
+                memcpy(argv[i], buf + pos, blen);     // 按长度拷贝
+                argv[i][blen] = '\0';
+            }
+            handle_parsed_command(c, argc, argv, ...); // 执行命令
+        } else {                         // inline 命令（兼容 redis-cli）
+            // 空格分割参数
+        }
+    }
+}
+```
+
 #### 测试验证
 
 ```mermaid
@@ -528,6 +591,56 @@ make check-kvstore TEST_PORT=5000
 | **Proactor** | io_uring   | "操作完成通知"。提交 SQE 后立即返回，从 CQ 取结果。避免就绪通知→阻塞读的两步开销 |
 | **NtyCo**    | 协程       | 同步写法，异步执行。`recv` 被 hook 为 `epoll_ctl` → `yield` → `resume`          |
 
+**核心实现**:
+
+```c
+// src/storage/kvs_rbtree.c — 红黑树左旋示例
+static void rbtree_left_rotate(kvs_rbtree_t *tree, kvs_rbnode_t *x) {
+    kvs_rbnode_t *y = x->right;
+    x->right = y->left;                     // y 的左子树变为 x 的右子树
+    if (y->left != NULL) y->left->parent = x;
+    y->parent = x->parent;                  // y 接管 x 的父节点
+    if (x->parent == NULL) tree->root = y;  // x 是根 → y 成为新根
+    else if (x == x->parent->left) x->parent->left = y;
+    else x->parent->right = y;
+    y->left = x;                            // x 成为 y 的左子
+    x->parent = y;
+}
+```
+
+#### Skiptable 引擎 核心实现
+
+```c
+// src/storage/kvs_skiptable.c — 跳表插入
+static int rand_level(void) {
+    int level = 1;
+    while ((rand() % 2) && level < KVS_SKIPTABLE_MAX_LEVEL) level++;
+    return level;  // 50% 概率提升层数
+}
+
+int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
+    kvs_sknode_t *update[KVS_SKIPTABLE_MAX_LEVEL];
+    kvs_sknode_t *cur = inst->head;
+    for (int i = inst->level - 1; i >= 0; i--) {  // 从高层向下
+        while (cur->next[i] && strcmp(cur->next[i]->key, key) < 0)
+            cur = cur->next[i];
+        update[i] = cur;  // 记录每层的前驱
+    }
+    int level = rand_level();  // 随机层数
+    if (level > inst->level) {
+        for (int i = inst->level; i < level; i++) update[i] = inst->head;
+        inst->level = level;
+    }
+    kvs_sknode_t *node = create_node(level, key, value);
+    for (int i = 0; i < level; i++) {  // 逐层插入
+        node->next[i] = update[i]->next[i];
+        update[i]->next[i] = node;
+    }
+    inst->total++;
+    return 0;
+}
+```
+
 #### Reactor（默认）
 
 ```
@@ -542,7 +655,28 @@ epoll_wait(100ms)
 - `on_read()` 读出数据到 `in_buf`，`parse_resp_stream()` 解析 RESP 协议
 - 写操作通过 `queue_bytes()` 入队到 `out_buf`，`on_write()` 发送
 
-源码: `src/core/reactor.c`
+**Reactor 核心循环**:
+
+```c
+// src/core/reactor.c
+while (1) {
+    int n = epoll_wait(g_epfd, events, MAX_EVENTS, 100);  // 等待事件
+    
+    long long now = kvs_now_ms();
+    if (now - g_last_expire >= 100) {                      // 每 100ms
+        int budget = expire_cycle_budget();                 // 自适应 budget
+        kvs_active_expire_cycle(budget);                   // 主动过期
+        persist_autosnap_cron();                           // 自动快照
+        g_last_expire = now;
+    }
+    
+    for (int i = 0; i < n; i++) {
+        conn_t *c = fdmap[events[i].data.fd];
+        if (events[i].events & EPOLLIN)  on_read(c);      // 可读
+        if (events[i].events & EPOLLOUT) on_write(c);      // 可写
+    }
+}
+```
 
 #### Proactor (io_uring)
 
@@ -617,15 +751,55 @@ redis-cli -p 5002 GET k
 
 如果 AOF 恢复过程中发生错误，通过 `g_aof_recover_errors` 记录但不中断。
 
-#### io_uring 写入管道
+**io_uring 写入实现**:
 
+```c
+// src/persistence/kvs_persist.c
+static struct io_uring g_persist_uring;  // 全局 io_uring 实例
+
+static int persist_write_fd_uring(int fd, const unsigned char *buf, size_t len, off_t *offset) {
+    if (persist_uring_init_once() != 0) return -1;  // 首次调用时 init
+    size_t written = 0;
+    while (written < len) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_persist_uring);
+        size_t chunk = len - written;
+        io_uring_prep_write(sqe, fd, buf + written, chunk, offset ? *offset : -1);
+        // 提交 SQE 并等待 CQE 完成
+        io_uring_submit_and_wait(&g_persist_uring, 1);
+        io_uring_wait_cqe(&g_persist_uring, &cqe);
+        written += cqe->res;  // 实际写入字节数
+        io_uring_cqe_seen(&g_persist_uring, cqe);
+    }
+    return 0;
+}
+
+int persist_append_raw(const unsigned char *buf, size_t len) {
+    off = g_aof_write_offset;
+    // 优先 io_uring，失败回退同步 pwrite
+    if (persist_write_fd_uring(g_aof_fd, buf, len, &off) != 0)
+        persist_write_fd_sync(g_aof_fd, buf, len, &off);
+    g_aof_write_offset = off;
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS)
+        persist_fsync_fd_uring(g_aof_fd);  // 或回退 fsync()
+    return 0;
+}
 ```
-persist_append_raw()
-  → 尝试 io_uring (IORING_OP_WRITE)
-     → SQE 提交到 SQ
-     → 后台线程消耗 CQ
-  → io_uring 不可用时回退:
-     → pwrite(fd, buf, len, offset)
+
+**mmap 恢复实现**:
+
+```c
+static int replay_dump_file(const char *path) {
+    int fd = open(path, O_RDONLY);
+    mapped = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    while (pos + 4 <= size) {
+        memcpy(&klen, mapped + pos, 4);  pos += 4;
+        key = mapped + pos;              pos += klen;
+        memcpy(&vlen, mapped + pos, 4);  pos += 4;
+        value = mapped + pos;            pos += vlen;
+        kvs_hash_set(&global_hash, key, value);
+    }
+    munmap(mapped, size);
+}
 ```
 
 源码: `src/persistence/`

@@ -460,6 +460,14 @@ int persist_recover(void) {
     g_aof_last_flush_ms = g_last_snapshot_ms;
     g_aof_dirty = 0;
     g_persist_recovering = 0;
+
+    /* AOF 重放完成后截断文件，避免跨 session 无限累积 */
+    if (g_aof_fd >= 0) {
+        if (ftruncate(g_aof_fd, 0) == 0) {
+            g_aof_write_offset = 0;
+            lseek(g_aof_fd, 0, SEEK_SET);
+        }
+    }
     return 0;
 }
 

@@ -322,6 +322,98 @@ kvstore/
 
 ## 实现原理
 
+### 总体架构
+
+```mermaid
+graph TB
+    subgraph 客户端层
+        C1[redis-cli]
+        C2[telnet/nc]
+        C3[自定义 RESP 客户端]
+    end
+
+    subgraph 网络层
+        REA[Reactor<br/>epoll LT]
+        PRO[Proactor<br/>io_uring]
+        NTY[NtyCo<br/>协程]
+    end
+
+    subgraph 协议层
+        RESP[RESP 协议解析<br/>parse_resp_stream]
+        CMD[命令分发<br/>handle_parsed_command]
+    end
+
+    subgraph 存储引擎
+        ARR[Array<br/>KVS_ARRAY_SIZE=1024]
+        HSH[Hash<br/>链地址法]
+        RBT[RBTREE<br/>红黑树]
+        SKP[Skiptable<br/>跳表]
+        DOC[Doc<br/>两层哈希]
+    end
+
+    subgraph 功能层
+        TTL[TTL 过期<br/>哈希索引+最小堆]
+        LOCK[分布式锁<br/>LOCK/UNLOCK/RENEW]
+        MEM[内存管理<br/>libc/jemalloc/custom]
+    end
+
+    subgraph 持久化
+        DMP[Dump<br/>KVSD 二进制<br/>mmap 恢复]
+        AOF[AOF<br/>RESP 命令<br/>io_uring 写入]
+    end
+
+    subgraph 主从复制
+        TCP[TCP 传输]
+        RDMA[RDMA SEND/RECV<br/>全量同步]
+        EBPF[eBPF sockmap<br/>增量同步]
+        KPR[kprobe+RDMA WRITE<br/>增量同步]
+    end
+
+    subgraph 监控
+        INF[INFO]
+        MEMS[MEMSTAT]
+        SNP[AutoSnapshot<br/>BGSAVE]
+    end
+
+    C1 & C2 & C3 --> REA & PRO & NTY
+    REA & PRO & NTY --> RESP
+    RESP --> CMD
+    CMD --> ARR & HSH & RBT & SKP & DOC
+    CMD --> TTL & LOCK
+    CMD --> DMP & AOF
+    CMD --> TCP & RDMA & EBPF & KPR
+    ARR & HSH & RBT & SKP & DOC --> MEM
+    CMD --> INF & MEMS & SNP
+    TTL -.->|主动过期<br/>kvs_active_expire_cycle| REA
+```
+
+### 命令执行流程
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant N as 网络层
+    participant R as RESP 解析
+    participant H as 命令分发
+    participant E as 存储引擎
+    participant T as TTL
+    participant P as 持久化
+    participant REP as 复制
+
+    C->>N: PING/SET/GET ...
+    N->>R: epoll_wait → on_read()
+    R->>R: parse_resp_stream(buf)
+    R->>H: handle_parsed_command()
+    H->>T: try_expire(key)
+    T-->>H: 已过期？删除
+    H->>E: engine_set/get/del
+    E-->>H: +OK / $value
+    H->>P: persist_append_raw()  ← 写 AOF
+    H->>REP: repl_broadcast()     ← 主从复制
+    H->>N: queue_bytes(resp)
+    N->>C: on_write() → send()
+
+
 ### 存储引擎 — 五种数据结构
 
 kvstore 实现了五种存储引擎，通过**命令前缀**切换。所有引擎共享同一套 TTL 过期系统和复制层。
@@ -502,6 +594,33 @@ persist_append_raw()
 复制协议基于 RESP 协议扩展，通过 `repl_transport_ops_t` **策略模式**切换传输层。
 
 #### 复制握手流程
+
+```mermaid
+sequenceDiagram
+    participant M as Master
+    participant S as Slave
+
+    S->>M: REPLSYNC <replid> <offset>
+    M->>M: backlog_can_continue?
+    alt 可以部分同步
+        M->>S: +CONTINUE <replid> <offset>
+        M->>S: backlog 数据 (从 offset 开始)
+    else 需要全量同步
+        M->>S: +FULLRESYNC <replid> <offset> <bytes>
+        M->>M: kvs_snapshot_to_fp()
+        loop 分块发送 snapshot
+            M->>S: [KVSD 二进制数据块]
+        end
+        M->>S: REPLDONE
+        Note over S: repl_slave_finish_fullsync()
+    end
+    Note over M,S: 增量同步阶段
+    loop 每条写命令
+        M->>M: repl_broadcast(raw)
+        M->>S: [增量 RESP 命令]
+        S-->>M: REPLACK <applied> <durable>
+    end
+```
 
 ```
 Master                              Slave

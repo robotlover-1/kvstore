@@ -59,7 +59,7 @@ static int g_wr_in_flight = 0;      /* 飞行中的 WR 计数 */
 static int g_wr_producer_seq = 0;   /* 生产者序号（用于 head 指针） */
 
 /* ---- Slave MR 环形缓冲区信息（Master 侧） ---- */
-static struct {
+static volatile struct {
     uint64_t remote_data_base;      /* Slave slots 基地址 */
     uint32_t rkey;                  /* Slave MR rkey */
     uint64_t remote_head_addr;      /* Slave producer_head 地址 */
@@ -369,6 +369,8 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
     g_wr_in_flight++;
     g_wr_producer_seq++;
     g_rdma_writes++;
+    if (g_rdma_writes == 1)
+        fprintf(stderr, "kprobe rdma: first RDMA WRITE succeeded, data now flowing via RDMA\n");
     return 0;
 }
 
@@ -911,6 +913,7 @@ int repl_kprobe_rdma_parse_mr_info(const char *resp) {
     g_slave_mr.remote_head_addr = addr;        /* head 在偏移 0 */
     g_slave_mr.slot_count = (size_t)slot_count;
     g_slave_mr.slot_capacity = (size_t)slot_cap;
+    __sync_synchronize();
 
     fprintf(stderr, "kprobe rdma: MR info parsed - rkey=%u data_base=0x%lx "
         "slots=%zu cap=%zu\n",
@@ -1012,6 +1015,7 @@ int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
     g_slave_mr.remote_head_addr = addr;
     g_slave_mr.slot_count = slot_count;
     g_slave_mr.slot_capacity = slot_capacity;
+    __sync_synchronize();
     fprintf(stderr, "kprobe rdma: MR info updated - rkey=%u addr=0x%lx data_base=0x%lx head_addr=0x%lx slots=%zu cap=%zu\n",
         rkey, (unsigned long)addr,
         (unsigned long)g_slave_mr.remote_data_base,

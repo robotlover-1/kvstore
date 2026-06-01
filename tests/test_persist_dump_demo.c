@@ -56,11 +56,15 @@ static struct {
     int port;
     int count;
     int batch;
+    const char *dump_path;
+    const char *aof_path;
 } g_opt = {
     .host = "127.0.0.1",
     .port = 5170,
     .count = 50000,
     .batch = 1000,
+    .dump_path = "kvstore.dump",
+    .aof_path = "kvstore.aof",
 };
 
 /* ---------- 辅助函数 ---------- */
@@ -276,6 +280,10 @@ int main(int argc, char **argv) {
             g_opt.count = atoi(argv[++i]);
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc)
             g_opt.batch = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-path") == 0 && i + 1 < argc)
+            g_opt.dump_path = argv[++i];
+        else if (strcmp(argv[i], "--aof-path") == 0 && i + 1 < argc)
+            g_opt.aof_path = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("用法: %s [选项]\n", argv[0]);
             printf("\n全量持久化演示 (dump):\n");
@@ -289,6 +297,8 @@ int main(int argc, char **argv) {
             printf("  --port PORT     kvstore 端口 (默认 %d)\n", g_opt.port);
             printf("  --count N       写入数据量 (默认 %d)\n", g_opt.count);
             printf("  --batch N       每批写入量 (默认 %d)\n", g_opt.batch);
+            printf("  --dump-path PATH  dump 文件路径 (默认 kvstore.dump)\n");
+            printf("  --aof-path PATH    AOF 文件路径 (默认 kvstore.aof)\n");
             printf("  -h              显示此帮助\n");
             printf("\n示例:\n");
             printf("  # 终端 1: ./kvstore --port 5170 --role master --appendfsync always\n");
@@ -382,16 +392,15 @@ int main(int argc, char **argv) {
     fd = -1;
 
     /* 显示持久化文件信息 */
-    long long dump_sz = file_size("kvstore.dump");
-    long long aof_sz = file_size("kvstore.aof");
+    long long dump_sz = file_size(g_opt.dump_path);
+    long long aof_sz = file_size(g_opt.aof_path);
     stat_line("dump 文件", fmt_bytes(dump_sz));
     stat_line("aof  文件", fmt_bytes(aof_sz));
     info("");
 
     if (dump_sz <= 0) {
-        fprintf(stderr, ANSI_RED "  ERROR: dump 文件不存在或为空\n" ANSI_RESET);
-        fprintf(stderr, "  提示: 请在项目根目录运行本测试 (./test_persist_dump_demo ...)\n");
-        fprintf(stderr, "  或确认 kvstore 的 --dump-path 与测试期望的路径一致\n");
+        fprintf(stderr, ANSI_RED "  ERROR: dump 文件不存在或为空 (%s)\n" ANSI_RESET, g_opt.dump_path);
+        fprintf(stderr, "  提示: 可通过 --dump-path 指定正确的 dump 文件路径\n");
         return 1;
     }
 

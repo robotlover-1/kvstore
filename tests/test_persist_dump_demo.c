@@ -270,9 +270,40 @@ static const char *fmt_bytes(long long bytes) {
  * ================================================================ */
 
 int main(int argc, char **argv) {
+    /* 默认加载 tests/test.conf */
+    {
+        FILE *fp = fopen("tests/test.conf", "r");
+        if (!fp) fp = fopen("test.conf", "r");
+        if (fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                char *p = line;
+                while (*p && isspace((unsigned char)*p)) p++;
+                if (*p == '#' || *p == '\0' || *p == '\n') continue;
+                char *eq = strchr(p, '=');
+                if (!eq) continue;
+                *eq = '\0';
+                char *key = p, *val = eq + 1;
+                while (val && (*val == ' ' || *val == '\t')) val++;
+                char *end = val + strlen(val) - 1;
+                while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
+                if (strcmp(key, "host") == 0) g_opt.host = strdup(val);
+                else if (strcmp(key, "port") == 0) g_opt.port = atoi(val);
+                else if (strcmp(key, "count") == 0) g_opt.count = atoi(val);
+                else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+                else if (strcmp(key, "dump_path") == 0) g_opt.dump_path = strdup(val);
+                else if (strcmp(key, "aof_path") == 0) g_opt.aof_path = strdup(val);
+            }
+            fclose(fp);
+        }
+    }
+
     /* 解析参数 */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            /* --config 已由上面的默认加载处理，此处重新加载指定文件 */
+            i++;
+        } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
             g_opt.host = argv[++i];
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             g_opt.port = atoi(argv[++i]);
@@ -293,6 +324,7 @@ int main(int argc, char **argv) {
             printf("  4. 用户手动重启 kvstore\n");
             printf("  5. 本程序验证数据从 dump 恢复\n\n");
             printf("选项:\n");
+            printf("  --config PATH   加载配置文件 (默认 tests/test.conf)\n");
             printf("  --host HOST     kvstore 地址 (默认 %s)\n", g_opt.host);
             printf("  --port PORT     kvstore 端口 (默认 %d)\n", g_opt.port);
             printf("  --count N       写入数据量 (默认 %d)\n", g_opt.count);

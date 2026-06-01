@@ -912,6 +912,44 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 
 这些 C 测试程序**不依赖 hiredis 等第三方库**，直接通过 TCP socket 构造 RESP 协议报文，可在任何 Linux 环境下编译运行。
 
+所有测试程序均支持 `--config <path>` 加载配置文件，免去每次输入冗长命令行的麻烦：
+
+```bash
+# 使用默认配置（自动加载 tests/test.conf）
+./test_batch
+
+# 或指定配置文件
+./test_batch --config my_test.conf
+
+# 命令行参数可覆盖配置文件
+./test_batch --port 6380 --count 50000
+```
+
+配置文件格式 (`tests/test.conf`):
+
+```ini
+# 通用连接
+host=127.0.0.1
+port=5200
+
+# 主从复制（test_repl_5w5w 用）
+master_host=192.168.233.128
+master_port=5160
+slave_host=192.168.233.129
+slave_port=5161
+
+# 测试参数
+count=10000
+batch=1000
+ttl=10
+pre=50000
+post=50000
+
+# 持久化文件路径
+dump_path=kvstore.dump
+aof_path=kvstore.aof
+```
+
 编译方式：
 
 ```bash
@@ -923,6 +961,8 @@ make test_persist_aof_demo     # → ./test_persist_aof_demo
 make test_uring_persist        # → ./test_uring_persist
 make test_mmap_recover         # → ./test_mmap_recover
 make test_repl_basic           # → ./test_repl_basic
+make test_mass_ttl             # → ./test_mass_ttl
+make test_batch                # → ./test_batch
 
 # 或手动编译
 gcc -I./include -o test_kvstore tests/test_kvstore.c

@@ -406,6 +406,7 @@ cmd[0] == 'X' → Skiptable 引擎
 
 三种模型的目的不是为了生产冗余，而是**对比学习**——同一套业务逻辑用三种 I/O 模型实现。
 
+
 | 模型         | 底层       | 核心思想                                                                          |
 | ------------ | ---------- | --------------------------------------------------------------------------------- |
 | **Reactor**  | epoll (LT) | 事件驱动，"就绪通知"。`epoll_wait` → 可读/可写回调。单线程事件循环               |
@@ -517,14 +518,16 @@ Master                              Slave
   │    ← REPLACK <applied> <durable>    │  Slave 定期 ACK
 ```
 
-| 状态         | 含义                         |
-| ------------ | ---------------------------- |
-| `repl_offset`| Master 侧累计写入字节数      |
-| `repl_applied_offset_ack` | Slave 已应用的偏移量         |
-| `repl_durable_offset_ack` | Slave 已持久化的偏移量       |
-| `backlog`    | 1MB 环形缓冲，存储最近的写命令 |
+
+| 状态                      | 含义                           |
+| ------------------------- | ------------------------------ |
+| `repl_offset`             | Master 侧累计写入字节数        |
+| `repl_applied_offset_ack` | Slave 已应用的偏移量           |
+| `repl_durable_offset_ack` | Slave 已持久化的偏移量         |
+| `backlog`                 | 1MB 环形缓冲，存储最近的写命令 |
 
 #### 四种传输方式
+
 
 | 传输方式              | 类型      | 数据路径                                                         | 优势                       |
 | --------------------- | --------- | ---------------------------------------------------------------- | -------------------------- |
@@ -622,12 +625,13 @@ kvs_expire_table_t
 
 #### 核心操作
 
-| 操作 | 函数 | 流程 |
-|---|---|---|
-| **EXPIRE key 10** | `kvs_expire_set()` | 计算 `expire_at = now + 10000ms` → 插入哈希表 → 入堆 `heap_sift_up` |
-| **TTL key** | `kvs_expire_ttl()` | 哈希表找到节点 → `(expire_at - now) / 1000` |
-| **PERSIST key** | `kvs_expire_del()` | 哈希表删除 → `heap_remove_at` → `heap_sift_down/sift_up` |
-| **更新 TTL** | `kvs_expire_set()` 已存在时 | 更新 `expire_at_ms` → `heap_update`（同时 sift_up 和 sift_down） |
+
+| 操作              | 函数                        | 流程                                                                 |
+| ----------------- | --------------------------- | -------------------------------------------------------------------- |
+| **EXPIRE key 10** | `kvs_expire_set()`          | 计算`expire_at = now + 10000ms` → 插入哈希表 → 入堆 `heap_sift_up` |
+| **TTL key**       | `kvs_expire_ttl()`          | 哈希表找到节点 →`(expire_at - now) / 1000`                          |
+| **PERSIST key**   | `kvs_expire_del()`          | 哈希表删除 →`heap_remove_at` → `heap_sift_down/sift_up`            |
+| **更新 TTL**      | `kvs_expire_set()` 已存在时 | 更新`expire_at_ms` → `heap_update`（同时 sift_up 和 sift_down）     |
 
 #### 过期删除策略
 
@@ -719,6 +723,7 @@ heap = [1000, 2000, 5000]   heap = [1000, 2000, 5000]
 
 ### 内存管理 — 三种后端
 
+
 | 后端         | 实现                         | 适用场景         |
 | ------------ | ---------------------------- | ---------------- |
 | **libc**     | `malloc()/free()`            | 开发调试         |
@@ -748,10 +753,12 @@ slab 分配器
 ### TTL 过期时间记录 in AOF
 
 写命令（SET/MSET/DEL/EXPIRE 等）会以原始 RESP 格式写入 AOF 文件：
+
 ```
 *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 *3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n
 ```
+
 恢复时重放 AOF，重新执行 EXPIRE 命令重建 TTL 堆。
 
 ### 自动化快照 (AutoSnapshot)
@@ -857,6 +864,7 @@ redis-cli -p 5000 INFO
 # ── 方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）──
 
 # 终端 1 (VM1, 先启动 Master, 需 root 加载 BPF):
+rm kvstore_transpoer.log kvstore.aof
 sudo ./kvstore --port 5160 --role master \
     --repl-fullsync-transport rdma \
     --repl-realtime-transport kprobe-rdma \

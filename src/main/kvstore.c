@@ -523,6 +523,8 @@ static int queue_snapshot(conn_t *c) {
     int ret = -1;
 
     repl_rdma_log("queue_snapshot - begin replid=%s offset=%llu", repl_master_id(), repl_master_offset());
+    /* 记录全量同步启动时的 offset，用于后续回放 gap */
+    unsigned long long snap_base_offset = repl_master_offset();
     /* Use a temporary path so we don't overwrite the binary dump file */
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
     fp = fopen(tmp_path, "wb");
@@ -535,9 +537,9 @@ static int queue_snapshot(conn_t *c) {
     fclose(fp);
     fp = NULL;
 
-    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu\r\n", repl_master_id(), repl_master_offset(), total_bytes);
+    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu\r\n", repl_master_id(), snap_base_offset, total_bytes);
 
-    repl_note_send_context("fullsync-header", (size_t)n, repl_master_offset(), (unsigned char *)hdr);
+    repl_note_send_context("fullsync-header", (size_t)n, snap_base_offset, (unsigned char *)hdr);
     if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)n) != 0) {
         repl_rdma_log("queue_snapshot - header send failed");
         goto out;
@@ -569,6 +571,19 @@ static int queue_snapshot(conn_t *c) {
         }
     }
     c->repl_fullsync_pending = 0;
+
+    /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset） */
+    if (repl_master_offset() > snap_base_offset) {
+        unsigned long long gap = repl_master_offset() - snap_base_offset;
+        repl_rdma_log("queue_snapshot - replaying gap offset=%llu bytes=%llu",
+            snap_base_offset, gap);
+        if (repl_backlog_write_range(c, snap_base_offset) != 0) {
+            repl_rdma_log("queue_snapshot - gap replay FAILED");
+        } else {
+            repl_rdma_log("queue_snapshot - gap replay OK");
+        }
+    }
+
     ret = 0;
     repl_rdma_log("queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu", total, repl_master_offset());
 out:

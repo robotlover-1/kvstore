@@ -412,7 +412,7 @@ sequenceDiagram
     H->>REP: repl_broadcast()     ← 主从复制
     H->>N: queue_bytes(resp)
     N->>C: on_write() → send()
-
+```
 
 ### 存储引擎 — 五种数据结构
 

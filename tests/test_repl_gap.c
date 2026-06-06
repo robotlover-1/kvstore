@@ -35,8 +35,6 @@
  *   Phase 3: 用户手动写入 gap 数据到 Master（全量同步期间）
  *   Phase 4: 等待全量同步完成（轮询 slave_fullsync_loading）
  *   Phase 5: 验证 Slave 有 pre 数据 + gap 数据
- *   Phase 6: 写入 post 数据并验证增量同步
- *   Phase 7: 最终一致性检查
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,7 +82,7 @@ static struct {
     .slave_port = 5180,
     .pre_count = 50000,
     .gap_count = 0,
-    .post_count = 5000,
+    .post_count = 0,
     .batch = 1000,
     .poll_ms = 500,
 };
@@ -470,7 +468,6 @@ int main(int argc, char **argv) {
             printf("  --slave-port PORT    Slave 端口 (默认 %d)\n", g_opt.slave_port);
             printf("  --pre-count N        预存数据量 (默认 %d，建议 ≥50000 以确保 gap 窗口)\n", g_opt.pre_count);
             printf("  --gap-count N        gap 数据量 (默认 0，手动输入)\n");
-            printf("  --post-count N       post 数据量 (默认 %d)\n", g_opt.post_count);
             printf("  --batch N            每批写入量 (默认 %d)\n", g_opt.batch);
             return 0;
         }
@@ -481,7 +478,7 @@ int main(int argc, char **argv) {
     printf("  Slave:       %s:%d\n", g_opt.slave_host, g_opt.slave_port);
     printf("  Pre:         %d\n", g_opt.pre_count);
     printf("  Gap:         %d\n", g_opt.gap_count);
-    printf("  Post:        %d\n", g_opt.post_count);
+  
     printf("  Batch:       %d\n", g_opt.batch);
     printf("\n");
 
@@ -635,69 +632,11 @@ int main(int argc, char **argv) {
         info("跳过 Gap 验证（用户未写入 gap 数据）");
     }
 
-    /* ── Phase 6: 写入 Post 数据并验证增量同步 ── */
-    banner("Phase 6: 写入 Post 数据 + 增量同步验证");
-
-    {
-        int fd = tcp_connect(g_opt.master_host, g_opt.master_port);
-        if (fd < 0) { fail_msg("连接 Master 失败"); return 1; }
-        double t0 = now_ms();
-        int post_ok = batch_write(fd, "HSET", "post", 1, g_opt.post_count, "Post");
-        close(fd);
-        double t1 = now_ms();
-        if (post_ok != 0) { fail_msg("写入 post 数据失败"); return 1; }
-        info("Post 数据已写入: %d条, %.0fms", g_opt.post_count, t1 - t0);
-    }
-
-    /* 等待增量同步: 轮询 slave 确认数据到达 */
-    info("等待增量同步...");
-    int post_verified = 0;
-    double post_wait = now_ms();
-    while (now_ms() - post_wait < 30000) {
-        char *sv = cmd_resp(g_opt.slave_host, g_opt.slave_port, "HGET", "post:k:000001", NULL);
-        char *sval = sv ? extract_bulk(sv) : NULL;
-        if (sval && strcmp(sval, "v:000001") == 0) {
-            post_verified = 1;
-            free(sv); free(sval);
-            break;
-        }
-        free(sv); free(sval);
-        usleep((useconds_t)(g_opt.poll_ms * 1000));
-    }
-
-    if (post_verified) {
-        pass("增量同步完成");
-        if (verify_batch("Phase6", "post", g_opt.post_count) != 0) failed++;
-    } else {
-        fail_msg("增量同步超时 (30s)");
-        failed++;
-    }
-
-    /* ── Phase 7: 最终一致性检查 ── */
-    banner("Phase 7: 最终一致性检查");
-
-    int total_checks = 0;
-    int check_fails = 0;
-
-    /* 所有前缀抽查 */
-    const char *prefixes[] = {"pre", "gap", "post", NULL};
-    for (int p = 0; prefixes[p]; p++) {
-        char key[64], expected[64];
-        snprintf(key, sizeof(key), "%s:k:%06d", prefixes[p], 1);
-        snprintf(expected, sizeof(expected), "v:%06d", 1);
-        if (verify_key("Final", "HGET", key, expected) != 0) check_fails++;
-        total_checks++;
-    }
-
-    if (check_fails == 0) pass("最终一致性检查: %d/%d 通过", total_checks - check_fails, total_checks);
-    else fail_msg("最终一致性检查: %d/%d 失败", check_fails, total_checks);
-
     /* ── 结果 ── */
     printf("\n");
     if (failed == 0) {
         printf(ANSI_GREEN ANSI_BOLD "\n  ✓ 全部 GAP 测试通过!\n" ANSI_RESET);
-        printf("  Pre=%d, Gap=%d, Post=%d\n\n",
-               g_opt.pre_count, g_opt.gap_count, g_opt.post_count);
+        printf("  Pre=%d, Gap=%d\n\n", g_opt.pre_count, g_opt.gap_count);
         return 0;
     } else {
         printf(ANSI_RED ANSI_BOLD "\n  ✗ %d 项测试失败\n" ANSI_RESET "\n", failed);

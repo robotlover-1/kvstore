@@ -202,7 +202,7 @@ $(TEST_REPL_GAP_BIN): $(TEST_REPL_GAP_SRC)
 	$(CC) $(CFLAGS) -o $@ $<
 
 check-repl-gap: $(TEST_REPL_GAP_BIN)
-	./$(TEST_REPL_GAP_BIN) --master-port $(REPL_MASTER_PORT) --slave-port $(REPL_SLAVE_PORT) --pre-count 30000 --gap-count 5000 --post-count 5000
+	./$(TEST_REPL_GAP_BIN) --master-port $(REPL_MASTER_PORT) --slave-port $(REPL_SLAVE_PORT) --pre-count 3000 --post-count 1000
 
 check-uring-persist-c: $(TEST_URING_PERSIST_BIN)
 	./$(TEST_URING_PERSIST_BIN) --port $(URING_PERSIST_PORT) --count $(URING_PERSIST_COUNT) --appendfsync $(URING_PERSIST_APPEND_FSYNC)

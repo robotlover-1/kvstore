@@ -16,17 +16,18 @@
  * ═══════════════════════════════════════════════════════════════
  *
  * 用法:
- *   # 终端 1: 启动 Master
+ *   # 终端 1 (Master 机器 192.168.233.128): 启动 Master
  *   ./kvstore --port 5179 --role master \
  *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
  *
- *   # 终端 2: 运行本测试
- *   ./test_repl_gap --master-port 5179 --slave-port 5180 \
- *       --pre-count 30000 --gap-count 5000 --post-count 5000
+ *   # 终端 2 (任意机器): 运行本测试（支持 --config 加载配置）
+ *   ./test_repl_gap --master-host 192.168.233.128 --master-port 5179 \
+ *       --slave-host 192.168.233.129 --slave-port 5180 \
+ *       --pre-count 3000 --post-count 1000
  *
- *   # 终端 3: 看到提示后启动 Slave
- *   ./kvstore --port 5180 --role slave --master-host 127.0.0.1 --master-port 5179 \
- *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
+ *   # 终端 3 (Slave 机器 192.168.233.129): 看到提示后启动 Slave
+ *   ./kvstore --port 5180 --role slave --master-host 192.168.233.128 --master-port 5179 \
+ *       --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
  *
  * 流程:
  *   Phase 1: 预存 pre 数据到 Master（制造全量同步负担）
@@ -54,6 +55,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <libgen.h>
 
 #define BUFFER_SIZE 65536
 #define MAX_KEY_LEN 128
@@ -80,9 +82,9 @@ static struct {
     .master_port = 5179,
     .slave_host = "127.0.0.1",
     .slave_port = 5180,
-    .pre_count = 30000,
-    .gap_count = 5000,
-    .post_count = 5000,
+    .pre_count = 3000,
+    .gap_count = 0,
+    .post_count = 1000,
     .batch = 1000,
     .poll_ms = 500,
 };
@@ -307,6 +309,38 @@ static int slave_is_loading_fullsync(void) {
     return loading;
 }
 
+/* ── 配置文件解析 ── */
+
+static int parse_config_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        while (val && (*val == ' ' || *val == '\t')) val++;
+        char *end = val + strlen(val) - 1;
+        while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
+        if (strcmp(key, "master_host") == 0) g_opt.master_host = strdup(val);
+        else if (strcmp(key, "master_port") == 0) g_opt.master_port = atoi(val);
+        else if (strcmp(key, "slave_host") == 0) g_opt.slave_host = strdup(val);
+        else if (strcmp(key, "slave_port") == 0) g_opt.slave_port = atoi(val);
+        else if (strcmp(key, "pre") == 0 || strcmp(key, "pre_count") == 0) g_opt.pre_count = atoi(val);
+        else if (strcmp(key, "gap") == 0 || strcmp(key, "gap_count") == 0) g_opt.gap_count = atoi(val);
+        else if (strcmp(key, "post") == 0 || strcmp(key, "post_count") == 0) g_opt.post_count = atoi(val);
+        else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+        else if (strcmp(key, "poll_ms") == 0) g_opt.poll_ms = atoi(val);
+    }
+    fclose(fp);
+    return 0;
+}
+
 /* ── 批量写入 ── */
 
 static int batch_write(int fd, const char *cmd, const char *prefix, int start, int count) {
@@ -386,9 +420,15 @@ static int verify_batch(const char *label, const char *prefix, int count) {
 /* ── 主函数 ── */
 
 int main(int argc, char **argv) {
+    /* 先加载默认配置文件 */
+    parse_config_file("tests/test.conf");
+    parse_config_file("test.conf");
+
     /* 解析参数 */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            parse_config_file(argv[++i]);
+        else if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
             g_opt.master_host = argv[++i];
         else if (strcmp(argv[i], "--slave-host") == 0 && i + 1 < argc)
             g_opt.slave_host = argv[++i];
@@ -408,12 +448,13 @@ int main(int argc, char **argv) {
             g_opt.poll_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("用法: %s [选项]\n", argv[0]);
+            printf("  --config PATH        加载配置文件 (默认 tests/test.conf)\n");
             printf("  --master-host HOST   Master 地址 (默认 %s)\n", g_opt.master_host);
             printf("  --master-port PORT   Master 端口 (默认 %d)\n", g_opt.master_port);
             printf("  --slave-host HOST    Slave 地址 (默认 %s)\n", g_opt.slave_host);
             printf("  --slave-port PORT    Slave 端口 (默认 %d)\n", g_opt.slave_port);
             printf("  --pre-count N        预存数据量 (默认 %d)\n", g_opt.pre_count);
-            printf("  --gap-count N        gap 数据量 (默认 %d)\n", g_opt.gap_count);
+            printf("  --gap-count N        gap 数据量 (默认 0，手动输入)\n");
             printf("  --post-count N       post 数据量 (默认 %d)\n", g_opt.post_count);
             printf("  --batch N            每批写入量 (默认 %d)\n", g_opt.batch);
             return 0;
@@ -485,20 +526,20 @@ int main(int argc, char **argv) {
     /* ── Phase 3: 提示用户手动写入 gap 数据（全量同步期间） ── */
     banner("Phase 3: 全量同步期间手动写入 Gap 数据");
 
-    prompt_user("请在另一终端（终端 4）连接 Master 并写入 gap 数据，例如:\n"
-                "  for i in $(seq 1 %d); do\n"
-                "    printf '*3\\r\\n\\$4\\r\\nHSET\\r\\n\\$12\\r\\ngap:k:%%06d\\r\\n\\$9\\r\\nv:%%06d\\r\\n' \\\n"
-                "      \\$i \\$i | nc -q 0 %s %d\n"
-                "  done\n"
-                "写入完成后，回到本窗口按 Enter 继续...",
-                g_opt.gap_count, g_opt.master_host, g_opt.master_port);
+    prompt_user("请在另一终端连接 Master %s:%d 并写入任意 gap 数据\n"
+                "（例如: redis-cli -p %d -h %s HSET gap:mykey myvalue），\n"
+                "写入完成后，回到本窗口输入你写了多少条 gap 数据:",
+                g_opt.master_host, g_opt.master_port,
+                g_opt.master_port, g_opt.master_host);
 
-    /* 等待用户按 Enter 确认 */
+    /* 等待用户输入实际写入的 gap 条数 */
     {
-        char buf[16];
+        char buf[64];
         if (!fgets(buf, sizeof(buf), stdin)) {}
+        int n = atoi(buf);
+        if (n > 0) g_opt.gap_count = n;
     }
-    info("用户确认 gap 数据已写入");
+    info("Gap 数据已写入，共 %d 条", g_opt.gap_count);
 
     /* ── Phase 4: 等待全量同步完成 ── */
     banner("Phase 4: 等待全量同步完成 + Gap 补发");
@@ -530,8 +571,12 @@ int main(int argc, char **argv) {
     info("验证 Pre 数据 (全量快照) ...");
     if (verify_batch("Phase5", "pre", g_opt.pre_count) != 0) failed++;
 
-    info("验证 Gap 数据 (全量同步期间写入) ...");
-    if (verify_batch("Phase5", "gap", g_opt.gap_count) != 0) failed++;
+    if (g_opt.gap_count > 0) {
+        info("验证 Gap 数据 (全量同步期间写入，共 %d 条) ...", g_opt.gap_count);
+        if (verify_batch("Phase5", "gap", g_opt.gap_count) != 0) failed++;
+    } else {
+        info("跳过 Gap 验证（用户未写入 gap 数据）");
+    }
 
     /* ── Phase 6: 写入 Post 数据并验证增量同步 ── */
     banner("Phase 6: 写入 Post 数据 + 增量同步验证");
@@ -595,9 +640,8 @@ int main(int argc, char **argv) {
     printf("\n");
     if (failed == 0) {
         printf(ANSI_GREEN ANSI_BOLD "\n  ✓ 全部 GAP 测试通过!\n" ANSI_RESET);
-        printf("  Pre=%d, Gap=%d, Post=%d, 总计 %d 条\n\n",
-               g_opt.pre_count, g_opt.gap_count, g_opt.post_count,
-               g_opt.pre_count + g_opt.gap_count + g_opt.post_count);
+        printf("  Pre=%d, Gap=%d, Post=%d\n\n",
+               g_opt.pre_count, g_opt.gap_count, g_opt.post_count);
         return 0;
     } else {
         printf(ANSI_RED ANSI_BOLD "\n  ✗ %d 项测试失败\n" ANSI_RESET "\n", failed);

@@ -3762,7 +3762,7 @@ sequenceDiagram
     Note over U: 用户另开终端连接 Master
     U->>M: HSET gap:k:000001 v:000001
     U->>M: HSET gap:k:000002 v:000002
-    Note over U: ... 写入 %d 条后按 Enter
+    Note over U: 输入实际写入的条数
     Note over U,M: gap 数据进入 backlog
 
     M->>S: REPLDONE + repl_backlog_write_range()
@@ -3777,27 +3777,25 @@ sequenceDiagram
 ```
 
 ```bash
-# ── 四终端测试（推荐）──
+# ── 双机四终端测试（推荐）──
 
-# 终端 1: 启动 Master（先启动）
+# 终端 1 (Master 机器 192.168.233.128): 先启动 Master
 ./kvstore --port 5179 --role master \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
 
-# 终端 2: 运行测试
-./test_repl_gap --master-port 5179 --slave-port 5180 \
+# 终端 2 (任意机器): 运行测试
+./test_repl_gap --master-host 192.168.233.128 --master-port 5179 \
+    --slave-host 192.168.233.129 --slave-port 5180 \
     --pre-count 30000 --gap-count 5000 --post-count 5000
 
-# 看到提示后，在终端 3 启动 Slave:
+# 看到提示后，在终端 3 (Slave 机器 192.168.233.129): 启动 Slave
 ./kvstore --port 5180 --role slave \
-    --master-host 127.0.0.1 --master-port 5179 \
+    --master-host 192.168.233.128 --master-port 5179 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
 
-# 看到全量同步开始提示后，在终端 4 手动写入 gap 数据:
-for i in $(seq 1 5000); do
-  printf '*3\r\n$4\r\nHSET\r\n$12\r\ngap:k:%06d\r\n$9\r\nv:%06d\r\n' \
-    $i $i | nc -q 0 127.0.0.1 5179
-done
-# 写入完成后，回到终端 2 按 Enter 继续
+# 看到全量同步开始提示后，在终端 4 手动写入任意 gap 数据:
+redis-cli -p 5179 -h 192.168.233.128 HSET gap:mykey myvalue
+# 写入完成后，回到终端 2，输入你实际写入的 gap 条数（例如 1）然后按 Enter
 ```
 
 三阶段验证确保数据不丢失：
@@ -3817,7 +3815,7 @@ done
 | `--master-port PORT` | 6379      | Master 端口         |
 | `--slave-port PORT`  | 6380      | Slave 端口          |
 | `--pre-count N`      | 30000     | 预存数据量（全量）  |
-| `--gap-count N`      | 5000      | gap 数据量           |
+| `--gap-count N`      | 0         | gap 数据量（全量同步期间手动写入后输入） |
 | `--post-count N`     | 5000      | 增量数据量          |
 | `--batch N`          | 1000      | 每批写入量          |
 | `--poll-ms N`        | 500       | 轮询间隔毫秒        |
@@ -3854,7 +3852,7 @@ done
 | `make check-mmap-recover-c`          | 1w            | mmap 恢复验证（C 程序，支持指定引擎，自动管理进程）                                                             | `artifacts/persist/mmap-recover/`   |
 | `make check-repl`                    | 5k            | 主从复制基本验证（shell 脚本）                                                                                  | —                                  |
 | `make check-repl-basic`              | 5k            | 主从复制基本验证（C 程序，自动管理 Master/Slave 进程）                                                          | —                                  |
-| `make check-repl-gap`                | 3w+5k+5k      | 全量同步 gap 补发验证（C 程序，用户管理进程）                                                                    | —                                  |
+| `make check-repl-gap`                | 3k+手动+1k     | 全量同步 gap 补发验证（C 程序，gap 数据由用户手动写入）                                                          | —                                  |
 | `make test_repl_5w5w`<br>（仅编译）  | **5w+5w**     | 5w+5w 主从同步 C 测试（`tests/test_repl_5w5w.c`）<br>编译后手动运行：`tests/test_repl_5w5w --master-host H ...` | —                                  |
 | `make check-repl-metrics`            | 5w+5k         | 复制指标基线                                                                                                    | `artifacts/repl/metrics/`           |
 | `make check-repl-profile`            | 5w+5k         | 复制 profiling                                                                                                  | `artifacts/repl/profile/`           |

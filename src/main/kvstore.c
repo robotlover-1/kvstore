@@ -164,9 +164,15 @@ static int parse_repl_transport_backend(const char *s) {
 
 static int parse_args(int argc, char **argv) {
     const char *config_path = NULL;
+    /* First pass: find config file path */
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--config") && i + 1 < argc) {
             config_path = argv[i + 1];
+            break;
+        }
+        if (i == 1 && argv[i][0] != '-') {
+            /* First positional argument: treat as config file */
+            config_path = argv[i];
             break;
         }
     }
@@ -288,6 +294,10 @@ static int parse_args(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--repl-kprobe-obj-path") && i + 1 < argc) {
             snprintf(g_cfg.repl_kprobe_obj_path, sizeof(g_cfg.repl_kprobe_obj_path), "%s", argv[++i]);
+        }
+        else if (argv[i][0] != '-') {
+            /* Bare argument: treat as config file path */
+            if (parse_config_file(argv[i]) != 0) return -1;
         }
         else return -1;
     }

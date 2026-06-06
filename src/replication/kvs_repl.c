@@ -276,6 +276,8 @@ static int repl_rdma_acquire_send_slot(int timeout_ms) {
     int slot;
     long long deadline = timeout_ms > 0 ? kvs_now_ms() + timeout_ms : 0;
     for (;;) {
+        /* 连接已断开，立即返回 */
+        if (!g_repl_rdma_ctx.connected) break;
         /* 线性扫描取第一个空闲 slot */
         for (int i = 0; i < g_repl_rdma_ctx.send_pipeline_depth; ++i) {
             slot = (g_repl_rdma_ctx.send_pipeline_head + i) % g_repl_rdma_ctx.send_pipeline_depth;
@@ -293,7 +295,7 @@ static int repl_rdma_acquire_send_slot(int timeout_ms) {
             continue;
         }
         /* CQ 轮询线程未运行：直接 poll CQ 回收 completion */
-        if (g_repl_rdma_ctx.cq) {
+        if (g_repl_rdma_ctx.connected && g_repl_rdma_ctx.cq) {
             struct ibv_wc wc;
             if (ibv_poll_cq(g_repl_rdma_ctx.cq, 1, &wc) > 0) {
                 if (wc.status == IBV_WC_SUCCESS &&
@@ -2896,7 +2898,8 @@ static void *rdma_master_listener_thread(void *arg) {
             }
         }
         repl_rdma_log("listener", g_repl_rdma_ctx.connected ? "listener loop exiting while still marked connected" : "listener loop exiting after disconnect");
-        repl_rdma_reset_conn_ctx(1);
+        /* cleanup 由主线程的 failover 逻辑处理，listener 线程不直接重置
+         * 避免线程间 RDMA 资源竞态导致的 segfault */
     }
     return NULL;
 }

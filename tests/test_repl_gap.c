@@ -343,11 +343,11 @@ static int parse_config_file(const char *path) {
     return 0;
 }
 
-/* ── 批量写入（分块发送，每块后读取响应防止 TCP 缓冲死锁） ── */
+/* ── 批量写入（分块发送+进度显示，每块后读取响应防止 TCP 缓冲死锁） ── */
 
-static int batch_write(int fd, const char *cmd, const char *prefix, int start, int count) {
-    size_t chunk = 500;  /* 每 500 条发送一次，避免填满 TCP 缓冲区 */
-    int sent = 0;
+static int batch_write(int fd, const char *cmd, const char *prefix, int start, int count, const char *label) {
+    size_t chunk = 500;
+    int sent = 0, pct = -1;
     while (sent < count) {
         size_t cur = (size_t)(count - sent) < chunk ? (size_t)(count - sent) : chunk;
         size_t cap = cur * 128;
@@ -367,11 +367,23 @@ static int batch_write(int fd, const char *cmd, const char *prefix, int start, i
         if (send_all(fd, buf, pos) != 0) { free(buf); return -1; }
         free(buf);
         sent += (int)cur;
-        /* 每块发送后尝试读取部分响应，防止 TCP 缓冲区满导致死锁 */
-        for (int i = 0; i < (int)cur; i++) {
+        /* 读取响应：用 poll 检查数据是否可读，避免 recv_resp 长时间阻塞 */
+        int ok = 0;
+        while (ok < (int)cur) {
+            struct pollfd pfd = {.fd = fd, .events = POLLIN};
+            int prc = poll(&pfd, 1, 2000);  /* 最多等 2 秒 */
+            if (prc <= 0) break;            /* 超时或出错，不再等 */
             unsigned char *r = recv_resp(fd);
             if (!r) break;
             free(r);
+            ok++;
+        }
+        /* 进度显示 */
+        int new_pct = sent * 100 / count;
+        if (new_pct / 10 > pct / 10) {
+            pct = new_pct;
+            printf("[INFO] %s 写入进度: %d/%d (%d%%)\n", label, sent, count, pct);
+            fflush(stdout);
         }
     }
     return 0;
@@ -483,12 +495,15 @@ int main(int argc, char **argv) {
         return 1;
     }
     pass("Master 已就绪");
+    fflush(stdout);
 
     {
+        info("开始写入 %d 条 Pre 数据 ...", g_opt.pre_count);
+        fflush(stdout);
         int fd = tcp_connect(g_opt.master_host, g_opt.master_port);
         if (fd < 0) { fail_msg("连接 Master 失败"); return 1; }
         double t0 = now_ms();
-        int pre_ok = batch_write(fd, "HSET", "pre", 1, g_opt.pre_count);
+        int pre_ok = batch_write(fd, "HSET", "pre", 1, g_opt.pre_count, "Pre");
         close(fd);
         double t1 = now_ms();
         if (pre_ok != 0) { fail_msg("写入 pre 数据失败"); return 1; }
@@ -587,7 +602,7 @@ int main(int argc, char **argv) {
         int fd = tcp_connect(g_opt.master_host, g_opt.master_port);
         if (fd < 0) { fail_msg("连接 Master 失败"); return 1; }
         double t0 = now_ms();
-        int post_ok = batch_write(fd, "HSET", "post", 1, g_opt.post_count);
+        int post_ok = batch_write(fd, "HSET", "post", 1, g_opt.post_count, "Post");
         close(fd);
         double t1 = now_ms();
         if (post_ok != 0) { fail_msg("写入 post 数据失败"); return 1; }

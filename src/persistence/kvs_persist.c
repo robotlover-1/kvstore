@@ -30,6 +30,13 @@ static long long g_last_snapshot_ms = 0;
 static int g_aof_dirty = 0;
 static long long g_aof_last_flush_ms = 0;
 
+static int g_aof_disabled = 0;
+
+int persist_aof_disable(void) {
+    g_aof_disabled = 1;
+    return 0;
+}
+
 static pid_t g_bgrewrite_pid = -1;
 static int g_bgrewrite_status = 0; /* 0 idle, 1 running, 2 ok, 3 err */
 static char g_rewrite_tmp_path[512] = {0};
@@ -364,6 +371,10 @@ static int finalize_rewrite_parent(void) {
 }
 
 int persist_init(void) {
+    if (g_aof_disabled) {
+        g_aof_fd = -1;
+        return 0;
+    }
     g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     g_aof_last_flush_ms = kvs_now_ms();
     if (g_aof_fd < 0) return -1;
@@ -405,7 +416,7 @@ int persist_force_aof_flush(void) {
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
     long long off;
-    if (g_aof_fd < 0) return -1;
+    if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;
     off = g_aof_write_offset;
     if (persist_write_raw_fd(g_aof_fd, buf, len, &off) != 0) return -1;
     g_aof_write_offset = off;
@@ -450,7 +461,9 @@ int persist_recover(void) {
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
     aof_begin_ms = kvs_now_ms();
-    replay_file(g_cfg.aof_path);
+    if (!g_aof_disabled) {
+        replay_file(g_cfg.aof_path);
+    }
     g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;
 
     g_recover_last_total_ms = kvs_now_ms() - begin_ms;

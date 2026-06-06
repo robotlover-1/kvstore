@@ -1,0 +1,5 @@
+scenario,total_keys,total_time_sec,save_count,write_time_sec,save_time_sec,avg_save_ms
+100w_hset_save_1,1000000,20.52,1,20.49,0.03,34.0
+10w_hset_save_10,1000000,69.73,10,69.69,0.03,3.7
+1w_hset_save_100,1000000,37.23,100,36.89,0.33,3.3
+1k_hset_save_1000,1000000,104.94,1000,101.75,3.19,3.1

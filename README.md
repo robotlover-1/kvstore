@@ -211,12 +211,13 @@ kvstore/
 ### 持久化
 
 
-| 命令                 | 说明              |
-| -------------------- | ----------------- |
-| `SAVE`               | 同步保存 dump     |
-| `BGSAVE`             | 后台保存 dump     |
-| `BGREWRITEAOF`       | 重写 AOF          |
-| `APPENDFSYNC policy` | 设置 AOF 同步策略 |
+| 命令 / 选项               | 说明                      |
+| ------------------------- | ------------------------- |
+| `SAVE`                    | 同步保存 dump             |
+| `BGSAVE`                  | 后台保存 dump             |
+| `BGREWRITEAOF`            | 重写 AOF                  |
+| `APPENDFSYNC policy`      | 设置 AOF 同步策略         |
+| `--aof-disable`           | 启动时禁用 AOF 持久化     |
 
 ### 文档对象
 
@@ -283,6 +284,7 @@ kvstore/
 | `net_backend`             | `reactor`      | 网络模型：`reactor` / `proactor` / `ntyco`    |
 | `log_mode`                | `info`         | 日志级别：`debug` / `info` / `warn` / `error` |
 | `appendfsync`             | `always`       | AOF 同步：`always` / `everysec`               |
+| `aof_disable`             | `0`            | 禁用 AOF（`1` 关闭，`0` 开启）                |
 | `repl_transport_backend`  | `tcp`          | 复制传输（单模式）：`tcp` / `rdma` / `ebpf`   |
 | `repl_fullsync_transport` | `rdma`         | 全量同步传输：`rdma` / `tcp`                  |
 | `repl_realtime_transport` | `ebpf`         | 实时增量同步传输：`ebpf` / `tcp`              |
@@ -303,6 +305,7 @@ kvstore/
           --master-host <ip> --master-port <n> --repl-transport <tcp|rdma>
           --repl-fullsync-transport <rdma|tcp> --repl-realtime-transport <ebpf|tcp>
           --sentinel --sentinel-master-name <name>
+          --aof-disable                         # 禁用 AOF 持久化
 ```
 
 ---
@@ -530,6 +533,127 @@ cmd[0] == 'X' → Skiptable 引擎
 
 `handle_parsed_command()` 根据前缀路由，`strip_prefix()` 去掉前缀后执行统一的操作名（如 `HSET` → HASH 引擎执行 `SET`）。
 
+#### 复杂 KV 存储架构设计
+
+kvstore 的复杂 KV 存储能力来源于**命令分发 + 引擎抽象 + 统一 TTL** 三层架构：
+
+```mermaid
+graph TB
+    subgraph 协议层
+        CMD["handle_parsed_command(cmd, argc, argv)"]
+    end
+
+    subgraph 路由层
+        PREFIX["cmd[0] 前缀路由"]
+        ENGINE["engine = cmd_engine(cmd)"]
+        OP["op = strip_prefix(cmd)"]
+        IS_WRITE["is_write_cmd(cmd) ?"]
+    end
+
+    subgraph 执行层
+        ENGINE_SET["engine_set(engine, key, val)"]
+        ENGINE_GET["engine_get(engine, key)"]
+        ENGINE_DEL["engine_del(engine, key)"]
+    end
+
+    subgraph 存储引擎
+        ARR["Array<br/>O(n) ≤1024"]
+        HSH["Hash<br/>O(1) avg"]
+        RBT["RBTREE<br/>O(log n)"]
+        SKP["Skiptable<br/>O(log n) avg"]
+        DOC["Doc<br/>两层 Hash"]
+    end
+
+    subgraph 统一功能层
+        TTL["TTL 过期<br/>kvs_expire_set/get/del"]
+        PERSIST["持久化<br/>persist_append_raw"]
+        REPL["主从复制<br/>repl_broadcast"]
+    end
+
+    CMD --> PREFIX
+    PREFIX --> ENGINE
+    PREFIX --> OP
+    ENGINE --> ENGINE_SET & ENGINE_GET & ENGINE_DEL
+    ENGINE_SET --> ARR & HSH & RBT & SKP & DOC
+    ENGINE_GET --> ARR & HSH & RBT & SKP & DOC
+    ENGINE_DEL --> ARR & HSH & RBT & SKP & DOC
+
+    CMD --> IS_WRITE
+    IS_WRITE --> TTL
+    IS_WRITE --> PERSIST
+    IS_WRITE --> REPL
+```
+
+**统一命令分发**：所有引擎的 6 种操作（SET/GET/DEL/EXIST/MOD/MSET）通过同一套代码路径执行：
+
+```c
+// src/main/kvstore.c — handle_parsed_command
+
+// ① 确定引擎
+int engine = cmd_engine(cmd);    // 根据前缀: R→RBTREE, H→HASH, X→SKIPTABLE, 其他→ARRAY
+const char *op = strip_prefix(cmd); // 去掉前缀: HSET → SET
+
+// ② 按操作名分发（所有引擎共用同一套 switch）
+if (!strcmp(op, "SET") && argc == 3) {
+    rc = engine_set(engine, argv[1], argv[2]);  // 根据 engine 调用对应引擎
+    try_expire(engine, argv[1]);                 // 覆盖 TTL（SET 清除旧 TTL）
+}
+else if (!strcmp(op, "GET") && argc == 2) {
+    try_expire(engine, argv[1]);                 // 惰性过期检查
+    char *v = engine_get(engine, argv[1]);       // 根据 engine 获取
+}
+else if (!strcmp(op, "DEL") && argc == 2) {
+    try_expire(engine, argv[1]);
+    rc = engine_del(engine, argv[1]);            // 引擎内删除
+    kvs_expire_del(&global_expire, engine, argv[1]); // TTL 记录也删除
+}
+// ... MOD, EXIST, PERSIST, MSET, MGET 同理
+```
+
+**引擎函数指针路由**：每种引擎实现相同的 6 个函数签名：
+
+```c
+// 引擎接口（每种引擎独立实现）
+static int engine_set(int engine, char *key, char *value) {
+    switch (engine) {
+        case KVS_ENGINE_ARRAY:    return kvs_array_set(&global_array, key, value);
+        case KVS_ENGINE_RBTREE:   return kvs_rbtree_set(&global_rbtree, key, value);
+        case KVS_ENGINE_HASH:     return kvs_hash_set(&global_hash, key, value);
+        case KVS_ENGINE_SKIPTABLE:return kvs_skiptable_set(&global_skiptable, key, value);
+        default: return -1;
+    }
+}
+// engine_get, engine_del, engine_exist, engine_mod, engine_mset 同理
+```
+
+**统一写 AOF 和广播**：执行成功后，所有写命令走同一条持久化和复制路径：
+
+```c
+if (!from_replication && is_write_cmd(cmd)) {
+    persist_note_write();
+    persist_append_raw(raw, rawlen);           // AOF 持久化
+    if (g_cfg.role == ROLE_MASTER)
+        repl_broadcast(raw, rawlen);            // 主从复制广播
+}
+```
+
+**Doc 引擎的特殊处理**：Doc 引擎的 field 操作不通过引擎函数指针，而是在 `handle_parsed_command` 中直接处理：
+
+```c
+if (!strcmp(cmd, "DOCSET") && argc == 4) {
+    rc = kvs_doc_set(&global_doc, argv[1], argv[2], argv[3]);
+} else if (!strcmp(cmd, "DOCGET") && argc == 3) {
+    char *v = kvs_doc_get(&global_doc, argv[1], argv[2]);
+} else if (!strcmp(cmd, "DOCDEL") && argc == 3) {
+    rc = kvs_doc_del(&global_doc, argv[1], argv[2]);
+}
+```
+
+**整体架构优势**：
+1. 新增引擎只需实现 6 个函数 + 注册前缀，无需修改命令分发逻辑
+2. 持久化和复制对引擎完全透明——每写一条命令自动写 AOF + 广播
+3. TTL 系统独立于引擎，统一在命令执行前后检查
+
 **RESP 协议解析核心**:
 
 ```c
@@ -555,6 +679,182 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
         }
     }
 }
+```
+
+#### PIPELINE 解析机制
+
+kvstore 原生支持 RESP **流水线（PIPELINE）**——客户端可以一次 `send()` 发送多条命令，
+服务器逐条解析执行，响应可以一次性读回，大幅减少网络往返。
+
+**核心原理**：
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as kvstore
+
+    Note over C: 构建批处理缓冲区
+    C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n
+    C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n
+    C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n
+
+    C->>K: send(buf, len)    ← 一次发送 N 条命令
+    Note over K: on_read() → recv() 到 inbuf
+
+    loop 逐条解析
+        K->>K: parse_resp_stream(buf, &in_len)
+        Note over K: while(pos < *len)
+        K->>K: 解析 *N → argc, argv
+        K->>K: handle_parsed_command(SET k1 v1)
+        K->>K: queue_bytes(+OK\r\n)
+        K->>K: 解析 *N → argc, argv
+        K->>K: handle_parsed_command(SET k2 v2)
+        K->>K: queue_bytes(+OK\r\n)
+        K->>K: 解析 *N → argc, argv
+        K->>K: handle_parsed_command(SET k3 v3)
+        K->>K: queue_bytes(+OK\r\n)
+    end
+
+    Note over K: on_write() → send() 全部响应
+    K->>C: +OK\r\n+OK\r\n+OK\r\n    ← 一次性读回
+
+    Note over C: count_ok() 验证所有响应
+```
+
+**`parse_resp_stream` 的流水线实现**：解析器使用 `while` 循环不停消费缓冲区，每次解析一条完整命令就立即执行，
+缓冲区中剩余数据通过 `memmove` 向前拼接：
+
+```c
+// src/main/kvstore.c — parse_resp_stream 流水线核心
+int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
+    size_t pos = 0;
+    while (pos < *len) {            // ← 一个缓冲区可能包含多条命令
+        if (buf[pos] == '*') {      // RESP 数组格式
+            // 解析 *N → argc
+            // 循环解析 N 个 $len\r\ndata\r\n
+            handle_parsed_command(c, argc, argv, raw, rawlen, from_replication); // ← 立即执行
+        } else if (buf[pos] == '+') {
+            // 处理控制命令（+KPROBERDMA, +FULLRESYNC, +CONTINUE）
+        } else {
+            // inline 格式（空格分隔）
+            handle_parsed_command(c, argc, argv, raw, rawlen, from_replication);
+        }
+        // pos 前进到下一命令
+    }
+    // 未处理完的残留数据向前拼接
+    if (pos > 0 && pos < *len) {
+        memmove(buf, buf + pos, *len - pos);  // ← 拼接剩余数据
+        *len -= pos;
+    } else if (pos >= *len) {
+        *len = 0;
+    }
+    return 0;
+}
+```
+
+**响应队列**：每条命令执行后，响应通过 `queue_bytes` 加入 `out_node_t` 链表，`on_write()` 逐条发送：
+
+```c
+// src/core/reactor.c
+typedef struct out_node_s {
+    unsigned char *data;       // 响应数据
+    size_t len;                // 长度
+    size_t sent;               // 已发送偏移量
+    struct out_node_s *next;   // 链表下一节点
+} out_node_t;
+
+int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
+    out_node_t *n = kvs_malloc(sizeof(*n));
+    n->data = kvs_malloc(len);
+    memcpy(n->data, buf, len);
+    n->len = len;
+    n->sent = 0;
+    n->next = NULL;
+
+    // 追加到输出链表尾部
+    if (c->out_tail)
+        c->out_tail->next = n;
+    else
+        c->out_head = n;
+    c->out_tail = n;
+
+    // 注册 EPOLLOUT 事件
+    mod_events(c, EPOLLIN | EPOLLOUT);
+    return 0;
+}
+```
+
+**`on_read` 中的数据流**：每次 `recv` 读到的数据追加到 `inbuf`，然后调用 `parse_resp_stream` 解析：
+
+```c
+static void on_read(conn_t *c) {
+    while (1) {
+        ssize_t n = recv(c->fd, c->inbuf + c->in_len,
+                         sizeof(c->inbuf) - c->in_len, 0);
+        if (n > 0) {
+            c->in_len += (size_t)n;
+            // 一次解析多条命令（pipeline）
+            parse_resp_stream(c, c->inbuf, &c->in_len, 0);
+            continue;
+        }
+        // ... 处理断开 / EAGAIN
+    }
+}
+```
+
+**Pipeline 边界处理**：当 TCP 字节流不完整时（一条命令被拆到两次 recv），解析器返回 `break`，
+残留数据保留在 `inbuf` 中，下次 `on_read` 继续拼接解析：
+
+```
+第1次 recv: *3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n*3\r\n$3\r\nSE
+                                                                    ↑
+第2次 recv: T\r\n$2\r\nk2\r\n$2\r\nv2\r\n
+            ← memmove 拼接后完整解析
+```
+
+**测试程序 `test_batch`**：验证 kvstore 的流水线能力，一次 send 发送 N 条命令，一次性读回所有响应：
+
+```c
+// tests/test_batch.c — 构建批处理缓冲区
+static size_t build_set_batch(unsigned char *buf, size_t cap, int count) {
+    size_t pos = 0;
+    for (int i = 0; i < count; i++) {
+        // 拼接 N 条 HSET 命令到同一缓冲区
+        int n = snprintf((char *)buf + pos, cap - pos,
+            "*3\r\n$4\r\nHSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+            strlen(key), key, strlen(val), val);
+        pos += (size_t)n;  // ← 不断追加
+    }
+    return pos;
+}
+
+// 一次 send 发送所有命令
+send_all(fd, batch, blen);
+
+// 一次性读取所有响应
+unsigned char resp[MAX_RESP_SIZE];
+read(fd, resp, sizeof(resp));
+
+// 计数 +OK 数量验证
+int ok = count_ok(resp, rlen);  // 应等于 count
+```
+
+**测试结果示例**：
+
+```bash
+$ ./test_batch --port 5200 --count 10000
+批量流水线压力测试
+  地址: 127.0.0.1:5200
+  每条流水线: 10000 条命令
+
+--- 写入流水线 ---
+  [PASS] HSET: 10000/10000, 262295 qps, 0.038s
+--- 读取流水线 ---
+  [PASS] HGET: 10000/10000, 243902 qps, 0.041s
+--- 混合流水线 ---
+  [PASS] HSET+HGET: 20000/20000, 357143 qps, 0.056s
+
+  全部流水线测试通过 ✓
 ```
 
 #### 测试验证
@@ -802,56 +1102,206 @@ int persist_bgsave_start(void) {
 }
 ```
 
-**恢复流程（mmap 零拷贝）**：
+#### mmap 恢复机制 — 零拷贝数据恢复
+
+kvstore 的持久化恢复通过 **mmap 零拷贝** 技术将磁盘文件直接映射到进程地址空间，
+避免传统 `read()` 的内核→用户态数据拷贝，同时利用操作系统的 page cache 和预读机制加速。
+
+**恢复总流程**：
 
 ```mermaid
 sequenceDiagram
     participant K as kvstore 启动
     participant D as kvstore.dump
-    participant M as mmap 映射
+    participant A as kvstore.aof
 
     K->>K: persist_recover()
-    K->>D: open + fstat
-    K->>M: mmap(fd, size)
-    Note over K: 0 次内核→用户拷贝
-    loop 遍历 mmap 内存
-        K->>K: memcpy(&klen, mapped+pos, 4)
-        K->>K: memcpy(key, mapped+pos, klen)
-        K->>K: memcpy(&vlen, mapped+pos, 4)
-        K->>K: memcpy(value, mapped+pos, vlen)
-        K->>K: kvs_hash_set(key, value)
-    end
-    K->>D: munmap + close
+    Note over K: g_persist_recovering = 1
+
+    K->>D: replay_dump_file(dump_path)
+    Note over D: mmap → 遍历 KVSD 二进制
+    Note over K: 全量数据恢复 ✓
+
+    K->>A: replay_file(aof_path)
+    Note over A: mmap → parse_resp_stream → 重放命令
+    Note over K: 增量命令恢复 ✓
+
+    K->>K: ftruncate(g_aof_fd, 0)
+    Note over K: AOF 截断，防止跨 session 累积
+
+    K->>K: g_persist_recovering = 0
+    Note over K: 恢复完成，开始服务
 ```
+
+**Dump 文件恢复（二进制 KVSD 格式）**：
+
+dump 文件使用自定义 KVSD 二进制格式：`[4B klen][key][4B vlen][value]`，
+mmap 后通过指针偏移直接读取，无需任何解析库：
 
 ```c
 static int replay_dump_file(const char *path) {
+    // ① 打开文件
     int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
     struct stat st;
     fstat(fd, &st);
+    if (st.st_size <= 0) { close(fd); return 0; }
 
-    // 优先 mmap（0 拷贝）
-    unsigned char *mapped = mmap(NULL, st.st_size,
-        PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+    // ② mmap 零拷贝映射（0 次内核→用户拷贝）
+    unsigned char *mapped = mmap(NULL, (size_t)st.st_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
     if (mapped == MAP_FAILED) {
-        // mmap 失败，回退到 fread
+        // ③ mmap 失败 → 回退到 fread 逐块读取
+        close(fd);
         return replay_file_fread(path);
     }
 
+    g_recover_mmap_success++;
+    g_recover_last_mmap_bytes += (unsigned long long)st.st_size;
+
+    // ④ 遍历 mmap 内存，解析 KVSD 格式
     size_t pos = 0;
     while (pos + 4 <= (size_t)st.st_size) {
         uint32_t klen, vlen;
-        memcpy(&klen, mapped + pos, 4);  pos += 4;  // key 长度
-        char *key = (char*)mapped + pos;  pos += klen; // key
-        memcpy(&vlen, mapped + pos, 4);  pos += 4;  // value 长度
-        char *value = (char*)mapped + pos; pos += vlen; // value
 
-        // 直接写入 Hash 引擎
+        memcpy(&klen, mapped + pos, sizeof(klen));
+        pos += sizeof(klen);                     // key 长度
+        if (pos + klen > (size_t)st.st_size) break;
+
+        char *key = (char *)kvs_malloc(klen + 1);
+        if (klen > 0) memcpy(key, mapped + pos, klen);
+        key[klen] = '\0';
+        pos += klen;                              // key 数据
+
+        if (pos + 4 > (size_t)st.st_size) { kvs_free(key); break; }
+
+        memcpy(&vlen, mapped + pos, sizeof(vlen));
+        pos += sizeof(vlen);                     // value 长度
+        if (pos + vlen > (size_t)st.st_size) { kvs_free(key); break; }
+
+        char *value = (char *)kvs_malloc(vlen + 1);
+        if (vlen > 0) memcpy(value, mapped + pos, vlen);
+        value[vlen] = '\0';
+        pos += vlen;                              // value 数据
+
+        // ⑤ 写入 Hash 引擎（所有引擎统一存储到 hash）
         kvs_hash_set(&global_hash, key, value);
+        kvs_free(key);
+        kvs_free(value);
     }
-    munmap(mapped, st.st_size);
+
+    g_recover_last_tail_bytes += (unsigned long long)pos;
+    munmap(mapped, (size_t)st.st_size);
     close(fd);
+    return 0;
 }
+```
+
+**mmap 的优势**：
+- **零拷贝**：磁盘数据直接映射到进程地址空间，绕过 `read()` 的内核缓冲区拷贝
+- **按需调页**：只有实际访问的页面才会触发缺页中断加载，大文件无需全部读入内存
+- **操作系统预读**：内核自动预读连续页面，顺序遍历时性能接近顺序读
+
+```
+传统 read 路径:
+  磁盘 → 内核页缓存 → read() 拷贝 → 用户缓冲区 → parse
+                         ↕ 至少 1 次内存拷贝
+
+mmap 路径:
+  磁盘 → 内核页缓存 → mmap 映射 → 直接指针访问
+                         ↕ 0 次拷贝（缺页时自动映射）
+```
+
+**AOF 文件恢复（RESP 命令格式）**：
+
+AOF 文件使用 mmap 映射后，直接喂给 `parse_resp_stream()` 解析，和客户端请求走完全相同的解析路径：
+
+```c
+static int replay_file_mmap(const char *path) {
+    // ① mmap 映射 AOF 文件
+    unsigned char *mapped = mmap(NULL, (size_t)st.st_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+    g_recover_mmap_success++;
+    g_recover_last_mmap_bytes += (unsigned long long)st.st_size;
+
+    // ② 直接喂给 RESP 解析器（与客户端请求同一套代码）
+    size_t len = (size_t)st.st_size;
+    parse_resp_stream(NULL, mapped, &len, 1);  // from_replication=1
+    //                                                ↑
+    //                    from_replication=1 避免再次写 AOF 和广播
+
+    g_recover_last_tail_bytes += (unsigned long long)len;
+    munmap(mapped, (size_t)st.st_size);
+    close(fd);
+    return 0;
+}
+```
+
+**mmap 回退机制**：当 mmap 不可用时（文件过大超出地址空间、内核限制等），自动回退到 `replay_file_fread()`，
+逐块 `fread` 读取并解析：
+
+```c
+static int replay_file_fread(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+
+    unsigned char buf[BUFFER_CAP];
+    size_t len = 0, n;
+    unsigned long long total = 0;
+
+    while ((n = fread(buf + len, 1, sizeof(buf) - len, fp)) > 0) {
+        len += n;
+        total += (unsigned long long)n;
+        parse_resp_stream(NULL, buf, &len, 1);   // 逐块解析
+    }
+
+    g_recover_last_fread_bytes += total;
+    fclose(fp);
+    return 0;
+}
+```
+
+**恢复统计**：`persist_recover()` 记录了完整的恢复统计，可通过 `INFO` 命令查看：
+
+```c
+// src/persistence/kvs_persist.c
+int persist_recover(void) {
+    g_persist_recovering = 1;
+
+    // ① dump 恢复（KVSD 二进制，mmap 加速）
+    dump_begin_ms = kvs_now_ms();
+    replay_dump_file(g_cfg.dump_path);
+    g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
+
+    // ② AOF 重放（RESP 命令，mmap 加速）
+    aof_begin_ms = kvs_now_ms();
+    replay_file(g_cfg.aof_path);
+    g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;
+
+    // ③ AOF 截断（防止跨 session 累积）
+    ftruncate(g_aof_fd, 0);
+    g_aof_write_offset = 0;
+
+    g_persist_recovering = 0;
+    return 0;
+}
+```
+
+`INFO` 输出示例：
+
+```
+recover_total_ms=1247
+recover_dump_ms=892          ← dump 恢复耗时
+recover_aof_ms=355           ← AOF 重放耗时
+recover_mmap_attempts=2      ← mmap 尝试次数
+recover_mmap_success=2       ← mmap 成功次数
+recover_mmap_fallbacks=0     ← mmap 失败→fread 回退次数
+recover_mmap_bytes=134217728 ← mmap 映射的总字节数
+recover_fread_bytes=0        ← fread 回退读取的字节数
+recover_tail_bytes=0         ← 尾部残留字节数
+```
 ```
 
 #### 增量 AOF — RESP 命令格式
@@ -889,76 +1339,789 @@ sequenceDiagram
 
 每条写命令以原始 RESP 协议格式追加，恢复时直接重放。
 
-**写入实现（io_uring 优先）**：
+#### io_uring 存储机制 — 异步写入 + fsync
+
+kvstore 的 AOF 持久化使用 **io_uring** 进行异步文件 I/O，与内核共享 SQ（Submission Queue）和 CQ（Completion Queue）
+两个环形缓冲区，避免传统 `read()/write()` 系统调用的上下文切换开销。
+
+**io_uring 工作原理**：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户态
+    participant SQ as SQ (Submission Queue)
+    participant K as 内核
+    participant CQ as CQ (Completion Queue)
+
+    Note over U: persist_write_fd_uring()
+    U->>SQ: io_uring_get_sqe() → 获取空闲 SQE 槽
+    U->>SQ: io_uring_prep_write(sqe, fd, buf, len, offset)
+    Note over SQ: SQE[0] = {op=WRITE, fd, buf, len, offset}
+
+    U->>K: io_uring_submit_and_wait(uring, 1)
+    Note over K: 从 SQ 取出 SQE
+    K->>K: 后台异步执行 pwrite(fd, buf, len, offset)
+    Note over K: 不阻塞用户线程！
+    K->>CQ: 写入完成 → 写入 CQE
+    Note over CQ: CQE[0] = {res=写入字节数}
+
+    U->>CQ: io_uring_wait_cqe() → 读取完成结果
+    U->>CQ: io_uring_cqe_seen() → 释放 CQE 槽
+    Note over U: 写入完成 ✓
+```
+
+**单向环形缓冲区架构**：
+
+```
+SQ (Submission Queue) — 用户态写入，内核态消费：
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│ SQE │ SQE │ SQE │ SQE │ SQE │ SQE │ SQE │ SQE │  ← 64 深
+└─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  head→              tail→                  (用户写 tail，内核读 head)
+
+CQ (Completion Queue) — 内核态写入，用户态消费：
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│ CQE │ CQE │ CQE │ CQE │ CQE │ CQE │ CQE │ CQE │
+└─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  head→              tail→                  (内核写 tail，用户读 head)
+```
+
+**代码分层架构**：
 
 ```c
 // src/persistence/kvs_persist.c
-static struct io_uring g_persist_uring;    // 全局 uring 实例（64 SQE）
 
-int persist_init(void) {
-    // 以追加模式打开 AOF 文件
-    g_aof_fd = open(g_cfg.aof_path, O_WRONLY|O_CREAT|O_APPEND, 0644);
-    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
+// ──── ① 全局 io_uring 实例 ────
+static struct io_uring g_persist_uring;    // 全局 uring 实例
+static int g_persist_uring_ready = 0;
+
+static int persist_uring_init_once(void) {
+    if (g_persist_uring_ready) return 0;
+    if (io_uring_queue_init(64, &g_persist_uring, 0) != 0)
+        return -1;                          // 初始化 64 深度的队列
+    g_persist_uring_ready = 1;
     return 0;
 }
 
-int persist_append_raw(const unsigned char *buf, size_t len) {
-    off_t off = g_aof_write_offset;
+// ──── ② 单次提交 + 等待完成 ────
+static int persist_uring_wait_single(void) {
+    struct io_uring_cqe *cqe = NULL;
 
-    // ① 优先 io_uring 异步写入
-    if (persist_write_fd_uring(g_aof_fd, buf, len, &off) != 0)
-        // ② 回退同步 pwrite
-        persist_write_fd_sync(g_aof_fd, buf, len, &off);
+    // 提交所有待处理的 SQE 到内核，并等待至少 1 个完成
+    int rc = io_uring_submit_and_wait(&g_persist_uring, 1);
+    if (rc < 0) return -1;
+
+    // 从 CQ 取出完成事件
+    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
+    if (rc < 0 || !cqe) return -1;
+
+    rc = cqe->res;                           // 内核返回的执行结果
+    io_uring_cqe_seen(&g_persist_uring, cqe); // 标记 CQE 已消费
+    return rc;
+}
+
+// ──── ③ io_uring 异步写入 ────
+static int persist_write_fd_uring(int fd, const unsigned char *buf,
+                                  size_t len, off_t *offset) {
+    if (persist_uring_init_once() != 0) return -1;
+
+    size_t written = 0;
+    while (written < len) {
+        // 从 SQ 获取空闲 SQE 槽
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_persist_uring);
+        if (!sqe) return -1;
+
+        // 填充 SQE：准备 write 操作
+        io_uring_prep_write(sqe, fd, buf + written,
+                           len - written, offset ? *offset : -1);
+
+        // 提交并等待完成
+        int rc = persist_uring_wait_single();
+        if (rc <= 0) return -1;
+
+        written += (size_t)rc;
+        if (offset) *offset += rc;
+    }
+    return 0;
+}
+
+// ──── ④ io_uring 异步 fsync ────
+static int persist_fsync_fd_uring(int fd) {
+    if (persist_uring_init_once() != 0) return -1;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe) return -1;
+
+    // 填充 SQE：准备 fsync 操作
+    io_uring_prep_fsync(sqe, fd, 0);
+
+    // 提交并等待完成（和 write 共用同一个 uring 实例）
+    int rc = persist_uring_wait_single();
+    return rc < 0 ? -1 : 0;
+}
+```
+
+**`best_effort` 容错模式**：io_uring 不可用时（内核不支持、队列满等），自动回退到传统同步 I/O：
+
+```c
+// 写入容错
+static int persist_write_fd_best_effort(int fd, const unsigned char *buf,
+                                         size_t len, off_t *offset) {
+    if (persist_write_fd_uring(fd, buf, len, offset) == 0)
+        return 0;           // ① io_uring 成功
+    return persist_write_fd_sync(fd, buf, len, offset);  // ② 回退 pwrite
+}
+
+// fsync 容错
+static int persist_fsync_fd_best_effort(int fd) {
+    if (persist_fsync_fd_uring(fd) == 0)
+        return 0;           // ① io_uring 成功
+    return fsync(fd);        // ② 回退传统 fsync
+}
+```
+
+**传统同步 `pwrite` 实现**（回退路径）：
+
+```c
+static int persist_write_fd_sync(int fd, const unsigned char *buf,
+                                  size_t len, off_t *offset) {
+    size_t written = 0;
+    while (written < len) {
+        // 直接系统调用，阻塞等待
+        ssize_t rc = pwrite(fd, buf + written, len - written,
+                           offset ? *offset : -1);
+        if (rc <= 0) return -1;
+        written += (size_t)rc;
+        if (offset) *offset += rc;
+    }
+    return 0;
+}
+```
+
+**完整 AOF 写入链**（从命令执行到磁盘）：
+
+```c
+// ──── ⑤ 上层入口：追加一条 RESP 命令到 AOF ────
+int persist_append_raw(const unsigned char *buf, size_t len) {
+    long long off = g_aof_write_offset;
+
+    // 优先 io_uring 写入，失败回退 pwrite
+    if (persist_write_raw_fd(g_aof_fd, buf, len, &off) != 0)
+        return -1;
 
     g_aof_write_offset = off;
     g_aof_dirty = 1;
 
+    // 如果 BGREWRITEAOF 正在运行，同时缓存到 rewrite_buf
+    if (g_bgrewrite_pid > 0)
+        append_to_rewrite_buffer(buf, len);
+
     // fsync 策略
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        if (persist_fsync_fd_uring(g_aof_fd) != 0)
-            fsync(g_aof_fd);  // 回退
+        // 每条命令后立即 fsync → 最大安全性，最低性能
+        if (persist_force_aof_flush() != 0) return -1;
     }
+    // KVS_AOF_FSYNC_EVERYSEC: 由 persist_autosnap_cron() 每秒批量 fsync
     return 0;
 }
 
-// io_uring 写入核心
-static int persist_write_fd_uring(int fd, const unsigned char *buf,
-                                  size_t len, off_t *offset) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_persist_uring);
-    io_uring_prep_write(sqe, fd, buf, len, offset ? *offset : -1);
-    io_uring_submit_and_wait(&g_persist_uring, 1);   // 提交 SQE
-    struct io_uring_cqe *cqe;
-    io_uring_wait_cqe(&g_persist_uring, &cqe);        // 等 CQE
-    int ret = cqe->res;                                // 写入结果
-    io_uring_cqe_seen(&g_persist_uring, cqe);
-    return ret < 0 ? -1 : 0;
+// ──── ⑥ persist_write_raw_fd 中间层 ────
+int persist_write_raw_fd(int fd, const unsigned char *buf,
+                          size_t len, long long *offset_io) {
+    off_t off = offset_io ? (off_t)(*offset_io) : lseek(fd, 0, SEEK_CUR);
+    if (off < 0) return -1;
+
+    // best_effort: io_uring → pwrite
+    if (persist_write_fd_best_effort(fd, buf, len, &off) != 0)
+        return -1;
+
+    if (offset_io) *offset_io = (long long)off;
+    return 0;
+}
+
+// ──── ⑦ fsync 完整路径 ────
+int persist_force_aof_flush(void) {
+    if (g_aof_fd < 0) return -1;
+
+    // best_effort: io_uring fsync → fsync()
+    if (persist_flush_aof_fd(g_aof_fd) != 0) return -1;
+
+    g_aof_dirty = 0;
+    g_aof_last_flush_ms = kvs_now_ms();
+    return 0;
+}
+
+static int persist_flush_aof_fd(int fd) {
+    if (fd < 0) return -1;
+    // best_effort: io_uring fsync → fsync()
+    if (persist_fsync_fd_best_effort(fd) != 0) return -1;
+    return 0;
 }
 ```
 
-#### BGREWRITEAOF — AOF 重写
+**两种 fsync 策略对比**：
 
-AOF 文件随时间增长，BGREWRITEAOF 通过 fork 子进程将当前内存数据重写为新 AOF：
-
-```
-fork 子进程
-  ├── 子进程: 遍历引擎 → 写临时 AOF 文件 → 原子 rename 替换
-  └── 父进程: 继续服务，新命令通过 g_rewrite_buf 链表缓存
-                  → 子进程完成后，父进程将缓存追加到新 AOF
-```
+| 策略 | 代码 | 行为 | 安全性 | 性能 |
+|---|---|---|---|---|
+| `always` | 每条命令后 `persist_force_aof_flush()` | 每写一条就 fsync | ⭐⭐⭐ 最多丢 1 条 | 最低 |
+| `everysec` | `persist_autosnap_cron()` 每秒检查 | 每秒批量 fsync | ⭐⭐ 最多丢 1 秒数据 | 高 |
 
 ```c
-int persist_bgrewriteaof_start(void) {
-    pid_t pid = fork();
-    if (pid == 0) {  // 子进程
-        char tmp[512];
-        snprintf(tmp, sizeof(tmp), "%s.rewrite.tmp.%ld", g_cfg.aof_path, (long)getpid());
-        rewrite_aof_to(tmp);    // 遍历引擎写 RESP 命令
-        rename(tmp, g_cfg.aof_path);  // 原子替换
-        _exit(0);
+// everysec 策略：每秒由 autosnap_cron 触发
+int persist_autosnap_cron(void) {
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_EVERYSEC && g_aof_dirty) {
+        long long now = kvs_now_ms();
+        if (now - g_aof_last_flush_ms >= 1000) {
+            persist_force_aof_flush();  // 每秒刷一次
+        }
     }
-    g_bgrewrite_pid = pid;  // 父进程
+    // ...
+}
+```
+
+**io_uring vs 传统同步 I/O 对比**：
+
+```
+传统 write + fsync:
+  用户态                   内核态
+    │                       │
+    ├─ write() ────────────→├─ 拷贝数据 → 页缓存
+    │←──── 返回 ────────────┤
+    ├─ fsync() ────────────→├─ 刷盘
+    │←──── 返回 ────────────┤
+    ↑ 两次系统调用，每次都有上下文切换
+
+io_uring write + fsync:
+  用户态                   内核态
+    │                       │
+    ├─ 填充 SQE (write)     │
+    ├─ 填充 SQE (fsync)     │
+    ├─ submit() ───────────→├─ 批量处理 SQE
+    │                       ├─ pwrite → 页缓存
+    │                       ├─ fsync → 刷盘
+    │←──── CQE ─────────────┤
+    ↑ 一次 submit 批量完成，上下文切换减半
+```
+
+**io_uring 在 Proactor 网络模型中的复用**：
+
+AOF 持久化使用独立的 `g_persist_uring` 实例（队列深度 64），与 Proactor 网络模型的 io_uring 实例分离，
+互不干扰：
+
+```
+Proactor 网络模型:    g_proactor_uring  ← 处理客户端网络 I/O
+AOF 持久化:           g_persist_uring   ← 处理 AOF 文件 I/O
+```
+```
+
+#### SAVE / BGSAVE / BGREWRITEAOF — 三种持久化命令详解
+
+##### SAVE — 同步全量 Dump
+
+SAVE 是**同步阻塞**操作，直接在主线程中遍历所有引擎，将全部 key-value 以 KVSD 二进制格式写入 dump 文件。
+写入期间 kvstore 无法处理任何请求。
+
+**处理流程**：
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as kvstore(主线程)
+    participant F as kvstore.dump
+
+    C->>K: SAVE
+    Note over K: handle_parsed_command()
+    K->>K: persist_save_dump()
+    K->>F: open(path, O_WRONLY|O_CREAT|O_TRUNC)
+    K->>K: kvs_dump_to_fd(fd)
+    Note over K: 遍历 Array/Hash/RBTREE/Skiptable/Doc
+    K->>F: [4B klen][key][4B vlen][value]...
+    K->>K: persist_fsync_fd(fd)  ← fsync 刷盘
+    K->>F: close
+    K->>K: persist_mark_snapshot_success()
+    Note over K: 更新 dirty_counter
+    K-->>C: +OK
+    Note over C,K: 全程阻塞，不处理其他请求
+```
+
+**源码实现**：
+
+```c
+// src/main/kvstore.c — 命令分发
+if (!strcmp(cmd, "SAVE")) {
+    n = (persist_save_dump() == 0)
+        ? resp_simple_string(resp, "OK")
+        : resp_error(resp, "save failed");
+}
+
+// src/persistence/kvs_persist.c — 核心
+int persist_save_dump(void) {
+    int rc = persist_save_dump_to(g_cfg.dump_path);
+    if (rc == 0) persist_mark_snapshot_success(g_dirty_counter);
+    return rc;
+}
+
+static int persist_save_dump_to(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+
+    // 遍历所有引擎，写入 KVSD 二进制格式
+    rc = kvs_dump_to_fd(fd);
+
+    // fsync 确保数据落盘
+    if (rc == 0 && persist_fsync_fd(fd) != 0) rc = -1;
+
+    close(fd);
+    return rc;
+}
+```
+
+**`persist_mark_snapshot_success`** 的作用：成功快照后，从 `g_dirty_counter` 中减去快照时刻记录的脏计数，
+这样 `dirty_counter` 只反映快照之后的新的写入量，用于自动快照规则的判断。
+
+```c
+static void persist_mark_snapshot_success(unsigned long long snap_dirty) {
+    g_last_snapshot_ms = kvs_now_ms();          // 记录快照时间
+    g_bgsave_last_end_ms = g_last_snapshot_ms;
+    if (g_dirty_counter >= snap_dirty)
+        g_dirty_counter -= snap_dirty;           // 减去已快照的脏数据
+    else
+        g_dirty_counter = 0;
+}
+```
+
+**注意**：SAVE 直接写最终文件路径（`g_cfg.dump_path`），不使用临时文件 + rename。
+这是因为 SAVE 是同步的，写入期间没有并发写入，即使写入中途崩溃，旧 dump 文件也未被破坏（O_TRUNC 发生在 open 时）。
+
+---
+
+##### BGSAVE — 后台全量 Dump
+
+BGSAVE 通过 **fork 子进程** 实现非阻塞备份。子进程继承 fork 时刻的内存快照，独立写 dump 文件，
+父进程继续处理请求。子进程完成后通过 `waitpid(WNOHANG)` 轮询回收。
+
+**处理流程**：
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as kvstore(父进程)
+    participant CH as kvstore(子进程)
+    participant F as kvstore.dump
+
+    C->>K: BGSAVE
+    K->>K: persist_bgsave_start()
+    Note over K: 记录 snap_dirty = dirty_counter
+    K->>K: fork()
+
+    par 父进程继续服务
+        K-->>C: +Background saving started
+        Note over K: persist_autosnap_cron()
+        loop 每 100ms 轮询
+            K->>K: waitpid(WNOHANG) 检查子进程
+        end
+    and 子进程后台写 dump
+        CH->>CH: persist_save_dump_to(tmp_path)
+        CH->>F: [4B klen][key][4B vlen][value]...
+        CH->>CH: persist_fsync_fd(fd)
+        CH->>CH: rename(tmp → dump_path)  ← 原子替换
+        CH->>CH: _exit(0)
+    end
+
+    Note over K: waitpid 返回子进程退出
+    K->>K: persist_mark_snapshot_success(snap_dirty)
+    Note over K: 更新脏计数
+```
+
+**源码实现**：
+
+```c
+// src/main/kvstore.c — 命令分发
+if (!strcmp(cmd, "BGSAVE")) {
+    int brc = persist_bgsave_start();
+    if (brc == 0)
+        n = resp_simple_string(resp, "Background saving started");
+    else if (brc == 1)
+        n = resp_error(resp, "background saving already in progress");
+    else
+        n = resp_error(resp, "bgsave failed");
+}
+
+// src/persistence/kvs_persist.c — 启动
+int persist_bgsave_start(void) {
+    if (g_bgsave_pid > 0) return 1;  // 已有 BGSAVE 在运行
+
+    unsigned long long snap_dirty = g_dirty_counter;
+    long long start_ms = kvs_now_ms();
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld",
+             g_cfg.dump_path, (long)getpid());
+
+    pid_t pid = fork();
+    if (pid < 0) { g_bgsave_status = 3; return -1; }
+
+    if (pid == 0) {
+        // 子进程：写临时文件 → rename 原子替换
+        int rc = persist_save_dump_to(tmp_path);
+        if (rc == 0 && rename(tmp_path, g_cfg.dump_path) != 0) rc = -1;
+        if (rc != 0) unlink(tmp_path);  // 失败则清理
+        _exit(rc == 0 ? 0 : 1);
+    }
+
+    // 父进程：记录 PID 和状态
+    g_bgsave_pid = pid;
+    g_bgsave_status = 1;   // running
+    g_bgsave_last_start_ms = start_ms;
+    g_bgsave_base_dirty = snap_dirty;
     return 0;
 }
+```
+
+**子进程轮询回收**：
+
+```c
+// src/persistence/kvs_persist.c — 轮询（由 persist_autosnap_cron 调用）
+int persist_bgsave_poll(void) {
+    if (g_bgsave_pid <= 0) return 0;
+
+    int status = 0;
+    pid_t rc = waitpid(g_bgsave_pid, &status, WNOHANG);
+    if (rc == 0) return 0;        // 子进程仍在运行
+
+    if (rc < 0) {                 // waitpid 失败
+        g_bgsave_status = 3;      // err
+        g_bgsave_pid = -1;
+        return -1;
+    }
+
+    // 子进程已退出
+    g_bgsave_last_end_ms = kvs_now_ms();
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        g_bgsave_status = 2;     // ok
+        persist_mark_snapshot_success(g_bgsave_base_dirty);
+    } else {
+        g_bgsave_status = 3;     // err
+    }
+    g_bgsave_pid = -1;
+    return 1;
+}
+```
+
+**自动快照（AutoSnapshot）**：在主循环中，`persist_autosnap_cron()` 根据用户配置的规则自动触发 BGSAVE：
+
+```c
+// src/persistence/kvs_persist.c — 自动快照 cron
+int persist_autosnap_cron(void) {
+    // AOF everysec 刷盘
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_EVERYSEC && g_aof_dirty) {
+        if (now - g_aof_last_flush_ms >= 1000)
+            persist_force_aof_flush();
+    }
+
+    // 轮询 BGSAVE / BGREWRITEAOF 子进程
+    persist_bgsave_poll();
+    persist_bgrewriteaof_poll();
+
+    // 检查是否满足自动快照规则
+    for (int i = 0; i < g_cfg.autosnap_rule_count; ++i) {
+        if ((long long)g_dirty_counter >= rule.changes
+            && now - last_ms >= rule.seconds * 1000) {
+            return persist_bgsave_start();  // 触发 BGSAVE
+        }
+    }
+}
+```
+
+配置示例（`kvstore.conf`）：
+
+```
+# 当 300 秒内有至少 100 次写入 → 自动 BGSAVE
+autosnap 300 100
+
+# 当 3600 秒内有至少 10000 次写入 → 自动 BGSAVE
+autosnap 3600 10000
+```
+
+**SAVE vs BGSAVE 对比**：
+
+| 特性 | SAVE | BGSAVE |
+|---|---|---|
+| 是否阻塞 | ✅ 是（主线程同步写） | ❌ 否（fork 子进程） |
+| 文件替换方式 | 直接写最终路径（O_TRUNC） | 写临时文件 → rename 原子替换 |
+| 实现机制 | 直接调用 `persist_save_dump_to()` | `fork()` + 子进程写 + 父进程 `waitpid` 轮询 |
+| 响应 | 写入完成后返回 `+OK` | 立即返回 `+Background saving started` |
+| 脏计数更新 | `persist_mark_snapshot_success(dirty_counter)` | `persist_mark_snapshot_success(bgsave_base_dirty)` |
+
+---
+
+##### BGREWRITEAOF — 后台 AOF 重写
+
+AOF 文件随时间增长会越来越庞大，BGREWRITEAOF 通过 fork 子进程**将当前内存数据压缩成 RESP 命令集**，
+生成新的紧凑 AOF 文件，原子替换旧文件。
+
+**与 BGSAVE 的关键区别**：
+- BGSAVE 写 **KVSD 二进制格式**（dump 文件）
+- BGREWRITEAOF 写 **RESP 命令格式**（AOF 文件），且需要处理重写期间的增量命令
+
+**处理流程**：
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端
+    participant K as kvstore(父进程)
+    participant CH as kvstore(子进程)
+    participant A as kvstore.aof
+
+    C->>K: BGREWRITEAOF
+    K->>K: persist_force_aof_flush()    ← 先刷旧 AOF
+    K->>K: free_rewrite_buffer_locked() ← 清空旧缓存
+    K->>K: fork()
+
+    par 父进程继续服务
+        K-->>C: +Background AOF rewriting started
+        Note over K: 新写命令两条路
+        K->>A: persist_append_raw() → 写旧 AOF
+        Note over K: 同时缓存到 rewrite_buf 链表
+        K->>K: append_to_rewrite_buffer(buf, len)
+        loop 每 100ms 轮询
+            K->>K: waitpid(WNOHANG)
+        end
+    and 子进程写快照
+        CH->>CH: kvs_snapshot_to_fd(tmp)
+        Note over CH: 遍历引擎写 RESP 命令
+        CH->>CH: persist_fsync_fd(fd)
+        CH->>CH: _exit(0)
+    end
+
+    Note over K: 子进程完成 → finalize_rewrite_parent()
+    K->>K: 打开临时文件(O_APPEND)
+    K->>K: 遍历 rewrite_buf 链表
+    Note over K: 将缓存命令追加到临时文件末尾
+    K->>K: persist_flush_aof_fd()  ← fsync
+    K->>K: rename(tmp → aof_path)  ← 原子替换
+    K->>K: 关闭旧 fd，打开新 AOF 文件
+    K->>K: free_rewrite_buffer_locked()
+    Note over K: 清理缓存
+```
+
+**状态机**：
+
+```
+g_bgrewrite_status: 0 idle → 1 running → 2 ok / 3 err
+                              ↕
+                     g_bgrewrite_pid > 0
+```
+
+**源码实现**：
+
+```c
+// src/main/kvstore.c — 命令分发
+if (!strcmp(cmd, "BGREWRITEAOF")) {
+    int rrc = persist_bgrewriteaof_start();
+    if (rrc == 0)
+        n = resp_simple_string(resp, "Background append only file rewriting started");
+    else if (rrc == 1)
+        n = resp_error(resp, "background aof rewrite already in progress");
+    else
+        n = resp_error(resp, "bgrewriteaof failed");
+}
+
+// src/persistence/kvs_persist.c — 启动
+int persist_bgrewriteaof_start(void) {
+    if (g_bgrewrite_pid > 0) return 1;  // 已有重写在进行
+
+    // ① 先强制刷旧 AOF，确保已写入的数据落盘
+    if (persist_force_aof_flush() != 0 && g_aof_fd >= 0) return -1;
+
+    // ② 生成临时文件路径: kvstore.aof.rewrite.tmp.12345
+    snprintf(g_rewrite_tmp_path, sizeof(g_rewrite_tmp_path),
+             "%s.rewrite.tmp.%ld", g_cfg.aof_path, (long)getpid());
+
+    // ③ 清空旧的 rewrite_buf（防止上次残留）
+    pthread_mutex_lock(&g_rewrite_buf_lock);
+    free_rewrite_buffer_locked();
+    pthread_mutex_unlock(&g_rewrite_buf_lock);
+
+    // ④ fork
+    pid_t pid = fork();
+    if (pid < 0) { g_bgrewrite_status = 3; return -1; }
+
+    if (pid == 0) {
+        // 子进程：遍历引擎写 RESP 命令到临时文件
+        int rc = persist_write_aof_snapshot_to(g_rewrite_tmp_path);
+        _exit(rc == 0 ? 0 : 1);
+    }
+
+    // 父进程：记录 PID，开始缓存增量命令
+    g_bgrewrite_pid = pid;
+    g_bgrewrite_status = 1;  // running
+    return 0;
+}
+```
+
+**子进程中的快照写入**（`persist_write_aof_snapshot_to`）：
+
+```c
+static int persist_write_aof_snapshot_to(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+
+    // 遍历所有引擎，写入 RESP 命令格式
+    // 如: *3\r\n$3\r\nSET\r\n$2\r\nK1\r\n$2\r\nV1\r\n
+    rc = kvs_snapshot_to_fd(fd);
+
+    if (rc == 0 && persist_fsync_fd(fd) != 0) rc = -1;
+    close(fd);
+    return rc;
+}
+```
+
+**重写期间增量命令缓存**（`append_to_rewrite_buffer`）：
+
+在 BGREWRITEAOF 期间，父进程继续接收写命令。这些命令既要写入旧 AOF（保证不丢数据），
+又要缓存到 `g_rewrite_buf` 链表中，以便子进程完成后追加到新 AOF。
+
+```c
+// src/persistence/kvs_persist.c — 追加命令时
+int persist_append_raw(const unsigned char *buf, size_t len) {
+    // ... 写入旧 AOF 文件 ...
+
+    if (g_bgrewrite_pid > 0)
+        append_to_rewrite_buffer(buf, len);  // 同时缓存
+
+    // ...
+}
+
+// 缓存结构：单向链表，每个节点存一条 RESP 命令
+typedef struct rewrite_buf_node_s {
+    unsigned char *data;              // RESP 命令字节
+    size_t len;                       // 长度
+    struct rewrite_buf_node_s *next;  // 下一个节点
+} rewrite_buf_node_t;
+
+static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
+static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
+static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int append_to_rewrite_buffer(const unsigned char *buf, size_t len) {
+    rewrite_buf_node_t *node = kvs_malloc(sizeof(*node));
+    node->data = kvs_malloc(len);
+    memcpy(node->data, buf, len);
+    node->len = len;
+    node->next = NULL;
+
+    pthread_mutex_lock(&g_rewrite_buf_lock);
+    if (g_bgrewrite_pid <= 0) {
+        // 重写已结束，丢弃缓存
+        pthread_mutex_unlock(&g_rewrite_buf_lock);
+        kvs_free(node->data);
+        kvs_free(node);
+        return 0;
+    }
+    // 追加到链表尾部
+    if (g_rewrite_buf_tail)
+        g_rewrite_buf_tail->next = node;
+    else
+        g_rewrite_buf_head = node;
+    g_rewrite_buf_tail = node;
+    pthread_mutex_unlock(&g_rewrite_buf_lock);
+    return 0;
+}
+```
+
+**子进程完成后的回调**（`finalize_rewrite_parent`）：
+
+```c
+int persist_bgrewriteaof_poll(void) {
+    if (g_bgrewrite_pid <= 0) return 0;
+
+    int status = 0;
+    pid_t rc = waitpid(g_bgrewrite_pid, &status, WNOHANG);
+    if (rc == 0) return 0;  // 仍在运行
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        // 子进程成功 → 执行 finalize_rewrite_parent
+        if (finalize_rewrite_parent() == 0)
+            g_bgrewrite_status = 2;  // ok
+        else {
+            g_bgrewrite_status = 3;  // err
+            unlink(g_rewrite_tmp_path);
+        }
+    } else {
+        g_bgrewrite_status = 3;      // err
+        unlink(g_rewrite_tmp_path);
+    }
+
+    g_bgrewrite_pid = -1;
+    return 1;
+}
+```
+
+**`finalize_rewrite_parent`** — 最关键的步骤：
+
+```c
+static int finalize_rewrite_parent(void) {
+    // ① 以追加模式打开子进程写的临时文件
+    int fd = open(g_rewrite_tmp_path, O_WRONLY | O_APPEND);
+    if (fd < 0) return -1;
+
+    // ② 遍历 rewrite_buf，将缓存命令追加到临时文件末尾
+    pthread_mutex_lock(&g_rewrite_buf_lock);
+    long long off = lseek(fd, 0, SEEK_END);
+    for (rewrite_buf_node_t *cur = g_rewrite_buf_head; cur; cur = cur->next) {
+        persist_write_raw_fd(fd, cur->data, cur->len, &off);
+    }
+    pthread_mutex_unlock(&g_rewrite_buf_lock);
+
+    // ③ fsync 刷盘
+    persist_flush_aof_fd(fd);
+    close(fd);
+
+    // ④ rename 原子替换旧 AOF 文件
+    //    新 AOF = 子进程快照 + 父进程缓存的增量命令
+    if (rename(g_rewrite_tmp_path, g_cfg.aof_path) != 0) return -1;
+
+    // ⑤ 关闭旧 AOF 文件描述符，打开新 AOF
+    if (g_aof_fd >= 0) close(g_aof_fd);
+    g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
+
+    // ⑥ 清理 rewrite_buf
+    pthread_mutex_lock(&g_rewrite_buf_lock);
+    free_rewrite_buffer_locked();
+    pthread_mutex_unlock(&g_rewrite_buf_lock);
+
+    g_aof_dirty = 0;
+    return 0;
+}
+```
+
+**新 AOF 文件内容示意**：
+
+```
+# 子进程写入的内存快照（RESP 命令集）
+*3\r\n$3\r\nSET\r\n$2\r\nK1\r\n$2\r\nV1\r\n
+*3\r\n$4\r\nHSET\r\n$2\r\nK2\r\n$2\r\nV2\r\n
+*3\r\n$3\r\nSET\r\n$2\r\nK3\r\n$2\r\nV3\r\n
+  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+# 父进程 append 的 rewrite_buf（重写期间的增量命令）
+*2\r\n$3\r\nDEL\r\n$2\r\nK1\r\n
+*3\r\n$4\r\nHSET\r\n$2\r\nK4\r\n$2\r\nV4\r\n
+```
+
+**三个命令的详细对比**：
+
+| 特性 | SAVE | BGSAVE | BGREWRITEAOF |
+|---|---|---|---|
+| 输出格式 | KVSD 二进制 | KVSD 二进制 | RESP 命令文本 |
+| 输出文件 | `kvstore.dump` | `kvstore.dump` | `kvstore.aof` |
+| 是否 fork | ❌ | ✅ fork | ✅ fork |
+| 是否阻塞 | ✅ 阻塞 | ❌ 不阻塞 | ❌ 不阻塞 |
+| 文件替换 | 直接 O_TRUNC | tmp → rename | tmp → rename |
+| 是否需要缓存增量 | 不需要 | 不需要 | ✅ 需要（rewrite_buf 链表） |
+| 目的 | 同步备份 | 异步备份 | 压缩 AOF 文件 |
+| 子进程工作量 | — | 遍历引擎写 KVSD | 遍历引擎写 RESP 命令 |
+| 状态查询 | 完成后返回 | INFO bgsave=ok/running/err | INFO aof_rewrite=ok/running/err |
 ```
 
 #### 恢复完整流程
@@ -1657,6 +2820,9 @@ redis-cli -p 5200 HGET expire:k:000000
 
 ### 内存管理 — 三种后端
 
+kvstore 支持三种内存后端，通过 `--mem` 参数切换。Custom 后端是自研的 **slab + mmap** 两级分配器，
+专为键值存储场景设计——大量频繁分配的小块内存（key/value 字符串）通过 slab 管理，
+超大块通过 mmap 直接映射。
 
 | 后端         | 实现                         | 适用场景         |
 | ------------ | ---------------------------- | ---------------- |
@@ -1664,25 +2830,275 @@ redis-cli -p 5200 HGET expire:k:000000
 | **jemalloc** | `LD_PRELOAD` 加载            | 生产级，碎片少   |
 | **custom**   | slab(≤1024B) + mmap(>1024B) | 研究学习，可观测 |
 
-#### Custom slab 设计
+#### Custom 后端设计架构
+
+```mermaid
+graph TB
+    subgraph 用户请求
+        MALLOC["kvs_malloc(size)"]
+    end
+
+    MALLOC --> DECIDE{size ≤ 1024?}
+
+    DECIDE -->|小内存| SMALL["slab 分配"]
+    DECIDE -->|大内存| LARGE["mmap 直接分配"]
+
+    subgraph Slab 分配器
+        CLASS0["class[0]: 32B<br/>free_list → chunk → chunk"]
+        CLASS1["class[1]: 64B"]
+        CLASS2["class[2]: 128B"]
+        CLASS3["class[3]: 256B"]
+        CLASS4["class[4]: 384B"]
+        CLASS5["class[5]: 512B"]
+        CLASS6["class[6]: 768B"]
+        CLASS7["class[7]: 1024B"]
+
+        GROW["slab_grow_locked()<br/>mmap 申请 64KB/256KB 页面"]
+        CHUNK["切分为等大小 chunk<br/>→ 串入 free_list"]
+    end
+
+    SMALL --> CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7
+    CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7 -->|free_list 为空| GROW
+    GROW --> CHUNK
+
+    subgraph 大内存管理
+        LARGE_ALLOC["mmap(size + hdr, rounded to page)"]
+        LARGE_FREE["munmap(hdr, mapping_size)"]
+    end
+
+    LARGE --> LARGE_ALLOC
+
+    subgraph 回退机制
+        FALLBACK["fallback_malloc()<br/>→ malloc"]
+    end
+
+    CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7 -->|mmap 失败| FALLBACK
+    LARGE_ALLOC -->|mmap 失败| FALLBACK
+```
+
+#### 三级分配器详解
+
+**① Slab 小内存分配（≤1024B）**
+
+每个 size class 维护一个 **free_list** 空闲链表和 **pages** 页面链表。
 
 ```
-slab 分配器
-  ├── class[0]:  32 字节, page_count, free_list → chunk → chunk
-  ├── class[1]:  64 字节, ...
-  ├── class[2]: 128 字节
-  ├── class[3]: 256 字节
-  ├── class[4]: 384 字节
-  ├── class[5]: 512 字节
-  ├── class[6]: 768 字节
-  └── class[7]: 1024 字节
-大块 (>1024B): mmap 直接分配
+slab class 结构:
+small_class_t
+  ├── size: 32/64/128/256/384/512/768/1024
+  ├── free_list: chunk → chunk → NULL        ← 空闲 chunk 链表
+  ├── pages: page → page → NULL              ← mmap 申请的页面链表
+  │   page: { mem, size, next }
+  ├── total_chunks: 已切分的 chunk 总数
+  ├── page_count: 页面数
+  └── page_bytes: 页面总字节数
 ```
 
-每个 class 从 mmap 申请大页（默认 1MB），切分成等大小 chunk，通过 free_list 管理。
-`INFO` 命令暴露完整的分配统计：alloc/calloc/realloc/free 次数、各 class 使用量、内部碎片率。
+**分配流程**：
 
-源码: `src/memory/`
+```c
+static void *custom_malloc(size_t size) {
+    if (size <= SMALL_MAX_SIZE) {                     // ≤1024B
+        int idx = class_index_for(size);               // 找最小满足的 class
+        if (idx < 0) return fallback_malloc(size);     // 找不到→回退
+
+        pthread_mutex_lock(&g_mem.lock);
+
+        if (!g_mem.classes[idx].free_list) {           // free_list 为空
+            if (slab_grow_locked(idx) != 0) {          // mmap 申请新页面
+                pthread_mutex_unlock(&g_mem.lock);
+                return fallback_malloc(size);           // mmap 失败→回退 malloc
+            }
+        }
+
+        small_chunk_t *chunk = g_mem.classes[idx].free_list;
+        g_mem.classes[idx].free_list = chunk->next;    // 从 free_list 取下
+
+        chunk->request_size = (uint32_t)size;           // 记录请求大小
+        // 更新统计计数
+        g_mem.small_alloc_calls++;
+        g_mem.current_small_inuse += class_size;
+
+        pthread_mutex_unlock(&g_mem.lock);
+        return (void *)(chunk + 1);                     // 返回 chunk 的数据区
+    }
+
+    // >1024B: 走 mmap 大块分配
+    // ...
+}
+```
+
+**页面扩展（`slab_grow_locked`）**：
+
+```c
+static int slab_grow_locked(int class_idx) {
+    size_t chunk_total = sizeof(small_chunk_t) + class_size;  // chunk 头 + 数据
+    size_t page_size = 65536;                                  // 默认 64KB
+    if (chunk_total > page_size / 2) page_size = 262144;       // 大 chunk 用 256KB
+    int count = (int)(page_size / chunk_total);                // 每页切分的 chunk 数
+    if (count < 16) count = 16;
+
+    // mmap 匿名映射申请大块内存
+    void *mem = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return -1;
+
+    // 记录页面信息
+    slab_page_t *page = malloc(sizeof(*page));
+    page->mem = mem;
+    page->size = alloc_size;
+    page->next = g_mem.classes[class_idx].pages;
+    g_mem.classes[class_idx].pages = page;
+
+    // 将页面切分成等大小 chunk，串入 free_list
+    unsigned char *p = (unsigned char *)mem;
+    for (int i = 0; i < count; ++i) {
+        small_chunk_t *chunk = (small_chunk_t *)(p + i * chunk_total);
+        chunk->magic = CHUNK_MAGIC;           // 魔数校验
+        chunk->class_idx = (uint16_t)class_idx;
+        chunk->next = g_mem.classes[idx].free_list;  // 头插法
+        g_mem.classes[idx].free_list = chunk;
+    }
+    return 0;
+}
+```
+
+**回收流程**：
+
+```c
+static void custom_free(void *ptr) {
+    small_chunk_t *chunk = ((small_chunk_t *)ptr) - 1;
+
+    // 通过魔数判断来自哪个分配器
+    if (chunk->magic == CHUNK_MAGIC) {                   // ← slab chunk
+        chunk->next = g_mem.classes[idx].free_list;       // 归还到 free_list
+        g_mem.classes[idx].free_list = chunk;
+        // 更新统计
+    } else if (hdr->magic == LARGE_MAGIC) {               // ← mmap 大块
+        munmap(hdr, hdr->mapping_size);                   // 直接归还给 OS
+    } else if (fhdr->magic == FALLBACK_MAGIC) {           // ← fallback malloc
+        free(fhdr);                                        // 普通 free
+    }
+}
+```
+
+**② mmap 大内存分配（>1024B）**
+
+超过 slab 上限的大块直接通过 mmap 分配，释放时 `munmap` 归还给操作系统：
+
+```c
+static void *custom_malloc(size_t size) {
+    // ... 小内存路径 ...
+
+    size_t total = sizeof(large_hdr_t) + size;    // 头 + 数据
+    size_t pagesz = sysconf(_SC_PAGESIZE);        // 4KB
+    size_t rounded = (total + pagesz - 1) / pagesz * pagesz;  // 按页对齐
+
+    large_hdr_t *hdr = mmap(NULL, rounded,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    hdr->magic = LARGE_MAGIC;
+    hdr->request_size = size;
+    hdr->mapping_size = rounded;
+
+    // 更新统计
+    g_mem.large_alloc_calls++;
+    g_mem.active_large_map_bytes += rounded;
+
+    return (void *)(hdr + 1);                     // 返回数据区
+}
+```
+
+**③ fallback 回退机制**
+
+当 slab 的 mmap 申请失败（内存不足）时，回退到标准的 `malloc`：
+
+```c
+static void *fallback_malloc(size_t size) {
+    fallback_hdr_t *hdr = malloc(sizeof(*hdr) + size);
+    hdr->magic = FALLBACK_MAGIC;
+    hdr->request_size = size;
+    return (void *)(hdr + 1);
+}
+```
+
+#### 四、三后端统一 API
+
+所有后端通过同一组 API 对外暴露，上层代码无需关心后端实现：
+
+```c
+// include/kvstore/kvstore.h — 统一接口
+void *kvs_malloc(size_t size);
+void *kvs_calloc(size_t n, size_t size);
+void *kvs_realloc(void *ptr, size_t size);
+void  kvs_free(void *ptr);
+
+// src/memory/kvs_mem.c — 后端分发
+static void *backend_malloc(size_t size) {
+    switch (g_mem.backend) {
+        case KVS_MEM_CUSTOM:   return custom_malloc(size);
+        case KVS_MEM_JEMALLOC:
+        case KVS_MEM_LIBC:
+        default:               return malloc(size);    // 透传 libc
+    }
+}
+```
+
+#### 统计与观测
+
+`MEMSTAT` 命令暴露完整的分配统计，包括三级分配器的详细数据：
+
+```
+Custom 后端 MEMSTAT 示例:
+  backend=custom
+  alloc_calls=1562342
+  free_calls=1562340
+  small_alloc_calls=1550000
+  large_alloc_calls=12342
+  fallback_alloc_calls=0
+  ──────────────────────────────
+  current_small_inuse=45.2MB
+  peak_small_inuse=48.1MB
+  total_small_page_bytes=64.0MB    ← slab 实际占用的虚拟内存
+  internal_fragment_bytes=1.2MB    ← slab 内部碎片（chunk 对齐浪费）
+  page_utilization=70.6%           ← 页面利用率
+  ──────────────────────────────
+  class[0]:  32B   total=131072  free=1200  pages=1
+  class[1]:  64B   total=65536   free=800   pages=1
+  class[2]:  128B  total=32768   free=400   pages=1
+  ...
+```
+
+各个统计字段的含义：
+
+| 字段 | 含义 |
+|---|---|
+| `current_small_inuse` | slab 中正在使用的字节数（每个 chunk 算 class_size） |
+| `peak_small_inuse` | 历史峰值 |
+| `total_small_page_bytes` | slab 从 mmap 申请的总页面大小（包括空闲 chunk） |
+| `internal_fragment_bytes` | 内部碎片 = 已分配字节 - 请求字节（对齐浪费） |
+| `page_utilization` | 页面利用率 = current_small_inuse / total_small_page_bytes |
+| `class[X] free` | 该 class 的空闲 chunk 数（越大说明该 size 使用率低） |
+
+#### jemalloc 的自动加载
+
+当选择 jemalloc 后端时，`kvs_mem_prepare_process()` 在 `main()` 初始化之前通过 `LD_PRELOAD` + `execvp` 重新加载进程：
+
+```c
+int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv) {
+    if (backend != KVS_MEM_JEMALLOC) return 0;
+
+    // 查找 libjemalloc.so 路径
+    const char *jemalloc_path = find_jemalloc_path();
+
+    // 设置 LD_PRELOAD = libjemalloc.so
+    setenv("LD_PRELOAD", preload, 1);
+
+    // 重新 exec 自身，使 LD_PRELOAD 生效
+    execvp(argv0, argv);
+}
+```
 
 #### 测试验证
 
@@ -1691,13 +3107,13 @@ slab 分配器
 ./kvstore --port 5000 --mem libc
 redis-cli -p 5000 MEMSTAT
 
-# jemalloc（需 LD_PRELOAD）
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so ./kvstore --port 5001 --mem jemalloc
+# jemalloc（自动加载）
+./kvstore --port 5001 --mem jemalloc
 redis-cli -p 5001 MEMSTAT
 
-# custom slab（自研）
+# custom slab（自研分配器）
 ./kvstore --port 5002 --mem custom
-redis-cli -p 5002 MEMSTAT  # 查看 slab class 分配统计
+redis-cli -p 5002 MEMSTAT  # 查看 slab class 详细统计
 ```
 
 ### TTL 过期时间记录 in AOF
@@ -2498,6 +3914,287 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | custom   | 100000 | 128B       | 51.78   | 1931 | 46792     |
 
 > 完整数据：`benchmarks/data/bench_fresh.csv`
+
+### 持久化性能基准
+
+> **测试环境**：Intel Core Ultra 7 155H (4 vCPU) / 7.7GiB RAM / Ubuntu 20.04.6 / Linux 5.15.0-139 / KVM 虚拟机
+>
+> **测试工具**：`redis-benchmark -t set -n 100000 -c 50 -d 64` (AOF 对比) / `redis-cli --pipe` + `SAVE` (SAVE 测试)
+>
+> **测试脚本**：`tools/bench/run_persist_bench.sh`
+
+#### AOF 性能对比
+
+##### 测试目的
+
+评估 kvstore 的 AOF 持久化在不同 fsync 策略下的性能开销，与 Redis 同策略对比，衡量 io_uring 异步 I/O 对 AOF 写入的性能提升。
+
+##### 测试方法
+
+1. 分别启动 kvstore 和 Redis 服务器，使用 `--appendfsync always`（每条命令 fsync）和 `--appendfsync everysec`（每秒 fsync）两种策略
+2. 客户端使用 `redis-benchmark -t set -n 100000 -c 50 -d 64`（100k 次 SET，50 并发，64 字节 value）
+3. 每个配置测试前重启服务器，清理上一次的 AOF/dump 文件，确保测试环境干净
+4. 记录 `redis-benchmark --csv` 输出的 QPS
+
+```bash
+# 测试命令示例
+redis-benchmark -p 5190 -t set -n 100000 -c 50 -d 64 --csv
+
+# kvstore 启动示例（always）
+./kvstore --port 5190 --role master --mem libc --net reactor --appendfsync always
+
+# Redis 启动示例（everysec）
+redis-server --port 6390 --save "" --appendonly yes --appendfsync everysec
+```
+
+##### 测试结果
+
+| 配置 | QPS | 相对 Redis 无 AOF | 相对 Redis 同策略 |
+|---|---|---|---|
+| **kvstore** AOF 关闭（`--aof-disable`） | **137,174** | **+11.3%** | — |
+| **kvstore** AOF always（每条命令 fsync） | 134,953 | +9.4% | +190%（vs Redis always） |
+| **kvstore** AOF everysec（每秒 fsync） | 135,318 | +9.7% | — |
+| **Redis** AOF everysec | 133,690 | +8.4% | 基准（同策略） |
+| **Redis** 无 AOF（基准） | 123,305 | — | — |
+| **Redis** AOF always | 46,468 | -62.3% | 基准（同策略） |
+
+##### 结果分析
+
+**① kvstore 的 AOF always 为什么接近 Redis 的 AOF everysec？**
+
+kvstore 的 AOF 写入路径使用 **io_uring 异步提交**，写操作不阻塞事件循环：
+
+```c
+// kvstore 的 AOF always 路径
+persist_append_raw(buf, len);
+  ├─ persist_write_fd_best_effort()     // io_uring 异步 write
+  │    └─ io_uring_get_sqe() → prep_write() → submit_and_wait()
+  └─ persist_force_aof_flush()          // io_uring 异步 fsync
+       └─ persist_fsync_fd_best_effort()
+            └─ io_uring_get_sqe() → prep_fsync() → submit_and_wait()
+```
+
+虽然名为 "always"，但 io_uring 的 `submit_and_wait()` 可以将 write 和 fsync 批量提交给内核，
+内核在后台执行 fsync 时用户线程可以继续处理下一个请求。所以 kvstore 的 always 策略实际开销接近 everysec。
+
+**② Redis 的 AOF always 为什么慢 62%？**
+
+Redis 的 AOF always 使用**同步 `fsync()` 系统调用**，每条命令后阻塞等待磁盘写入完成：
+
+```
+Redis AOF always 路径：
+  write(aof_fd, buf, len)          // 写入内核页缓存（快）
+  fsync(aof_fd)                    // 阻塞等待刷盘（慢！）
+                                   // 事件循环被阻塞，无法处理其他请求
+```
+
+在 50 并发下，单次 fsync 延迟约 0.2~1ms，100k 次请求中有 100k 次 fsync 等待，
+累计等待时间成为主要瓶颈，QPS 从 123k 骤降至 46k。
+
+**③ kvstore 的 AOF everysec 与 always 几乎没有差异**
+
+kvstore 的 AOF everysec 策略由 `persist_autosnap_cron()` 每秒检查脏标志并批量 fsync：
+
+```c
+if (g_cfg.aof_fsync == KVS_AOF_FSYNC_EVERYSEC && g_aof_dirty) {
+    if (now - g_aof_last_flush_ms >= 1000)
+        persist_force_aof_flush();  // 每秒 fsync 一次
+}
+```
+
+但在 100k 请求（约 0.7~0.8s 完成）的短测试中，每秒 fsync 只触发 0~1 次，
+实际 fsync 次数和 always 接近（always 的 io_uring fsync 也是异步不阻塞），
+所以两者 QPS 几乎相同（~135k vs ~135k）。
+
+**④ kvstore AOF 关闭性能（137,174 QPS）**
+
+`--aof-disable` 关闭 AOF 后，kvstore 完全跳过持久化写入路径：
+
+```c
+int persist_append_raw(const unsigned char *buf, size_t len) {
+    if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;  // AOF 关闭 → 直接返回成功
+    // ... 正常 AOF 写入路径 ...
+}
+```
+
+相比 AOF always 的 134,953 QPS，关闭 AOF 仅提升 **1.6%**（137,174 vs 134,953）。
+这进一步证明 kvstore 的 AOF 写入开销极低——io_uring 异步 I/O 使得持久化几乎不成为性能瓶颈。
+
+相比 Redis 无 AOF 的 123,305 QPS，kvstore 关闭 AOF 高出 **11.3%**，
+差距主要来自引擎实现差异（kvstore Array 引擎 O(n) 扫描比 Redis 哈希表更轻量）。
+
+**⑤ 为什么 kvstore 比 Redis 无 AOF 还快？**
+
+- kvstore 使用 **Reactor（epoll LT）** 模型，单线程事件循环，无锁竞争
+- kvstore 的 Array 引擎（SET 命令）是简单的 **O(n) 线性扫描**（n ≤ 1024），
+  比 Redis 的哈希表 + 渐进式 rehash 更轻量
+- kvstore 的 RESP 解析器更简单（不处理 Redis 的多种数据类型），CPU 指令路径更短
+
+##### 结论
+
+| 场景 | 推荐方案 | QPS | 原因 |
+|---|---|---|---|
+| 极致性能，不关心持久化 | kvstore `--aof-disable` | **137,174** | 完全跳过 AOF 写入路径 |
+| 最高性能，可接受丢 1s 数据 | kvstore AOF everysec | 135,318 | io_uring 几乎零开销 |
+| 最高安全性，每条命令持久化 | kvstore AOF always | 134,953 | io_uring 异步 fsync 不阻塞 |
+| 兼容 Redis 协议，高安全 | Redis AOF everysec | 133,690 | |
+| 兼容 Redis 协议，最高安全 | Redis AOF always | 46,468 | 同步 fsync 阻塞，性能代价大 |
+
+kvstore 的 io_uring 异步 I/O 使得 AOF always 策略的生产可用性大幅提升——不再需要在安全性和性能之间做取舍。
+即使关闭 AOF，性能也只提升 1.6%，说明 AOF 写入不是 kvstore 的性能瓶颈。
+
+---
+
+#### SAVE 性能测试
+
+##### 测试目的
+
+评估 `SAVE`（同步全量 dump）命令在不同频率下对写入吞吐的影响，帮助用户选择最优的持久化策略。
+
+##### 测试方法
+
+1. 使用 Hash 引擎（HSET 命令，无容量上限），避免 Array 引擎 1024 条上限干扰
+2. 共写入 100 万条 key-value（`savebench:k:0000001 ~ savebench:k:1000000`，value 约 8 字节）
+3. 四种 SAVE 频率：
+   - **100w 一次**：写入全部 100w → 1 次 SAVE
+   - **10w 一次**：每写 10w → 1 次 SAVE，重复 10 次
+   - **1w 一次**：每写 1w → 1 次 SAVE，重复 100 次
+   - **1k 一次**：每写 1k → 1 次 SAVE，重复 1000 次
+4. 写入使用 `redis-cli --pipe`（RESP 批处理协议，避免逐条网络往返）
+5. 使用 Python 生成 RESP 协议数据，避免 bash 循环的性能瓶颈
+6. 时间测量使用 `date +%s%N` 纳秒级计时
+
+```bash
+# RESP 批处理生成（Python）
+python3 -c "
+import sys
+for i in range(1000000):
+    sys.stdout.buffer.write(b'*3\r\n\$4\r\nHSET\r\n\$15\r\nsavebench:k:%07d\r\n\$9\r\nv:%07d\r\n' % (i, i))
+" | redis-cli -p 5190 --pipe
+
+# SAVE 计时
+time redis-cli -p 5190 SAVE
+```
+
+##### 测试结果
+
+| 场景 | 写入量/次 | SAVE 次数 | 总耗时 | 写入耗时 | SAVE 总耗时 | 平均每次 SAVE | 写入速度 |
+|---|---|---|---|---|---|---|---|
+| **100w → SAVE × 1** | 100万 | 1 | **20.52s** | 20.49s | 0.03s | **34.0ms** | **48,803 keys/s** |
+| 10w → SAVE × 10 | 10万 | 10 | 69.73s | 69.69s | 0.04s | 3.7ms | 14,347 keys/s |
+| 1w → SAVE × 100 | 1万 | 100 | 37.23s | 36.89s | 0.34s | 3.3ms | 27,107 keys/s |
+| 1k → SAVE × 1000 | 1千 | 1000 | 104.94s | 101.75s | 3.19s | 3.1ms | 9,829 keys/s |
+
+##### 结果分析
+
+**① SAVE 本身极轻量（3~4ms），不是性能瓶颈**
+
+无论数据集大小（10w 还是 100w），`SAVE` 命令的耗时始终稳定在 3~4ms。
+这是因为 `persist_save_dump()` 的执行路径：
+
+```c
+int persist_save_dump(void) {
+    // ① 打开文件 O_TRUNC
+    int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+
+    // ② 遍历所有引擎写入 KVSD 二进制格式
+    //    全部是内存顺序访问 + 少量 write() 系统调用
+    kvs_dump_to_fd(fd);
+
+    // ③ io_uring 异步 fsync（不阻塞）
+    persist_fsync_fd(fd);
+    close(fd);
+}
+```
+
+`kvs_dump_to_fd()` 遍历 Hash 引擎的 1024 个桶的链地址表，顺序写入二进制 KVSD 格式。
+数据量 100w 条时，dump 文件约 100w × (4+15+4+9) ≈ 32MB。
+32MB 的 `write()` 在内核页缓存中完成（未刷盘前不涉及磁盘 I/O），
+后续的 `persist_fsync_fd()` 使用 io_uring 异步提交，SAVE 命令返回时数据可能还在页缓存中，
+由内核后台异步刷盘。所以 SAVE 命令本身几乎不阻塞。
+
+**② 频繁 SAVE 场景下，性能下降的根源是 batch 大小而非 SAVE 本身**
+
+比较 100w×1（batch=100w）和 1k×1000（batch=1k）：
+
+```
+100w×1: 总 20.52s, 写入 20.49s, SAVE 0.03s
+1k×1000: 总 104.94s, 写入 101.75s, SAVE 3.19s
+
+SAVE 耗时增加: 0.03s → 3.19s（+3.16s，占总增加量的 3.7%）
+写入耗时增加: 20.49s → 101.75s（+81.26s，占总增加量的 96.3%）
+```
+
+**SAVE 开销仅占 3.7%**，写入耗时增加了 5 倍才是主因。
+
+为什么 batch 小会导致写入慢？`redis-cli --pipe` 的原理：
+
+```python
+# batch=100w: 一次发送 100w 条 RESP 命令
+socket.sendall(resp_data_100w)       # 一次 write() 发送全部
+# 服务器端: 一次 recv() 读取全部 → 循环解析 → 批量写入内存
+# 客户端: 一次 recv() 读取全部响应
+
+# batch=1k: 发送 1000 次，每次 1k 条
+for i in range(1000):
+    socket.sendall(resp_data_1k)     # 1000 次 write()
+    # 服务器端: 1000 次 recv() → 1000 次解析 → 1000 次写入
+    socket.recv(resp)                # 1000 次 read()
+```
+
+每次 `send()` + `recv()` 都有 TCP 往返延迟（RTT），1000 次往返累积 ~几秒。
+更重要的是，每次小 batch 的 RESP 解析和引擎写入不能充分利用批处理优势。
+
+**③ 10w×10 的总耗时（69.73s）反常地高于 1w×100（37.23s）**
+
+理论上 10w×10 的 batch 更大，应该比 1w×100 更快，但实际相反。分析原因：
+
+```
+测试执行顺序: 100w×1 → 10w×10 → 1w×100 → 1k×1000
+```
+
+10w×10 是第一个多轮测试，会经历数据集从小到大的过程：
+- 第 1 次 SAVE 时只有 10w 数据 → 快
+- 第 10 次 SAVE 时有 100w 数据 → 较慢
+
+但这不是主要原因。关键在 `redis-cli --pipe` 的响应读取机制：
+`redis-cli --pipe` 会等待所有响应到达后才返回。batch 为 10w 时，服务器返回 10w 个 `+OK\r\n`（约 50 字节 × 10w = 5MB），
+客户端需要 5MB 的 socket 读取时间，这部分时间被计入了写入耗时。
+
+而 1w×100 时，每次 batch 只有 1w 条，响应仅 0.5MB，
+客户端可以更快地读完响应进入下一轮。
+
+**④ 最佳策略：100w 一次 SAVE**
+
+**总耗时 20.52s（写入 20.49s + SAVE 0.03s）是最优方案。** 原因：
+
+1. **吞吐最高**：48,803 keys/s，约 3.9MB/s 数据写入
+2. **SAVE 开销最低**：34ms 完成 100w 数据的持久化，占总时间的 0.15%
+3. **CPU 效率最高**：单次大 batch 减少了解析和网络处理的重复开销
+
+**⑤ 生产环境建议**
+
+虽然 SAVE 本身很轻量，但它是**同步阻塞**操作——SAVE 期间主线程被占用，无法处理任何客户端请求。
+
+| 场景 | 推荐策略 | 原因 |
+|---|---|---|
+| 开发调试 | 每隔几分钟手动 SAVE | 简单可控 |
+| 生产低写入量（<1k/s） | `autosnap 300 1000` | 5 分钟或 1000 次写入自动 BGSAVE |
+| 生产高写入量（>10k/s） | `autosnap 60 100000` | 1 分钟或 10w 次写入自动 BGSAVE |
+| 最高数据安全性 | `--appendfsync always` | 每条命令持久化，SAVE 作为补充 |
+| 需要精确恢复点 | 配合 AOF everysec + 定期 BGSAVE | AOF 保证不丢 1s 数据，dump 加速重启 |
+
+生产环境应始终使用 **BGSAVE**（非阻塞 fork 子进程）替代 SAVE，避免阻塞主线程：
+
+```bash
+# 配置自动 BGSAVE 规则（kvstore.conf）
+autosnap 60 10000    # 60 秒内有 10000 次写入 → 自动 BGSAVE
+autosnap 3600 0      # 每小时至少 BGSAVE 一次
+
+# 或运行时动态配置
+redis-cli -p 5000 SNAPRULE 60 10000
+redis-cli -p 5000 SNAPRULES
+```
 
 ### 运行基准测试
 

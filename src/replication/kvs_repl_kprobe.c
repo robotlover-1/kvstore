@@ -972,7 +972,8 @@ void repl_kprobe_rdma_cleanup(void) {
     g_wr_head = 0;
     g_wr_in_flight = 0;
     g_wr_producer_seq = 0;
-    memset(&g_slave_mr, 0, sizeof(g_slave_mr));
+    /* volatile 指针转 void* 清除 memset warning */
+    { volatile typeof(g_slave_mr) *vp = &g_slave_mr; memset((void *)vp, 0, sizeof(g_slave_mr)); }
     pthread_mutex_unlock(&g_kprobe_rdma_lock);
 
     /* 清理 Slave 侧 MR */

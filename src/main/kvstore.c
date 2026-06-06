@@ -191,6 +191,7 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--master-port") && i + 1 < argc) g_cfg.master_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--aof") && i + 1 < argc) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--aof-disable")) persist_aof_disable();
         else if (!strcmp(argv[i], "--mem") && i + 1 < argc) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--net") && i + 1 < argc) {
             snprintf(g_cfg.net_backend, sizeof(g_cfg.net_backend), "%s", argv[++i]);

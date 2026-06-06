@@ -502,6 +502,7 @@ int persist_bgrewriteaof_start(void);
 int persist_bgrewriteaof_poll(void);
 int persist_bgrewriteaof_in_progress(void);
 const char *persist_bgrewriteaof_state_name(void);
+int persist_aof_disable(void);
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy);
 kvs_aof_fsync_policy_t persist_get_aof_policy(void);
 const char *persist_aof_policy_name(void);

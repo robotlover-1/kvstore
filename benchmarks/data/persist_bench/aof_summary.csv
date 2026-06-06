@@ -1,0 +1,6 @@
+label,qps
+kvstore_aof_always,134952.77
+kvstore_aof_everysec,135318.00
+redis_no_aof,123304.56
+redis_aof_everysec,133689.83
+redis_aof_always,46468.40

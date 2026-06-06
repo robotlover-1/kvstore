@@ -45,6 +45,18 @@ sudo apt install gcc make liburing-dev libjemalloc-dev
 # RDMA 支持（可选）
 sudo apt install librdmacm-dev libibverbs-dev
 
+# RDMA 设备配置（Soft-iWARP 或 Soft-RoCE）
+# 加载内核模块并创建 RDMA 设备（使用本机物理网卡，如 ens33）
+sudo modprobe siw
+sudo rdma link add siw0 type siw netdev ens33
+sudo modprobe rdma_rxe
+sudo rdma link add rxe0 type rxe netdev ens33
+# 验证
+rdma link show
+# 输出应包含:
+#   link siw0/1 state ACTIVE physical_state LINK_UP netdev ens33
+#   link rxe0/1 state ACTIVE physical_state LINK_UP netdev ens33
+
 # eBPF 支持（可选，需 ENABLE_EBPF=1）
 sudo apt install libbpf-dev libelf-dev clang
 ```

@@ -18,8 +18,8 @@
  *   # 终端 1 (VM1): 启动 master（必须先启动）
  *   sudo ./kvstore --port 5160 --role master \
  *       --repl-fullsync-transport rdma \
- *       --repl-realtime-transport ebpf \
- *       --ebpf-enabled --rdma-dev siw0 --rdma-recv-slots 64
+ *       --repl-realtime-transport kprobe-rdma \
+ *       --kprobe-enabled --rdma-dev siw0
  *
  *   # 终端 2 (任意机器): 运行本测试（预存数据，等待 slave）
  *   ./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
@@ -30,7 +30,7 @@
  *   sudo ./kvstore --port 5161 --role slave \
  *       --master-host 192.168.233.128 --master-port 5160 \
  *       --repl-fullsync-transport rdma \
- *       --repl-realtime-transport ebpf
+ *       --repl-realtime-transport kprobe-rdma
  *
  * 用法二: eBPF sockmap 增量（双虚拟机，kprobe不可用时自动回退至此）
  *   与用法一相同，区别在于内核不支持 kprobe 附件（如 kprobe_events 不可写）
@@ -1115,7 +1115,7 @@ static void print_usage(const char *prog) {
     printf("  sudo ./kvstore --port %d --role master \\\n", g_opt.master_port);
     printf("      --repl-fullsync-transport rdma \\\n");
     printf("      --repl-realtime-transport kprobe-rdma \\\n");
-    printf("      --rdma-dev siw0 --kprobe-enabled 1\n");
+    printf("      --rdma-dev siw0 --kprobe-enabled\n");
     printf("\n");
     printf("  # 终端 2 (任意机器):\n");
     printf("  %s --master-host <MASTER_IP> --master-port %d \\\n", prog, g_opt.master_port);

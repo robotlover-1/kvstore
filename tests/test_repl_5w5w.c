@@ -111,9 +111,9 @@ static struct {
     int batch;
     int poll_ms;
 } g_opt = {
-    .master_host = "127.0.0.1",
+    .master_host = "192.168.233.128",
     .master_port = 5160,
-    .slave_host = "127.0.0.1",
+    .slave_host = "192.168.233.129",
     .slave_port = 5161,
     .pre_count = 50000,
     .post_count = 50000,
@@ -537,10 +537,11 @@ static int run_test(void) {
     banner("Phase 2: 等待 Slave 连接");
 
     printf("  请启动 Slave (另一终端):\n");
-    printf("    sudo %s --port %d --role slave --master-host %s --master-port %d \\\n",
-           "./kvstore", g_opt.slave_port, g_opt.master_host, g_opt.master_port);
+    printf("    sudo ./kvstore kvstore.conf --role slave\n");
+    printf("  或:\n");
+    printf("    sudo ./kvstore --port %d --role slave --master-host %s --master-port %d \\\n",
+           g_opt.slave_port, g_opt.master_host, g_opt.master_port);
     printf("        --repl-fullsync-transport rdma --repl-realtime-transport kprobe-rdma\n");
-    printf("    (或 --repl-realtime-transport ebpf 使用 eBPF sockmap)\n");
     printf("\n  等待 Slave 连接...\n");
 
     int slave_ready = 0;
@@ -1112,10 +1113,7 @@ static void print_usage(const char *prog) {
     printf("\n");
     printf("方式一: RDMA 全量 + kprobe+RDMA WRITE 增量（双虚拟机，推荐）\n");
     printf("  # 终端 1 (VM1, 先启动):\n");
-    printf("  sudo ./kvstore --port %d --role master \\\n", g_opt.master_port);
-    printf("      --repl-fullsync-transport rdma \\\n");
-    printf("      --repl-realtime-transport kprobe-rdma \\\n");
-    printf("      --rdma-dev siw0 --kprobe-enabled\n");
+    printf("  sudo ./kvstore kvstore.conf --role master\n");
     printf("\n");
     printf("  # 终端 2 (任意机器):\n");
     printf("  %s --master-host <MASTER_IP> --master-port %d \\\n", prog, g_opt.master_port);
@@ -1123,10 +1121,11 @@ static void print_usage(const char *prog) {
     printf("      --pre %d --post %d\n", g_opt.pre_count, g_opt.post_count);
     printf("\n");
     printf("  # 终端 3 (VM2, 等\"等待 Slave 连接...\"提示后启动):\n");
+    printf("  sudo ./kvstore kvstore.conf --role slave\n");
+    printf("\n");
+    printf("  或手动指定参数:\n");
     printf("  sudo ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
-    printf("      --master-host <MASTER_IP> --master-port %d \\\n", g_opt.master_port);
-    printf("      --repl-fullsync-transport rdma \\\n");
-    printf("      --repl-realtime-transport kprobe-rdma\n");
+    printf("      --master-host <MASTER_IP> --master-port %d\n", g_opt.master_port);
     printf("\n");
     printf("方式二: RDMA 全量 + eBPF 增量（双虚拟机）\n");
     printf("  # 终端 1 (VM1, 先启动):\n");
@@ -1150,7 +1149,7 @@ static void print_usage(const char *prog) {
     printf("  启动参数同方式一，区别在于内核不支持 kprobe 附件，\n");
     printf("  走 sk_msg → bpf_msg_redirect_map → TCP 路径\n");
     printf("\n");
-    printf("方式三: TCP 全量（单机，无 RDMA/eBPF）\n");
+    printf("方式三: TCP 全量 + TCP 增量（单机，无 RDMA/eBPF）\n");
     printf("  # 终端 1 (先启动):\n");
     printf("  ./kvstore --port %d --role master \\\n", g_opt.master_port);
     printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
@@ -1172,13 +1171,51 @@ static void print_usage(const char *prog) {
     printf("  --pre COUNT          全量同步前数据量 (默认 %d)\n", g_opt.pre_count);
     printf("  --post COUNT         全量同步后数据量 (默认 %d)\n", g_opt.post_count);
     printf("  --batch SIZE         每批写入量 (默认 %d)\n", g_opt.batch);
+    printf("  --config PATH        加载配置文件 (默认 tests/test.conf)\n");
     printf("  --poll MS            轮询间隔毫秒 (默认 %d)\n", g_opt.poll_ms);
     printf("  -h                   显示此帮助\n");
 }
 
+/* ── 配置文件解析（支持 --config test.conf） ── */
+
+static int parse_config_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        while (val && (*val == ' ' || *val == '\t')) val++;
+        char *end = val + strlen(val) - 1;
+        while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
+        if (strcmp(key, "master_host") == 0) g_opt.master_host = strdup(val);
+        else if (strcmp(key, "master_port") == 0) g_opt.master_port = atoi(val);
+        else if (strcmp(key, "slave_host") == 0) g_opt.slave_host = strdup(val);
+        else if (strcmp(key, "slave_port") == 0) g_opt.slave_port = atoi(val);
+        else if (strcmp(key, "pre") == 0) g_opt.pre_count = atoi(val);
+        else if (strcmp(key, "post") == 0) g_opt.post_count = atoi(val);
+        else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+        else if (strcmp(key, "poll_ms") == 0) g_opt.poll_ms = atoi(val);
+    }
+    fclose(fp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* 自动加载默认配置文件 */
+    parse_config_file("tests/test.conf");
+    parse_config_file("test.conf");
+
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            parse_config_file(argv[++i]);
+        else if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
             g_opt.master_host = argv[++i];
         else if (strcmp(argv[i], "--master-port") == 0 && i + 1 < argc)
             g_opt.master_port = atoi(argv[++i]);

@@ -23,9 +23,9 @@ extern int g_slave_fd;
 
 kv_config_t g_cfg = {
     .role = ROLE_MASTER,
-    .port = 5000,
-    .master_host = "127.0.0.1",
-    .master_port = 5000,
+    .port = 5160,
+    .master_host = "192.168.233.128",
+    .master_port = 5160,
     .dump_path = "kvstore.dump",
     .aof_path = "kvstore.aof",
     .mem_backend = "libc",
@@ -43,7 +43,7 @@ kv_config_t g_cfg = {
     .rdma_ib_port = 1,
     .rdma_gid_idx = 1,
     .rdma_port = 0,
-    .rdma_recv_slots = 32,
+    .rdma_recv_slots = 64,
     .rdma_chunk_size = BUFFER_CAP * 4,
     .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
@@ -56,7 +56,7 @@ kv_config_t g_cfg = {
     .sentinel_down_after_ms = 5000,
     .sentinel_failover_timeout_ms = 10000,
     .sentinel_quorum = 1,
-    .kprobe_enabled = 0,
+    .kprobe_enabled = 1,
     .repl_kprobe_obj_path = "build/replication/bpf/repl_kprobe.bpf.o",
 };
 conn_t *g_replicas = NULL;
@@ -2067,7 +2067,45 @@ int kvs_dump_to_fd(int fd) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     if (parse_args(argc, argv) != 0) {
-        fprintf(stderr, "Usage: %s [--config kvstore.conf] [--port 5000] [--role master|slave] [--master-host 127.0.0.1 --master-port 5000] [--mem libc|jemalloc|custom] [--net reactor|proactor|ntyco] [--repl-transport tcp|rdma|ebpf] [--repl-fullsync-transport rdma] [--repl-realtime-transport ebpf] [--ebpf-obj build/replication/bpf/repl_sockmap.bpf.o] [--ebpf-pin /sys/fs/bpf/kvstore] [--ebpf-redirect --ebpf-redirect-key 0] [--ebpf-forward] [--rdma-dev rxe0] [--rdma-port 5001] [--rdma-ib-port 1] [--rdma-gid-idx 1] [--rdma-recv-slots 32] [--rdma-chunk-size 16384] [--rdma-qp-wr-depth 64] [--appendfsync always|everysec] [--autosnap 60:1000,300:10]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [kvstore.conf] [--role master|slave] [options]\n"
+                "  kvstore.conf 中的所有选项均可通过命令行覆盖:\n"
+                "  --port PORT             监听端口 (默认 5160)\n"
+                "  --role master|slave     角色 (默认 master)\n"
+                "  --master-host HOST      主机地址 (默认 192.168.233.128)\n"
+                "  --master-port PORT      主机端口 (默认 5160)\n"
+                "  --dump PATH             dump 文件路径 (默认 kvstore.dump)\n"
+                "  --aof PATH              AOF 文件路径 (默认 kvstore.aof)\n"
+                "  --mem libc|jemalloc|custom  内存后端 (默认 libc)\n"
+                "  --net reactor|proactor|ntyco  网络模型 (默认 reactor)\n"
+                "  --repl-fullsync-transport tcp|rdma  全量同步传输 (默认 rdma)\n"
+                "  --repl-realtime-transport tcp|kprobe-rdma|ebpf  增量同步传输 (默认 kprobe-rdma)\n"
+                "  --kprobe-enabled        启用 kprobe+RDMA 增量同步\n"
+                "  --rdma-dev DEV          RDMA 设备 (默认 siw0)\n"
+                "  --rdma-port PORT        RDMA 监听端口 (默认 0 = main+1)\n"
+                "  --rdma-ib-port PORT     RDMA IB 端口 (默认 1)\n"
+                "  --rdma-gid-idx IDX      RDMA GID 索引 (默认 1)\n"
+                "  --rdma-recv-slots N     接收槽位数 (默认 64)\n"
+                "  --rdma-chunk-size SIZE  分块大小 (默认 262144)\n"
+                "  --rdma-qp-wr-depth N    QP 队列深度 (默认 64)\n"
+                "  --appendfsync always|everysec  AOF fsync 策略 (默认 always)\n"
+                "  --ebpf-enabled          启用 eBPF sockmap\n"
+                "  --ebpf-obj PATH         eBPF 对象文件路径\n"
+                "  --ebpf-pin PATH         eBPF pin 路径\n"
+                "  --ebpf-redirect         启用 eBPF 重定向\n"
+                "  --ebpf-redirect-key N   eBPF 重定向 key\n"
+                "  --ebpf-forward          启用 eBPF 转发\n"
+                "  --aof-disable           禁用 AOF 持久化\n"
+                "  --autosnap RULES        自动快照规则 (例如 60:1000,300:10)\n"
+                "  --sentinel              启用哨兵模式\n"
+                "  --sentinel-master-name NAME  哨兵主节点名\n"
+                "  --sentinel-monitor-host HOST  哨兵监控主机\n"
+                "  --sentinel-monitor-port PORT  哨兵监控端口\n"
+                "  --sentinel-known-slaves LIST  已知从机列表\n"
+                "  --sentinel-down-after MS     判定下线毫秒数\n"
+                "  --sentinel-failover-timeout MS  故障转移超时\n"
+                "  --sentinel-quorum N     哨兵法定人数\n"
+                "  --log-mode MODE         日志模式 (默认 info)\n"
+                "  --config PATH           配置文件路径 (默认 ./kvstore.conf)\n", argv[0]);
         return 1;
     }
     if (!strcmp(g_cfg.mem_backend, "jemalloc")) {

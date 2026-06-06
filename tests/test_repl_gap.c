@@ -82,9 +82,9 @@ static struct {
     .master_port = 5179,
     .slave_host = "127.0.0.1",
     .slave_port = 5180,
-    .pre_count = 3000,
+    .pre_count = 50000,
     .gap_count = 0,
-    .post_count = 1000,
+    .post_count = 5000,
     .batch = 1000,
     .poll_ms = 500,
 };
@@ -468,7 +468,7 @@ int main(int argc, char **argv) {
             printf("  --master-port PORT   Master 端口 (默认 %d)\n", g_opt.master_port);
             printf("  --slave-host HOST    Slave 地址 (默认 %s)\n", g_opt.slave_host);
             printf("  --slave-port PORT    Slave 端口 (默认 %d)\n", g_opt.slave_port);
-            printf("  --pre-count N        预存数据量 (默认 %d)\n", g_opt.pre_count);
+            printf("  --pre-count N        预存数据量 (默认 %d，建议 ≥50000 以确保 gap 窗口)\n", g_opt.pre_count);
             printf("  --gap-count N        gap 数据量 (默认 0，手动输入)\n");
             printf("  --post-count N       post 数据量 (默认 %d)\n", g_opt.post_count);
             printf("  --batch N            每批写入量 (默认 %d)\n", g_opt.batch);
@@ -527,22 +527,61 @@ int main(int argc, char **argv) {
     }
     pass("Slave 已就绪");
 
-    /* 等待全量同步开始 */
+    /* 等待全量同步开始（或已快速完成） */
     info("等待全量同步开始...");
-    int loading = -1;
+    int loading = -1, fullsync_done = 0;
     double wait_start = now_ms();
-    while ((loading = slave_is_loading_fullsync()) != 1) {
+    while (1) {
+        loading = slave_is_loading_fullsync();
+        if (loading == 1) {
+            pass("全量同步已开始 (slave_fullsync_loading=1)");
+            break;
+        }
+        /* loading=0 + slave 已有数据 = 全量同步已完成（太快没捕获到 loading=1） */
+        if (loading == 0) {
+            char *sv = cmd_resp(g_opt.slave_host, g_opt.slave_port, "HGET", "pre:k:000001", NULL);
+            char *sval = sv ? extract_bulk(sv) : NULL;
+            if (sval && strcmp(sval, "v:000001") == 0) {
+                fullsync_done = 1;
+                free(sv); free(sval);
+                pass("全量同步已完成 (slave 已有 pre 数据)");
+                break;
+            }
+            free(sv); free(sval);
+        }
         if (now_ms() - wait_start > 30000) {
-            fail_msg("等待全量同步开始超时");
+            fail_msg("等待全量同步开始超时 (loading=%d)", loading);
             return 1;
         }
         usleep((useconds_t)(g_opt.poll_ms * 1000));
     }
-    pass("全量同步已开始 (slave_fullsync_loading=1)");
+    /* gap 数据在全量同步期间写入才有意义，如果全量已完成则跳过 gap */
+    if (fullsync_done) {
+        info("全量同步太快已结束，跳过 gap 阶段（gap 只测试全量同步期间写入的场景）");
+        g_opt.gap_count = 0;
+        goto phase4;
+    }
+
+    /* 确认仍在全量同步中（5 秒超时），确保 gap 窗口有效 */
+    info("确认全量同步仍在进行中...");
+    double confirm_start = now_ms();
+    while (slave_is_loading_fullsync() == 1) {
+        if (now_ms() - confirm_start > 5000) {
+            /* 持续 5 秒以上仍在同步，说明 gap 窗口充足 */
+            break;
+        }
+        usleep(100000);
+    }
+    if (slave_is_loading_fullsync() != 1) {
+        info("全量同步在等待期间已结束，跳过 gap 阶段");
+        g_opt.gap_count = 0;
+        goto phase4;
+    }
 
     /* ── Phase 3: 提示用户手动写入 gap 数据（全量同步期间） ── */
     banner("Phase 3: 全量同步期间手动写入 Gap 数据");
 
+    info("当前 slave_fullsync_loading=1，有充足时间写入 gap 数据");
     prompt_user("请在另一终端连接 Master %s:%d 并写入任意 gap 数据\n"
                 "（例如: redis-cli -p %d -h %s HSET gap:mykey myvalue），\n"
                 "写入完成后，回到本窗口输入你写了多少条 gap 数据:",
@@ -559,6 +598,7 @@ int main(int argc, char **argv) {
     info("Gap 数据已写入，共 %d 条", g_opt.gap_count);
 
     /* ── Phase 4: 等待全量同步完成 ── */
+    phase4:
     banner("Phase 4: 等待全量同步完成 + Gap 补发");
 
     info("等待 slave_fullsync_loading → 0 ...");

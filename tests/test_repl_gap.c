@@ -163,8 +163,10 @@ static int tcp_connect_timeout(const char *host, int port, int timeout_ms) {
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
     if (err) { close(fd); return -1; }
     fcntl(fd, F_SETFL, flags);
-    struct timeval tv = {5, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct timeval tv_rcv = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_rcv, sizeof(tv_rcv));
+    struct timeval tv_snd = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv_snd, sizeof(tv_snd));
     return fd;
 }
 
@@ -341,37 +343,38 @@ static int parse_config_file(const char *path) {
     return 0;
 }
 
-/* ── 批量写入 ── */
+/* ── 批量写入（分块发送，每块后读取响应防止 TCP 缓冲死锁） ── */
 
 static int batch_write(int fd, const char *cmd, const char *prefix, int start, int count) {
-    size_t cap = (size_t)count * 128;
-    unsigned char *buf = (unsigned char *)malloc(cap);
-    if (!buf) return -1;
-    size_t pos = 0;
-    for (int i = start; i < start + count; i++) {
-        char key[64], val[64];
-        snprintf(key, sizeof(key), "%s:k:%06d", prefix, i);
-        snprintf(val, sizeof(val), "v:%06d", i);
-        int n = snprintf((char *)buf + pos, cap - pos,
-            "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-            strlen(cmd), cmd, strlen(key), key, strlen(val), val);
-        if (n < 0 || (size_t)n >= cap - pos) { free(buf); return -1; }
-        pos += (size_t)n;
+    size_t chunk = 500;  /* 每 500 条发送一次，避免填满 TCP 缓冲区 */
+    int sent = 0;
+    while (sent < count) {
+        size_t cur = (size_t)(count - sent) < chunk ? (size_t)(count - sent) : chunk;
+        size_t cap = cur * 128;
+        unsigned char *buf = (unsigned char *)malloc(cap);
+        if (!buf) return -1;
+        size_t pos = 0;
+        for (int i = start + sent; i < start + sent + (int)cur; i++) {
+            char key[64], val[64];
+            snprintf(key, sizeof(key), "%s:k:%06d", prefix, i);
+            snprintf(val, sizeof(val), "v:%06d", i);
+            int n = snprintf((char *)buf + pos, cap - pos,
+                "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                strlen(cmd), cmd, strlen(key), key, strlen(val), val);
+            if (n < 0 || (size_t)n >= cap - pos) { free(buf); return -1; }
+            pos += (size_t)n;
+        }
+        if (send_all(fd, buf, pos) != 0) { free(buf); return -1; }
+        free(buf);
+        sent += (int)cur;
+        /* 每块发送后尝试读取部分响应，防止 TCP 缓冲区满导致死锁 */
+        for (int i = 0; i < (int)cur; i++) {
+            unsigned char *r = recv_resp(fd);
+            if (!r) break;
+            free(r);
+        }
     }
-    int rc = send_all(fd, buf, pos);
-    free(buf);
-    return rc;
-}
-
-/* 等待所有响应 */
-static int drain_responses(int fd, int count) {
-    int ok = 0;
-    for (int i = 0; i < count; i++) {
-        char *r = (char *)recv_resp(fd);
-        if (r && r[0] == '+') ok++;
-        free(r);
-    }
-    return ok;
+    return 0;
 }
 
 /* ── 验证 ── */
@@ -486,7 +489,6 @@ int main(int argc, char **argv) {
         if (fd < 0) { fail_msg("连接 Master 失败"); return 1; }
         double t0 = now_ms();
         int pre_ok = batch_write(fd, "HSET", "pre", 1, g_opt.pre_count);
-        drain_responses(fd, g_opt.pre_count);
         close(fd);
         double t1 = now_ms();
         if (pre_ok != 0) { fail_msg("写入 pre 数据失败"); return 1; }
@@ -586,7 +588,6 @@ int main(int argc, char **argv) {
         if (fd < 0) { fail_msg("连接 Master 失败"); return 1; }
         double t0 = now_ms();
         int post_ok = batch_write(fd, "HSET", "post", 1, g_opt.post_count);
-        drain_responses(fd, g_opt.post_count);
         close(fd);
         double t1 = now_ms();
         if (post_ok != 0) { fail_msg("写入 post 数据失败"); return 1; }

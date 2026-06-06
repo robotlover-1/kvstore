@@ -59,8 +59,8 @@ static struct {
     int count;
     int batch;
 } g_opt = {
-    .host = "127.0.0.1",
-    .port = 5170,
+    .host = "192.168.233.128",
+    .port = 5160,
     .count = 50000,
     .batch = 1000,
 };

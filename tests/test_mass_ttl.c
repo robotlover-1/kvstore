@@ -68,8 +68,8 @@ static struct {
     int ttl;
     int batch;
 } g_opt = {
-    .host = "127.0.0.1",
-    .port = 5200,
+    .host = "192.168.233.128",
+    .port = 5160,
     .count = 10000,
     .ttl = 10,
     .batch = 1000,

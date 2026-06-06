@@ -631,8 +631,8 @@ static void test_stress_brief(void) {
  * ================================================================*/
 
 /* ── 配置文件解析（支持 --config test.conf） ── */
-static const char *g_host = "127.0.0.1";
-static int g_port = 5000;
+static const char *g_host = "192.168.233.128";
+static int g_port = 5160;
 
 static int parse_config_file(const char *path) {
     FILE *fp = fopen(path, "r");

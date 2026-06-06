@@ -59,8 +59,8 @@ static struct {
     int batch;
     const char *engine;
 } g_opt = {
-    .host = "127.0.0.1",
-    .port = 5190,
+    .host = "192.168.233.128",
+    .port = 5160,
     .count = 10000,
     .batch = 1000,
     .engine = "hash",

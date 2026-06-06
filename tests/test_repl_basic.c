@@ -75,10 +75,10 @@ static struct {
     int batch;
     int poll_ms;
 } g_opt = {
-    .master_host = "127.0.0.1",
-    .slave_host = "127.0.0.1",
-    .master_port = 6379,
-    .slave_port = 6380,
+    .master_host = "192.168.233.128",
+    .slave_host = "192.168.233.129",
+    .master_port = 5160,
+    .slave_port = 5160,
     .count = 5000,
     .batch = 500,
     .poll_ms = 500,

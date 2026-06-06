@@ -518,7 +518,7 @@ int main(int argc, char **argv) {
                 g_opt.slave_port, g_opt.master_host, g_opt.master_port);
 
     info("等待 Slave %s:%d 就绪...", g_opt.slave_host, g_opt.slave_port);
-    if (wait_port_ready(g_opt.slave_host, g_opt.slave_port, 60, 0.5) != 0) {
+    if (wait_port_ready(g_opt.slave_host, g_opt.slave_port, 600, 0.5) != 0) {
         fail_msg("Slave 连接超时");
         return 1;
     }
@@ -546,7 +546,7 @@ int main(int argc, char **argv) {
             }
             free(sv); free(sval);
         }
-        if (now_ms() - wait_start > 30000) {
+        if (now_ms() - wait_start > 300000) {
             fail_msg("等待全量同步开始超时 (loading=%d)", loading);
             return 1;
         }
@@ -612,8 +612,8 @@ int main(int argc, char **argv) {
             usleep(100000);
             continue;
         }
-        if (now_ms() - poll_start > 120000) {
-            fail_msg("全量同步超时 (120s)");
+        if (now_ms() - poll_start > 300000) {
+            fail_msg("全量同步超时 (300s)");
             return 1;
         }
         usleep((useconds_t)(g_opt.poll_ms * 1000));

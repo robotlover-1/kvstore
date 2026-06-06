@@ -31,7 +31,7 @@
  * 流程:
  *   Phase 1: 预存 pre 数据到 Master（制造全量同步负担）
  *   Phase 2: 等待 Slave 连接并开始全量同步
- *   Phase 3: 全量同步期间写入 gap 数据到 Master
+ *   Phase 3: 用户手动写入 gap 数据到 Master（全量同步期间）
  *   Phase 4: 等待全量同步完成（轮询 slave_fullsync_loading）
  *   Phase 5: 验证 Slave 有 pre 数据 + gap 数据
  *   Phase 6: 写入 post 数据并验证增量同步
@@ -176,18 +176,19 @@ static int send_all(int fd, const unsigned char *buf, size_t len) {
     }
     return 0;
 }
-    for (int i = 0; i < argc; i++) {
-        size_t slen = strlen(args[i]);
-        n = snprintf((char *)wbuf + pos, cap - pos, "$%zu\r\n", slen);
-        pos += (size_t)n;
-        memcpy(wbuf + pos, args[i], slen);
-        pos += slen;
-        wbuf[pos++] = '\r'; wbuf[pos++] = '\n';
+static unsigned char *recv_resp(int fd) {
+    size_t cap = 4096, len = 0;
+    unsigned char *buf = (unsigned char *)malloc(cap);
+    if (!buf) return NULL;
+    while (len < BUFFER_SIZE) {
+        if (cap - len < 1024) { cap *= 2; buf = realloc(buf, cap); }
+        ssize_t r = read(fd, buf + len, cap - len - 1);
+        if (r <= 0) break;
+        len += (size_t)r;
+        if (len >= 2 && buf[len - 1] == '\n') break;
     }
-    int ok = send_all(fd, wbuf, pos);
-    free(wbuf);
-    if (ok != 0) return NULL;
-    return (char *)recv_resp(fd);
+    buf[len] = '\0';
+    return buf;
 }
 
 static char *cmd_resp(const char *host, int port, const char *arg0, ...) {
@@ -481,20 +482,23 @@ int main(int argc, char **argv) {
     }
     pass("全量同步已开始 (slave_fullsync_loading=1)");
 
-    /* ── Phase 3: 全量同步期间写入 gap 数据 ── */
-    banner("Phase 3: 全量同步期间写入 Gap 数据");
+    /* ── Phase 3: 提示用户手动写入 gap 数据（全量同步期间） ── */
+    banner("Phase 3: 全量同步期间手动写入 Gap 数据");
 
+    prompt_user("请在另一终端（终端 4）连接 Master 并写入 gap 数据，例如:\n"
+                "  for i in $(seq 1 %d); do\n"
+                "    printf '*3\\r\\n\\$4\\r\\nHSET\\r\\n\\$12\\r\\ngap:k:%%06d\\r\\n\\$9\\r\\nv:%%06d\\r\\n' \\\n"
+                "      \\$i \\$i | nc -q 0 %s %d\n"
+                "  done\n"
+                "写入完成后，回到本窗口按 Enter 继续...",
+                g_opt.gap_count, g_opt.master_host, g_opt.master_port);
+
+    /* 等待用户按 Enter 确认 */
     {
-        int fd = tcp_connect(g_opt.master_host, g_opt.master_port);
-        if (fd < 0) { fail_msg("连接 Master 失败"); return 1; }
-        double t0 = now_ms();
-        int gap_ok = batch_write(fd, "HSET", "gap", 1, g_opt.gap_count);
-        drain_responses(fd, g_opt.gap_count);
-        close(fd);
-        double t1 = now_ms();
-        if (gap_ok != 0) { fail_msg("写入 gap 数据失败"); return 1; }
-        info("Gap 数据已写入: %d条, %.0fms", g_opt.gap_count, t1 - t0);
+        char buf[16];
+        if (!fgets(buf, sizeof(buf), stdin)) {}
     }
+    info("用户确认 gap 数据已写入");
 
     /* ── Phase 4: 等待全量同步完成 ── */
     banner("Phase 4: 等待全量同步完成 + Gap 补发");

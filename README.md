@@ -3747,6 +3747,7 @@ redis-cli -p 6381 SET should_fail x
 ```mermaid
 sequenceDiagram
     participant T as test_repl_gap
+    participant U as 用户 (手动)
     participant M as Master
     participant S as Slave
 
@@ -3757,8 +3758,12 @@ sequenceDiagram
 
     Note over M,S: 全量同步进行中...
 
-    T->>M: 写入 gap 数据 (5000条 HSET)  ← 此时全量同步未完成
-    Note over M: gap 数据进入 backlog
+    Note over T: 提示用户手动写入 gap 数据
+    Note over U: 用户另开终端连接 Master
+    U->>M: HSET gap:k:000001 v:000001
+    U->>M: HSET gap:k:000002 v:000002
+    Note over U: ... 写入 %d 条后按 Enter
+    Note over U,M: gap 数据进入 backlog
 
     M->>S: REPLDONE + repl_backlog_write_range()
     Note over M,S: gap 数据补发到 Slave
@@ -3772,7 +3777,7 @@ sequenceDiagram
 ```
 
 ```bash
-# ── 单机三终端测试 ──
+# ── 四终端测试（推荐）──
 
 # 终端 1: 启动 Master（先启动）
 ./kvstore --port 6379 --role master \
@@ -3786,15 +3791,22 @@ sequenceDiagram
 ./kvstore --port 6380 --role slave \
     --master-host 127.0.0.1 --master-port 6379 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
+
+# 看到全量同步开始提示后，在终端 4 手动写入 gap 数据:
+for i in $(seq 1 5000); do
+  printf '*3\r\n$4\r\nHSET\r\n$12\r\ngap:k:%06d\r\n$9\r\nv:%06d\r\n' \
+    $i $i | nc -q 0 127.0.0.1 6379
+done
+# 写入完成后，回到终端 2 按 Enter 继续
 ```
 
 三阶段验证确保数据不丢失：
 
-| 阶段 | 数据 | 写入时机 | 同步机制 | 验证点 |
-|---|---|---|---|---|
-| Phase 1 | `pre:k:000001~030000` | 全量同步前 | 全量快照 `+FULLRESYNC` | Slave 有全部 pre 数据 |
-| Phase 2 | `gap:k:000001~005000` | **全量同步期间** | backlog gap 补发 `repl_backlog_write_range()` | Slave 有全部 gap 数据 |
-| Phase 3 | `post:k:000001~005000` | 全量同步后 | 实时同步 `repl_broadcast()` | Slave 有全部 post 数据 |
+| 阶段 | 数据 | 写入者 | 写入时机 | 同步机制 | 验证点 |
+|---|---|---|---|---|---|
+| Phase 1 | `pre:k:001~030000` | 测试程序 | 全量同步前 | 全量快照 `+FULLRESYNC` | Slave 有全部 pre |
+| **Phase 2** | `gap:k:001~005000` | **用户手动** | **全量同步期间** | **backlog gap 补发** | **Slave 有全部 gap** |
+| Phase 3 | `post:k:001~005000` | 测试程序 | 全量同步后 | 实时 `repl_broadcast()` | Slave 有全部 post |
 
 **选项说明**：
 

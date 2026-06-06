@@ -387,9 +387,43 @@ static int check_info_field(const char *host, int port, const char *field, const
 
 /* ── 主测试逻辑 ── */
 
+/* ── 配置文件解析（支持 --config test.conf） ── */
+
+static int parse_config_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        while (val && (*val == ' ' || *val == '\t')) val++;
+        char *end = val + strlen(val) - 1;
+        while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
+        if (strcmp(key, "master_host") == 0) g_opt.master_host = strdup(val);
+        else if (strcmp(key, "slave_host") == 0) g_opt.slave_host = strdup(val);
+        else if (strcmp(key, "master_port") == 0) g_opt.master_port = atoi(val);
+        else if (strcmp(key, "slave_port") == 0) g_opt.slave_port = atoi(val);
+        else if (strcmp(key, "count") == 0) g_opt.count = atoi(val);
+        else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+        else if (strcmp(key, "poll_ms") == 0) g_opt.poll_ms = atoi(val);
+    }
+    fclose(fp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    parse_config_file("tests/test.conf");
+    parse_config_file("test.conf");
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            parse_config_file(argv[++i]);
+        else if (strcmp(argv[i], "--master-host") == 0 && i + 1 < argc)
             g_opt.master_host = argv[++i];
         else if (strcmp(argv[i], "--slave-host") == 0 && i + 1 < argc)
             g_opt.slave_host = argv[++i];
@@ -419,6 +453,7 @@ int main(int argc, char **argv) {
             printf("  --count N             预存/增量数据量 (默认 %d)\n", g_opt.count);
             printf("  --batch N             每批写入量 (默认 %d)\n", g_opt.batch);
             printf("  --poll MS             轮询间隔毫秒 (默认 %d)\n", g_opt.poll_ms);
+            printf("  --config PATH         加载配置文件 (默认 tests/test.conf)\n");
             printf("  -h                    显示此帮助\n");
             printf("\n示例:\n");
             printf("  # 终端 1 (先启动 Master):\n");

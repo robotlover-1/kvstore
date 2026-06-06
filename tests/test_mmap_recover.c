@@ -283,9 +283,41 @@ static int engine_adjust_count(void) {
 
 /* ── 主测试逻辑 ── */
 
+/* ── 配置文件解析（支持 --config test.conf） ── */
+
+static int parse_config_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        while (val && (*val == ' ' || *val == '\t')) val++;
+        char *end = val + strlen(val) - 1;
+        while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
+        if (strcmp(key, "host") == 0) g_opt.host = strdup(val);
+        else if (strcmp(key, "port") == 0) g_opt.port = atoi(val);
+        else if (strcmp(key, "count") == 0) g_opt.count = atoi(val);
+        else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+        else if (strcmp(key, "engine") == 0) g_opt.engine = strdup(val);
+    }
+    fclose(fp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    parse_config_file("tests/test.conf");
+    parse_config_file("test.conf");
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+            parse_config_file(argv[++i]);
+        else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
             g_opt.host = argv[++i];
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             g_opt.port = atoi(argv[++i]);
@@ -308,6 +340,7 @@ int main(int argc, char **argv) {
             printf("  --count N       写入数据量 (默认 %d)\n", g_opt.count);
             printf("  --engine NAME   引擎: array/hash/rbtree/skiptable (默认 %s)\n", g_opt.engine);
             printf("  --batch N       每批写入量 (默认 %d)\n", g_opt.batch);
+            printf("  --config PATH   加载配置文件 (默认 tests/test.conf)\n");
             printf("  -h              显示此帮助\n");
             printf("\n示例:\n");
             printf("  # 终端 1: ./kvstore --port %d --role master --appendfsync always\n", g_opt.port);

@@ -630,12 +630,75 @@ static void test_stress_brief(void) {
  * Main
  * ================================================================*/
 
+/* ── 配置文件解析（支持 --config test.conf） ── */
+static const char *g_host = "127.0.0.1";
+static int g_port = 5000;
+
+static int parse_config_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        while (val && (*val == ' ' || *val == '\t')) val++;
+        char *end = val + strlen(val) - 1;
+        while (end > val && isspace((unsigned char)*end)) *end-- = '\0';
+        if (strcmp(key, "host") == 0) g_host = strdup(val);
+        else if (strcmp(key, "port") == 0) g_port = atoi(val);
+    }
+    fclose(fp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *host = "127.0.0.1";
     int port = 5000;
+    int positional = 0;
 
-    if (argc >= 2) host = argv[1];
-    if (argc >= 3) port = atoi(argv[2]);
+    parse_config_file("tests/test.conf");
+    parse_config_file("test.conf");
+
+    /* Use config values as base */
+    host = g_host;
+    port = g_port;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            parse_config_file(argv[++i]);
+            host = g_host;
+            port = g_port;
+        } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            host = argv[++i];
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("用法: %s [选项] [host port]\n", argv[0]);
+            printf("\nkvstore 综合功能测试:\n\n");
+            printf("选项:\n");
+            printf("  --host HOST     kvstore 地址 (默认 %s)\n", host);
+            printf("  --port PORT     kvstore 端口 (默认 %d)\n", port);
+            printf("  --config PATH   加载配置文件 (默认 tests/test.conf)\n");
+            printf("  -h              显示此帮助\n");
+            printf("\n也支持位置参数: %s <host> <port>\n", argv[0]);
+            return 0;
+        } else if (argv[i][0] != '-' && positional == 0) {
+            host = argv[i];
+            positional = 1;
+        } else if (argv[i][0] != '-' && positional == 1) {
+            port = atoi(argv[i]);
+            positional = 2;
+        } else {
+            fprintf(stderr, "未知选项: %s\n", argv[i]);
+            return 1;
+        }
+    }
 
     printf("kvstore test client — connecting to %s:%d\n\n", host, port);
 

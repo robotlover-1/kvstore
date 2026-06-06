@@ -73,11 +73,20 @@ make clean && make
 
 ### 启动
 
+> **权限说明**: kprobe+RDMA 增量同步需要加载 BPF 程序，必须用 `sudo` 启动。
+> 如不需要 kprobe（纯 TCP 同步），无需 `sudo`，kprobe 加载失败后自动禁用。
+
 ```bash
-./kvstore kvstore.conf --role master    # Master（自动加载 kvstore.conf）
-./kvstore kvstore.conf --role slave     # Slave
-./kvstore --config kvstore.conf --port 5160 --role master  # 显式指定配置
-./kvstore --port 6380 --mem jemalloc                     # 命令行覆盖单个选项
+# ── 启用 kprobe+RDMA（需 root）──
+sudo ./kvstore kvstore.conf --role master    # Master
+sudo ./kvstore kvstore.conf --role slave     # Slave
+
+# ── 纯 TCP 模式（无需 root）──
+./kvstore kvstore.conf --role master
+./kvstore kvstore.conf --role slave
+
+# ── 命令行覆盖单个选项 ──
+./kvstore --config kvstore.conf --port 6380 --mem jemalloc
 ```
 
 ### 快速验证
@@ -87,6 +96,8 @@ make clean && make
 printf '*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n' | nc 127.0.0.1 5160
 printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5160
 ```
+
+> **提示**: kprobe+RDMA 需要 root 权限加载 BPF。启动时加 `sudo` 启用，不加则自动降级为 TCP 增量同步，其余功能完全正常。
 
 或使用 Redis 客户端（如 `redis-cli`）直接连接 5160 端口。
 
@@ -314,11 +325,13 @@ kvstore/
 ### 命令行参数
 
 ```
-# 最简启动（所有选项均从 kvstore.conf 读取）
-./kvstore kvstore.conf --role master
+# ── 最简启动（所有选项从 kvstore.conf 读取）──
+sudo ./kvstore kvstore.conf --role master          # 启用 kprobe+RDMA（需 root）
+sudo ./kvstore kvstore.conf --role slave
+./kvstore kvstore.conf --role master                # 纯 TCP（kprobe 自动禁用）
 ./kvstore kvstore.conf --role slave
 
-# 也支持逐项参数覆盖
+# ── 逐项参数覆盖 ──
 ./kvstore --port 5160 --role master --repl-fullsync-transport rdma \
           --repl-realtime-transport kprobe-rdma --rdma-dev siw0 \
           --rdma-recv-slots 64 --kprobe-enabled --appendfsync always

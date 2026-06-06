@@ -84,7 +84,7 @@ static struct {
     .poll_ms = 500,
 };
 
-static double time_now(void) {
+__attribute__((unused)) static double time_now(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
@@ -131,7 +131,7 @@ static void prompt(const char *fmt, ...) {
     printf(ANSI_BOLD " <<<" ANSI_RESET "\n\n");
 }
 
-static void stat_line(const char *label, const char *fmt, ...) {
+__attribute__((unused)) static void stat_line(const char *label, const char *fmt, ...) {
     char val[128];
     va_list ap;
     va_start(ap, fmt);
@@ -464,8 +464,8 @@ int main(int argc, char **argv) {
                    argv[0], g_opt.master_port, g_opt.slave_port, g_opt.count);
             printf("  # 终端 3 (看到提示后启动 Slave):\n");
             printf("  rm -f kvstore.dump kvstore.aof    # 清理旧数据\n");
-            printf("  ./kvstore --port %%d --role slave \\\n", g_opt.slave_port);
-            printf("      --master-host %%s --master-port %%d \\\n", g_opt.master_host, g_opt.master_port);
+            printf("  ./kvstore --port %d --role slave \\n", g_opt.slave_port);
+            printf("      --master-host %s --master-port %d \\n", g_opt.master_host, g_opt.master_port);
             printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
             return 0;
         } else {

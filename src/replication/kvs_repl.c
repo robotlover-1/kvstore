@@ -265,6 +265,7 @@ static void repl_rdma_refresh_runtime_cfg(void) {
 static int repl_rdma_pending_recv_push(int slot, size_t len);
 static int repl_rdma_pending_recv_pop(int *slot_out, size_t *len_out);
 static void repl_rdma_stop_cq_poll_thread(void);
+static volatile int g_cq_poll_thread_exited = 0;
 static int repl_rdma_start_cq_poll_thread(void);
 
 /* ---- Pipeline: 获取一个空闲的 send slot ----
@@ -1043,6 +1044,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
     repl_rdma_log("cq_poll", "thread started");
     while (g_repl_rdma_ctx.cq_poll_thread_running && g_repl_rdma_ctx.connected) {
         /* 使用 completion channel 事件驱动，避免 busy poll */
+        if (!g_repl_rdma_ctx.comp_chan) break;
         if (ibv_get_cq_event(g_repl_rdma_ctx.comp_chan, &ev_cq, &ev_ctx) != 0) {
             if (errno == EINTR) continue;
             repl_rdma_log("cq_poll", "ibv_get_cq_event failed");
@@ -1068,7 +1070,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
          * 如果先 poll(全空) 再 re-arm，中间有 completion 到达时
          * 该 completion 不会触发 event，导致永久阻塞。
          */
-        if (g_repl_rdma_ctx.cq && g_repl_rdma_ctx.connected) {
+        if (g_repl_rdma_ctx.cq && g_repl_rdma_ctx.comp_chan && g_repl_rdma_ctx.connected) {
             ibv_req_notify_cq(cq, 0);
             /*  Drain: poll 一次确认 poll→re-arm 之间没有漏掉 completion */
             int n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
@@ -1091,6 +1093,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
             ibv_ack_cq_events(cq, 1);
         }
     }
+    g_cq_poll_thread_exited = 1;
     repl_rdma_log("cq_poll", "thread exiting");
     return NULL;
 }
@@ -1115,13 +1118,20 @@ static int repl_rdma_start_cq_poll_thread(void) {
     return 0;
 }
 
+
 static void repl_rdma_stop_cq_poll_thread(void) {
+static volatile int g_cq_poll_thread_exited = 0;
     if (!g_repl_rdma_ctx.cq_poll_thread_running) return;
     g_repl_rdma_ctx.cq_poll_thread_running = 0;
+    g_cq_poll_thread_exited = 0;
     /* 断开 completion channel 以唤醒线程 */
     if (g_repl_rdma_ctx.comp_chan) {
         ibv_destroy_comp_channel(g_repl_rdma_ctx.comp_chan);
         g_repl_rdma_ctx.comp_chan = NULL;
+    }
+    /* 等待线程退出（最多 3 秒）*/
+    for (int i = 0; i < 300 && !g_cq_poll_thread_exited; i++) {
+        usleep(10000);
     }
     repl_rdma_log("cq_poll", "thread stop signalled");
 }

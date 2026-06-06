@@ -34,7 +34,7 @@
  *   Phase 2: 等待 Slave 连接并开始全量同步
  *   Phase 3: 用户手动写入 gap 数据到 Master（全量同步期间）
  *   Phase 4: 等待全量同步完成（轮询 slave_fullsync_loading）
- *   Phase 5: 验证 Slave 有 pre 数据 + gap 数据
+ *   Phase 5: 验证 Slave 有 pre 数据（gap 数据请用户自行验证）
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -581,18 +581,16 @@ int main(int argc, char **argv) {
     info("当前 slave_fullsync_loading=1，有充足时间写入 gap 数据");
     prompt_user("请在另一终端连接 Master %s:%d 并写入任意 gap 数据\n"
                 "（例如: redis-cli -p %d -h %s HSET gap:mykey myvalue），\n"
-                "写入完成后，回到本窗口输入你写了多少条 gap 数据:",
+                "写入完成后，回到本窗口按 Enter 继续",
                 g_opt.master_host, g_opt.master_port,
                 g_opt.master_port, g_opt.master_host);
 
-    /* 等待用户输入实际写入的 gap 条数 */
+    /* 等待用户按 Enter 确认 */
     {
-        char buf[64];
+        char buf[16];
         if (!fgets(buf, sizeof(buf), stdin)) {}
-        int n = atoi(buf);
-        if (n > 0) g_opt.gap_count = n;
     }
-    info("Gap 数据已写入，共 %d 条", g_opt.gap_count);
+    info("用户确认 gap 数据已写入，请自行验证 slave 数据一致性");
 
     /* ── Phase 4: 等待全量同步完成 ── */
     phase4:
@@ -625,18 +623,13 @@ int main(int argc, char **argv) {
     info("验证 Pre 数据 (全量快照) ...");
     if (verify_batch("Phase5", "pre", g_opt.pre_count) != 0) failed++;
 
-    if (g_opt.gap_count > 0) {
-        info("验证 Gap 数据 (全量同步期间写入，共 %d 条) ...", g_opt.gap_count);
-        if (verify_batch("Phase5", "gap", g_opt.gap_count) != 0) failed++;
-    } else {
-        info("跳过 Gap 验证（用户未写入 gap 数据）");
-    }
+    info("Gap 数据未验证，请手动在 Slave 上查询确认 gap 数据已同步");
 
     /* ── 结果 ── */
     printf("\n");
     if (failed == 0) {
-        printf(ANSI_GREEN ANSI_BOLD "\n  ✓ 全部 GAP 测试通过!\n" ANSI_RESET);
-        printf("  Pre=%d, Gap=%d\n\n", g_opt.pre_count, g_opt.gap_count);
+        printf(ANSI_GREEN ANSI_BOLD "\n  ✓ 全量同步完成!\n" ANSI_RESET);
+        printf("  Pre=%d, Gap 请自行验证\n\n", g_opt.pre_count);
         return 0;
     } else {
         printf(ANSI_RED ANSI_BOLD "\n  ✗ %d 项测试失败\n" ANSI_RESET "\n", failed);

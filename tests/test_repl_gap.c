@@ -75,7 +75,6 @@ static struct {
     int post_count;
     int batch;
     int poll_ms;
-    int skip_write;
 } g_opt = {
     .master_host = "127.0.0.1",
     .master_port = 5179,
@@ -86,7 +85,6 @@ static struct {
     .post_count = 0,
     .batch = 1000,
     .poll_ms = 500,
-    .skip_write = 0,
 };
 
 /* ── 工具函数 ── */
@@ -461,8 +459,6 @@ int main(int argc, char **argv) {
             g_opt.batch = atoi(argv[++i]);
         else if (strcmp(argv[i], "--poll-ms") == 0 && i + 1 < argc)
             g_opt.poll_ms = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--skip-write") == 0)
-            g_opt.skip_write = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("用法: %s [选项]\n", argv[0]);
             printf("  --config PATH        加载配置文件 (默认 tests/test.conf)\n");
@@ -471,7 +467,6 @@ int main(int argc, char **argv) {
             printf("  --slave-host HOST    Slave 地址 (默认 %s)\n", g_opt.slave_host);
             printf("  --slave-port PORT    Slave 端口 (默认 %d)\n", g_opt.slave_port);
             printf("  --pre-count N        预存数据量 (默认 %d，建议 ≥50000 以确保 gap 窗口)\n", g_opt.pre_count);
-            printf("  --skip-write          跳过写入（数据已通过 AOF 预存）\n");
             printf("  --gap-count N        gap 数据量 (默认 0，手动输入)\n");
             printf("  --batch N            每批写入量 (默认 %d)\n", g_opt.batch);
             return 0;
@@ -499,19 +494,7 @@ int main(int argc, char **argv) {
     pass("Master 已就绪");
     fflush(stdout);
 
-    if (g_opt.skip_write) {
-        info("跳过写入（--skip-write），验证预存数据...");
-        char *sv = cmd_resp(g_opt.master_host, g_opt.master_port, "HGET", "pre:k:000001", NULL);
-        char *sval = sv ? extract_bulk(sv) : NULL;
-        if (sval && strcmp(sval, "v:000001") == 0) {
-            pass("预存数据验证通过 (pre:k:000001 = %s)", sval);
-        } else {
-            fail_msg("预存数据不存在，请确认 Master 已通过 AOF 加载数据");
-            free(sv); free(sval);
-            return 1;
-        }
-        free(sv); free(sval);
-    } else {
+    {
         info("开始写入 %d 条 Pre 数据 ...", g_opt.pre_count);
         fflush(stdout);
         int fd = tcp_connect(g_opt.master_host, g_opt.master_port);

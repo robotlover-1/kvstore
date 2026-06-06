@@ -17,17 +17,15 @@
  *
  * 用法:
  *   # 终端 1 (Master 机器 192.168.233.128): 启动 Master
- *   ./kvstore --port 5179 --role master \
- *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
+ * 用法:
+ *   # 终端 1 (VM1): 先启动 Master
+ *   sudo ./kvstore kvstore.conf --role master
  *
- *   # 终端 2 (任意机器): 运行本测试（支持 --config 加载配置）
- *   ./test_repl_gap --master-host 192.168.233.128 --master-port 5179 \
- *       --slave-host 192.168.233.129 --slave-port 5180 \
- *       --pre-count 3000 --post-count 1000
+ *   # 终端 2 (任意机器): 运行本测试
+ *   ./test_repl_gap --config tests/test.conf
  *
  *   # 终端 3 (Slave 机器 192.168.233.129): 看到提示后启动 Slave
- *   ./kvstore --port 5180 --role slave --master-host 192.168.233.128 --master-port 5179 \
- *       --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
+ *   sudo ./kvstore kvstore.conf --role slave
  *
  * 流程:
  *   Phase 1: 预存 pre 数据到 Master（制造全量同步负担）

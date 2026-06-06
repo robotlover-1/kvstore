@@ -15,22 +15,14 @@
  *   数据路径: 全量(rdma) + 增量(kprobe捕获TCP→ring buf→RDMA pipeline)
  *             自动回退: 若kprobe不可用 → eBPF sockmap → TCP fallback
  *
- *   # 终端 1 (VM1): 启动 master（必须先启动）
- *   sudo ./kvstore --port 5160 --role master \
- *       --repl-fullsync-transport rdma \
- *       --repl-realtime-transport kprobe-rdma \
- *       --kprobe-enabled --rdma-dev siw0
+ *   # 终端 1 (VM1): 启动 master（需 root 加载 BPF）
+ *   sudo ./kvstore kvstore.conf --role master
  *
- *   # 终端 2 (任意机器): 运行本测试（预存数据，等待 slave）
- *   ./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
- *       --slave-host 192.168.233.129 --slave-port 5161 \
- *       --pre 50000 --post 50000
+ *   # 终端 2 (任意机器): 运行本测试
+ *   ./test_repl_5w5w --config tests/test.conf
  *
  *   # 看到 "等待 Slave 连接..." 后，在终端 3 (VM2) 启动 slave
- *   sudo ./kvstore --port 5161 --role slave \
- *       --master-host 192.168.233.128 --master-port 5160 \
- *       --repl-fullsync-transport rdma \
- *       --repl-realtime-transport kprobe-rdma
+ *   sudo ./kvstore kvstore.conf --role slave
  *
  * 用法二: eBPF sockmap 增量（双虚拟机，kprobe不可用时自动回退至此）
  *   与用法一相同，区别在于内核不支持 kprobe 附件（如 kprobe_events 不可写）
@@ -1127,7 +1119,7 @@ static void print_usage(const char *prog) {
     printf("  sudo ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
     printf("      --master-host <MASTER_IP> --master-port %d\n", g_opt.master_port);
     printf("\n");
-    printf("方式二: RDMA 全量 + eBPF 增量（双虚拟机）\n");
+    printf("方式二: RDMA 全量 + eBPF 增量（双虚拟机，kprobe 不可用时回退）\n");
     printf("  # 终端 1 (VM1, 先启动):\n");
     printf("  sudo ./kvstore --port %d --role master \\\n", g_opt.master_port);
     printf("      --repl-fullsync-transport rdma \\\n");
@@ -1135,9 +1127,7 @@ static void print_usage(const char *prog) {
     printf("      --ebpf-enabled --rdma-dev siw0 --rdma-recv-slots 64\n");
     printf("\n");
     printf("  # 终端 2 (任意机器):\n");
-    printf("  %s --master-host <MASTER_IP> --master-port %d \\\n", prog, g_opt.master_port);
-    printf("      --slave-host <SLAVE_IP> --slave-port %d \\\n", g_opt.slave_port);
-    printf("      --pre %d --post %d\n", g_opt.pre_count, g_opt.post_count);
+    printf("  %s --config tests/test.conf\n", prog);
     printf("\n");
     printf("  # 终端 3 (VM2, 等\"等待 Slave 连接...\"提示后启动):\n");
     printf("  sudo ./kvstore --port %d --role slave \\\n", g_opt.slave_port);
@@ -1145,19 +1135,13 @@ static void print_usage(const char *prog) {
     printf("      --repl-fullsync-transport rdma \\\n");
     printf("      --repl-realtime-transport ebpf\n");
     printf("\n");
-    printf("方式二: eBPF sockmap 增量（双虚拟机，kprobe不可用时自动回退）\n");
-    printf("  启动参数同方式一，区别在于内核不支持 kprobe 附件，\n");
-    printf("  走 sk_msg → bpf_msg_redirect_map → TCP 路径\n");
-    printf("\n");
     printf("方式三: TCP 全量 + TCP 增量（单机，无 RDMA/eBPF）\n");
     printf("  # 终端 1 (先启动):\n");
     printf("  ./kvstore --port %d --role master \\\n", g_opt.master_port);
     printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
     printf("\n");
     printf("  # 终端 2:\n");
-    printf("  %s --master-host 127.0.0.1 --master-port %d \\\n", prog, g_opt.master_port);
-    printf("      --slave-host 127.0.0.1 --slave-port %d \\\n", g_opt.slave_port);
-    printf("      --pre %d --post %d\n", g_opt.pre_count, g_opt.post_count);
+    printf("  %s --config tests/test.conf\n", prog);
     printf("\n");
     printf("  # 终端 3 (等\"等待 Slave 连接...\"提示后启动):\n");
     printf("  ./kvstore --port %d --role slave \\\n", g_opt.slave_port);

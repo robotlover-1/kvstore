@@ -11,15 +11,16 @@
  *
  * 用法:
  *   # 终端 1: 启动 kvstore
- *   ./kvstore --port 5200 --role master
+ *   ./kvstore kvstore.conf --role master
  *
  *   # 终端 2: 运行本测试
- *   ./test_batch [选项]
+ *   ./test_batch --config tests/test.conf
  *
  * 选项:
- *   --host HOST       kvstore 地址 (默认 127.0.0.1)
- *   --port PORT       kvstore 端口 (默认 5200)
+ *   --host HOST       kvstore 地址 (默认 192.168.233.128)
+ *   --port PORT       kvstore 端口 (默认 5160)
  *   --count N         每条流水线的命令数 (默认 10000)
+ *   --config PATH     加载配置文件
  *   -h                显示帮助
  */
 #include <stdio.h>

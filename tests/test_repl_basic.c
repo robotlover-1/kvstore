@@ -24,16 +24,13 @@
  *
  * 用法:
  *   # 终端 1: 启动 Master（先启动）
- *   ./kvstore --port 6379 --role master \
- *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
+ *   ./kvstore kvstore.conf --role master
  *
  *   # 终端 2: 运行测试
- *   ./test_repl_basic --master-port 6379 --slave-port 6380 --count 5000
+ *   ./test_repl_basic --config tests/test.conf
  *
  *   # 终端 3: 看到提示后再启动 Slave
- *   ./kvstore --port 6380 --role slave \
- *       --master-host 127.0.0.1 --master-port 6379 \
- *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
+ *   ./kvstore kvstore.conf --role slave
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -457,16 +454,12 @@ int main(int argc, char **argv) {
             printf("  -h                    显示此帮助\n");
             printf("\n示例:\n");
             printf("  # 终端 1 (先启动 Master):\n");
-            printf("  ./kvstore --port %d --role master \\\n", g_opt.master_port);
-            printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
+            printf("  ./kvstore kvstore.conf --role master\n");
             printf("  # 终端 2:\n");
-            printf("  %s --master-port %d --slave-port %d --count %d\n",
-                   argv[0], g_opt.master_port, g_opt.slave_port, g_opt.count);
-            printf("  # 终端 3 (看到提示后启动 Slave):\n");
+            printf("  %s --config tests/test.conf\n", argv[0]);
+            printf("  # 终端 3 (看到提示后再启动 Slave):\n");
             printf("  rm -f kvstore.dump kvstore.aof    # 清理旧数据\n");
-            printf("  ./kvstore --port %d --role slave \\n", g_opt.slave_port);
-            printf("      --master-host %s --master-port %d \\n", g_opt.master_host, g_opt.master_port);
-            printf("      --repl-fullsync-transport tcp --repl-realtime-transport tcp\n");
+            printf("  ./kvstore kvstore.conf --role slave\n");
             return 0;
         } else {
             fprintf(stderr, "未知选项: %s\n", argv[i]);

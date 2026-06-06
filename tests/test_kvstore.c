@@ -5,7 +5,7 @@
  *   gcc -Wall -Wextra -O2 -I../include -o test_kvstore test_kvstore.c
  *
  * Usage:
- *   ./test_kvstore <host> <port>
+ *   ./test_kvstore [--config tests/test.conf] [host port]
  *
  * This program connects to a running kvstore server via TCP and tests all
  * major features using the Redis RESP protocol.  It is self-contained
@@ -19,15 +19,15 @@
  *
  * Example:
  *   # Terminal 1: start kvstore
- *   ./kvstore --port 5000
+ *   ./kvstore kvstore.conf --role master
  *
  *   # Terminal 2: run tests
- *   ./test_kvstore 127.0.0.1 5000
+ *   ./test_kvstore --config tests/test.conf
  *
  *   # Or use redis-cli / redis-benchmark directly:
- *   redis-cli -p 5000 SET foo bar
- *   redis-cli -p 5000 GET foo
- *   redis-benchmark -p 5000 -n 10000 -c 50 SET __rand_int__ __rand_int__
+ *   redis-cli -p 5160 SET foo bar
+ *   redis-cli -p 5160 GET foo
+ *   redis-benchmark -p 5160 -n 10000 -c 50 SET __rand_int__ __rand_int__
  */
 
 #include <stdio.h>

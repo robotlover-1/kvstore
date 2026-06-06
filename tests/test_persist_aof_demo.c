@@ -10,14 +10,11 @@
  *   make test_persist_aof_demo
  *
  * 用法:
- *   # 终端 1: 启动 kvstore (必须 --appendfsync always 确保 AOF 及时落盘)
- *   ./kvstore --port 5170 --role master --appendfsync always
+ *   # 终端 1: 启动 kvstore（默认 appendfsync=always）
+ *   ./kvstore kvstore.conf --role master
  *
- *   # 终端 2: 运行增量持久化演示（可从项目根目录或 tests/ 目录运行）
- *   # 从项目根目录:
- *   ./test_persist_aof_demo --port 5170 --count 100000
- *   # 从 tests/ 目录:
- *   cd tests && ../test_persist_aof_demo --port 5170 --count 100000
+ *   # 终端 2: 运行增量持久化演示
+ *   ./test_persist_aof_demo --config tests/test.conf
  *
  *   注意: 本演示不执行 SAVE，数据仅保存在 AOF 文件中。
  *   重启后 kvstore 从 AOF 回放写入命令来恢复数据。
@@ -322,8 +319,8 @@ int main(int argc, char **argv) {
             printf("  --config PATH   加载配置文件 (默认 tests/test.conf)\n");
             printf("  -h              显示此帮助\n");
             printf("\n示例:\n");
-            printf("  # 终端 1: ./kvstore --port 5170 --role master --appendfsync always\n");
-            printf("  # 终端 2: %s --port 5170 --count 100000\n", argv[0]);
+            printf("  # 终端 1: ./kvstore kvstore.conf --role master\n");
+            printf("  # 终端 2: %s --config tests/test.conf\n", argv[0]);
             printf("\n注意: kvstore 需使用 --appendfsync always 确保每条写入即时落盘。\n");
             printf("      如果使用 --appendfsync everysec，停止前需等最多 1 秒落盘。\n");
             return 0;

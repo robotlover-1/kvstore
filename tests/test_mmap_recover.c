@@ -15,11 +15,11 @@
  *   Step 5: 本程序自动验证数据恢复，从 INFO 读取 mmap 恢复统计
  *
  * 用法:
- *   # 终端 1: 启动 kvstore（先启动）
- *   ./kvstore --port 5190 --role master --appendfsync always
+ *   # 终端 1: 启动 kvstore
+ *   ./kvstore kvstore.conf --role master
  *
  *   # 终端 2: 运行测试
- *   ./test_mmap_recover --port 5190 --count 10000 --engine hash
+ *   ./test_mmap_recover --config tests/test.conf --engine hash
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -343,8 +343,8 @@ int main(int argc, char **argv) {
             printf("  --config PATH   加载配置文件 (默认 tests/test.conf)\n");
             printf("  -h              显示此帮助\n");
             printf("\n示例:\n");
-            printf("  # 终端 1: ./kvstore --port %d --role master --appendfsync always\n", g_opt.port);
-            printf("  # 终端 2: %s --port %d --engine hash --count %d\n", argv[0], g_opt.port, g_opt.count);
+            printf("  # 终端 1: ./kvstore kvstore.conf --role master\n");
+            printf("  # 终端 2: %s --config tests/test.conf --engine hash\n", argv[0]);
             return 0;
         } else {
             fprintf(stderr, "未知选项: %s\n", argv[i]);

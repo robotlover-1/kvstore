@@ -9,14 +9,11 @@
  *   make test_persist_dump_demo
  *
  * 用法:
- *   # 终端 1: 启动 kvstore（在项目根目录下执行）
- *   ./kvstore --port 5170 --role master --appendfsync always
+ *   # 终端 1: 启动 kvstore
+ *   ./kvstore kvstore.conf --role master
  *
- *   # 终端 2: 运行全量持久化演示（可从项目根目录或 tests/ 目录运行）
- *   # 从项目根目录:
- *   ./test_persist_dump_demo --port 5170 --count 100000
- *   # 从 tests/ 目录:
- *   cd tests && ../test_persist_dump_demo --port 5170 --count 100000
+ *   # 终端 2: 运行全量持久化演示
+ *   ./test_persist_dump_demo --config tests/test.conf
  *
  *   程序写入数据后会提示你停止并重启 kvstore，然后自动验证数据恢复。
  */
@@ -333,8 +330,8 @@ int main(int argc, char **argv) {
             printf("  --aof-path PATH    AOF 文件路径 (默认 kvstore.aof)\n");
             printf("  -h              显示此帮助\n");
             printf("\n示例:\n");
-            printf("  # 终端 1: ./kvstore --port 5170 --role master --appendfsync always\n");
-            printf("  # 终端 2: %s --port 5170 --count 100000\n", argv[0]);
+            printf("  # 终端 1: ./kvstore kvstore.conf --role master\n");
+            printf("  # 终端 2: %s --config tests/test.conf\n", argv[0]);
             return 0;
         } else {
             fprintf(stderr, "未知选项: %s\n", argv[i]);

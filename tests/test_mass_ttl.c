@@ -12,23 +12,24 @@
  *
  * 用法:
  *   # 终端 1: 启动 kvstore
- *   ./kvstore --port 5200 --role master
+ *   ./kvstore kvstore.conf --role master
  *
  *   # 终端 2: 运行本测试
- *   ./test_mass_ttl [选项]
+ *   ./test_mass_ttl --config tests/test.conf
  *
  *   # 终端 3: 手动检查 TTL（在本测试等待期间）
- *   redis-cli -p 5200 HTTL expire:k:000000
- *   redis-cli -p 5200 HTTL expire:k:005000
- *   redis-cli -p 5200 HTTL expire:k:009999
- *   redis-cli -p 5200 HGET  expire:k:000000   # 10s 后应返回 (nil)
+ *   redis-cli -p 5160 HTTL expire:k:000000
+ *   redis-cli -p 5160 HTTL expire:k:005000
+ *   redis-cli -p 5160 HTTL expire:k:009999
+ *   redis-cli -p 5160 HGET  expire:k:000000   # 10s 后应返回 (nil)
  *
  * 选项:
- *   --host HOST       kvstore 地址 (默认 127.0.0.1)
- *   --port PORT       kvstore 端口 (默认 5200)
+ *   --host HOST       kvstore 地址 (默认 192.168.233.128)
+ *   --port PORT       kvstore 端口 (默认 5160)
  *   --count N         设置 key 数量 (默认 10000)
  *   --ttl SECONDS     过期时间秒 (默认 10)
  *   --batch N         每批写入量 (默认 1000)
+ *   --config PATH     加载配置文件
  *   -h                显示帮助
  */
 #include <stdio.h>

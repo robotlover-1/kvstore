@@ -15,11 +15,11 @@
  *   Step 5: 本程序自动验证数据恢复
  *
  * 用法:
- *   # 终端 1: 启动 kvstore（先启动）
- *   ./kvstore --port 5180 --role master --appendfsync always
+ *   # 终端 1: 启动 kvstore
+ *   ./kvstore kvstore.conf --role master
  *
  *   # 终端 2: 运行测试
- *   ./test_uring_persist --port 5180 --count 10000
+ *   ./test_uring_persist --config tests/test.conf
  */
 #include <stdio.h>
 #include <stdlib.h>

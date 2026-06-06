@@ -3780,22 +3780,22 @@ sequenceDiagram
 # ── 四终端测试（推荐）──
 
 # 终端 1: 启动 Master（先启动）
-./kvstore --port 6379 --role master \
+./kvstore --port 5179 --role master \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
 
 # 终端 2: 运行测试
-./test_repl_gap --master-port 6379 --slave-port 6380 \
+./test_repl_gap --master-port 5179 --slave-port 5180 \
     --pre-count 30000 --gap-count 5000 --post-count 5000
 
 # 看到提示后，在终端 3 启动 Slave:
-./kvstore --port 6380 --role slave \
-    --master-host 127.0.0.1 --master-port 6379 \
+./kvstore --port 5180 --role slave \
+    --master-host 127.0.0.1 --master-port 5179 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
 
 # 看到全量同步开始提示后，在终端 4 手动写入 gap 数据:
 for i in $(seq 1 5000); do
   printf '*3\r\n$4\r\nHSET\r\n$12\r\ngap:k:%06d\r\n$9\r\nv:%06d\r\n' \
-    $i $i | nc -q 0 127.0.0.1 6379
+    $i $i | nc -q 0 127.0.0.1 5179
 done
 # 写入完成后，回到终端 2 按 Enter 继续
 ```

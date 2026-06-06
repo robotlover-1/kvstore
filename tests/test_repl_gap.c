@@ -17,15 +17,15 @@
  *
  * 用法:
  *   # 终端 1: 启动 Master
- *   ./kvstore --port 6379 --role master \
+ *   ./kvstore --port 5179 --role master \
  *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
  *
  *   # 终端 2: 运行本测试
- *   ./test_repl_gap --master-port 6379 --slave-port 6380 \
+ *   ./test_repl_gap --master-port 5179 --slave-port 5180 \
  *       --pre-count 30000 --gap-count 5000 --post-count 5000
  *
  *   # 终端 3: 看到提示后启动 Slave
- *   ./kvstore --port 6380 --role slave --master-host 127.0.0.1 --master-port 6379 \
+ *   ./kvstore --port 5180 --role slave --master-host 127.0.0.1 --master-port 5179 \
  *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
  *
  * 流程:
@@ -77,9 +77,9 @@ static struct {
     int poll_ms;
 } g_opt = {
     .master_host = "127.0.0.1",
-    .master_port = 6379,
+    .master_port = 5179,
     .slave_host = "127.0.0.1",
-    .slave_port = 6380,
+    .slave_port = 5180,
     .pre_count = 30000,
     .gap_count = 5000,
     .post_count = 5000,

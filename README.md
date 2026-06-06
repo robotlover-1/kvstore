@@ -74,20 +74,21 @@ make clean && make
 ### 启动
 
 ```bash
-./kvstore                           # 自动加载 ./kvstore.conf（如存在）
-./kvstore --config kvstore.conf     # 显式指定配置
-./kvstore --port 6380 --mem jemalloc  # 命令行覆盖配置
+./kvstore kvstore.conf --role master    # Master（自动加载 kvstore.conf）
+./kvstore kvstore.conf --role slave     # Slave
+./kvstore --config kvstore.conf --port 5160 --role master  # 显式指定配置
+./kvstore --port 6380 --mem jemalloc                     # 命令行覆盖单个选项
 ```
 
 ### 快速验证
 
 ```bash
-# 启动服务后，用 nc 测试基本读写
-printf '*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n' | nc 127.0.0.1 5000
-printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5000
+# 启动 Master 后，用 nc 测试基本读写
+printf '*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n' | nc 127.0.0.1 5160
+printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5160
 ```
 
-或使用 Redis 客户端（如 `redis-cli`）直接连接 5000 端口。
+或使用 Redis 客户端（如 `redis-cli`）直接连接 5160 端口。
 
 ---
 
@@ -283,41 +284,44 @@ kvstore/
 
 ### 全部配置项
 
+完整配置见 [`kvstore.conf`](kvstore.conf)，以下为主要选项：
 
-| 配置项                    | 默认值         | 说明                                          |
-| ------------------------- | -------------- | --------------------------------------------- |
-| `port`                    | `5000`         | 监听端口                                      |
-| `role`                    | `master`       | 角色：`master` / `slave`                      |
-| `master_host`             | `127.0.0.1`    | 主节点地址                                    |
-| `master_port`             | `5000`         | 主节点端口                                    |
-| `dump_path`               | `kvstore.dump` | dump 文件路径                                 |
-| `aof_path`                | `kvstore.aof`  | AOF 文件路径                                  |
-| `mem_backend`             | `libc`         | 内存后端：`libc` / `jemalloc` / `custom`      |
-| `net_backend`             | `reactor`      | 网络模型：`reactor` / `proactor` / `ntyco`    |
-| `log_mode`                | `info`         | 日志级别：`debug` / `info` / `warn` / `error` |
-| `appendfsync`             | `always`       | AOF 同步：`always` / `everysec`               |
-| `aof_disable`             | `0`            | 禁用 AOF（`1` 关闭，`0` 开启）                |
-| `repl_transport_backend`  | `tcp`          | 复制传输（单模式）：`tcp` / `rdma` / `ebpf`   |
-| `repl_fullsync_transport` | `rdma`         | 全量同步传输：`rdma` / `tcp`                  |
-| `repl_realtime_transport` | `ebpf`         | 实时增量同步传输：`ebpf` / `tcp`              |
-| `autosnap`                | 无             | 自动快照规则，如`60:1000,300:10`              |
-| `sentinel`                | `0`            | 启用哨兵模式                                  |
-| `sentinel_master_name`    | `mymaster`     | 哨兵监控名称                                  |
-| `sentinel_quorum`         | `1`            | 哨兵法定人数                                  |
+| 配置项                    | 默认值             | 说明                                          |
+| ------------------------- | ------------------ | --------------------------------------------- |
+| `port`                    | `5160`             | 监听端口                                      |
+| `role`                    | `master`           | 角色：`master` / `slave`                      |
+| `master_host`             | `192.168.233.128`  | 主节点地址                                    |
+| `master_port`             | `5160`             | 主节点端口                                    |
+| `dump_path`               | `kvstore.dump`     | dump 文件路径                                 |
+| `aof_path`                | `kvstore.aof`      | AOF 文件路径                                  |
+| `mem_backend`             | `libc`             | 内存后端：`libc` / `jemalloc` / `custom`      |
+| `net_backend`             | `reactor`          | 网络模型：`reactor` / `proactor` / `ntyco`    |
+| `log_mode`                | `info`             | 日志级别：`debug` / `info` / `warn` / `error` |
+| `appendfsync`             | `always`           | AOF 同步：`always` / `everysec`               |
+| `repl_fullsync_transport` | `rdma`             | 全量同步传输：`rdma` / `tcp`                  |
+| `repl_realtime_transport` | `kprobe-rdma`      | 增量同步传输：`kprobe-rdma` / `ebpf` / `tcp`  |
+| `kprobe_enabled`          | `1`                | 启用 kprobe+RDMA 增量同步                     |
+| `rdma_dev`                | `siw0`             | RDMA 设备                                     |
+| `rdma_recv_slots`         | `64`               | RDMA 接收槽位数                               |
+| `rdma_chunk_size`         | `262144`           | RDMA 分块大小（字节）                         |
+| `autosnap`                | 无                 | 自动快照规则，如`60:1000,300:10`              |
+| `sentinel`                | `0`                | 启用哨兵模式                                  |
 
-> 命令行参数优先级高于配置文件。
-> **双通道模式**：设置 `repl_fullsync_transport=rdma` + `repl_realtime_transport=ebpf` 可使 RDMA 负责全量同步、eBPF 负责实时增量同步，两者同时工作。
+> 命令行参数优先级高于配置文件。启动时只需 `./kvstore kvstore.conf --role master`。
+> **双通道模式**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=kprobe-rdma` 默认启用。
+> 完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
 
 ### 命令行参数
 
 ```
-./kvstore --config <path> --port <n> --role <master|slave>
-          --mem <libc|jemalloc|custom> --net <reactor|proactor|ntyco>
-          --log-mode <debug|info|warn|error> --dump <path> --aof <path>
-          --master-host <ip> --master-port <n> --repl-transport <tcp|rdma>
-          --repl-fullsync-transport <rdma|tcp> --repl-realtime-transport <ebpf|tcp>
-          --sentinel --sentinel-master-name <name>
-          --aof-disable                         # 禁用 AOF 持久化
+# 最简启动（所有选项均从 kvstore.conf 读取）
+./kvstore kvstore.conf --role master
+./kvstore kvstore.conf --role slave
+
+# 也支持逐项参数覆盖
+./kvstore --port 5160 --role master --repl-fullsync-transport rdma \
+          --repl-realtime-transport kprobe-rdma --rdma-dev siw0 \
+          --rdma-recv-slots 64 --kprobe-enabled --appendfsync always
 ```
 
 ---
@@ -854,7 +858,7 @@ int ok = count_ok(resp, rlen);  // 应等于 count
 **测试结果示例**：
 
 ```bash
-$ ./test_batch --port 5200 --count 10000
+$ ./test_batch --config tests/test.conf
 批量流水线压力测试
   地址: 127.0.0.1:5200
   每条流水线: 10000 条命令
@@ -886,10 +890,10 @@ graph LR
 
 ```bash
 # 测试全部五种引擎
-./test_kvstore 127.0.0.1 5000
+./test_kvstore --config tests/test.conf
 
 # 或通过 Makefile
-make check-kvstore TEST_PORT=5000
+make check-kvstore TEST_PORT=5160
 ```
 
 ### 网络模型 — 三种 I/O 模型
@@ -1010,16 +1014,16 @@ while (1) {
 
 ```bash
 # 默认 Reactor（epoll）
-./kvstore --port 5000 --net reactor
-redis-cli -p 5000 PING
+./kvstore kvstore.conf --role master
+redis-cli -p 5160 PING
 
 # Proactor（io_uring）
-./kvstore --port 5001 --net proactor
-redis-cli -p 5001 SET k v
+./kvstore kvstore.conf --role master --net proactor
+redis-cli -p 5160 SET k v
 
 # NtyCo（协程）
-./kvstore --port 5002 --net ntyco
-redis-cli -p 5002 GET k
+./kvstore kvstore.conf --role master --net ntyco
+redis-cli -p 5160 GET k
 ```
 
 三种模型对外暴露完全相同的 RESP 协议接口，客户端无需修改。
@@ -2215,15 +2219,15 @@ sequenceDiagram
 
 ```bash
 # 全量持久化测试
-./kvstore --port 5170 --role master --appendfsync always
-./test_persist_dump_demo --port 5170 --count 100000
+./kvstore kvstore.conf --role master
+./test_persist_dump_demo --config tests/test.conf
 
 # AOF 重写测试
-redis-cli -p 5170 BGREWRITEAOF
-redis-cli -p 5170 INFO | grep aof_rewrite
+redis-cli -p 5160 BGREWRITEAOF
+redis-cli -p 5160 INFO | grep aof_rewrite
 
 # 持久化状态查看
-redis-cli -p 5170 INFO | grep -E "(aof|dump|bgsave|dirty)"
+redis-cli -p 5160 INFO | grep -E "(aof|dump|bgsave|dirty)"
 ```
     T->>T: 等待 kvstore 就绪
     K->>D: mmap 读取 dump 恢复数据
@@ -2234,10 +2238,10 @@ redis-cli -p 5170 INFO | grep -E "(aof|dump|bgsave|dirty)"
 
 ```bash
 # 终端 1: 启动 kvstore
-./kvstore --port 5170 --role master --appendfsync always
+./kvstore kvstore.conf --role master
 
 # 终端 2: 运行全量持久化演示
-./test_persist_dump_demo --port 5170 --count 100000
+./test_persist_dump_demo --config tests/test.conf
 # 程序会写入 → SAVE → 提示停 kvstore → 提示重启 → 自动验证
 
 # AOF 重写验证
@@ -2820,14 +2824,14 @@ graph LR
 
 ```bash
 # 终端 1: 启动 kvstore
-./kvstore --port 5200 --role master
+./kvstore kvstore.conf --role master
 
 # 终端 2: 运行大量 TTL 测试
-./test_mass_ttl --port 5200 --count 10000 --ttl 10
+./tests/test_mass_ttl --config tests/test.conf
 
 # 终端 3: 手动检查 TTL（可选）
-redis-cli -p 5200 HTTL expire:k:000000
-redis-cli -p 5200 HGET expire:k:000000
+redis-cli -p 5160 HTTL expire:k:000000
+redis-cli -p 5160 HGET expire:k:000000
 ```
 
 ### 内存管理 — 三种后端
@@ -3116,16 +3120,16 @@ int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv) 
 
 ```bash
 # libc 后端
-./kvstore --port 5000 --mem libc
-redis-cli -p 5000 MEMSTAT
+./kvstore kvstore.conf --role master --mem libc
+redis-cli -p 5160 MEMSTAT
 
 # jemalloc（自动加载）
-./kvstore --port 5001 --mem jemalloc
-redis-cli -p 5001 MEMSTAT
+./kvstore kvstore.conf --role master --mem jemalloc
+redis-cli -p 5160 MEMSTAT
 
 # custom slab（自研分配器）
-./kvstore --port 5002 --mem custom
-redis-cli -p 5002 MEMSTAT  # 查看 slab class 详细统计
+./kvstore kvstore.conf --role master --mem custom
+redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 ```
 
 ### TTL 过期时间记录 in AOF
@@ -3191,13 +3195,13 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 
 ```bash
 # 使用默认配置（自动加载 tests/test.conf）
-./test_batch
+./tests/test_repl_5w5w
 
 # 或指定配置文件
 ./test_batch --config my_test.conf
 
 # 命令行参数可覆盖配置文件
-./test_batch --port 6380 --count 50000
+./test_batch --config tests/test.conf --port 6380 --count 50000
 ```
 
 配置文件格式 (`tests/test.conf`):
@@ -3207,22 +3211,21 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 host=127.0.0.1
 port=5200
 
-# 主从复制（test_repl_5w5w 用）
+# 主从复制地址
 master_host=192.168.233.128
 master_port=5160
 slave_host=192.168.233.129
 slave_port=5161
 
-# 测试参数
-count=10000
-batch=1000
-ttl=10
+# 测试数据量
 pre=50000
 post=50000
+count=10000
 
-# 持久化文件路径
-dump_path=kvstore.dump
-aof_path=kvstore.aof
+# 测试参数
+batch=1000
+poll_ms=500
+ttl=10
 ```
 
 编译方式：
@@ -3249,35 +3252,40 @@ gcc -I./include -o test_kvstore tests/test_kvstore.c
 #### `test_kvstore` — 全功能 C 客户端测试
 
 ```
-编译: make test_kvstore
-运行: ./test_kvstore <host> <port>
+编译: make test_kvstore           # → ./test_kvstore
+运行: ./test_kvstore [--config tests/test.conf] [host port]
 ```
 
 连接 kvstore 后依次测试 PING、各引擎 SET/GET/DEL、MSET/MGET、TTL/EXPIRE/PERSIST、
 LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、INFO 命令，
 最后输出 PASS/FAIL 汇总报告。
 
+支持位置参数（向后兼容）和 `--config` / `--host` / `--port` 命名参数：
+
 ```bash
 # 终端 1: 启动 kvstore（任意端口）
-./kvstore --port 5000
+./kvstore kvstore.conf --role master
 
-# 终端 2: 运行全功能测试
-./test_kvstore 127.0.0.1 5000
+# 终端 2: 运行全功能测试（使用配置文件）
+./test_kvstore --config tests/test.conf
+
+# 或使用位置参数（向后兼容）
+./test_kvstore 127.0.0.1 5160
 
 # 或通过 Makefile 自动启动 + 测试
-make check-kvstore TEST_PORT=5000
+make check-kvstore TEST_PORT=5160
 ```
 
 **验证**: 测试通过后，用 redis-cli 确认数据正确：
 
 ```bash
-redis-cli -p 5000 PING
+redis-cli -p 5160 PING
 +PONG
-redis-cli -p 5000 GET a:pre:1
+redis-cli -p 5160 GET a:pre:1
 "av:1"
-redis-cli -p 5000 HGET h:pre:100
+redis-cli -p 5160 HGET h:pre:100
 "hv:100"
-redis-cli -p 5000 INFO
+redis-cli -p 5160 INFO
 # 查看 role、mem、dirty 等信息
 ```
 
@@ -3295,30 +3303,18 @@ redis-cli -p 5000 INFO
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
 
 ```bash
-
 # ── 方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）──
 
-# 终端 1 (VM1, 先启动 Master, 需 root 加载 BPF):
-rm kvstore_transpoer.log kvstore.aof
-sudo ./kvstore --port 5160 --role master \
-    --repl-fullsync-transport rdma \
-    --repl-realtime-transport kprobe-rdma \
-    --rdma-dev siw0 --rdma-recv-slots 64 \
-    --kprobe-enabled
+# 终端 1 (VM1, 先启动 Master):
+sudo rm -f kvstore_transport.log kvstore.aof
+sudo ./kvstore kvstore.conf --role master
 
 # 终端 2 (任意机器, Master 启动后运行):
-./test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
-    --slave-host 192.168.233.129 --slave-port 5161 \
-    --pre 50000 --post 50000
+./tests/test_repl_5w5w --config tests/test.conf
 
 # 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
-rm -f kvstore.dump kvstore.aof
-sudo ./kvstore --port 5161 --role slave \
-    --master-host 192.168.233.128 --master-port 5160 \
-    --repl-fullsync-transport rdma \
-    --repl-realtime-transport kprobe-rdma \
-    --rdma-dev siw0 \
-    --kprobe-enabled
+sudo rm -f kvstore.dump kvstore.aof
+sudo ./kvstore kvstore.conf --role slave
 
 # ── 方式二: TCP 全量 + TCP 增量（单机，无需 root）──
 
@@ -3327,9 +3323,7 @@ sudo ./kvstore --port 5161 --role slave \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 
 # 终端 2 (Master 启动后运行):
-./test_repl_5w5w --master-host 127.0.0.1 --master-port 5160 \
-    --slave-host 127.0.0.1 --slave-port 5161 \
-    --pre 50000 --post 50000
+./tests/test_repl_5w5w --config tests/test.conf
 
 # 终端 3 (看到提示后再启动 Slave):
 rm -f kvstore.dump kvstore.aof
@@ -3386,18 +3380,17 @@ redis-cli -p 5161 HGET post:k:000000
 
 ```
 编译: make test_persist_dump_demo    # → ./test_persist_dump_demo
-运行: ./test_persist_dump_demo [选项]
+运行: ./test_persist_dump_demo [--config tests/test.conf]
 ```
 
 交互式流程：连接 kvstore → 写入 count 条数据 → 提示用户执行 `SAVE` → 提示用户停止并重启 kvstore → 自动验证数据从 dump 文件恢复。
 
 ```bash
-# 终端 1: 启动 kvstore（必须 --appendfsync always 确保数据可恢复）
-./kvstore --port 5170 --role master --appendfsync always \
-    --dump kvstore.dump --aof kvstore.aof
+# 终端 1: 启动 kvstore（默认 appendfsync=always 确保数据可恢复）
+./kvstore kvstore.conf --role master
 
 # 终端 2: 运行全量持久化演示
-./test_persist_dump_demo --port 5170 --count 100000
+./test_persist_dump_demo --config tests/test.conf
 
 # 程序会写入数据，然后提示你:
 #   >>> Please execute SAVE in kvstore (redis-cli SAVE or nc ...)
@@ -3409,11 +3402,11 @@ redis-cli -p 5161 HGET post:k:000000
 **验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
 
 ```bash
-redis-cli -p 5170 SAVE
+redis-cli -p 5160 SAVE
 +OK
-redis-cli -p 5170 HGET bench:key:1
+redis-cli -p 5160 HGET bench:key:1
 "value:1"
-redis-cli -p 5170 HGET bench:key:50000
+redis-cli -p 5160 HGET bench:key:50000
 "value:50000"
 ```
 
@@ -3442,12 +3435,11 @@ redis-cli -p 5170 HGET bench:key:50000
 > 使用 `--appendfsync everysec` 时，停止前需等最多 1 秒落盘，可能导致数据丢失。
 
 ```bash
-# 终端 1: 启动 kvstore（必须 --appendfsync always）
-./kvstore --port 5170 --role master --appendfsync always \
-    --dump kvstore.dump --aof kvstore.aof
+# 终端 1: 启动 kvstore（默认 appendfsync=always）
+./kvstore kvstore.conf --role master
 
 # 终端 2: 运行增量持久化演示
-./test_persist_aof_demo --port 5170 --count 100000
+./test_persist_aof_demo --config tests/test.conf
 
 # 程序写入数据后提示:
 #   >>> Please stop kvstore (Ctrl+C) and restart it
@@ -3496,11 +3488,11 @@ redis-cli -p 5170 PING
 流程：自动启动 kvstore → HSET 写入 N 条数据 → SAVE → 停止 kvstore → 重启 → 验证数据恢复 → 输出性能指标。
 
 ```bash
-# 终端 1: 启动 kvstore（先启动）
-./kvstore --port 5180 --role master --appendfsync always
+# 终端 1: 启动 kvstore
+./kvstore kvstore.conf --role master
 
 # 终端 2: 运行测试
-./test_uring_persist --port 5180 --count 10000
+./test_uring_persist --config tests/test.conf
 
 # 程序写入数据后提示:
 #   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
@@ -3584,19 +3576,19 @@ redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 流程：自动启动 kvstore → 按指定引擎写入 N 条数据 → SAVE → 停止 → 重启并计时 → 从 INFO 读取恢复统计（mmap 尝试次数/成功次数/回退次数/耗时）→ 验证数据一致性。
 
 ```bash
-# 终端 1: 启动 kvstore（先启动）
-./kvstore --port 5190 --role master --appendfsync always
+# 终端 1: 启动 kvstore
+./kvstore kvstore.conf --role master
 
 # 终端 2: 运行测试（hash 引擎, 10000 条）
-./test_mmap_recover --port 5190 --engine hash --count 10000
+./test_mmap_recover --config tests/test.conf --engine hash
 
 # 程序写入数据后提示:
 #   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
 # 停止并重启 kvstore，程序自动验证数据恢复并显示 mmap 统计
 
 # 使用其他引擎
-./test_mmap_recover --port 5190 --engine rbtree --count 5000
-./test_mmap_recover --port 5190 --engine array --count 10000   # 自动限制 1024
+./test_mmap_recover --config tests/test.conf --engine rbtree
+./test_mmap_recover --config tests/test.conf --engine array
 ```
 
 **验证**: 测试完成后，确认各引擎数据恢复正确：
@@ -3792,22 +3784,17 @@ sequenceDiagram
 # ── 双机四终端测试（推荐）──
 
 # 终端 1 (Master 机器 192.168.233.128): 先启动 Master
-./kvstore --port 5179 --role master \
-    --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
+./kvstore kvstore.conf --role master --aof-disable
 
 # 终端 2 (任意机器): 运行测试
-./test_repl_gap --master-host 192.168.233.128 --master-port 5179 \
-    --slave-host 192.168.233.129 --slave-port 5180 \
-    --pre-count 30000 --gap-count 5000 --post-count 5000
+./tests/test_repl_gap --config tests/test.conf
 
 # 看到提示后，在终端 3 (Slave 机器 192.168.233.129): 启动 Slave
-./kvstore --port 5180 --role slave \
-    --master-host 192.168.233.128 --master-port 5179 \
-    --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
+./kvstore kvstore.conf --role slave --aof-disable
 
 # 看到全量同步开始提示后，在终端 4 手动写入任意 gap 数据:
-redis-cli -p 5179 -h 192.168.233.128 HSET gap:mykey myvalue
-# 写入完成后，回到终端 2，输入你实际写入的 gap 条数（例如 1）然后按 Enter
+redis-cli -p 5160 -h 192.168.233.128 HSET gap:mykey myvalue
+# 写入完成后，回到终端 2，按 Enter 继续
 ```
 
 三阶段验证确保数据不丢失：
@@ -3905,7 +3892,7 @@ redis-cli -p 5179 -h 192.168.233.128 HSET gap:mykey myvalue
 
 ```bash
 # 多引擎主从测试
-bash tools/tests/test_master_slave_multi_engine_nc.sh 127.0.0.1 5000
+bash tools/tests/test_master_slave_multi_engine_nc.sh 127.0.0.1 5160
 
 # SAVE/BGSAVE 性能测试
 bash tools/persist/run_save_bgsave_perf_test.sh
@@ -3915,7 +3902,7 @@ bash tools/persist/run_save_bgsave_perf_test.sh
 
 ```bash
 # 指定端口
-make check TEST_PORT=6380
+make check TEST_PORT=5160
 
 # 主从复制自定义端口
 make check-repl REPL_MASTER_PORT=7000 REPL_SLAVE_PORT=7001
@@ -4044,7 +4031,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 redis-benchmark -p 5190 -t set -n 100000 -c 50 -d 64 --csv
 
 # kvstore 启动示例（always）
-./kvstore --port 5190 --role master --mem libc --net reactor --appendfsync always
+./kvstore kvstore.conf --role master
 
 # Redis 启动示例（everysec）
 redis-server --port 6390 --save "" --appendonly yes --appendfsync everysec
@@ -4364,7 +4351,7 @@ make CFLAGS="-Wall -Wextra -O2"
 ### 内存观测
 
 ```bash
-printf '*1\r\n$7\r\nMEMSTAT\r\n' | nc 127.0.0.1 5000
+printf '*1\r\n$7\r\nMEMSTAT\r\n' | nc 127.0.0.1 5160
 ```
 
 关注指标：`current_small_inuse`、`peak_small_inuse`、`internal_fragment_ppm`。

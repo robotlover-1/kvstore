@@ -3224,6 +3224,7 @@ make test_persist_aof_demo     # → ./test_persist_aof_demo
 make test_uring_persist        # → ./test_uring_persist
 make test_mmap_recover         # → ./test_mmap_recover
 make test_repl_basic           # → ./test_repl_basic
+make test_repl_gap             # → ./test_repl_gap
 make test_mass_ttl             # → ./test_mass_ttl
 make test_batch                # → ./test_batch
 
@@ -3732,6 +3733,85 @@ redis-cli -p 6381 SET should_fail x
 
 ---
 
+#### `test_repl_gap` — 全量同步 Gap 补发验证
+
+```
+编译: make test_repl_gap          # → ./test_repl_gap
+运行: ./test_repl_gap [选项]
+```
+
+验证全量同步期间客户端写入 Master 的数据（gap）在全量同步完成后正确补发到 Slave。
+
+**测试原理**：
+
+```mermaid
+sequenceDiagram
+    participant T as test_repl_gap
+    participant M as Master
+    participant S as Slave
+
+    T->>M: 预存 pre 数据 (30000条 HSET)
+
+    Note over T: 提示用户启动 Slave
+    T->>S: 轮询 slave_fullsync_loading=1
+
+    Note over M,S: 全量同步进行中...
+
+    T->>M: 写入 gap 数据 (5000条 HSET)  ← 此时全量同步未完成
+    Note over M: gap 数据进入 backlog
+
+    M->>S: REPLDONE + repl_backlog_write_range()
+    Note over M,S: gap 数据补发到 Slave
+
+    T->>M: 写入 post 数据 (5000条 HSET)  ← 正常增量同步
+    Note over M,S: repl_broadcast() 实时同步
+
+    T->>M: HGET pre/gap/post 验证
+    T->>S: HGET pre/gap/post 验证
+    Note over T: 确认 Master == Slave
+```
+
+```bash
+# ── 单机三终端测试 ──
+
+# 终端 1: 启动 Master（先启动）
+./kvstore --port 6379 --role master \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
+
+# 终端 2: 运行测试
+./test_repl_gap --master-port 6379 --slave-port 6380 \
+    --pre-count 30000 --gap-count 5000 --post-count 5000
+
+# 看到提示后，在终端 3 启动 Slave:
+./kvstore --port 6380 --role slave \
+    --master-host 127.0.0.1 --master-port 6379 \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp --aof-disable
+```
+
+三阶段验证确保数据不丢失：
+
+| 阶段 | 数据 | 写入时机 | 同步机制 | 验证点 |
+|---|---|---|---|---|
+| Phase 1 | `pre:k:000001~030000` | 全量同步前 | 全量快照 `+FULLRESYNC` | Slave 有全部 pre 数据 |
+| Phase 2 | `gap:k:000001~005000` | **全量同步期间** | backlog gap 补发 `repl_backlog_write_range()` | Slave 有全部 gap 数据 |
+| Phase 3 | `post:k:000001~005000` | 全量同步后 | 实时同步 `repl_broadcast()` | Slave 有全部 post 数据 |
+
+**选项说明**：
+
+| 选项                 | 默认值    | 说明                |
+| -------------------- | --------- | ------------------- |
+| `--master-host HOST` | 127.0.0.1 | Master 地址         |
+| `--slave-host HOST`  | 127.0.0.1 | Slave 地址          |
+| `--master-port PORT` | 6379      | Master 端口         |
+| `--slave-port PORT`  | 6380      | Slave 端口          |
+| `--pre-count N`      | 30000     | 预存数据量（全量）  |
+| `--gap-count N`      | 5000      | gap 数据量           |
+| `--post-count N`     | 5000      | 增量数据量          |
+| `--batch N`          | 1000      | 每批写入量          |
+| `--poll-ms N`        | 500       | 轮询间隔毫秒        |
+
+---
+
 #### 辅助文件
 
 
@@ -3762,6 +3842,7 @@ redis-cli -p 6381 SET should_fail x
 | `make check-mmap-recover-c`          | 1w            | mmap 恢复验证（C 程序，支持指定引擎，自动管理进程）                                                             | `artifacts/persist/mmap-recover/`   |
 | `make check-repl`                    | 5k            | 主从复制基本验证（shell 脚本）                                                                                  | —                                  |
 | `make check-repl-basic`              | 5k            | 主从复制基本验证（C 程序，自动管理 Master/Slave 进程）                                                          | —                                  |
+| `make check-repl-gap`                | 3w+5k+5k      | 全量同步 gap 补发验证（C 程序，用户管理进程）                                                                    | —                                  |
 | `make test_repl_5w5w`<br>（仅编译）  | **5w+5w**     | 5w+5w 主从同步 C 测试（`tests/test_repl_5w5w.c`）<br>编译后手动运行：`tests/test_repl_5w5w --master-host H ...` | —                                  |
 | `make check-repl-metrics`            | 5w+5k         | 复制指标基线                                                                                                    | `artifacts/repl/metrics/`           |
 | `make check-repl-profile`            | 5w+5k         | 复制 profiling                                                                                                  | `artifacts/repl/profile/`           |

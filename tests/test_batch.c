@@ -331,26 +331,27 @@ int main(int argc, char **argv) {
     printf("  地址: %s:%d\n", g_opt.host, g_opt.port);
     printf("  每条流水线: %d 条命令\n\n", g_opt.count);
 
-    int fd = tcp_connect(g_opt.host, g_opt.port);
-    if (fd < 0) {
-        fprintf(stderr, ANSI_RED "错误: 无法连接 %s:%d\n" ANSI_RESET, g_opt.host, g_opt.port);
-        return 1;
-    }
-
     int failed = 0;
 
     /* 测试 1: 写入流水线 */
     printf("--- 写入流水线 ---\n");
+    int fd = tcp_connect(g_opt.host, g_opt.port);
+    if (fd < 0) { fprintf(stderr, "无法连接 %s:%d\n", g_opt.host, g_opt.port); return 1; }
     if (run_pipeline(fd, "HSET", NULL, 0, g_opt.count) != 0) failed++;
+    close(fd);
 
-    /* 测试 2: 读取流水线 */
+    /* 测试 2: 读取流水线（新连接） */
     printf("--- 读取流水线 ---\n");
+    fd = tcp_connect(g_opt.host, g_opt.port);
+    if (fd < 0) { fprintf(stderr, "无法连接 %s:%d\n", g_opt.host, g_opt.port); return 1; }
     if (run_pipeline(fd, "HGET", NULL, 0, g_opt.count) != 0) failed++;
+    close(fd);
 
-    /* 测试 3: 混合流水线 — 每轮 HSET+HGET 两条命令 */
+    /* 测试 3: 混合流水线（新连接） */
     printf("--- 混合流水线 ---\n");
+    fd = tcp_connect(g_opt.host, g_opt.port);
+    if (fd < 0) { fprintf(stderr, "无法连接 %s:%d\n", g_opt.host, g_opt.port); return 1; }
     if (run_mixed_pipeline(fd, g_opt.count) != 0) failed++;
-
     close(fd);
 
     printf("\n");

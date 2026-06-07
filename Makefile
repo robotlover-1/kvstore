@@ -107,7 +107,10 @@ KVS_KPROBE_BPF_OBJS=$(if $(filter 1,$(ENABLE_KPROBE_RDMA)),build/replication/bpf
 
 all: build_dir kvstore
 
-kvstore: $(KVS_BPF_OBJS) $(KVS_KPROBE_BPF_OBJS) $(OBJS)
+NtyCo/libntyco.a:
+	$(MAKE) -C NtyCo
+
+kvstore: NtyCo/libntyco.a $(KVS_BPF_OBJS) $(KVS_KPROBE_BPF_OBJS) $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LDFLAGS)
 
 build/replication/kvs_repl_ebpf.o: $(SRC_DIR)/replication/kvs_repl_ebpf.c $(INC_DIR)/kvstore.h

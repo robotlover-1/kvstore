@@ -627,19 +627,9 @@ int repl_kprobe_rdma_connect_mr(const char *host, int port, int tcp_fd) {
         return -1;
     }
 
-    /* 2. 启动转发线程（轮询 BPF ringbuf → RDMA WRITE） */
-    g_kprobe_running = 1;
-    if (!g_master_forward_started) {
-        pthread_t fwd_tid;
-        if (pthread_create(&fwd_tid, NULL,
-                kprobe_rdma_forward_thread, NULL) == 0) {
-            pthread_detach(fwd_tid);
-            g_master_forward_started = 1;
-            fprintf(stderr, "kprobe rdma: forward thread started (from connect_mr)\n");
-        }
-    }
-
-    /* 3. 等 slave 完成 MR 注册后发送 KPROBEMR */
+    /* 2. 等 slave 完成 MR 注册后发送 KPROBEMR
+     *    forward 线程在 MR info 收到后才启动（见 parse_mr_info_direct），
+     *    避免在 MR 就绪前处理 ringbuf events 导致大量 skip */
     usleep(200000);  /* 200ms */
 
     const char req[] = "KPROBEMR\r\n";
@@ -885,18 +875,9 @@ int repl_kprobe_rdma_establish(const char *host, int port) {
         return -1;
     }
 
-    /* 2. 设置 kprobe fd 过滤 — 这里在建立 TCP 控制连接后设置 */
     g_kprobe_running = 1;
-
-    /* 3. 启动转发线程 */
-    if (!g_master_forward_started) {
-        if (pthread_create(&g_master_forward_tid, NULL,
-                kprobe_rdma_forward_thread, NULL) == 0) {
-            pthread_detach(g_master_forward_tid);
-            g_master_forward_started = 1;
-        }
-    }
-
+    /* forward 线程在 parse_mr_info / parse_mr_info_direct 中
+     * 收到 MR 信息后才启动，避免提前处理无效 ringbuf events */
     return 0;
 }
 
@@ -914,6 +895,16 @@ int repl_kprobe_rdma_parse_mr_info(const char *resp) {
     g_slave_mr.slot_count = (size_t)slot_count;
     g_slave_mr.slot_capacity = (size_t)slot_cap;
     __sync_synchronize();
+
+    /* MR 就绪后启动 forward 线程 */
+    if (!g_master_forward_started) {
+        if (pthread_create(&g_master_forward_tid, NULL,
+                kprobe_rdma_forward_thread, NULL) == 0) {
+            pthread_detach(g_master_forward_tid);
+            g_master_forward_started = 1;
+            fprintf(stderr, "kprobe rdma: forward thread started (MR ready)\n");
+        }
+    }
 
     fprintf(stderr, "kprobe rdma: MR info parsed - rkey=%u data_base=0x%lx "
         "slots=%zu cap=%zu\n",
@@ -1017,6 +1008,18 @@ int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
     g_slave_mr.slot_count = slot_count;
     g_slave_mr.slot_capacity = slot_capacity;
     __sync_synchronize();
+
+    /* MR 就绪后启动 forward 线程，避免处理 KPROBEMR 前的无效 events */
+    g_kprobe_running = 1;
+    if (!g_master_forward_started) {
+        if (pthread_create(&g_master_forward_tid, NULL,
+                kprobe_rdma_forward_thread, NULL) == 0) {
+            pthread_detach(g_master_forward_tid);
+            g_master_forward_started = 1;
+            fprintf(stderr, "kprobe rdma: forward thread started (MR ready)\n");
+        }
+    }
+
     fprintf(stderr, "kprobe rdma: MR info updated - rkey=%u addr=0x%lx data_base=0x%lx head_addr=0x%lx slots=%zu cap=%zu\n",
         rkey, (unsigned long)addr,
         (unsigned long)g_slave_mr.remote_data_base,

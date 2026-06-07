@@ -276,18 +276,22 @@ static int wr_submit_data(int slot, size_t len) {
     return rc;
 }
 
+/* 独立 8 字节缓冲区用于更新 producer_head，避免与数据 WR 共用 buf */
+static unsigned char g_head_buf[8] __attribute__((aligned(64)));
+static struct ibv_mr *g_head_mr = NULL;
+
 /* RDMA WRITE: 更新 Slave producer_head */
 static int wr_submit_head(int slot) {
     struct ibv_sge sge;
     struct ibv_send_wr wr, *bad = NULL;
 
     uint64_t new_head = (uint64_t)(g_wr_producer_seq + 1);
-    memcpy(g_wr_slots[slot].buf, &new_head, 8);
+    memcpy(g_head_buf, &new_head, 8);
 
     memset(&sge, 0, sizeof(sge));
-    sge.addr = (uintptr_t)g_wr_slots[slot].buf;
+    sge.addr = (uintptr_t)g_head_buf;
     sge.length = 8;
-    sge.lkey = g_wr_slots[slot].mr->lkey;
+    sge.lkey = g_head_mr->lkey;
 
     memset(&wr, 0, sizeof(wr));
     wr.wr_id = (uint64_t)slot | 0x10000;    /* 高位标记 head update */
@@ -577,6 +581,13 @@ static int kprobe_rdma_qp_connect(const char *host, int port) {
             fprintf(stderr, "kprobe rdma: reg mr slot %d failed\n", i);
             return -1;
         }
+    }
+    /* 注册 head 更新专用缓冲区（独立于数据 slot，避免覆盖） */
+    g_head_mr = ibv_reg_mr(g_rdma_kprobe.pd, g_head_buf, 8,
+        IBV_ACCESS_LOCAL_WRITE);
+    if (!g_head_mr) {
+        fprintf(stderr, "kprobe rdma: reg mr for head buf failed\n");
+        return -1;
     }
 
     /* 连接 */
@@ -943,6 +954,10 @@ void repl_kprobe_rdma_cleanup(void) {
             ibv_dereg_mr(g_wr_slots[i].mr);
             g_wr_slots[i].mr = NULL;
         }
+    }
+    if (g_head_mr) {
+        ibv_dereg_mr(g_head_mr);
+        g_head_mr = NULL;
     }
     if (g_rdma_kprobe.cq) {
         ibv_destroy_cq(g_rdma_kprobe.cq);

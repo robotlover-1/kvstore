@@ -149,7 +149,7 @@ static int run_pipeline(int fd, const char *label,
     int is_get = (strcmp(label, "HGET") == 0);
     size_t chunk = 500;
     int sent = 0;
-    unsigned char resp[65536];
+    unsigned char resp[1024 * 1024];
     size_t rlen = 0;
 
     while (sent < expected) {
@@ -212,7 +212,7 @@ static int run_mixed_pipeline(int fd, int rounds) {
 
     size_t chunk = 500;
     int sent = 0, expected = rounds * 2;
-    unsigned char resp[65536];
+    unsigned char resp[1024 * 1024];
     size_t rlen = 0;
 
     while (sent < rounds) {

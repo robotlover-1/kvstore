@@ -128,11 +128,24 @@ static int count_ok(const unsigned char *resp, size_t len) {
 static int drain_responses(int fd, unsigned char *resp, size_t *rlen, size_t cap, int need) {
     while (count_ok(resp, *rlen) < need && *rlen < cap) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int prc = poll(&pfd, 1, 5000);
-        if (prc <= 0) break;
+        int prc = poll(&pfd, 1, 1000);  /* 1s 超时便于调试 */
+        if (prc <= 0) {
+            /* 超时：打印当前状态 */
+            int got = count_ok(resp, *rlen);
+            if (got > 0) fprintf(stderr, "  [dbg] drain timeout: need=%d got=%d rlen=%zu\n", need, got, *rlen);
+            break;
+        }
         ssize_t r = read(fd, resp + *rlen, cap - *rlen - 1);
         if (r <= 0) break;
         *rlen += (size_t)r;
+        int got = count_ok(resp, *rlen);
+        if (got == 0 && *rlen <= 64) {
+            /* 打印首次收到的原始字节 */
+            fprintf(stderr, "  [dbg] first recv: rlen=%zu raw=", *rlen);
+            for (size_t ri = 0; ri < *rlen; ri++) fputc(resp[ri] >= 32 ? resp[ri] : '?', stderr);
+            fputc('\n', stderr);
+        }
+        if (got > 0 && got % 500 == 0) fprintf(stderr, "  [dbg] drain: need=%d got=%d rlen=%zu\n", need, got, *rlen);
     }
     return count_ok(resp, *rlen);
 }

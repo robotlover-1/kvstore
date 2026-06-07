@@ -128,25 +128,10 @@ static int count_ok(const unsigned char *resp, size_t len) {
 
 /* 响应读取辅助：用 poll 读取，直到收够 need 条或超时 */
 static int drain_responses(int fd, unsigned char *resp, size_t *rlen, size_t cap, int need) {
-    static int dump_done = 0;
     while (count_ok(resp, *rlen) < need && *rlen < cap) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
         int prc = poll(&pfd, 1, 5000);
-        if (prc <= 0) {
-            int got = count_ok(resp, *rlen);
-            if (!dump_done && got < 500 && *rlen > 0) {
-                dump_done = 1;
-                size_t show = *rlen > 256 ? 256 : *rlen;
-                fprintf(stderr, "  [dbg] HGET raw bytes (need=%d got=%d rlen=%zu):\n", need, got, *rlen);
-                fprintf(stderr, "  [dbg] hex:");
-                for (size_t ri = 0; ri < show; ri++) {
-                    if (ri % 32 == 0) fputc('\n', stderr), fprintf(stderr, "  [dbg]   ");
-                    fprintf(stderr, "%02x ", resp[ri]);
-                }
-                fputc('\n', stderr);
-            }
-            break;
-        }
+        if (prc <= 0) break;
         ssize_t r = read(fd, resp + *rlen, cap - *rlen - 1);
         if (r <= 0) break;
         *rlen += (size_t)r;

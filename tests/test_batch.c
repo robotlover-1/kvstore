@@ -126,26 +126,28 @@ static int count_ok(const unsigned char *resp, size_t len) {
 
 /* 响应读取辅助：用 poll 读取，直到收够 need 条或超时 */
 static int drain_responses(int fd, unsigned char *resp, size_t *rlen, size_t cap, int need) {
+    static int dump_done = 0;
     while (count_ok(resp, *rlen) < need && *rlen < cap) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int prc = poll(&pfd, 1, 1000);  /* 1s 超时便于调试 */
+        int prc = poll(&pfd, 1, 5000);
         if (prc <= 0) {
-            /* 超时：打印当前状态 */
             int got = count_ok(resp, *rlen);
-            if (got > 0) fprintf(stderr, "  [dbg] drain timeout: need=%d got=%d rlen=%zu\n", need, got, *rlen);
+            if (!dump_done && got < 500 && *rlen > 0) {
+                dump_done = 1;
+                size_t show = *rlen > 256 ? 256 : *rlen;
+                fprintf(stderr, "  [dbg] HGET raw bytes (need=%d got=%d rlen=%zu):\n", need, got, *rlen);
+                fprintf(stderr, "  [dbg] hex:");
+                for (size_t ri = 0; ri < show; ri++) {
+                    if (ri % 32 == 0) fputc('\n', stderr), fprintf(stderr, "  [dbg]   ");
+                    fprintf(stderr, "%02x ", resp[ri]);
+                }
+                fputc('\n', stderr);
+            }
             break;
         }
         ssize_t r = read(fd, resp + *rlen, cap - *rlen - 1);
         if (r <= 0) break;
         *rlen += (size_t)r;
-        int got = count_ok(resp, *rlen);
-        if (got == 0 && *rlen <= 64) {
-            /* 打印首次收到的原始字节 */
-            fprintf(stderr, "  [dbg] first recv: rlen=%zu raw=", *rlen);
-            for (size_t ri = 0; ri < *rlen; ri++) fputc(resp[ri] >= 32 ? resp[ri] : '?', stderr);
-            fputc('\n', stderr);
-        }
-        if (got > 0 && got % 500 == 0) fprintf(stderr, "  [dbg] drain: need=%d got=%d rlen=%zu\n", need, got, *rlen);
     }
     return count_ok(resp, *rlen);
 }

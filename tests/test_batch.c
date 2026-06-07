@@ -88,53 +88,6 @@ static int send_all(int fd, const unsigned char *buf, size_t len) {
     return 0;
 }
 
-/* ==== 构建批处理缓冲区 ==== */
-
-static size_t build_set_batch(unsigned char *buf, size_t cap, int count) {
-    size_t pos = 0;
-    for (int i = 0; i < count; i++) {
-        char key[MAX_KEY_LEN], val[MAX_KEY_LEN];
-        snprintf(key, sizeof(key), "batch:k:%06d", i);
-        snprintf(val, sizeof(val), "batch:v:%06d", i);
-        int n = snprintf((char *)buf + pos, cap - pos,
-            "*3\r\n$4\r\nHSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-            strlen(key), key, strlen(val), val);
-        if (n < 0 || (size_t)n >= cap - pos) break;
-        pos += (size_t)n;
-    }
-    return pos;
-}
-
-static size_t build_get_batch(unsigned char *buf, size_t cap, int count) {
-    size_t pos = 0;
-    for (int i = 0; i < count; i++) {
-        char key[MAX_KEY_LEN];
-        snprintf(key, sizeof(key), "batch:k:%06d", i);
-        int n = snprintf((char *)buf + pos, cap - pos,
-            "*2\r\n$4\r\nHGET\r\n$%zu\r\n%s\r\n", strlen(key), key);
-        if (n < 0 || (size_t)n >= cap - pos) break;
-        pos += (size_t)n;
-    }
-    return pos;
-}
-
-static size_t build_mixed_batch(unsigned char *buf, size_t cap, int count) {
-    size_t pos = 0;
-    for (int i = 0; i < count; i++) {
-        char key[MAX_KEY_LEN], val[MAX_KEY_LEN];
-        snprintf(key, sizeof(key), "batch:mix:%06d", i);
-        snprintf(val, sizeof(val), "mix:v:%06d", i);
-        int n = snprintf((char *)buf + pos, cap - pos,
-            "*3\r\n$4\r\nHSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n"
-            "*2\r\n$4\r\nHGET\r\n$%zu\r\n%s\r\n",
-            strlen(key), key, strlen(val), val,
-            strlen(key), key);
-        if (n < 0 || (size_t)n >= cap - pos) break;
-        pos += (size_t)n;
-    }
-    return pos;
-}
-
 /* ==== 响应验证 ==== */
 
 static int count_ok(const unsigned char *resp, size_t len) {
@@ -171,39 +124,140 @@ static int count_ok(const unsigned char *resp, size_t len) {
 
 /* ==== 单条流水线测试 ==== */
 
+/* 响应读取辅助：用 poll 读取，直到收够 need 条或超时 */
+static int drain_responses(int fd, unsigned char *resp, size_t *rlen, size_t cap, int need) {
+    while (count_ok(resp, *rlen) < need && *rlen < cap) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int prc = poll(&pfd, 1, 5000);
+        if (prc <= 0) break;
+        ssize_t r = read(fd, resp + *rlen, cap - *rlen - 1);
+        if (r <= 0) break;
+        *rlen += (size_t)r;
+    }
+    return count_ok(resp, *rlen);
+}
+
+/* 分块发送 HSET/HGET，每块后读响应，避免 TCP 缓冲区死锁 */
 static int run_pipeline(int fd, const char *label,
     unsigned char *batch, size_t blen, int expected)
 {
+    (void)batch;
+    (void)blen;
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
 
-    if (send_all(fd, batch, blen) != 0) {
-        fprintf(stderr, "  [FAIL] %s: send failed\n", label);
-        return -1;
+    int is_get = (strcmp(label, "HGET") == 0);
+    size_t chunk = 500;
+    int sent = 0;
+    unsigned char resp[65536];
+    size_t rlen = 0;
+
+    while (sent < expected) {
+        size_t cur = (size_t)(expected - sent);
+        if (cur > chunk) cur = chunk;
+        size_t cap = cur * 128;
+        unsigned char *buf = (unsigned char *)malloc(cap);
+        if (!buf) return -1;
+        size_t pos = 0;
+
+        for (size_t i = 0; i < cur; i++) {
+            int idx = sent + (int)i;
+            char key[64], val[64];
+            snprintf(key, sizeof(key), "batch:k:%06d", idx);
+            if (is_get) {
+                int n = snprintf((char *)buf + pos, cap - pos,
+                    "*2\r\n$4\r\nHGET\r\n$%zu\r\n%s\r\n", strlen(key), key);
+                if (n < 0 || (size_t)n >= cap - pos) { free(buf); return -1; }
+                pos += (size_t)n;
+            } else {
+                snprintf(val, sizeof(val), "batch:v:%06d", idx);
+                int n = snprintf((char *)buf + pos, cap - pos,
+                    "*3\r\n$4\r\nHSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                    strlen(key), key, strlen(val), val);
+                if (n < 0 || (size_t)n >= cap - pos) { free(buf); return -1; }
+                pos += (size_t)n;
+            }
+        }
+
+        if (send_all(fd, buf, pos) != 0) { free(buf); return -1; }
+        free(buf);
+        sent += (int)cur;
+        drain_responses(fd, resp, &rlen, sizeof(resp), sent);
     }
 
-    unsigned char resp[MAX_RESP_SIZE];
-    size_t rlen = 0;
-    while (rlen < sizeof(resp)) {
-        ssize_t r = read(fd, resp + rlen, sizeof(resp) - rlen - 1);
-        if (r <= 0) break;
-        rlen += (size_t)r;
-        if (count_ok(resp, rlen) >= expected) break;
-    }
+    /* 读取剩余响应 */
+    drain_responses(fd, resp, &rlen, sizeof(resp), expected);
+    int total_ok = count_ok(resp, rlen);
+
     gettimeofday(&t1, NULL);
     double elapsed = (double)(t1.tv_sec - t0.tv_sec)
                    + (double)(t1.tv_usec - t0.tv_usec) / 1000000.0;
-
-    int ok = count_ok(resp, rlen);
     double qps = (double)expected / (elapsed > 0 ? elapsed : 0.001);
 
-    if (ok == expected) {
+    if (total_ok == expected) {
         printf(ANSI_GREEN "  [PASS]" ANSI_RESET " %s: %d/%d, %.0f qps, %.3fs\n",
-               label, ok, expected, qps, elapsed);
+               label, total_ok, expected, qps, elapsed);
         return 0;
     } else {
         printf(ANSI_RED "  [FAIL]" ANSI_RESET " %s: %d/%d, %.0f qps, %.3fs\n",
-               label, ok, expected, qps, elapsed);
+               label, total_ok, expected, qps, elapsed);
+        return -1;
+    }
+}
+
+/* 混合流水线：每轮 HSET+HGET 两条命令 */
+static int run_mixed_pipeline(int fd, int rounds) {
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+
+    size_t chunk = 500;
+    int sent = 0, expected = rounds * 2;
+    unsigned char resp[65536];
+    size_t rlen = 0;
+
+    while (sent < rounds) {
+        size_t cur = (size_t)(rounds - sent);
+        if (cur > chunk) cur = chunk;
+        size_t cap = cur * 256;
+        unsigned char *buf = (unsigned char *)malloc(cap);
+        if (!buf) return -1;
+        size_t pos = 0;
+
+        for (size_t i = 0; i < cur; i++) {
+            int idx = sent + (int)i;
+            char key[64], val[64];
+            snprintf(key, sizeof(key), "batch:mix:%06d", idx);
+            snprintf(val, sizeof(val), "mix:v:%06d", idx);
+            int n = snprintf((char *)buf + pos, cap - pos,
+                "*3\r\n$4\r\nHSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n"
+                "*2\r\n$4\r\nHGET\r\n$%zu\r\n%s\r\n",
+                strlen(key), key, strlen(val), val,
+                strlen(key), key);
+            if (n < 0 || (size_t)n >= cap - pos) { free(buf); return -1; }
+            pos += (size_t)n;
+        }
+
+        if (send_all(fd, buf, pos) != 0) { free(buf); return -1; }
+        free(buf);
+        sent += (int)cur;
+        drain_responses(fd, resp, &rlen, sizeof(resp), sent * 2);
+    }
+
+    drain_responses(fd, resp, &rlen, sizeof(resp), expected);
+    int total_ok = count_ok(resp, rlen);
+
+    gettimeofday(&t1, NULL);
+    double elapsed = (double)(t1.tv_sec - t0.tv_sec)
+                   + (double)(t1.tv_usec - t0.tv_usec) / 1000000.0;
+    double qps = (double)expected / (elapsed > 0 ? elapsed : 0.001);
+
+    if (total_ok == expected) {
+        printf(ANSI_GREEN "  [PASS]" ANSI_RESET " HSET+HGET: %d/%d, %.0f qps, %.3fs\n",
+               total_ok, expected, qps, elapsed);
+        return 0;
+    } else {
+        printf(ANSI_RED "  [FAIL]" ANSI_RESET " HSET+HGET: %d/%d, %.0f qps, %.3fs\n",
+               total_ok, expected, qps, elapsed);
         return -1;
     }
 }
@@ -283,26 +337,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    unsigned char *buf = (unsigned char *)malloc(BUFFER_SIZE * 2);
-    if (!buf) { close(fd); return 1; }
     int failed = 0;
 
     /* 测试 1: 写入流水线 */
     printf("--- 写入流水线 ---\n");
-    size_t wlen = build_set_batch(buf, BUFFER_SIZE, g_opt.count);
-    if (run_pipeline(fd, "HSET", buf, wlen, g_opt.count) != 0) failed++;
+    if (run_pipeline(fd, "HSET", NULL, 0, g_opt.count) != 0) failed++;
 
     /* 测试 2: 读取流水线 */
     printf("--- 读取流水线 ---\n");
-    size_t rlen = build_get_batch(buf, BUFFER_SIZE, g_opt.count);
-    if (run_pipeline(fd, "HGET", buf, rlen, g_opt.count) != 0) failed++;
+    if (run_pipeline(fd, "HGET", NULL, 0, g_opt.count) != 0) failed++;
 
-    /* 测试 3: 混合流水线 */
+    /* 测试 3: 混合流水线 — 每轮 HSET+HGET 两条命令 */
     printf("--- 混合流水线 ---\n");
-    size_t mlen = build_mixed_batch(buf, BUFFER_SIZE * 2, g_opt.count);
-    if (run_pipeline(fd, "HSET+HGET", buf, mlen, g_opt.count * 2) != 0) failed++;
+    if (run_mixed_pipeline(fd, g_opt.count) != 0) failed++;
 
-    free(buf);
     close(fd);
 
     printf("\n");

@@ -103,7 +103,9 @@ static int count_ok(const unsigned char *resp, size_t len) {
             char *end;
             long blen = strtol((const char *)resp + pos + 1, &end, 10);
             if (!end || *end != '\r') break;
-            size_t skip = (size_t)(end - (const char *)resp) + 2;
+            /* 从当前 pos 到 \r\n 的偏移 */
+            size_t hdr = (size_t)(end - (const char *)(resp + pos)) + 2;
+            size_t skip = hdr;
             if (blen >= 0) skip += (size_t)blen + 2;
             if (pos + skip > len) break;
             ok++;

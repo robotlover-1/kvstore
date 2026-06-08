@@ -541,27 +541,6 @@ int persist_recover(void) {
 
     g_persist_recovering = 0;
 
-    /* 恢复后压缩 AOF：写入紧凑快照，替换冗余的 AOF 文件 */
-    if (!g_aof_disabled && g_aof_fd >= 0) {
-        char rw_tmp[512];
-        snprintf(rw_tmp, sizeof(rw_tmp), "%s.rewrite.tmp.%ld",
-                 g_cfg.aof_path, (long)getpid());
-        if (persist_write_aof_snapshot_to(rw_tmp) == 0) {
-            close(g_aof_fd);
-            if (rename(rw_tmp, g_cfg.aof_path) == 0) {
-                g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-                if (g_aof_fd >= 0) {
-                    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
-                    if (g_aof_write_offset < 0) g_aof_write_offset = 0;
-                }
-            } else {
-                unlink(rw_tmp);
-                g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            }
-            g_aof_dirty = 0;
-        }
-    }
-
     return 0;
 }
 

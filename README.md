@@ -1281,12 +1281,15 @@ sequenceDiagram
 **二进制格式**：
 
 ```
-[4B key_len][key数据][4B value_len][value数据]
-[4B key_len][key数据][4B value_len][value数据]
+[8B aof_offset]                                        ← AOF 位置，用于跳过早期 AOF
+[1B engine_id][4B klen][key数据][4B vlen][value数据]   ← engine_id: 1=Array 2=RBTREE 3=Hash 4=Skiptable 5=Doc
+[1B engine_id][4B klen][key数据][4B vlen][value数据]
 ...
 ```
 
-每个 key-value 对用 4 字节长度前缀 + 数据交替存储，解析时按长度读取，**不以任何字符作为分隔符**，因此 key/value 中可包含空格、换行等任意字符。
+- `aof_offset`（8 字节）：记录保存时刻的 AOF 文件大小，恢复时跳过已被 dump 覆盖的 AOF 部分
+- `engine_id`（1 字节）：标识数据所属的存储引擎，恢复时分发到对应引擎
+- 每个 key-value 对用 4 字节长度前缀 + 数据交替存储，**不以任何字符作为分隔符**
 
 **保存实现**：
 
@@ -1317,19 +1320,21 @@ int kvs_snapshot_to_fp(FILE *fp) {
 
 // 持久化入口
 int persist_save_dump(void) {
-    // SAVE: 直接写
+    // SAVE: 记录当前 AOF 偏移，写入 dump 头
+    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
     int fd = open(g_cfg.dump_path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-    kvs_dump_to_fd(fd);       // 遍历引擎，写入 KVSD 格式
-    persist_fsync_fd(fd);     // fsync 刷盘
+    kvs_dump_to_fd(fd, aof_off);  // 遍历引擎 + 引擎 ID + AOF 偏移
+    persist_fsync_fd(fd);
     close(fd);
     return 0;
 }
 
 int persist_bgsave_start(void) {
-    // BGSAVE: fork 子进程
+    // BGSAVE: fork 前捕获 AOF 偏移
+    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
     pid_t pid = fork();
     if (pid == 0) {                // 子进程
-        persist_save_dump();       // 写 dump
+        persist_save_dump_to(tmp_path, aof_off);  // 写入 AOF 偏移 + 引擎 ID
         _exit(0);
     }
     g_bgsave_pid = pid;            // 父进程记录 PID
@@ -1354,27 +1359,27 @@ sequenceDiagram
     Note over K: g_persist_recovering = 1
 
     K->>D: "replay_dump_file(dump_path)"
-    Note over D: mmap → 遍历 KVSD 二进制
-    Note over K: 全量数据恢复 ✓
+    Note over D: mmap → 读取 aof_offset 头
+    Note over D: 按 engine_id 分发到各引擎
+    Note over K: 全量数据恢复 ✓，返回 aof_offset
 
-    K->>A: "replay_file(aof_path)"
-    Note over A: mmap → parse_resp_stream → 重放命令
+    K->>A: "replay_file(aof_path, aof_offset)"
+    Note over A: mmap → 跳过前 aof_offset 字节
+    Note over A: 只重放 dump 之后的增量 RESP 命令
     Note over K: 增量命令恢复 ✓
 
-    K->>K: "ftruncate(g_aof_fd, 0)"
-    Note over K: AOF 截断，防止跨 session 累积
+    K->>K: "kvs_active_expire_cycle(1000000)"
+    Note over K: 清理恢复期间已过期的 key
 
     K->>K: g_persist_recovering = 0
     Note over K: 恢复完成，开始服务
 ```
 
-**Dump 文件恢复（二进制 KVSD 格式）**：
-
-dump 文件使用自定义 KVSD 二进制格式：`[4B klen][key][4B vlen][value]`，
-mmap 后通过指针偏移直接读取，无需任何解析库：
+**Dump 文件使用自定义二进制格式：先读 8 字节 `aof_offset` 头，然后按 `[1B engine_id][4B klen][key][4B vlen][value]` 遍历，
+mmap 后通过指针偏移直接读取，按 `engine_id` 分发到对应存储引擎：
 
 ```c
-static int replay_dump_file(const char *path) {
+static unsigned long long replay_dump_file(const char *path) {
     // ① 打开文件
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -1385,43 +1390,56 @@ static int replay_dump_file(const char *path) {
     // ② mmap 零拷贝映射（0 次内核→用户拷贝）
     unsigned char *mapped = mmap(NULL, (size_t)st.st_size,
         PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-
-    if (mapped == MAP_FAILED) {
-        // ③ mmap 失败 → 回退到 fread 逐块读取
-        close(fd);
-        return replay_file_fread(path);
-    }
+    if (mapped == MAP_FAILED) { close(fd); return 0; }
 
     g_recover_mmap_success++;
     g_recover_last_mmap_bytes += (unsigned long long)st.st_size;
 
-    // ④ 遍历 mmap 内存，解析 KVSD 格式
-    size_t pos = 0;
-    while (pos + 4 <= (size_t)st.st_size) {
+    // ③ 读取 AOF 偏移头
+    unsigned long long aof_offset = 0;
+    memcpy(&aof_offset, mapped, sizeof(aof_offset));
+    size_t pos = sizeof(aof_offset);
+
+    // ④ 遍历 mmap 内存，按 engine_id 分发
+    while (pos + 1 + 4 <= (size_t)st.st_size) {
+        uint8_t engine_id = mapped[pos++];
         uint32_t klen, vlen;
 
         memcpy(&klen, mapped + pos, sizeof(klen));
-        pos += sizeof(klen);                     // key 长度
+        pos += sizeof(klen);
         if (pos + klen > (size_t)st.st_size) break;
 
         char *key = (char *)kvs_malloc(klen + 1);
         if (klen > 0) memcpy(key, mapped + pos, klen);
         key[klen] = '\0';
-        pos += klen;                              // key 数据
+        pos += klen;
 
         if (pos + 4 > (size_t)st.st_size) { kvs_free(key); break; }
 
         memcpy(&vlen, mapped + pos, sizeof(vlen));
-        pos += sizeof(vlen);                     // value 长度
+        pos += sizeof(vlen);
         if (pos + vlen > (size_t)st.st_size) { kvs_free(key); break; }
 
         char *value = (char *)kvs_malloc(vlen + 1);
         if (vlen > 0) memcpy(value, mapped + pos, vlen);
         value[vlen] = '\0';
-        pos += vlen;                              // value 数据
+        pos += vlen;
 
-        // ⑤ 写入 Hash 引擎（所有引擎统一存储到 hash）
-        kvs_hash_set(&global_hash, key, value);
+        // ⑤ 按 engine_id 分发到对应引擎，不再只写 hash
+        switch (engine_id) {
+        case 1: kvs_array_set(&global_array, key, value); break;
+        case 2: kvs_rbtree_set(&global_rbtree, key, value); break;
+        case 3: kvs_hash_set(&global_hash, key, value); break;
+        case 4: kvs_skiptable_set(&global_skiptable, key, value); break;
+        case 5: /* Doc: field1=val1 field2=val2 ... */
+            for (char *tok = strtok(dup, " "); tok; tok = strtok(NULL, " "))
+                if (char *eq = strchr(tok, '=')) {
+                    *eq = '\0';
+                    kvs_doc_set(&global_doc, key, tok, eq + 1);
+                }
+            break;
+        }
+
         kvs_free(key);
         kvs_free(value);
     }
@@ -1429,9 +1447,12 @@ static int replay_dump_file(const char *path) {
     g_recover_last_tail_bytes += (unsigned long long)pos;
     munmap(mapped, (size_t)st.st_size);
     close(fd);
-    return 0;
+    return aof_offset;  // 返回 AOF 偏移，用于跳过早期 AOF
 }
 ```
+
+> **关键变更**：原有的 dump 格式只写入 4 字节 klen/value，且恢复时全部写入 hash 引擎（`kvs_hash_set`）。
+> 新格式增加 8 字节 `aof_offset` 头和 1 字节 `engine_id`，恢复时按引擎分发到 array/rbtree/hash/skiptable/doc。
 
 **mmap 的优势**：
 - **零拷贝**：磁盘数据直接映射到进程地址空间，绕过 `read()` 的内核缓冲区拷贝
@@ -1450,22 +1471,23 @@ mmap 路径:
 
 **AOF 文件恢复（RESP 命令格式）**：
 
-AOF 文件使用 mmap 映射后，直接喂给 `parse_resp_stream()` 解析，和客户端请求走完全相同的解析路径：
+AOF 文件使用 mmap 映射后，**跳过已被 dump 覆盖的前 `aof_offset` 字节**，只将增量部分
+喂给 `parse_resp_stream()` 解析，避免重放 dump 中已包含的冗余命令：
 
 ```c
-static int replay_file_mmap(const char *path) {
+static int replay_file_mmap(const char *path, unsigned long long skip_bytes) {
     // ① mmap 映射 AOF 文件
     unsigned char *mapped = mmap(NULL, (size_t)st.st_size,
         PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
     g_recover_mmap_success++;
-    g_recover_last_mmap_bytes += (unsigned long long)st.st_size;
+    g_recover_last_mmap_bytes += (unsigned long long)st.st_size - skip_bytes;
 
-    // ② 直接喂给 RESP 解析器（与客户端请求同一套代码）
-    size_t len = (size_t)st.st_size;
-    parse_resp_stream(NULL, mapped, &len, 1);  // from_replication=1
-    //                                                ↑
-    //                    from_replication=1 避免再次写 AOF 和广播
+    // ② 跳过已被 dump 覆盖的部分，只重放增量 RESP 命令
+    size_t len = (size_t)st.st_size - (size_t)skip_bytes;
+    parse_resp_stream(NULL, mapped + skip_bytes, &len, 1);  // from_replication=1
+    //                                                             ↑
+    //                               from_replication=1 避免再次写 AOF 和广播
 
     g_recover_last_tail_bytes += (unsigned long long)len;
     munmap(mapped, (size_t)st.st_size);
@@ -1475,12 +1497,15 @@ static int replay_file_mmap(const char *path) {
 ```
 
 **mmap 回退机制**：当 mmap 不可用时（文件过大超出地址空间、内核限制等），自动回退到 `replay_file_fread()`，
-逐块 `fread` 读取并解析：
+同样支持 skip_bytes 跳过头部的冗余数据：
 
 ```c
-static int replay_file_fread(const char *path) {
+static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
+
+    if (skip_bytes > 0)
+        fseeko(fp, (off_t)skip_bytes, SEEK_SET);  // 跳过已被 dump 覆盖的部分
 
     unsigned char buf[BUFFER_CAP];
     size_t len = 0, n;
@@ -1489,7 +1514,7 @@ static int replay_file_fread(const char *path) {
     while ((n = fread(buf + len, 1, sizeof(buf) - len, fp)) > 0) {
         len += n;
         total += (unsigned long long)n;
-        parse_resp_stream(NULL, buf, &len, 1);   // 逐块解析
+        parse_resp_stream(NULL, buf, &len, 1);   // 逐块解析增量
     }
 
     g_recover_last_fread_bytes += total;
@@ -1505,19 +1530,18 @@ static int replay_file_fread(const char *path) {
 int persist_recover(void) {
     g_persist_recovering = 1;
 
-    // ① dump 恢复（KVSD 二进制，mmap 加速）
+    // ① dump 恢复（二进制格式，含 engine_id 分发，返回 AOF 偏移）
     dump_begin_ms = kvs_now_ms();
-    replay_dump_file(g_cfg.dump_path);
+    unsigned long long aof_offset = replay_dump_file(g_cfg.dump_path);
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
-    // ② AOF 重放（RESP 命令，mmap 加速）
+    // ② AOF 增量重放（跳过已被 dump 覆盖的前 aof_offset 字节）
     aof_begin_ms = kvs_now_ms();
-    replay_file(g_cfg.aof_path);
+    replay_file(g_cfg.aof_path, aof_offset);
     g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;
 
-    // ③ AOF 截断（防止跨 session 累积）
-    ftruncate(g_aof_fd, 0);
-    g_aof_write_offset = 0;
+    // ③ 清理恢复过程中已过期的短 TTL key
+    kvs_active_expire_cycle(1000000);
 
     g_persist_recovering = 0;
     return 0;

@@ -681,115 +681,235 @@ if (!strcmp(cmd, "DOCSET") && argc == 4) {
 2. 持久化和复制对引擎完全透明——每写一条命令自动写 AOF + 广播
 3. TTL 系统独立于引擎，统一在命令执行前后检查
 
-**RESP 协议解析核心**:
+## RESP 协议解析
+
+kvstore 使用 **RESP（REdis Serialization Protocol）** 作为通信协议，兼容 `redis-cli`、`hiredis` 等标准 Redis 客户端。协议的解析实现在 `parse_resp_stream()` 函数中。
+
+### 解析器架构
+
+`parse_resp_stream` 是一个**无状态的流式解析器**，接收 TCP 字节流，逐字节扫描，按 RESP 协议格式提取命令并执行。解析器核心逻辑分为三条路径：
+
+```
+TCP 字节流 → recv() → inbuf[64KB]
+                           ↓
+                parse_resp_stream(buf, &len)
+                           ↓
+            ┌──────────────┼──────────────┐
+            ↓              ↓              ↓
+      '+' 简单字符串   '*' 数组格式    其他(inline)
+            │              │              │
+            ↓              ↓              ↓
+    KPROBERDMA/      解析 argc,argv    split_inline_argv
+    FULLRESYNC/      逐个提取 bulk         空格分割
+    CONTINUE         handle_parsed_      handle_parsed_
+    (协议扩展)         command()           command()
+            │              │              │
+            └──────────────┼──────────────┘
+                           ↓
+                   queue_bytes(响应)
+                           ↓
+                    on_write() 发送
+```
+
+### 三种解析路径详解
+
+#### ① 简单字符串（`+`）—— 协议控制通道
+
+以 `+` 开头、`\r\n` 结尾的行。标准 RESP 中 `+OK\r\n` 表示成功，但 kvstore 扩展了此格式用于**带内控制信令**：
 
 ```c
-// src/main/kvstore.c — parse_resp_stream
-int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
-    size_t pos = 0;
-    while (pos < *len) {
-        if (buf[pos] == '+') {           // 简单字符串: +OK\r\n
-            // 提取行内容，处理 KPROBERDMA / FULLRESYNC / CONTINUE
-        } else if (buf[pos] == '*') {    // 数组: *3\r\n$3\r\nSET\r\n...
-            int argc = atoi(buf + pos + 1);  // 解析参数个数
-            // 逐个解析 bulk string: $len\r\ndata\r\n
-            for (int i = 0; i < argc; i++) {
-                if (buf[pos] != '$') break;          // 不是 bulk
-                long blen = strtol(buf + pos + 1);    // bulk 长度
-                argv[i] = malloc(blen + 1);
-                memcpy(argv[i], buf + pos, blen);     // 按长度拷贝
-                argv[i][blen] = '\0';
-            }
-            handle_parsed_command(c, argc, argv, ...); // 执行命令
-        } else {                         // inline 命令（兼容 redis-cli）
-            // 空格分割参数
-        }
-    }
+if (buf[pos] == '+') {                          // +KPROBERDMA 1 2 3 4 5\r\n
+    line = extract_line(buf + pos);             // 提取行内容
+    argv = split_inline_argv(line);             // 空格分割参数
+
+    if (argv[0] == "KPROBERDMA" && argc >= 6)  // kprobe RDMA MR 信息交换
+        repl_kprobe_rdma_parse_mr_info_direct(argv[1..5]);
+
+    if (from_replication && argv[0] == "FULLRESYNC")  // 全量同步开始
+        repl_slave_set_sync_state(argv[1], argv[2], loading=1);
+
+    if (from_replication && argv[0] == "CONTINUE")     // 增量同步继续
+        repl_slave_set_sync_state(argv[1], offset, loading=0);
 }
 ```
 
-#### PIPELINE 解析机制
+这些命令**不经过命令分发器**，直接在解析层处理，用于主从复制和 RDMA 内存注册信息交换。
 
-kvstore 原生支持 RESP **流水线（PIPELINE）**——客户端可以一次 `send()` 发送多条命令，
-服务器逐条解析执行，响应可以一次性读回，大幅减少网络往返。
+#### ② RESP 数组（`*`）—— 标准命令格式
 
-**核心原理**：
+RESP 数组是 kvstore 的主要命令格式，结构为：
+
+```
+*<argc>\r\n$<len1>\r\n<data1>\r\n$<len2>\r\n<data2>\r\n...
+```
+
+解析流程：
+
+```c
+// 源码: src/main/kvstore.c — parse_resp_stream (数组分支)
+if (buf[pos] == '*') {
+    size_t start = pos;              // 记录命令起始位置
+    p = pos + 1;
+
+    // 步骤 1: 扫描 \r\n 获取参数个数
+    while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
+    if (p + 1 >= *len) break;        // 数据不完整，等待下次 recv
+    if (p - (pos + 1) >= 32) { pos = p + 2; continue; }  // 格式错误
+
+    argc = atoi(buf + pos + 1);      // 解析 N
+    if (argc <= 0 || argc > 32) {    // 最多 32 个参数
+        queue_bytes(c, "-ERR invalid argc\r\n");
+        pos = p + 2; continue;
+    }
+    p += 2;                          // 跳过 \r\n
+
+    // 步骤 2: 逐个解析 N 个 bulk string
+    for (int i = 0; i < argc; ++i) {
+        // 每个 bulk: $<len>\r\n<data>\r\n
+        if (buf[p] != '$') { malformed = 1; break; }
+
+        // 读取长度字段
+        lp = p + 1;
+        while (lp + 1 < *len && !(buf[lp] == '\r' && buf[lp + 1] == '\n')) lp++;
+        if (lp + 1 >= *len) { incomplete = 1; break; }
+        if (lp - (p + 1) >= 32) { malformed = 1; break; }  // 长度字段过长
+
+        blen = strtol(buf + p + 1, &endp, 10);
+        if (!endp || *endp != '\0' || blen < 0) {  // 非数字或负长度
+            malformed = 1; break;
+        }
+
+        p = lp + 2;                  // 跳过 $len\r\n
+        if (p + blen + 2 > *len) { incomplete = 1; break; }
+
+        argv[i] = kvs_malloc(blen + 1);
+        memcpy(argv[i], buf + p, blen);  // 按长度拷贝，含二进制的 \0
+        argv[i][blen] = '\0';
+        p += blen;
+        if (!(buf[p] == '\r' && buf[p + 1] == '\n')) { malformed = 1; break; }
+        p += 2;                      // 跳过末尾 \r\n
+    }
+    if (incomplete) {                // 数据不全，保留缓冲区等下次
+        for (i) kvs_free(argv[i]);
+        break;
+    }
+    if (malformed) {                 // 格式错误，跳过
+        for (i) kvs_free(argv[i]);
+        pos = (p > start) ? p : start + 1;
+        continue;
+    }
+    // 执行命令
+    handle_parsed_command(c, argc, argv, raw, rawlen, from_replication);
+    for (i) kvs_free(argv[i]);
+    pos = p;                         // pos 前进到下一命令
+}
+```
+
+**关键设计**：
+- `incomplete` vs `malformed`：**`incomplete` 保留缓冲区等下次 recv**，**`malformed` 丢弃错误数据继续**
+- `argc > 32` 或 `blen < 0` 或 `blen > 2^31`：拒绝并发送错误响应
+- **二进制安全**：按长度拷贝，value 可包含 `\0`、`\r\n` 等任意字节
+
+#### ③ Inline 命令（非 `*` 非 `+`）—— 兼容 redis-cli
+
+当首个字节不是 `*` 或 `+` 时，视为空格分隔的 inline 命令，主要用于兼容 `redis-cli` 发送的简单命令（如 `PING`）：
+
+```c
+// 截取到 \n 为止的一行
+line_end = find_next_newline(buf, pos);
+line = kvs_malloc(line_len + 1);
+memcpy(line, buf + pos, line_len);
+argc = split_inline_argv(line, argv, 32);  // 空格分割
+if (argc > 0)
+    handle_parsed_command(c, argc, argv, raw, rawlen, from_replication);
+pos = line_end + 1;
+```
+
+### PIPELINE 流水线实现
+
+PIPELINE 的核心机制是 **一次 recv 多次解析**。`on_read()` 将 TCP 数据读入 `inbuf`（64KB），然后调用 `parse_resp_stream()`，后者通过 `while (pos < *len)` 循环在一个缓冲区中反复解析多条命令。
+
+```
+TCP 字节流（一次 send）:
+   *3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n
+   *3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n
+   *3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n
+                           ↓ recv() 到 inbuf[64KB]
+parse_resp_stream() while 循环:
+   ┌─────────────────────────────────────────────────┐
+   │ 迭代1: pos=0  解析 *3 → SET k1 v1 → 执行 + 响应 │
+   │ 迭代2: pos=37 解析 *3 → SET k2 v2 → 执行 + 响应 │
+   │ 迭代3: pos=74 解析 *3 → SET k3 v3 → 执行 + 响应 │
+   │ pos=111, len=111 → 全部消费完毕                  │
+   └─────────────────────────────────────────────────┘
+on_write() 一次 send 三份响应:
+   +OK\r\n+OK\r\n+OK\r\n
+```
 
 ```mermaid
 sequenceDiagram
     participant C as 客户端
     participant K as kvstore
 
-    Note over C: 构建批处理缓冲区
-    C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n
-    C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n
-    C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n
+    Note over C: 一次 send N 条命令
+    C->>C: snprintf("*3\\r\\n$3\\r\\nSET\\r\\n...")
+    C->>K: "send(buf, len)"
 
-    C->>K: "send(buf, len)    ← 一次发送 N 条命令"
-    Note over K: "on_read() → recv() 到 inbuf"
+    Note over K: "recv() → inbuf"
+    K->>K: "parse_resp_stream(buf, &len)"
 
-    loop 逐条解析
-        K->>K: "parse_resp_stream(buf, &in_len)"
-        Note over K: "while(pos < *len)"
-        K->>K: 解析 *N → argc, argv
-        K->>K: "handle_parsed_command(SET k1 v1)"
-        K->>K: "queue_bytes(+OK\r\n)"
-        K->>K: 解析 *N → argc, argv
-        K->>K: "handle_parsed_command(SET k2 v2)"
-        K->>K: "queue_bytes(+OK\r\n)"
-        K->>K: 解析 *N → argc, argv
-        K->>K: "handle_parsed_command(SET k3 v3)"
-        K->>K: "queue_bytes(+OK\r\n)"
+    loop while(pos < len)
+        K->>K: 解析 *3 → HSET k1 v1
+        K->>K: handle_parsed_command()
+        K->>K: queue_bytes("+OK\\r\\n")
+        K->>K: pos 前进到下一命令
     end
 
-    Note over K: "on_write() → send() 全部响应"
-    K->>C: "+OK\r\n+OK\r\n+OK\r\n    ← 一次性读回"
-
-    Note over C: "count_ok() 验证所有响应"
+    Note over K: on_write() 刷新输出
+    K->>C: "+OK\\r\\n+OK\\r\\n+OK\\r\\n"
+    Note over C: 一次 recv 全部响应
 ```
 
-**`parse_resp_stream` 的流水线实现**：解析器使用 `while` 循环不停消费缓冲区，每次解析一条完整命令就立即执行，
-缓冲区中剩余数据通过 `memmove` 向前拼接：
+### 缓冲区管理与 TCP 分片
+
+TCP 是流协议，数据可能被拆分成多个 `recv()`。`on_read()` 通过 **循环 recv + 残留拼接** 处理：
 
 ```c
-// src/main/kvstore.c — parse_resp_stream 流水线核心
-int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
-    size_t pos = 0;
-    while (pos < *len) {            // ← 一个缓冲区可能包含多条命令
-        if (buf[pos] == '*') {      // RESP 数组格式
-            // 解析 *N → argc
-            // 循环解析 N 个 $len\r\ndata\r\n
-            handle_parsed_command(c, argc, argv, raw, rawlen, from_replication); // ← 立即执行
-        } else if (buf[pos] == '+') {
-            // 处理控制命令（+KPROBERDMA, +FULLRESYNC, +CONTINUE）
-        } else {
-            // inline 格式（空格分隔）
-            handle_parsed_command(c, argc, argv, raw, rawlen, from_replication);
+static void on_read(conn_t *c) {
+    while (1) {
+        n = recv(c->fd, c->inbuf + c->in_len,
+                 sizeof(c->inbuf) - c->in_len, 0);
+        if (n > 0) {
+            c->in_len += n;
+            parse_resp_stream(c, c->inbuf, &c->in_len, 0);  // ← 解析
+            // parse_resp_stream 已通过 memmove 整理缓冲区
+            continue;  // 继续读，可能还有数据
         }
-        // pos 前进到下一命令
+        if (errno == EAGAIN) break;  // 本次读完
     }
-    // 未处理完的残留数据向前拼接
-    if (pos > 0 && pos < *len) {
-        memmove(buf, buf + pos, *len - pos);  // ← 拼接剩余数据
-        *len -= pos;
-    } else if (pos >= *len) {
-        *len = 0;
-    }
-    return 0;
 }
 ```
 
-**响应队列**：每条命令执行后，响应通过 `queue_bytes` 加入 `out_node_t` 链表，`on_write()` 逐条发送：
+**`parse_resp_stream` 返回后的缓冲区状态**：
+
+```
+解析前: pos=0                          len=50
+         [CMD1完整][CMD2完整][CMD3不完整       ]
+                                             ↑ len
+解析后:
+         [CMD3不完整       ]                    ← memmove 向前拼
+          ↑ len=剩余20
+下次 recv:
+         [CMD3不完整][CMD4完整                 ]
+          ↑ 拼接后继续解析
+```
+
+### Pipeline 响应队列
+
+每条命令执行后，响应不直接发送，而是通过 `queue_bytes` 加入输出链表：
 
 ```c
 // src/core/reactor.c
-typedef struct out_node_s {
-    unsigned char *data;       // 响应数据
-    size_t len;                // 长度
-    size_t sent;               // 已发送偏移量
-    struct out_node_s *next;   // 链表下一节点
-} out_node_t;
-
 int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
     out_node_t *n = kvs_malloc(sizeof(*n));
     n->data = kvs_malloc(len);
@@ -799,104 +919,81 @@ int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
     n->next = NULL;
 
     // 追加到输出链表尾部
-    if (c->out_tail)
-        c->out_tail->next = n;
-    else
-        c->out_head = n;
+    if (c->out_tail) c->out_tail->next = n;
+    else c->out_head = n;
     c->out_tail = n;
 
-    // 注册 EPOLLOUT 事件
-    mod_events(c, EPOLLIN | EPOLLOUT);
+    mod_events(c, EPOLLIN | EPOLLOUT);  // 注册写事件
     return 0;
 }
 ```
 
-**`on_read` 中的数据流**：每次 `recv` 读到的数据追加到 `inbuf`，然后调用 `parse_resp_stream` 解析：
+`on_write()` 在事件循环中逐个节点发送，支持部分发送（`EAGAIN` 时中断）：
 
 ```c
-static void on_read(conn_t *c) {
-    while (1) {
-        ssize_t n = recv(c->fd, c->inbuf + c->in_len,
-                         sizeof(c->inbuf) - c->in_len, 0);
-        if (n > 0) {
-            c->in_len += (size_t)n;
-            // 一次解析多条命令（pipeline）
-            parse_resp_stream(c, c->inbuf, &c->in_len, 0);
-            continue;
+static void on_write(conn_t *c) {
+    while (c->out_head) {
+        w = send(c->fd, n->data + n->sent, n->len - n->sent, 0);
+        if (w < 0) {
+            if (errno == EAGAIN) break;  // 发送缓冲区满，下次再发
+            close_conn(c); return;
         }
-        // ... 处理断开 / EAGAIN
+        n->sent += w;
+        if (n->sent == n->len) {         // 这个节点发完了
+            c->out_head = n->next;        // 移到下一个
+            kvs_free(n->data); kvs_free(n);
+        } else break;
     }
 }
 ```
 
-**Pipeline 边界处理**：当 TCP 字节流不完整时（一条命令被拆到两次 recv），解析器返回 `break`，
-残留数据保留在 `inbuf` 中，下次 `on_read` 继续拼接解析：
+### 纯 C Pipeline 测试
 
-```
-第1次 recv: *3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n*3\r\n$3\r\nSE
-                                                                    ↑
-第2次 recv: T\r\n$2\r\nk2\r\n$2\r\nv2\r\n
-            ← memmove 拼接后完整解析
-```
-
-**测试程序 `test_batch`**：验证 kvstore 的流水线能力，一次 send 发送 N 条命令，一次性读回所有响应：
+`tests/test_batch.c` 实现了一个纯 C 的 RESP pipeline 压力测试，不依赖 hiredis 等第三方库：
 
 ```c
-// tests/test_batch.c — 构建批处理缓冲区
-static size_t build_set_batch(unsigned char *buf, size_t cap, int count) {
-    size_t pos = 0;
-    for (int i = 0; i < count; i++) {
-        // 拼接 N 条 HSET 命令到同一缓冲区
-        int n = snprintf((char *)buf + pos, cap - pos,
-            "*3\r\n$4\r\nHSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-            strlen(key), key, strlen(val), val);
-        pos += (size_t)n;  // ← 不断追加
+// tests/test_batch.c — 分块发送 + 内联读取
+// 为避免 TCP 缓冲区死锁，每 500 条发送一次，然后立即读取响应
+static int run_pipeline(int fd, const char *label, int count) {
+    size_t chunk = 500;
+    int sent = 0;
+    unsigned char resp[1024 * 1024];
+    size_t rlen = 0;
+
+    while (sent < count) {
+        // 构建一批命令
+        unsigned char *buf = build_batch(sent, cur);
+        send_all(fd, buf, len);
+        free(buf);
+        sent += cur;
+
+        // 立即读取这一批的响应
+        drain_responses(fd, resp, &rlen, sizeof(resp), sent);
     }
-    return pos;
+    // 读取剩余响应
+    int total_ok = count_ok(resp, rlen);
+    printf("[PASS] %s: %d/%d\n", label, total_ok, count);
 }
-
-// 一次 send 发送所有命令
-send_all(fd, batch, blen);
-
-// 一次性读取所有响应
-unsigned char resp[MAX_RESP_SIZE];
-read(fd, resp, sizeof(resp));
-
-// 计数 +OK 数量验证
-int ok = count_ok(resp, rlen);  // 应等于 count
 ```
 
-**测试结果示例**：
+`count_ok()` 函数解析混合 RESP 响应（`+OK\r\n`、`$-1\r\n`、`$len\r\ndata\r\n`、`:integer\r\n`），精确计数正确响应条数。
+
+测试结果示例（HSET 10000 条流水线 + HGET 10000 条流水线 + 混合 HSET+HGET 各 10000 条）：
 
 ```bash
-$ ./test_batch --config tests/test.conf
+$ ./tests/test_batch --config tests/test.conf
 批量流水线压力测试
-  地址: 127.0.0.1:5200
+  地址: 192.168.233.128:5160
   每条流水线: 10000 条命令
 
 --- 写入流水线 ---
-  [PASS] HSET: 10000/10000, 262295 qps, 0.038s
+  [PASS] HSET: 10000/10000, 11823 qps, 0.846s
 --- 读取流水线 ---
-  [PASS] HGET: 10000/10000, 243902 qps, 0.041s
+  [PASS] HGET: 10000/10000, 9523 qps, 1.050s
 --- 混合流水线 ---
-  [PASS] HSET+HGET: 20000/20000, 357143 qps, 0.056s
+  [PASS] HSET+HGET: 20000/20000, 12500 qps, 1.600s
 
   全部流水线测试通过 ✓
-```
-
-#### 测试验证
-
-```mermaid
-graph LR
-    subgraph 测试流程
-        A[启动 kvstore] --> B[运行 test_kvstore]
-        B --> C[SET/GET/DEL 测试 Array]
-        B --> D[HSET/HGET/HDEL 测试 Hash]
-        B --> E[RSET/RGET/RDEL 测试 RBTREE]
-        B --> F[XSET/XGET/XDEL 测试 Skiptable]
-        B --> G[DOCSET/DOCGET 测试 Doc]
-        C & D & E & F & G --> H[PASS/FAIL 报告]
-    end
 ```
 
 ```bash

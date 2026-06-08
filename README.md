@@ -1,7 +1,5 @@
 # kvstore — 高性能键值存储系统
 
-<div align="center">
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C](https://img.shields.io/badge/language-C-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 [![Build](https://img.shields.io/badge/build-4%20configs-brightgreen)]()
@@ -365,46 +363,46 @@ graph TB
     end
 
     subgraph 网络层
-        REA[Reactor<br/>epoll LT]
-        PRO[Proactor<br/>io_uring]
-        NTY[NtyCo<br/>协程]
+        REA["Reactor\nepoll LT"]
+        PRO["Proactor\nio_uring"]
+        NTY["NtyCo\n协程"]
     end
 
     subgraph 协议层
-        RESP[RESP 协议解析<br/>parse_resp_stream]
-        CMD[命令分发<br/>handle_parsed_command]
+        RESP["RESP 协议解析\nparse_resp_stream"]
+        CMD["命令分发\nhandle_parsed_command"]
     end
 
     subgraph 存储引擎
-        ARR[Array<br/>KVS_ARRAY_SIZE=1024]
-        HSH[Hash<br/>链地址法]
-        RBT[RBTREE<br/>红黑树]
-        SKP[Skiptable<br/>跳表]
-        DOC[Doc<br/>两层哈希]
+        ARR["Array\nKVS_ARRAY_SIZE=1024"]
+        HSH["Hash\n链地址法"]
+        RBT["RBTREE\n红黑树"]
+        SKP["Skiptable\n跳表"]
+        DOC["Doc\n两层哈希"]
     end
 
     subgraph 功能层
-        TTL[TTL 过期<br/>哈希索引+最小堆]
-        LOCK[分布式锁<br/>LOCK/UNLOCK/RENEW]
-        MEM[内存管理<br/>libc/jemalloc/custom]
+        TTL["TTL 过期\n哈希索引+最小堆"]
+        LOCK["分布式锁\nLOCK/UNLOCK/RENEW"]
+        MEM["内存管理\nlibc/jemalloc/custom"]
     end
 
     subgraph 持久化
-        DMP[Dump<br/>KVSD 二进制<br/>mmap 恢复]
-        AOF[AOF<br/>RESP 命令<br/>io_uring 写入]
+        DMP["Dump\nKVSD 二进制\nmmap 恢复"]
+        AOF["AOF\nRESP 命令\nio_uring 写入"]
     end
 
     subgraph 主从复制
         TCP[TCP 传输]
-        RDMA[RDMA SEND/RECV<br/>全量同步]
-        EBPF[eBPF sockmap<br/>增量同步]
-        KPR[kprobe+RDMA WRITE<br/>增量同步]
+        RDMA["RDMA SEND/RECV\n全量同步"]
+        EBPF["eBPF sockmap\n增量同步"]
+        KPR["kprobe+RDMA WRITE\n增量同步"]
     end
 
     subgraph 监控
         INF[INFO]
         MEMS[MEMSTAT]
-        SNP[AutoSnapshot<br/>BGSAVE]
+        SNP["AutoSnapshot\nBGSAVE"]
     end
 
     C1 & C2 & C3 --> REA & PRO & NTY
@@ -416,7 +414,7 @@ graph TB
     CMD --> TCP & RDMA & EBPF & KPR
     ARR & HSH & RBT & SKP & DOC --> MEM
     CMD --> INF & MEMS & SNP
-    TTL -.->|主动过期<br/>kvs_active_expire_cycle| REA
+    TTL -.->|主动过期\nkvs_active_expire_cycle| REA
 ```
 
 ### 命令执行流程
@@ -586,17 +584,17 @@ graph TB
     end
 
     subgraph 存储引擎
-        ARR["Array<br/>O(n) ≤1024"]
-        HSH["Hash<br/>O(1) avg"]
-        RBT["RBTREE<br/>O(log n)"]
-        SKP["Skiptable<br/>O(log n) avg"]
-        DOC["Doc<br/>两层 Hash"]
+        ARR["Array\nO(n) ≤1024"]
+        HSH["Hash\nO(1) avg"]
+        RBT["RBTREE\nO(log n)"]
+        SKP["Skiptable\nO(log n) avg"]
+        DOC["Doc\n两层 Hash"]
     end
 
     subgraph 统一功能层
-        TTL["TTL 过期<br/>kvs_expire_set/get/del"]
-        PERSIST["持久化<br/>persist_append_raw"]
-        REPL["主从复制<br/>repl_broadcast"]
+        TTL["TTL 过期\nkvs_expire_set/get/del"]
+        PERSIST["持久化\npersist_append_raw"]
+        REPL["主从复制\nrepl_broadcast"]
     end
 
     CMD --> PREFIX
@@ -2873,7 +2871,7 @@ graph TB
     DECIDE -->|大内存| LARGE["mmap 直接分配"]
 
     subgraph Slab 分配器
-        CLASS0["class[0]: 32B<br/>free_list → chunk → chunk"]
+        CLASS0["class[0]: 32B\nfree_list → chunk → chunk"]
         CLASS1["class[1]: 64B"]
         CLASS2["class[2]: 128B"]
         CLASS3["class[3]: 256B"]
@@ -2882,8 +2880,8 @@ graph TB
         CLASS6["class[6]: 768B"]
         CLASS7["class[7]: 1024B"]
 
-        GROW["slab_grow_locked()<br/>mmap 申请 64KB/256KB 页面"]
-        CHUNK["切分为等大小 chunk<br/>→ 串入 free_list"]
+        GROW["slab_grow_locked()\nmmap 申请 64KB/256KB 页面"]
+        CHUNK["切分为等大小 chunk\n→ 串入 free_list"]
     end
 
     SMALL --> CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7
@@ -2898,7 +2896,7 @@ graph TB
     LARGE --> LARGE_ALLOC
 
     subgraph 回退机制
-        FALLBACK["fallback_malloc()<br/>→ malloc"]
+        FALLBACK["fallback_malloc()\n→ malloc"]
     end
 
     CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7 -->|mmap 失败| FALLBACK

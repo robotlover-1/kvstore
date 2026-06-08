@@ -55,11 +55,15 @@ static struct {
     int port;
     int count;
     int batch;
+    const char *dump_path;
+    const char *aof_path;
 } g_opt = {
     .host = "192.168.233.128",
     .port = 5160,
     .count = 50000,
     .batch = 1000,
+    .dump_path = "kvstore.dump",
+    .aof_path = "kvstore.aof",
 };
 
 /* ---------- 辅助函数 ---------- */
@@ -284,6 +288,8 @@ static int parse_config_file(const char *path) {
         else if (strcmp(key, "port") == 0) g_opt.port = atoi(val);
         else if (strcmp(key, "count") == 0) g_opt.count = atoi(val);
         else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+        else if (strcmp(key, "dump_path") == 0) g_opt.dump_path = strdup(val);
+        else if (strcmp(key, "aof_path") == 0) g_opt.aof_path = strdup(val);
     }
     fclose(fp);
     return 0;
@@ -303,6 +309,10 @@ int main(int argc, char **argv) {
             g_opt.count = atoi(argv[++i]);
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc)
             g_opt.batch = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-path") == 0 && i + 1 < argc)
+            g_opt.dump_path = argv[++i];
+        else if (strcmp(argv[i], "--aof-path") == 0 && i + 1 < argc)
+            g_opt.aof_path = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("用法: %s [选项]\n", argv[0]);
             printf("\n增量持久化演示 (AOF):\n");
@@ -316,6 +326,8 @@ int main(int argc, char **argv) {
             printf("  --port PORT     kvstore 端口 (默认 %d)\n", g_opt.port);
             printf("  --count N       写入数据量 (默认 %d)\n", g_opt.count);
             printf("  --batch N       每批写入量 (默认 %d)\n", g_opt.batch);
+            printf("  --dump-path PATH  dump 文件路径 (默认 %s)\n", g_opt.dump_path);
+            printf("  --aof-path PATH    AOF 文件路径 (默认 %s)\n", g_opt.aof_path);
             printf("  --config PATH   加载配置文件 (默认 tests/test.conf)\n");
             printf("  -h              显示此帮助\n");
             printf("\n示例:\n");
@@ -397,8 +409,8 @@ int main(int argc, char **argv) {
     fd = -1;
 
     /* 显示持久化文件信息 */
-    long long dump_sz = file_size("kvstore.dump");
-    long long aof_sz = file_size("kvstore.aof");
+    long long dump_sz = file_size(g_opt.dump_path);
+    long long aof_sz = file_size(g_opt.aof_path);
     stat_line("dump 文件", fmt_bytes(dump_sz));
     stat_line("aof  文件", fmt_bytes(aof_sz));
     info("");

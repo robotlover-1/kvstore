@@ -431,17 +431,17 @@ sequenceDiagram
     participant REP as 复制
 
     C->>N: PING/SET/GET ...
-    N->>R: epoll_wait → on_read()
-    R->>R: parse_resp_stream(buf)
-    R->>H: handle_parsed_command()
-    H->>T: try_expire(key)
+    N->>R: "epoll_wait → on_read()"
+    R->>R: "parse_resp_stream(buf)"
+    R->>H: "handle_parsed_command()"
+    H->>T: "try_expire(key)"
     T-->>H: 已过期？删除
     H->>E: engine_set/get/del
-    E-->>H: +OK / $value
-    H->>P: persist_append_raw()  ← 写 AOF
-    H->>REP: repl_broadcast()     ← 主从复制
-    H->>N: queue_bytes(resp)
-    N->>C: on_write() → send()
+    E-->>H: "+OK / $value"
+    H->>P: "persist_append_raw()  ← 写 AOF"
+    H->>REP: "repl_broadcast()     ← 主从复制"
+    H->>N: "queue_bytes(resp)"
+    N->>C: "on_write() → send()"
 ```
 
 ### 存储引擎 — 五种数据结构
@@ -725,27 +725,27 @@ sequenceDiagram
     C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n
     C->>C: snprintf: *3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n
 
-    C->>K: send(buf, len)    ← 一次发送 N 条命令
-    Note over K: on_read() → recv() 到 inbuf
+    C->>K: "send(buf, len)    ← 一次发送 N 条命令"
+    Note over K: "on_read() → recv() 到 inbuf"
 
     loop 逐条解析
-        K->>K: parse_resp_stream(buf, &in_len)
-        Note over K: while(pos < *len)
+        K->>K: "parse_resp_stream(buf, &in_len)"
+        Note over K: "while(pos < *len)"
         K->>K: 解析 *N → argc, argv
-        K->>K: handle_parsed_command(SET k1 v1)
-        K->>K: queue_bytes(+OK\r\n)
+        K->>K: "handle_parsed_command(SET k1 v1)"
+        K->>K: "queue_bytes(+OK\r\n)"
         K->>K: 解析 *N → argc, argv
-        K->>K: handle_parsed_command(SET k2 v2)
-        K->>K: queue_bytes(+OK\r\n)
+        K->>K: "handle_parsed_command(SET k2 v2)"
+        K->>K: "queue_bytes(+OK\r\n)"
         K->>K: 解析 *N → argc, argv
-        K->>K: handle_parsed_command(SET k3 v3)
-        K->>K: queue_bytes(+OK\r\n)
+        K->>K: "handle_parsed_command(SET k3 v3)"
+        K->>K: "queue_bytes(+OK\r\n)"
     end
 
-    Note over K: on_write() → send() 全部响应
-    K->>C: +OK\r\n+OK\r\n+OK\r\n    ← 一次性读回
+    Note over K: "on_write() → send() 全部响应"
+    K->>C: "+OK\r\n+OK\r\n+OK\r\n    ← 一次性读回"
 
-    Note over C: count_ok() 验证所有响应
+    Note over C: "count_ok() 验证所有响应"
 ```
 
 **`parse_resp_stream` 的流水线实现**：解析器使用 `while` 循环不停消费缓冲区，每次解析一条完整命令就立即执行，
@@ -1054,20 +1054,20 @@ sequenceDiagram
     participant K as kvstore
     participant F as kvstore.dump
 
-    C->>K: SAVE (同步)
-    K->>K: kvs_snapshot_to_fp(fp)
+    C->>K: "SAVE (同步)"
+    K->>K: "kvs_snapshot_to_fp(fp)"
     Note over K: 遍历所有存储引擎
-    K->>F: [4B klen][key][4B vlen][value]
-    K->>F: [4B klen][key][4B vlen][value]
+    K->>F: "[4B klen][key][4B vlen][value]"
+    K->>F: "[4B klen][key][4B vlen][value]"
     K->>F: ...
-    K-->>C: +OK
+    K-->>C: "+OK"
 
-    Note over C,K: BGSAVE (异步，fork 子进程)
+    Note over C,K: "BGSAVE (异步，fork 子进程)"
     C->>K: BGSAVE
-    K->>K: fork()
+    K->>K: "fork()"
     Note over K: 子进程执行 kvs_snapshot_to_fp
     Note over K: 父进程继续服务
-    K-->>C: +Background saving started
+    K-->>C: "+Background saving started"
 ```
 
 **二进制格式**：
@@ -1142,18 +1142,18 @@ sequenceDiagram
     participant D as kvstore.dump
     participant A as kvstore.aof
 
-    K->>K: persist_recover()
+    K->>K: "persist_recover()"
     Note over K: g_persist_recovering = 1
 
-    K->>D: replay_dump_file(dump_path)
+    K->>D: "replay_dump_file(dump_path)"
     Note over D: mmap → 遍历 KVSD 二进制
     Note over K: 全量数据恢复 ✓
 
-    K->>A: replay_file(aof_path)
+    K->>A: "replay_file(aof_path)"
     Note over A: mmap → parse_resp_stream → 重放命令
     Note over K: 增量命令恢复 ✓
 
-    K->>K: ftruncate(g_aof_fd, 0)
+    K->>K: "ftruncate(g_aof_fd, 0)"
     Note over K: AOF 截断，防止跨 session 累积
 
     K->>K: g_persist_recovering = 0
@@ -1342,18 +1342,18 @@ sequenceDiagram
     participant A as kvstore.aof
 
     C->>K: SET key value
-    K->>K: handle_parsed_command()
-    K->>K: engine_set(key, value)     ← 写入内存
-    K->>K: persist_append_raw(raw)    ← 追加到 AOF
+    K->>K: "handle_parsed_command()"
+    K->>K: "engine_set(key, value)     ← 写入内存"
+    K->>K: "persist_append_raw(raw)    ← 追加到 AOF"
     Note over K: raw 是原始 RESP 命令
-    K->>A: io_uring_prep_write(SET)\nor pwrite(SET)\n
+    K->>A: "io_uring_prep_write(SET)\nor pwrite(SET)\n"
     alt fsync=always
-        K->>A: io_uring_prep_fsync()
+        K->>A: "io_uring_prep_fsync()"
         Note over K: 每条命令后刷盘
     else fsync=everysec
         Note over K: 每秒批量 fsync
     end
-    K-->>C: +OK
+    K-->>C: "+OK"
 ```
 
 **AOF 文件内容示例**：
@@ -1376,24 +1376,24 @@ kvstore 的 AOF 持久化使用 **io_uring** 进行异步文件 I/O，与内核�
 ```mermaid
 sequenceDiagram
     participant U as 用户态
-    participant SQ as SQ (Submission Queue)
+    participant SQ as "SQ (Submission Queue)"
     participant K as 内核
-    participant CQ as CQ (Completion Queue)
+    participant CQ as "CQ (Completion Queue)"
 
-    Note over U: persist_write_fd_uring()
-    U->>SQ: io_uring_get_sqe() → 获取空闲 SQE 槽
-    U->>SQ: io_uring_prep_write(sqe, fd, buf, len, offset)
-    Note over SQ: SQE[0] = {op=WRITE, fd, buf, len, offset}
+    Note over U: "persist_write_fd_uring()"
+    U->>SQ: "io_uring_get_sqe() → 获取空闲 SQE 槽"
+    U->>SQ: "io_uring_prep_write(sqe, fd, buf, len, offset)"
+    Note over SQ: "SQE[0] = {op=WRITE, fd, buf, len, offset}"
 
-    U->>K: io_uring_submit_and_wait(uring, 1)
+    U->>K: "io_uring_submit_and_wait(uring, 1)"
     Note over K: 从 SQ 取出 SQE
-    K->>K: 后台异步执行 pwrite(fd, buf, len, offset)
+    K->>K: "后台异步执行 pwrite(fd, buf, len, offset)"
     Note over K: 不阻塞用户线程！
     K->>CQ: 写入完成 → 写入 CQE
-    Note over CQ: CQE[0] = {res=写入字节数}
+    Note over CQ: "CQE[0] = {res=写入字节数}"
 
-    U->>CQ: io_uring_wait_cqe() → 读取完成结果
-    U->>CQ: io_uring_cqe_seen() → 释放 CQE 槽
+    U->>CQ: "io_uring_wait_cqe() → 读取完成结果"
+    U->>CQ: "io_uring_cqe_seen() → 释放 CQE 槽"
     Note over U: 写入完成 ✓
 ```
 
@@ -1653,21 +1653,21 @@ SAVE 是**同步阻塞**操作，直接在主线程中遍历所有引擎，将�
 ```mermaid
 sequenceDiagram
     participant C as 客户端
-    participant K as kvstore(主线程)
+    participant K as "kvstore(主线程)"
     participant F as kvstore.dump
 
     C->>K: SAVE
-    Note over K: handle_parsed_command()
-    K->>K: persist_save_dump()
-    K->>F: open(path, O_WRONLY|O_CREAT|O_TRUNC)
-    K->>K: kvs_dump_to_fd(fd)
+    Note over K: "handle_parsed_command()"
+    K->>K: "persist_save_dump()"
+    K->>F: "open(path, O_WRONLY|O_CREAT|O_TRUNC)"
+    K->>K: "kvs_dump_to_fd(fd)"
     Note over K: 遍历 Array/Hash/RBTREE/Skiptable/Doc
-    K->>F: [4B klen][key][4B vlen][value]...
-    K->>K: persist_fsync_fd(fd)  ← fsync 刷盘
+    K->>F: "[4B klen][key][4B vlen][value]..."
+    K->>K: "persist_fsync_fd(fd)  ← fsync 刷盘"
     K->>F: close
-    K->>K: persist_mark_snapshot_success()
+    K->>K: "persist_mark_snapshot_success()"
     Note over K: 更新 dirty_counter
-    K-->>C: +OK
+    K-->>C: "+OK"
     Note over C,K: 全程阻塞，不处理其他请求
 ```
 
@@ -1732,31 +1732,31 @@ BGSAVE 通过 **fork 子进程** 实现非阻塞备份。子进程继承 fork �
 ```mermaid
 sequenceDiagram
     participant C as 客户端
-    participant K as kvstore(父进程)
-    participant CH as kvstore(子进程)
+    participant K as "kvstore(父进程)"
+    participant CH as "kvstore(子进程)"
     participant F as kvstore.dump
 
     C->>K: BGSAVE
-    K->>K: persist_bgsave_start()
+    K->>K: "persist_bgsave_start()"
     Note over K: 记录 snap_dirty = dirty_counter
-    K->>K: fork()
+    K->>K: "fork()"
 
     par 父进程继续服务
-        K-->>C: +Background saving started
-        Note over K: persist_autosnap_cron()
+        K-->>C: "+Background saving started"
+        Note over K: "persist_autosnap_cron()"
         loop 每 100ms 轮询
-            K->>K: waitpid(WNOHANG) 检查子进程
+            K->>K: "waitpid(WNOHANG) 检查子进程"
         end
     and 子进程后台写 dump
-        CH->>CH: persist_save_dump_to(tmp_path)
-        CH->>F: [4B klen][key][4B vlen][value]...
-        CH->>CH: persist_fsync_fd(fd)
-        CH->>CH: rename(tmp → dump_path)  ← 原子替换
-        CH->>CH: _exit(0)
+        CH->>CH: "persist_save_dump_to(tmp_path)"
+        CH->>F: "[4B klen][key][4B vlen][value]..."
+        CH->>CH: "persist_fsync_fd(fd)"
+        CH->>CH: "rename(tmp → dump_path)  ← 原子替换"
+        CH->>CH: "_exit(0)"
     end
 
     Note over K: waitpid 返回子进程退出
-    K->>K: persist_mark_snapshot_success(snap_dirty)
+    K->>K: "persist_mark_snapshot_success(snap_dirty)"
     Note over K: 更新脏计数
 ```
 
@@ -1895,39 +1895,39 @@ AOF 文件随时间增长会越来越庞大，BGREWRITEAOF 通过 fork 子进程
 ```mermaid
 sequenceDiagram
     participant C as 客户端
-    participant K as kvstore(父进程)
-    participant CH as kvstore(子进程)
+    participant K as "kvstore(父进程)"
+    participant CH as "kvstore(子进程)"
     participant A as kvstore.aof
 
     C->>K: BGREWRITEAOF
-    K->>K: persist_force_aof_flush()    ← 先刷旧 AOF
-    K->>K: free_rewrite_buffer_locked() ← 清空旧缓存
-    K->>K: fork()
+    K->>K: "persist_force_aof_flush()    ← 先刷旧 AOF"
+    K->>K: "free_rewrite_buffer_locked() ← 清空旧缓存"
+    K->>K: "fork()"
 
     par 父进程继续服务
-        K-->>C: +Background AOF rewriting started
+        K-->>C: "+Background AOF rewriting started"
         Note over K: 新写命令两条路
-        K->>A: persist_append_raw() → 写旧 AOF
+        K->>A: "persist_append_raw() → 写旧 AOF"
         Note over K: 同时缓存到 rewrite_buf 链表
-        K->>K: append_to_rewrite_buffer(buf, len)
+        K->>K: "append_to_rewrite_buffer(buf, len)"
         loop 每 100ms 轮询
-            K->>K: waitpid(WNOHANG)
+            K->>K: "waitpid(WNOHANG)"
         end
     and 子进程写快照
-        CH->>CH: kvs_snapshot_to_fd(tmp)
+        CH->>CH: "kvs_snapshot_to_fd(tmp)"
         Note over CH: 遍历引擎写 RESP 命令
-        CH->>CH: persist_fsync_fd(fd)
-        CH->>CH: _exit(0)
+        CH->>CH: "persist_fsync_fd(fd)"
+        CH->>CH: "_exit(0)"
     end
 
-    Note over K: 子进程完成 → finalize_rewrite_parent()
-    K->>K: 打开临时文件(O_APPEND)
+    Note over K: "子进程完成 → finalize_rewrite_parent()"
+    K->>K: "打开临时文件(O_APPEND)"
     K->>K: 遍历 rewrite_buf 链表
     Note over K: 将缓存命令追加到临时文件末尾
-    K->>K: persist_flush_aof_fd()  ← fsync
-    K->>K: rename(tmp → aof_path)  ← 原子替换
+    K->>K: "persist_flush_aof_fd()  ← fsync"
+    K->>K: "rename(tmp → aof_path)  ← 原子替换"
     K->>K: 关闭旧 fd，打开新 AOF 文件
-    K->>K: free_rewrite_buffer_locked()
+    K->>K: "free_rewrite_buffer_locked()"
     Note over K: 清理缓存
 ```
 
@@ -2159,18 +2159,18 @@ sequenceDiagram
     participant D as kvstore.dump
     participant A as kvstore.aof
 
-    K->>K: persist_recover()
+    K->>K: "persist_recover()"
     Note over K: g_persist_recovering = 1
 
-    K->>D: replay_dump_file(dump_path)
+    K->>D: "replay_dump_file(dump_path)"
     Note over D: mmap → 遍历 KVSD 二进制
     Note over K: 全量数据恢复 ✓
 
-    K->>A: replay_file(aof_path)
+    K->>A: "replay_file(aof_path)"
     Note over A: mmap → parse_resp_stream → 重放命令
     Note over K: 增量命令恢复 ✓
 
-    K->>A: ftruncate(aof_fd, 0)
+    K->>A: "ftruncate(aof_fd, 0)"
     Note over K: AOF 截断，防止跨 session 累积
 
     K->>K: g_persist_recovering = 0
@@ -2218,7 +2218,7 @@ sequenceDiagram
     T->>T: 提示用户停止 kvstore
     T->>T: 等待断开
     T->>T: 提示用户重启 kvstore
-    K->>K: 启动 → persist_recover()
+    K->>K: "启动 → persist_recover()"
     K->>D: mmap 读取 dump
     K->>A: mmap 重放 AOF
     Note over K: 数据恢复完成
@@ -2297,22 +2297,22 @@ sequenceDiagram
     S->>M: REPLSYNC <replid> <offset>
     M->>M: backlog_can_continue?
     alt 部分同步成功
-        M->>S: +CONTINUE <replid> <end_offset>
-        M->>S: backlog[offset..end_offset]
+        M->>S: "+CONTINUE <replid> <end_offset>"
+        M->>S: "backlog[offset..end_offset]"
     else 需要全量同步
-        M->>S: +FULLRESYNC <replid> <offset> <bytes>
-        M->>M: queue_snapshot()
+        M->>S: "+FULLRESYNC <replid> <offset> <bytes>"
+        M->>M: "queue_snapshot()"
         loop 分块 snapshot
-            M->>S: [KVSD 二进制]
+            M->>S: "[KVSD 二进制]"
         end
         M->>S: REPLDONE
-        Note over S: repl_slave_finish_fullsync()
+        Note over S: "repl_slave_finish_fullsync()"
     end
     Note over M,S: 增量阶段
     loop 每条写命令
-        M->>M: repl_broadcast(raw)
+        M->>M: "repl_broadcast(raw)"
         M--)S: [TCP/ebpf/kprobe-RDMA]
-        S-->>M: REPLACK (每秒)
+        S-->>M: "REPLACK (每秒)"
     end
 ```
 
@@ -3762,11 +3762,11 @@ redis-cli -p 6381 SET should_fail x
 ```mermaid
 sequenceDiagram
     participant T as test_repl_gap
-    participant U as 用户 (手动)
+    participant U as "用户 (手动)"
     participant M as Master
     participant S as Slave
 
-    T->>M: 预存 pre 数据 (30000条 HSET)
+    T->>M: "预存 pre 数据 (30000条 HSET)"
 
     Note over T: 提示用户启动 Slave
     T->>S: 轮询 slave_fullsync_loading=1
@@ -3780,11 +3780,11 @@ sequenceDiagram
     Note over U: 输入实际写入的条数
     Note over U,M: gap 数据进入 backlog
 
-    M->>S: REPLDONE + repl_backlog_write_range()
+    M->>S: "REPLDONE + repl_backlog_write_range()"
     Note over M,S: gap 数据补发到 Slave
 
-    T->>M: 写入 post 数据 (5000条 HSET)  ← 正常增量同步
-    Note over M,S: repl_broadcast() 实时同步
+    T->>M: "写入 post 数据 (5000条 HSET)  ← 正常增量同步"
+    Note over M,S: "repl_broadcast() 实时同步"
 
     T->>M: HGET pre/gap/post 验证
     T->>S: HGET pre/gap/post 验证

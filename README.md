@@ -726,29 +726,54 @@ if (buf[pos] == '+') {
     if (pos + 1 >= *len) break;              // 不完整，保留等下次
     if (pos > line_start) {
         size_t line_len = pos - line_start;
-        char *line = kvs_malloc(line_len + 1);
-        memcpy(line, buf + line_start, line_len);
-        line[line_len] = '\0';
+        char *line = (char *)kvs_malloc(line_len + 1);
+        if (line) {                          // kvs_malloc 可能返回 NULL
+            memcpy(line, buf + line_start, line_len);
+            line[line_len] = '\0';
 
-        char *argv[8] = {0};
-        int argc = split_inline_argv(line, argv, 8);  // 空格分割参数
+            char *argv[8] = {0};
+            int argc = split_inline_argv(line, argv, 8);  // 空格分割参数
 
-        // +KPROBERDMA <rkey> <addr> <size> <slots> <cap>  — MR 信息交换
-        if (argc >= 6 && !strcmp(argv[0], "KPROBERDMA")) {
-            if (g_cfg.role == ROLE_MASTER)              // 仅 master 处理
-                repl_kprobe_rdma_parse_mr_info_direct(
-                    strtoull(argv[1]), strtoull(argv[2]),
-                    strtoull(argv[3]), strtoull(argv[4]), strtoull(argv[5]));
+            // +KPROBERDMA <rkey> <addr> <size> <slots> <cap>  — MR 信息交换
+            if (argc >= 6 && !strcmp(argv[0], "KPROBERDMA")) {
+                unsigned long rkey = (unsigned long)strtoull(argv[1], NULL, 10);
+                unsigned long addr = (unsigned long)strtoull(argv[2], NULL, 10);
+                fprintf(stderr, "kprobe rdma: +KPROBERDMA received (role=%s) rkey=%lu addr=0x%lx\n",
+                    g_cfg.role == ROLE_MASTER ? "master" : "slave", rkey, addr);
+                if (g_cfg.role == ROLE_MASTER)              // 仅 master 处理
+                    repl_kprobe_rdma_parse_mr_info_direct(rkey, addr,
+                        (size_t)strtoull(argv[3], NULL, 10),
+                        (size_t)strtoull(argv[4], NULL, 10),
+                        (size_t)strtoull(argv[5], NULL, 10));
+            }
+            // +FULLRESYNC <replid> <offset> [target_bytes] — 全量同步开始（仅 slave 复制流）
+            else if (from_replication && argc >= 3 && !strcmp(argv[0], "FULLRESYNC")) {
+                unsigned long long fullsync_target = argc >= 4 ?
+                    (unsigned long long)strtoull(argv[3], NULL, 10) : 0;
+                repl_slave_set_sync_state(argv[1],
+                    (unsigned long long)strtoull(argv[2], NULL, 10),
+                    (unsigned long long)strtoull(argv[2], NULL, 10),
+                    1, fullsync_target);
+                repl_rdma_log("slave_parse - FULLRESYNC replid=%s offset=%s target=%s",
+                    argv[1], argv[2], argc >= 4 ? argv[3] : "0");
+            }
+            // +CONTINUE <replid> <offset> — 增量同步继续（仅 slave 复制流）
+            else if (from_replication && argc >= 3 && !strcmp(argv[0], "CONTINUE")) {
+                unsigned long long continue_end =
+                    (unsigned long long)strtoull(argv[2], NULL, 10);
+                unsigned long long continue_start = repl_slave_offset();
+                unsigned long long durable_start = repl_slave_durable_offset();
+                if (continue_end < continue_start)
+                    continue_end = continue_start;
+                repl_slave_set_sync_state(argv[1],
+                    continue_start, durable_start, 0, 0);
+                repl_slave_send_ack();
+                repl_rdma_log("slave_parse - CONTINUE replid=%s start_offset=%llu "
+                    "durable_offset=%llu end_offset=%llu",
+                    argv[1], continue_start, durable_start, continue_end);
+            }
+            kvs_free(line);
         }
-        // +FULLRESYNC <replid> <offset> — 全量同步开始（仅 slave 复制流）
-        else if (from_replication && argc >= 3 && !strcmp(argv[0], "FULLRESYNC"))
-            repl_slave_set_sync_state(argv[1], strtoull(argv[2]), 1);
-
-        // +CONTINUE <replid> <offset> — 增量同步继续（仅 slave 复制流）
-        else if (from_replication && argc >= 3 && !strcmp(argv[0], "CONTINUE"))
-            repl_slave_set_sync_state(argv[1], offset, 0);
-
-        kvs_free(line);
     }
     pos += 2;  // 跳过 \r\n
     continue;
@@ -763,75 +788,85 @@ RESP 数组是 kvstore 的主要命令格式，结构为 `*<argc>\r\n$<len>\r\n<
 
 ```c
 // src/main/kvstore.c — parse_resp_stream (*) 数组分支
-if (buf[pos] == '*') {
-    size_t start = pos;      // 命令起始，用于 raw 指针
-    p = pos + 1;
+// 无 if 包裹：inline 分支用 if (buf[pos] != '*') 排除后自然落到此处
+size_t start = pos, p = pos + 1;
+int incomplete = 0;
+int malformed = 0;
 
-    // 扫描 \r\n 得到参数个数文本，拷贝到 nbuf[32] 防越界
-    while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
-    if (p + 1 >= *len) break;                      // 不完整，保留
-    if (p - (pos + 1) >= 32) { pos = p + 2; continue; }  // 长度字段超限
+// 扫描 \r\n 得到参数个数文本，拷贝到 nbuf[32] 防越界
+while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
+if (p + 1 >= *len) break;                      // 不完整，保留
+if (p - (pos + 1) >= 32) { pos = p + 2; continue; }  // 长度字段超限
 
-    char nbuf[32] = {0};
-    memcpy(nbuf, buf + pos + 1, p - (pos + 1));
-    int argc = atoi(nbuf);
+char nbuf[32] = {0};
+memcpy(nbuf, buf + pos + 1, p - (pos + 1));
+int argc = atoi(nbuf);
 
-    if (argc <= 0 || argc > 32) {                  // 参数个数限制
-        if (c) { char r[64]; resp_error(r, "$-ERR invalid argc\r\n");
-                queue_bytes(c, r, strlen(r)); }
-        pos = p + 2; continue;
+if (argc <= 0 || argc > 32) {                  // 参数个数限制
+    if (c) {
+        char r[64];
+        int n = resp_error(r, sizeof(r), "invalid argc");
+        queue_bytes(c, (unsigned char *)r, (size_t)n);
     }
-    p += 2;                                         // 跳过 \r\n
-
-    char *argv[32] = {0};
-    size_t argl[32] = {0};
-    int incomplete = 0, malformed = 0;
-
-    for (int i = 0; i < argc; ++i) {                // 逐个解析 bulk
-        if (p >= *len) { incomplete = 1; break; }
-        if (buf[p] != '$') { malformed = 1; break; }
-
-        size_t lp = p + 1;
-        // 扫描长度字段 \r\n，拷贝到 lbuf[32] 后用 strtol 解析
-        while (lp + 1 < *len && !(buf[lp] == '\r' && buf[lp + 1] == '\n')) lp++;
-        if (lp + 1 >= *len) { incomplete = 1; break; }
-        if (lp - (p + 1) >= 32) { malformed = 1; break; }
-
-        char lbuf[32] = {0};
-        memcpy(lbuf, buf + p + 1, lp - (p + 1));
-        char *endp = NULL;
-        long blen = strtol(lbuf, &endp, 10);
-        if (!endp || *endp != '\0' || blen < 0) {   // 格式错误/负长度
-            malformed = 1; break;
-        }
-
-        p = lp + 2;                                 // 跳过 $len\r\n
-        if (p + (size_t)blen + 2 > *len) { incomplete = 1; break; }
-
-        argv[i] = kvs_malloc((size_t)blen + 1);
-        memcpy(argv[i], buf + p, (size_t)blen);     // 按长度拷贝，二进制安全
-        argv[i][blen] = '\0';
-        argl[i] = (size_t)blen;
-        p += (size_t)blen;
-
-        if (!(buf[p] == '\r' && buf[p + 1] == '\n')) { malformed = 1; break; }
-        p += 2;                                     // 跳过 data\r\n
-    }
-
-    if (incomplete) {                               // 数据不完整
-        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
-        break;                                      // 保留缓冲区等下次 recv
-    }
-    if (malformed) {                                // 格式错误
-        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
-        if (p > start) pos = p; else break;         // 尽量跳过坏数据
-        continue;
-    }
-
-    handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
-    for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
-    pos = p;                                         // 前进到下一命令
+    pos = p + 2;
+    continue;
 }
+p += 2;                                         // 跳过 \r\n
+
+char *argv[32] = {0};
+size_t argl[32] = {0};
+
+for (int i = 0; i < argc; ++i) {                // 逐个解析 bulk
+    if (p >= *len) { incomplete = 1; break; }
+    if (buf[p] != '$') { malformed = 1; break; }
+
+    size_t lp = p + 1;
+    // 扫描长度字段 \r\n，拷贝到 lbuf[32] 后用 strtol 解析
+    while (lp + 1 < *len && !(buf[lp] == '\r' && buf[lp + 1] == '\n')) lp++;
+    if (lp + 1 >= *len) { incomplete = 1; break; }
+    if (lp - (p + 1) >= 32) { malformed = 1; break; }
+
+    char lbuf[32] = {0};
+    memcpy(lbuf, buf + p + 1, lp - (p + 1));
+    char *endp = NULL;
+    long blen = strtol(lbuf, &endp, 10);
+    if (!endp || *endp != '\0' || blen < 0) {   // 格式错误/负长度
+        malformed = 1;
+        if (c) {
+            char r[128];
+            int n = resp_error(r, sizeof(r), "invalid bulk length");
+            queue_bytes(c, (unsigned char *)r, (size_t)n);
+        }
+        break;
+    }
+
+    p = lp + 2;                                 // 跳过 $len\r\n
+    if (p + (size_t)blen + 2 > *len) { incomplete = 1; break; }
+
+    argv[i] = (char *)kvs_malloc((size_t)blen + 1);
+    if (!argv[i]) { malformed = 1; break; }     // OOM
+    memcpy(argv[i], buf + p, (size_t)blen);     // 按长度拷贝，二进制安全
+    argv[i][blen] = '\0';
+    argl[i] = (size_t)blen;
+    p += (size_t)blen;
+
+    if (!(buf[p] == '\r' && buf[p + 1] == '\n')) { malformed = 1; break; }
+    p += 2;                                     // 跳过 data\r\n
+}
+
+if (incomplete) {                               // 数据不完整
+    for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+    break;                                      // 保留缓冲区等下次 recv
+}
+if (malformed) {                                // 格式错误
+    for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+    if (p > start) pos = p; else break;         // 尽量跳过坏数据
+    continue;
+}
+
+handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
+for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+pos = p;                                         // 前进到下一命令
 ```
 
 **关键设计**：
@@ -855,13 +890,20 @@ if (buf[pos] != '*') {
 
     size_t line_len = line_end - pos;
     if (line_len > 0 && buf[pos + line_len - 1] == '\r') line_len--;  // 去 \r
-    if (line_len == 0) { pos = line_end + 1; continue; }  // 空行跳过
+    if (line_len == 0) {
+        pos = line_end + 1;
+        continue;                                   // 空行跳过
+    }
 
-    char *line = kvs_malloc(line_len + 1);
+    char *line = (char *)kvs_malloc(line_len + 1);
     if (!line) {                                     // OOM
-        if (c) { char r[64]; resp_error(r, "oom");
-                queue_bytes(c, r, strlen(r)); }
-        pos = line_end + 1; continue;
+        if (c) {
+            char r[64];
+            int n = resp_error(r, sizeof(r), "oom");
+            queue_bytes(c, (unsigned char *)r, (size_t)n);
+        }
+        pos = line_end + 1;
+        continue;
     }
     memcpy(line, buf + pos, line_len);
     line[line_len] = '\0';

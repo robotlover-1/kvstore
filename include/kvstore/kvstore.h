@@ -55,6 +55,7 @@
 #define KVS_ENGINE_RBTREE     2
 #define KVS_ENGINE_HASH       3
 #define KVS_ENGINE_SKIPTABLE  4
+#define KVS_ENGINE_DOC        5
 
 #define ENABLE_ARRAY 1
 #define ENABLE_RBTREE 1
@@ -492,7 +493,7 @@ int persist_recover(void);
 int persist_recover_in_progress(void);
 int kvs_snapshot_to_fp(FILE *fp);
 int kvs_snapshot_to_fd(int fd);
-int kvs_dump_to_fd(int fd);
+int kvs_dump_to_fd(int fd, unsigned long long aof_offset);
 int kvs_load_dump_from_fd(int fd);
 int persist_bgsave_start(void);
 int persist_bgsave_poll(void);

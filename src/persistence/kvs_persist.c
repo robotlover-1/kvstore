@@ -141,9 +141,13 @@ int persist_fsync_fd(int fd) {
     return persist_fsync_fd_best_effort(fd);
 }
 
-static int replay_file_fread(const char *path) {
+static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
+    if (skip_bytes > 0 && fseeko(fp, (off_t)skip_bytes, SEEK_SET) != 0) {
+        fclose(fp);
+        return 0;
+    }
     unsigned char buf[BUFFER_CAP];
     size_t len = 0, n;
     unsigned long long total = 0;
@@ -157,7 +161,7 @@ static int replay_file_fread(const char *path) {
     return 0;
 }
 
-static int replay_file_mmap(const char *path) {
+static int replay_file_mmap(const char *path, unsigned long long skip_bytes) {
     int fd;
     struct stat st;
     unsigned char *mapped;
@@ -170,9 +174,9 @@ static int replay_file_mmap(const char *path) {
     if (fstat(fd, &st) != 0) {
         g_recover_mmap_fallbacks++;
         close(fd);
-        return replay_file_fread(path);
+        return replay_file_fread(path, skip_bytes);
     }
-    if (st.st_size <= 0) {
+    if ((unsigned long long)st.st_size <= skip_bytes) {
         close(fd);
         return 0;
     }
@@ -181,14 +185,14 @@ static int replay_file_mmap(const char *path) {
     if (mapped == MAP_FAILED) {
         g_recover_mmap_fallbacks++;
         close(fd);
-        return replay_file_fread(path);
+        return replay_file_fread(path, skip_bytes);
     }
 
     g_recover_mmap_success++;
-    g_recover_last_mmap_bytes += (unsigned long long)st.st_size;
+    g_recover_last_mmap_bytes += (unsigned long long)st.st_size - skip_bytes;
 
-    len = (size_t)st.st_size;
-    parse_resp_stream(NULL, mapped, &len, 1);
+    len = (size_t)st.st_size - (size_t)skip_bytes;
+    parse_resp_stream(NULL, mapped + skip_bytes, &len, 1);
     g_recover_last_tail_bytes += (unsigned long long)len;
 
     munmap(mapped, (size_t)st.st_size);
@@ -196,15 +200,29 @@ static int replay_file_mmap(const char *path) {
     return 0;
 }
 
-static int replay_file(const char *path) {
-    return replay_file_mmap(path);
+static int replay_file(const char *path, unsigned long long skip_bytes) {
+    return replay_file_mmap(path, skip_bytes);
 }
 
-static int replay_dump_file(const char *path) {
+/*
+ * 恢复 dump 文件（二进制格式）：
+ *   [8]  uint64_t aof_offset          — AOF 偏移量，用于跳过早期 AOF
+ *   重复：
+ *     [1]  uint8_t  engine_id         — KVS_ENGINE_xxx
+ *     [4]  uint32_t klen
+ *     [klen] key
+ *     [4]  uint32_t vlen
+ *     [vlen] value
+ *
+ * DOC 引擎的 value 格式：field1=val1 field2=val2 ...
+ * 返回 aof_offset
+ */
+static unsigned long long replay_dump_file(const char *path) {
     int fd;
     struct stat st;
     unsigned char *mapped;
     size_t pos = 0, size;
+    unsigned long long aof_offset = 0;
 
     fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -217,17 +235,24 @@ static int replay_dump_file(const char *path) {
     g_recover_mmap_success++;
     g_recover_last_mmap_bytes += (unsigned long long)size;
 
-    /* parse binary format: uint32_t klen, key, uint32_t vlen, value */
-    while (pos + 4 <= size) {
+    /* read AOF offset header */
+    if (pos + sizeof(aof_offset) > size) goto out;
+    memcpy(&aof_offset, mapped + pos, sizeof(aof_offset));
+    pos += sizeof(aof_offset);
+
+    /* parse entries: uint8_t engine, uint32_t klen, key, uint32_t vlen, value */
+    while (pos + 1 + 4 <= size) {
+        uint8_t engine_id;
         uint32_t klen, vlen;
         char *key, *value;
 
-        /* read key length */
+        engine_id = mapped[pos++];
+
+        if (pos + 4 > size) break;
         memcpy(&klen, mapped + pos, sizeof(klen));
         pos += sizeof(klen);
         if (pos + klen > size) break;
 
-        /* read key */
         key = (char *)kvs_malloc(klen + 1);
         if (!key) break;
         if (klen > 0) memcpy(key, mapped + pos, klen);
@@ -236,29 +261,66 @@ static int replay_dump_file(const char *path) {
 
         if (pos + 4 > size) { kvs_free(key); break; }
 
-        /* read value length */
         memcpy(&vlen, mapped + pos, sizeof(vlen));
         pos += sizeof(vlen);
         if (pos + vlen > size) { kvs_free(key); break; }
 
-        /* read value */
         value = (char *)kvs_malloc(vlen + 1);
         if (!value) { kvs_free(key); break; }
         if (vlen > 0) memcpy(value, mapped + pos, vlen);
         value[vlen] = '\0';
         pos += vlen;
 
-        kvs_hash_set(&global_hash, key, value);
+        /* dispatch to correct engine */
+        switch (engine_id) {
+        case KVS_ENGINE_ARRAY:
+            kvs_array_set(&global_array, key, value);
+            break;
+        case KVS_ENGINE_RBTREE:
+            kvs_rbtree_set(&global_rbtree, key, value);
+            break;
+        case KVS_ENGINE_HASH:
+            kvs_hash_set(&global_hash, key, value);
+            break;
+        case KVS_ENGINE_SKIPTABLE:
+            kvs_skiptable_set(&global_skiptable, key, value);
+            break;
+        case KVS_ENGINE_DOC:
+            /* DOC value format: "field1=val1 field2=val2 ..." */
+            {
+                char *tok, *saveptr;
+                char *dup = (char *)kvs_malloc(vlen + 1);
+                if (dup) {
+                    memcpy(dup, value, vlen);
+                    dup[vlen] = '\0';
+                    tok = strtok_r(dup, " ", &saveptr);
+                    while (tok) {
+                        char *eq = strchr(tok, '=');
+                        if (eq) {
+                            *eq = '\0';
+                            kvs_doc_set(&global_doc, key, tok, eq + 1);
+                        }
+                        tok = strtok_r(NULL, " ", &saveptr);
+                    }
+                    kvs_free(dup);
+                }
+            }
+            break;
+        default:
+            break;
+        }
+
         kvs_free(key);
         kvs_free(value);
 
         if (pos >= size) break;
     }
 
+out:
     g_recover_last_tail_bytes += (unsigned long long)pos;
     munmap(mapped, size);
     close(fd);
-    return 0;
+    return aof_offset;
 }
 
 static int persist_flush_aof_fd(int fd) {
@@ -267,11 +329,11 @@ static int persist_flush_aof_fd(int fd) {
     return 0;
 }
 
-static int persist_save_dump_to(const char *path) {
+static int persist_save_dump_to(const char *path, unsigned long long aof_offset) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     int rc;
     if (fd < 0) return -1;
-    rc = kvs_dump_to_fd(fd);
+    rc = kvs_dump_to_fd(fd, aof_offset);
     if (rc == 0 && persist_fsync_fd(fd) != 0) rc = -1;
     close(fd);
     return rc;
@@ -431,7 +493,8 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 }
 
 int persist_save_dump(void) {
-    int rc = persist_save_dump_to(g_cfg.dump_path);
+    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
+    int rc = persist_save_dump_to(g_cfg.dump_path, aof_off);
     if (rc == 0) persist_mark_snapshot_success(g_dirty_counter);
     return rc;
 }
@@ -457,12 +520,12 @@ int persist_recover(void) {
     g_recover_last_tail_bytes = 0;
 
     dump_begin_ms = kvs_now_ms();
-    replay_dump_file(g_cfg.dump_path);
+    unsigned long long aof_offset = replay_dump_file(g_cfg.dump_path);
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
     aof_begin_ms = kvs_now_ms();
     if (!g_aof_disabled) {
-        replay_file(g_cfg.aof_path);
+        replay_file(g_cfg.aof_path, aof_offset);
     }
     g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;
 
@@ -472,6 +535,10 @@ int persist_recover(void) {
     g_bgsave_last_end_ms = g_last_snapshot_ms;
     g_aof_last_flush_ms = g_last_snapshot_ms;
     g_aof_dirty = 0;
+
+    /* 清理恢复过程中已过期的 TTL key（短 TTL 可能在恢复期间已过期） */
+    kvs_active_expire_cycle(1000000);
+
     g_persist_recovering = 0;
 
     return 0;
@@ -481,6 +548,7 @@ int persist_bgsave_start(void) {
     if (g_bgsave_pid > 0) return 1;
 
     unsigned long long snap_dirty = g_dirty_counter;
+    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
     long long start_ms = kvs_now_ms();
     char tmp_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", g_cfg.dump_path, (long)getpid());
@@ -491,7 +559,7 @@ int persist_bgsave_start(void) {
         return -1;
     }
     if (pid == 0) {
-        int rc = persist_save_dump_to(tmp_path);
+        int rc = persist_save_dump_to(tmp_path, aof_off);
         if (rc == 0 && rename(tmp_path, g_cfg.dump_path) != 0) rc = -1;
         if (rc != 0) unlink(tmp_path);
         _exit(rc == 0 ? 0 : 1);

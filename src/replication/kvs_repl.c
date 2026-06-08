@@ -1919,7 +1919,7 @@ void repl_slave_finish_fullsync(void) {
      * 后续增量数据通过 AOF 持续写入 */
     int dump_fd = open(g_cfg.dump_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (dump_fd >= 0) {
-        if (kvs_dump_to_fd(dump_fd) == 0) {
+        if (kvs_dump_to_fd(dump_fd, 0) == 0) {
             fprintf(stderr, "repl: slave fullsync dump saved to %s\n", g_cfg.dump_path);
         } else {
             fprintf(stderr, "repl: slave fullsync dump write failed\n");

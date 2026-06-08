@@ -1989,8 +1989,10 @@ int kvs_snapshot_to_fd(int fd) {
 
 static int dump_skiptable_write_kv(const char *key, const char *value, void *arg) {
     int fd = *(int *)arg;
+    uint8_t engine = (uint8_t)KVS_ENGINE_SKIPTABLE;
     uint32_t klen = (uint32_t)strlen(key);
     uint32_t vlen = (uint32_t)strlen(value);
+    if (write(fd, &engine, sizeof(engine)) != sizeof(engine)) return -1;
     if (write(fd, &klen, sizeof(klen)) != sizeof(klen)) return -1;
     if (write(fd, key, klen) != (ssize_t)klen) return -1;
     if (write(fd, &vlen, sizeof(vlen)) != sizeof(vlen)) return -1;
@@ -1998,13 +2000,18 @@ static int dump_skiptable_write_kv(const char *key, const char *value, void *arg
     return 0;
 }
 
-int kvs_dump_to_fd(int fd) {
+int kvs_dump_to_fd(int fd, unsigned long long aof_offset) {
     if (fd < 0) return -1;
 
-    /* dump helper: write uint32_t klen + key + uint32_t vlen + value (binary, length-prefixed) */
-#define DUMP_WRITE_KV(key, value) do { \
+    /* header: AOF file size at dump creation time */
+    if (write(fd, &aof_offset, sizeof(aof_offset)) != sizeof(aof_offset)) return -1;
+
+    /* dump helper: write uint8_t engine + uint32_t klen + key + uint32_t vlen + value */
+#define DUMP_WRITE_KV(engine_id, key, value) do { \
+    uint8_t _eng = (uint8_t)(engine_id); \
     uint32_t _klen = (uint32_t)strlen(key); \
     uint32_t _vlen = (uint32_t)strlen(value); \
+    if (write(fd, &_eng, sizeof(_eng)) != sizeof(_eng)) return -1; \
     if (write(fd, &_klen, sizeof(_klen)) != sizeof(_klen)) return -1; \
     if (write(fd, key, _klen) != (ssize_t)_klen) return -1; \
     if (write(fd, &_vlen, sizeof(_vlen)) != sizeof(_vlen)) return -1; \
@@ -2015,7 +2022,7 @@ int kvs_dump_to_fd(int fd) {
     if (global_hash.nodes) {
         for (int i = 0; i < global_hash.max_slots; ++i) {
             for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
-                DUMP_WRITE_KV(node->key, node->value);
+                DUMP_WRITE_KV(KVS_ENGINE_HASH, node->key, node->value);
             }
         }
     }
@@ -2023,7 +2030,7 @@ int kvs_dump_to_fd(int fd) {
     /* iterate array entries */
     for (int i = 0; i < KVS_ARRAY_SIZE; ++i) {
         if (global_array.table && global_array.table[i].key) {
-            DUMP_WRITE_KV(global_array.table[i].key, global_array.table[i].value);
+            DUMP_WRITE_KV(KVS_ENGINE_ARRAY, global_array.table[i].key, global_array.table[i].value);
         }
     }
 
@@ -2040,7 +2047,7 @@ int kvs_dump_to_fd(int fd) {
                     cur = cur->left;
                 }
                 cur = stack[--top];
-                DUMP_WRITE_KV(cur->key, (char*)cur->value);
+                DUMP_WRITE_KV(KVS_ENGINE_RBTREE, cur->key, (char*)cur->value);
                 cur = cur->right;
             }
             kvs_free(stack);
@@ -2065,7 +2072,7 @@ int kvs_dump_to_fd(int fd) {
                 }
                 if (doc_pos > 0 && doc_buf[doc_pos-1] == ' ') doc_pos--;
                 doc_buf[doc_pos] = '\0';
-                DUMP_WRITE_KV(d->key, doc_buf);
+                DUMP_WRITE_KV(KVS_ENGINE_DOC, d->key, doc_buf);
             }
         }
     }

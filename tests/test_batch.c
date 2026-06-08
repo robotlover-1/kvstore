@@ -56,10 +56,14 @@ static struct {
     const char *host;
     int port;
     int count;
+    const char *dump_path;
+    const char *aof_path;
 } g_opt = {
     .host = "192.168.233.128",
     .port = 5160,
     .count = 10000,
+    .dump_path = "kvstore.dump",
+    .aof_path = "kvstore.aof",
 };
 
 /* ==== TCP / RESP 工具 ==== */
@@ -285,6 +289,8 @@ static int parse_config_file(const char *path) {
         if (strcmp(key, "host") == 0) g_opt.host = strdup(val);
         else if (strcmp(key, "port") == 0) g_opt.port = atoi(val);
         else if (strcmp(key, "count") == 0) g_opt.count = atoi(val);
+        else if (strcmp(key, "dump_path") == 0) g_opt.dump_path = strdup(val);
+        else if (strcmp(key, "aof_path") == 0) g_opt.aof_path = strdup(val);
     }
     fclose(fp);
     return 0;
@@ -300,6 +306,8 @@ static void print_usage(const char *prog) {
     printf("  --host HOST   kvstore 地址 (默认 %s)\n", g_opt.host);
     printf("  --port PORT   kvstore 端口 (默认 %d)\n", g_opt.port);
     printf("  --count N     每条流水线的命令数 (默认 %d)\n", g_opt.count);
+    printf("  --dump-path PATH  dump 文件路径 (默认 %s)\n", g_opt.dump_path);
+    printf("  --aof-path PATH    AOF 文件路径 (默认 %s)\n", g_opt.aof_path);
     printf("  -h            显示帮助\n");
 }
 
@@ -319,6 +327,10 @@ int main(int argc, char **argv) {
             g_opt.port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--count") == 0 && i + 1 < argc)
             g_opt.count = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-path") == 0 && i + 1 < argc)
+            g_opt.dump_path = argv[++i];
+        else if (strcmp(argv[i], "--aof-path") == 0 && i + 1 < argc)
+            g_opt.aof_path = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;

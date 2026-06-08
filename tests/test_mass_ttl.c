@@ -68,12 +68,16 @@ static struct {
     int count;
     int ttl;
     int batch;
+    const char *dump_path;
+    const char *aof_path;
 } g_opt = {
     .host = "192.168.233.128",
     .port = 5160,
     .count = 10000,
     .ttl = 10,
     .batch = 1000,
+    .dump_path = "kvstore.dump",
+    .aof_path = "kvstore.aof",
 };
 
 /* ---- TCP / RESP 工具 ---- */
@@ -195,6 +199,8 @@ static int parse_config_file(const char *path) {
         else if (strcmp(key, "count") == 0) g_opt.count = atoi(val);
         else if (strcmp(key, "ttl") == 0) g_opt.ttl = atoi(val);
         else if (strcmp(key, "batch") == 0) g_opt.batch = atoi(val);
+        else if (strcmp(key, "dump_path") == 0) g_opt.dump_path = strdup(val);
+        else if (strcmp(key, "aof_path") == 0) g_opt.aof_path = strdup(val);
     }
     fclose(fp);
     return 0;
@@ -212,6 +218,8 @@ static void print_usage(const char *prog) {
     printf("  --count N         设置 key 数量 (默认 %d)\n", g_opt.count);
     printf("  --ttl SECONDS     过期时间秒 (默认 %d)\n", g_opt.ttl);
     printf("  --batch N         每批写入量 (默认 %d)\n", g_opt.batch);
+    printf("  --dump-path PATH  dump 文件路径 (默认 %s)\n", g_opt.dump_path);
+    printf("  --aof-path PATH    AOF 文件路径 (默认 %s)\n", g_opt.aof_path);
     printf("  -h                显示帮助\n");
 }
 
@@ -233,6 +241,10 @@ int main(int argc, char **argv) {
             g_opt.ttl = atoi(argv[++i]);
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc)
             g_opt.batch = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dump-path") == 0 && i + 1 < argc)
+            g_opt.dump_path = argv[++i];
+        else if (strcmp(argv[i], "--aof-path") == 0 && i + 1 < argc)
+            g_opt.aof_path = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;

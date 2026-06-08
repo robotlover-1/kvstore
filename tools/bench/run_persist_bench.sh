@@ -55,28 +55,38 @@ start_redis() {
 }
 
 run_bench() {
-    local label="$1" port="$2"
+    local label="$1" port="$2" cmd="${3:-set}"
     local outfile="$OUTDIR/aof_${label}.txt"
-    redis-benchmark -p "$port" -t set -n 100000 -c 50 -d 64 --csv > "$outfile" 2>&1 || true
-    local qps=$(grep 'SET' "$outfile" | head -1 | cut -d',' -f2 | tr -d '"' || echo "N/A")
+    redis-benchmark -p "$port" -n 100000 -c 50 -d 64 "$cmd" > "$outfile" 2>&1 || true
+    local qps=$(grep 'requests per second' "$outfile" | tail -1 | awk '{print $1}' || echo "N/A")
     echo "  $label QPS: $qps"
     echo "$label,$qps" >> "$OUTDIR/aof_summary.csv"
 }
 
-# ==================== 测试1: AOF 对比 ====================
+# ==================== 测试1: AOF + ECHO 对比 ====================
 echo ""
 echo "============================================"
-echo " 测试1: AOF 性能对比"
+echo " 测试1: AOF + ECHO 性能对比"
 echo "============================================"
 echo "label,qps" > "$OUTDIR/aof_summary.csv"
 
+# --- ECHO 基线（纯协议开销，不依赖 AOF 配置）---
+echo "--- kvstore_echo ---"
+start_kvstore "--aof-disable" || exit 1
+run_bench "kvstore_echo" $KVSTORE_PORT "echo"
+
+echo "--- redis_echo ---"
+start_redis "" || exit 1
+run_bench "redis_echo" $REDIS_PORT "echo"
+
+# --- SET 测试 ---
 echo "--- kvstore_aof_always ---"
 start_kvstore "--appendfsync always" || exit 1
-run_bench "kvstore_aof_always" $KVSTORE_PORT
+run_bench "kvstore_aof_always" $KVSTORE_PORT "set"
 
 echo "--- kvstore_aof_everysec ---"
 start_kvstore "--appendfsync everysec" || exit 1
-run_bench "kvstore_aof_everysec" $KVSTORE_PORT
+run_bench "kvstore_aof_everysec" $KVSTORE_PORT "set"
 
 echo "--- redis_no_aof ---"
 start_redis "" || exit 1

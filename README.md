@@ -718,112 +718,169 @@ TCP 字节流 → recv() → inbuf[64KB]
 以 `+` 开头、`\r\n` 结尾的行。标准 RESP 中 `+OK\r\n` 表示成功，但 kvstore 扩展了此格式用于**带内控制信令**：
 
 ```c
-if (buf[pos] == '+') {                          // +KPROBERDMA 1 2 3 4 5\r\n
-    line = extract_line(buf + pos);             // 提取行内容
-    argv = split_inline_argv(line);             // 空格分割参数
+// src/main/kvstore.c — parse_resp_stream (+) 分支
+if (buf[pos] == '+') {
+    // 提取 \r\n 之前的内容
+    size_t line_start = pos + 1;
+    while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
+    if (pos + 1 >= *len) break;              // 不完整，保留等下次
+    if (pos > line_start) {
+        size_t line_len = pos - line_start;
+        char *line = kvs_malloc(line_len + 1);
+        memcpy(line, buf + line_start, line_len);
+        line[line_len] = '\0';
 
-    if (argv[0] == "KPROBERDMA" && argc >= 6)  // kprobe RDMA MR 信息交换
-        repl_kprobe_rdma_parse_mr_info_direct(argv[1..5]);
+        char *argv[8] = {0};
+        int argc = split_inline_argv(line, argv, 8);  // 空格分割参数
 
-    if (from_replication && argv[0] == "FULLRESYNC")  // 全量同步开始
-        repl_slave_set_sync_state(argv[1], argv[2], loading=1);
+        // +KPROBERDMA <rkey> <addr> <size> <slots> <cap>  — MR 信息交换
+        if (argc >= 6 && !strcmp(argv[0], "KPROBERDMA")) {
+            if (g_cfg.role == ROLE_MASTER)              // 仅 master 处理
+                repl_kprobe_rdma_parse_mr_info_direct(
+                    strtoull(argv[1]), strtoull(argv[2]),
+                    strtoull(argv[3]), strtoull(argv[4]), strtoull(argv[5]));
+        }
+        // +FULLRESYNC <replid> <offset> — 全量同步开始（仅 slave 复制流）
+        else if (from_replication && argc >= 3 && !strcmp(argv[0], "FULLRESYNC"))
+            repl_slave_set_sync_state(argv[1], strtoull(argv[2]), 1);
 
-    if (from_replication && argv[0] == "CONTINUE")     // 增量同步继续
-        repl_slave_set_sync_state(argv[1], offset, loading=0);
+        // +CONTINUE <replid> <offset> — 增量同步继续（仅 slave 复制流）
+        else if (from_replication && argc >= 3 && !strcmp(argv[0], "CONTINUE"))
+            repl_slave_set_sync_state(argv[1], offset, 0);
+
+        kvs_free(line);
+    }
+    pos += 2;  // 跳过 \r\n
+    continue;
 }
 ```
 
-这些命令**不经过命令分发器**，直接在解析层处理，用于主从复制和 RDMA 内存注册信息交换。
+这些命令不经过 `handle_parsed_command()`，直接在解析层处理，用于主从复制控制流和 RDMA 内存注册信息交换。
 
 #### ② RESP 数组（`*`）—— 标准命令格式
 
-RESP 数组是 kvstore 的主要命令格式，结构为：
-
-```
-*<argc>\r\n$<len1>\r\n<data1>\r\n$<len2>\r\n<data2>\r\n...
-```
-
-解析流程：
+RESP 数组是 kvstore 的主要命令格式，结构为 `*<argc>\r\n$<len>\r\n<data>\r\n...`。解析时先将参数个数字段拷贝到临时缓冲区 `nbuf[32]` 后用 `atoi` 解析，避免直接操作 `buf` 导致边界问题：
 
 ```c
-// 源码: src/main/kvstore.c — parse_resp_stream (数组分支)
+// src/main/kvstore.c — parse_resp_stream (*) 数组分支
 if (buf[pos] == '*') {
-    size_t start = pos;              // 记录命令起始位置
+    size_t start = pos;      // 命令起始，用于 raw 指针
     p = pos + 1;
 
-    // 步骤 1: 扫描 \r\n 获取参数个数
+    // 扫描 \r\n 得到参数个数文本，拷贝到 nbuf[32] 防越界
     while (p + 1 < *len && !(buf[p] == '\r' && buf[p + 1] == '\n')) p++;
-    if (p + 1 >= *len) break;        // 数据不完整，等待下次 recv
-    if (p - (pos + 1) >= 32) { pos = p + 2; continue; }  // 格式错误
+    if (p + 1 >= *len) break;                      // 不完整，保留
+    if (p - (pos + 1) >= 32) { pos = p + 2; continue; }  // 长度字段超限
 
-    argc = atoi(buf + pos + 1);      // 解析 N
-    if (argc <= 0 || argc > 32) {    // 最多 32 个参数
-        queue_bytes(c, "-ERR invalid argc\r\n");
+    char nbuf[32] = {0};
+    memcpy(nbuf, buf + pos + 1, p - (pos + 1));
+    int argc = atoi(nbuf);
+
+    if (argc <= 0 || argc > 32) {                  // 参数个数限制
+        if (c) { char r[64]; resp_error(r, "$-ERR invalid argc\r\n");
+                queue_bytes(c, r, strlen(r)); }
         pos = p + 2; continue;
     }
-    p += 2;                          // 跳过 \r\n
+    p += 2;                                         // 跳过 \r\n
 
-    // 步骤 2: 逐个解析 N 个 bulk string
-    for (int i = 0; i < argc; ++i) {
-        // 每个 bulk: $<len>\r\n<data>\r\n
+    char *argv[32] = {0};
+    size_t argl[32] = {0};
+    int incomplete = 0, malformed = 0;
+
+    for (int i = 0; i < argc; ++i) {                // 逐个解析 bulk
+        if (p >= *len) { incomplete = 1; break; }
         if (buf[p] != '$') { malformed = 1; break; }
 
-        // 读取长度字段
-        lp = p + 1;
+        size_t lp = p + 1;
+        // 扫描长度字段 \r\n，拷贝到 lbuf[32] 后用 strtol 解析
         while (lp + 1 < *len && !(buf[lp] == '\r' && buf[lp + 1] == '\n')) lp++;
         if (lp + 1 >= *len) { incomplete = 1; break; }
-        if (lp - (p + 1) >= 32) { malformed = 1; break; }  // 长度字段过长
+        if (lp - (p + 1) >= 32) { malformed = 1; break; }
 
-        blen = strtol(buf + p + 1, &endp, 10);
-        if (!endp || *endp != '\0' || blen < 0) {  // 非数字或负长度
+        char lbuf[32] = {0};
+        memcpy(lbuf, buf + p + 1, lp - (p + 1));
+        char *endp = NULL;
+        long blen = strtol(lbuf, &endp, 10);
+        if (!endp || *endp != '\0' || blen < 0) {   // 格式错误/负长度
             malformed = 1; break;
         }
 
-        p = lp + 2;                  // 跳过 $len\r\n
-        if (p + blen + 2 > *len) { incomplete = 1; break; }
+        p = lp + 2;                                 // 跳过 $len\r\n
+        if (p + (size_t)blen + 2 > *len) { incomplete = 1; break; }
 
-        argv[i] = kvs_malloc(blen + 1);
-        memcpy(argv[i], buf + p, blen);  // 按长度拷贝，含二进制的 \0
+        argv[i] = kvs_malloc((size_t)blen + 1);
+        memcpy(argv[i], buf + p, (size_t)blen);     // 按长度拷贝，二进制安全
         argv[i][blen] = '\0';
-        p += blen;
+        argl[i] = (size_t)blen;
+        p += (size_t)blen;
+
         if (!(buf[p] == '\r' && buf[p + 1] == '\n')) { malformed = 1; break; }
-        p += 2;                      // 跳过末尾 \r\n
+        p += 2;                                     // 跳过 data\r\n
     }
-    if (incomplete) {                // 数据不全，保留缓冲区等下次
-        for (i) kvs_free(argv[i]);
-        break;
+
+    if (incomplete) {                               // 数据不完整
+        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+        break;                                      // 保留缓冲区等下次 recv
     }
-    if (malformed) {                 // 格式错误，跳过
-        for (i) kvs_free(argv[i]);
-        pos = (p > start) ? p : start + 1;
+    if (malformed) {                                // 格式错误
+        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+        if (p > start) pos = p; else break;         // 尽量跳过坏数据
         continue;
     }
-    // 执行命令
-    handle_parsed_command(c, argc, argv, raw, rawlen, from_replication);
-    for (i) kvs_free(argv[i]);
-    pos = p;                         // pos 前进到下一命令
+
+    handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
+    for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+    pos = p;                                         // 前进到下一命令
 }
 ```
 
 **关键设计**：
-- `incomplete` vs `malformed`：**`incomplete` 保留缓冲区等下次 recv**，**`malformed` 丢弃错误数据继续**
-- `argc > 32` 或 `blen < 0` 或 `blen > 2^31`：拒绝并发送错误响应
-- **二进制安全**：按长度拷贝，value 可包含 `\0`、`\r\n` 等任意字节
+- **`incomplete` vs `malformed`**：`incomplete` 保留缓冲区等下次 recv，`malformed` 丢弃错误数据继续
+- **`nbuf[32]` / `lbuf[32]` 临时缓冲区**：先拷贝长度文本再解析，避免在 `buf` 中原址解析的越界风险
+- **`argc > 32` 拒绝**：防止恶意大数组耗尽内存
+- **`blen < 0` 拒绝**：`$-1` 是 RESP null bulk，但 kvstore 命令参数不允许 null
+- **二进制安全**：数据按 `blen` 拷贝，value 可包含 `\0`、`\r\n` 等任意字节
+- **`raw` 指针指向 `buf + start`**：`handle_parsed_command` 需要原始 RESP 字节用于 AOF 追加
 
-#### ③ Inline 命令（非 `*` 非 `+`）—— 兼容 redis-cli
+#### ③ Inline 命令（非 `*` 非 `+`）—— 兼容 redis-cli 及错误恢复
 
-当首个字节不是 `*` 或 `+` 时，视为空格分隔的 inline 命令，主要用于兼容 `redis-cli` 发送的简单命令（如 `PING`）：
+当首个字节既不是 `*` 也不是 `+` 时，视为 inline 文本命令（空格分隔参数），或用于扫描跳过损坏数据。解析到 `\n` 为止，去掉尾随 `\r`：
 
 ```c
-// 截取到 \n 为止的一行
-line_end = find_next_newline(buf, pos);
-line = kvs_malloc(line_len + 1);
-memcpy(line, buf + pos, line_len);
-argc = split_inline_argv(line, argv, 32);  // 空格分割
-if (argc > 0)
-    handle_parsed_command(c, argc, argv, raw, rawlen, from_replication);
-pos = line_end + 1;
+// src/main/kvstore.c — parse_resp_stream (inline 分支)
+if (buf[pos] != '*') {
+    size_t line_end = pos;
+    while (line_end < *len && buf[line_end] != '\n') line_end++;
+    if (line_end >= *len) break;                    // 不完整，等下次
+
+    size_t line_len = line_end - pos;
+    if (line_len > 0 && buf[pos + line_len - 1] == '\r') line_len--;  // 去 \r
+    if (line_len == 0) { pos = line_end + 1; continue; }  // 空行跳过
+
+    char *line = kvs_malloc(line_len + 1);
+    if (!line) {                                     // OOM
+        if (c) { char r[64]; resp_error(r, "oom");
+                queue_bytes(c, r, strlen(r)); }
+        pos = line_end + 1; continue;
+    }
+    memcpy(line, buf + pos, line_len);
+    line[line_len] = '\0';
+
+    char *argv[32] = {0};
+    size_t argl[32] = {0};
+    int argc = split_inline_argv(line, argv, 32);    // 空格分割
+    if (argc > 0) {
+        for (int i = 0; i < argc; ++i) argl[i] = strlen(argv[i]);
+        handle_parsed_command(c, argc, argv, argl,
+            buf + pos, line_end + 1 - pos, from_replication);
+    }
+    kvs_free(line);
+    pos = line_end + 1;
+    continue;
+}
 ```
+
+注意解析顺序：先检查 `+`（协议控制），再检查 `*`（标准数组），最后才是 inline。`+` 和 inline 互斥——`+` 开头的简单字符串不会落入 inline 分支。
 
 ### PIPELINE 流水线实现
 
@@ -875,18 +932,30 @@ sequenceDiagram
 TCP 是流协议，数据可能被拆分成多个 `recv()`。`on_read()` 通过 **循环 recv + 残留拼接** 处理：
 
 ```c
+// src/core/reactor.c — on_read
 static void on_read(conn_t *c) {
     while (1) {
-        n = recv(c->fd, c->inbuf + c->in_len,
-                 sizeof(c->inbuf) - c->in_len, 0);
-        if (n > 0) {
-            c->in_len += n;
-            parse_resp_stream(c, c->inbuf, &c->in_len, 0);  // ← 解析
-            // parse_resp_stream 已通过 memmove 整理缓冲区
-            continue;  // 继续读，可能还有数据
+        if (c->in_len >= sizeof(c->inbuf)) {    // 缓冲区满，断开防毒
+            close_conn(c); return;
         }
-        if (errno == EAGAIN) break;  // 本次读完
+        ssize_t n = recv(c->fd, c->inbuf + c->in_len,
+                         sizeof(c->inbuf) - c->in_len, 0);
+        if (n > 0) {
+            c->in_len += (size_t)n;
+            parse_resp_stream(c, c->inbuf, &c->in_len, 0);
+            continue;                           // 再读，可能还有数据
+        }
+        if (n == 0) {                           // 对端关闭
+            if (c->out_head) mod_events(c, EPOLLOUT);  // 发完再关
+            else close_conn(c);
+            return;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // 本次读完
+        close_conn(c); return;                  // 异常断开
     }
+    // 调整 epoll 事件
+    if (c->out_head) mod_events(c, EPOLLIN | EPOLLOUT);
+    else mod_events(c, EPOLLIN);
 }
 ```
 

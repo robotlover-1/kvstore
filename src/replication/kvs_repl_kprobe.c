@@ -1164,6 +1164,26 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
     return 0;
 }
 
+/* Client capture ringbuf 轮询线程 */
+static pthread_t g_client_poll_tid;
+static int g_client_poll_started = 0;
+
+static void *client_poll_thread(void *arg) {
+    (void)arg;
+    fprintf(stderr, "client_capture: poll thread started\n");
+
+    while (g_client_running && g_client_ringbuf) {
+        int err = ring_buffer__poll(g_client_ringbuf, 50);  /* 50ms 超时 */
+        if (err < 0 && err != -EAGAIN) {
+            fprintf(stderr, "client_capture: ringbuf poll err=%d\n", err);
+            usleep(10000);
+        }
+    }
+
+    fprintf(stderr, "client_capture: poll thread exiting\n");
+    return NULL;
+}
+
 /* 初始化 client capture BPF */
 int repl_client_capture_init(void) {
     if (g_client_obj) return 0;  /* 已经初始化 */
@@ -1235,6 +1255,17 @@ int repl_client_capture_init(void) {
         repl_client_capture_cleanup();
         return -1;
     }
+
+    /* 启动 ringbuf 轮询线程 */
+    g_client_running = 1;
+    if (pthread_create(&g_client_poll_tid, NULL, client_poll_thread, NULL) != 0) {
+        fprintf(stderr, "client_capture: failed to create poll thread\n");
+        g_client_running = 0;
+        repl_client_capture_cleanup();
+        return -1;
+    }
+    pthread_detach(g_client_poll_tid);
+    g_client_poll_started = 1;
 
     fprintf(stderr, "client_capture: initialized (pid=%d)\n", getpid());
     return 0;

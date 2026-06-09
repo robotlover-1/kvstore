@@ -2157,14 +2157,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") ||
-        !strcasecmp(g_cfg.repl_transport_backend, "rdma")) {
-        if (start_rdma_master_listener() != 0) {
-            fprintf(stderr, "failed to start rdma master listener thread\n");
-            return 1;
-        }
-    }
-
     /* kprobe+RDMA 增量同步初始化 */
     if (g_cfg.kprobe_enabled &&
         !strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {

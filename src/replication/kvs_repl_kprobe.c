@@ -945,6 +945,14 @@ int repl_kprobe_rdma_set_pid(pid_t pid) {
     return bpf_map_update_elem(g_kprobe_ctl_fd, &key, &val, BPF_ANY);
 }
 
+int repl_kprobe_rdma_set_fd(int fd) {
+    (void)fd;
+    /* kprobe BPF 当前使用 PID 过滤，不直接支持 fd 过滤。
+     * 此函数保留供未来 BPF 扩展使用。 */
+    fprintf(stderr, "kprobe rdma: set_fd(%d) - no-op (PID filter active)\n", fd);
+    return 0;
+}
+
 /* 清理 */
 void repl_kprobe_rdma_cleanup(void) {
     g_kprobe_running = 0;
@@ -1380,6 +1388,7 @@ void repl_kprobe_rdma_cleanup(void) {}
 int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *s)
     { if (s) memset(s, 0, sizeof(*s)); return 0; }
 int repl_kprobe_rdma_set_pid(pid_t p) { (void)p; return -1; }
+int repl_kprobe_rdma_set_fd(int f) { (void)f; return -1; }
 int repl_kprobe_rdma_parse_mr_info(const char *r) { (void)r; return -1; }
 int repl_kprobe_rdma_enqueue(const unsigned char *d, size_t l)
     { (void)d; (void)l; return -1; }

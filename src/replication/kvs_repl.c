@@ -2214,17 +2214,21 @@ static void *slave_thread(void *arg) {
                 continue;
             }
 
-            /* 后台启动 RDMA fullsync QP 连接 */
+            /* 按需模式: REPLSYNC 立即通过 TCP 发送，不再等待 RDMA 就绪。
+             * Master 收到 REPLSYNC 后会在 queue_snapshot() 中按需启动 RDMA listener。
+             * Slave 在后台并发尝试 RDMA 连接（会自动重试直到 master listener 就绪）。 */
 #if KVS_ENABLE_RDMA
-            repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
-            if (rdma_arg) {
-                snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
-                rdma_arg->port = port;
-                pthread_t rdma_tid;
-                if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
-                    kvs_free(rdma_arg);
-                } else {
-                    pthread_detach(rdma_tid);
+            {
+                repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
+                if (rdma_arg) {
+                    snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
+                    rdma_arg->port = port;
+                    pthread_t rdma_tid;
+                    if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
+                        kvs_free(rdma_arg);
+                    } else {
+                        pthread_detach(rdma_tid);
+                    }
                 }
             }
 #endif
@@ -2232,41 +2236,25 @@ static void *slave_thread(void *arg) {
             repl_transport_mark_active("kprobe-rdma");
             rdma_fail_streak = 0;
 
+            /* 立即发送 REPLSYNC（不等待 RDMA） */
+            {
+                unsigned char cmd[256];
+                char offbuf[32], durablebuf[32];
+                snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
+                snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
+                size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
+                fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP immediately\n");
+            }
+
             g_slave_fd = tcp_fd;
             repl_set_link_state(1);
             unsigned char buf[BUFFER_CAP * 4 + 4096];
             size_t blen = 0;
-            int replsync_sent = 0;
-            long long rdma_wait_start = kvs_now_ms();
 
             for (;;) {
                 if (slave_should_reconnect(gen)) break;
-
-                /* 延迟 REPLSYNC 直到 RDMA fullsync QP 就绪或超时（5s） */
-                if (!replsync_sent) {
-                    int rdma_ready = 0;
-#if KVS_ENABLE_RDMA
-                    rdma_ready = g_repl_rdma_ctx.connected;
-#endif
-                    if (rdma_ready || (kvs_now_ms() - rdma_wait_start) > 5000) {
-                        unsigned char cmd[256];
-                        char offbuf[32], durablebuf[32];
-                        snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
-                        snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                        size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                            g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
-                        if (send(tcp_fd, cmd, n, 0) < 0) break;
-                        replsync_sent = 1;
-                        repl_transport_mark_active(rdma_ready ? "rdma+kprobe" : "kprobe-rdma");
-#if KVS_ENABLE_RDMA
-                        if (rdma_ready) fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP, fullsync will use RDMA\n");
-                        else fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP, RDMA not ready, fullsync will fallback to TCP\n");
-#endif
-                        continue;
-                    }
-                    usleep(50000);
-                    continue;
-                }
 
                 int had_new_data = 0;
 
@@ -2338,8 +2326,8 @@ static void *slave_thread(void *arg) {
         int use_ebpf_realtime = repl_realtime_should_use_ebpf();
 
         /* If using dual transport, always establish TCP as the primary link.
-         * RDMA is established first (background), and REPLSYNC is delayed until
-         * RDMA is ready or a timeout expires, so fullsync can use RDMA. */
+         * REPLSYNC 立即通过 TCP 发送，不再等待 RDMA 就绪。
+         * Master 收到 REPLSYNC 后在 queue_snapshot() 中按需启动 RDMA listener。 */
         if (use_rdma_fullsync && use_ebpf_realtime) {
             int tcp_fd = repl_transport_tcp_connect_slave(host, port);
             if (tcp_fd < 0) {
@@ -2349,18 +2337,19 @@ static void *slave_thread(void *arg) {
                 continue;
             }
 
-            /* Kick off RDMA connection attempt in a background thread.
-             * We delay REPLSYNC until RDMA is ready so fullsync can use RDMA. */
+            /* 后台并发尝试 RDMA 连接（会自动重试直到 master listener 就绪） */
 #if KVS_ENABLE_RDMA
-            repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
-            if (rdma_arg) {
-                snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
-                rdma_arg->port = port;
-                pthread_t rdma_tid;
-                if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
-                    kvs_free(rdma_arg);
-                } else {
-                    pthread_detach(rdma_tid);
+            {
+                repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
+                if (rdma_arg) {
+                    snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
+                    rdma_arg->port = port;
+                    pthread_t rdma_tid;
+                    if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
+                        kvs_free(rdma_arg);
+                    } else {
+                        pthread_detach(rdma_tid);
+                    }
                 }
             }
 #endif
@@ -2373,42 +2362,25 @@ static void *slave_thread(void *arg) {
                 fprintf(stderr, "repl ebpf: fd registration failed on slave link, using tcp-compatible path\n");
             }
 
+            /* 立即发送 REPLSYNC（不等待 RDMA） */
+            {
+                unsigned char cmd[256];
+                char offbuf[32], durablebuf[32];
+                snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
+                snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
+                size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                if (send(tcp_fd, cmd, n, 0) < 0) break;
+                fprintf(stderr, "repl: REPLSYNC sent over TCP immediately\n");
+            }
+
             g_slave_fd = tcp_fd;
             repl_set_link_state(1);
             unsigned char buf[BUFFER_CAP * 4 + 4096];
             size_t blen = 0;
-            int replsync_sent = 0;
-            long long rdma_wait_start = kvs_now_ms();
 
             for (;;) {
                 if (slave_should_reconnect(gen)) break;
-
-                /* Delay REPLSYNC until RDMA is connected or timeout (5s).
-                 * This lets fullsync bulk data flow over RDMA when available. */
-                if (!replsync_sent) {
-                    int rdma_ready = 0;
-#if KVS_ENABLE_RDMA
-                    rdma_ready = g_repl_rdma_ctx.connected;
-#endif
-                    if (rdma_ready || (kvs_now_ms() - rdma_wait_start) > 5000) {
-                        unsigned char cmd[256];
-                        char offbuf[32], durablebuf[32];
-                        snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
-                        snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                        size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                            g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
-                        if (send(tcp_fd, cmd, n, 0) < 0) break;
-                        replsync_sent = 1;
-                        repl_transport_mark_active(rdma_ready ? "rdma+ebpf" : "ebpf");
-#if KVS_ENABLE_RDMA
-                        if (rdma_ready) repl_rdma_log("slave_loop", "REPLSYNC sent, fullsync will use RDMA");
-#endif
-                        continue;
-                    }
-                    /* Wait a bit for RDMA to connect, then retry */
-                    usleep(50000);  /* 50ms */
-                    continue;
-                }
 
                 int had_new_data = 0;
 

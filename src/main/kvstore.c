@@ -61,6 +61,9 @@ kv_config_t g_cfg = {
 };
 conn_t *g_replicas = NULL;
 pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 全量同步进行中标志 — 同步期间跳过实时广播，启停 RDMA */
+volatile int g_repl_fullsync_in_progress = 0;
 static pthread_mutex_t g_repl_last_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_repl_last_send_stage[64] = "none";
 static unsigned long long g_repl_last_send_len = 0;

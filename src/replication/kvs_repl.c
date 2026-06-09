@@ -2918,3 +2918,223 @@ int start_rdma_master_listener(void) {
 #endif
     return 0;
 }
+
+#if KVS_ENABLE_RDMA
+/**
+ * repl_rdma_start_fullsync — 全量同步开始时按需启动 RDMA
+ *
+ * Master 侧: 创建 event channel → bind/listen → 等待 slave RDMA 连接
+ *           → accept → 建立 QP/buffers → 等待 ESTABLISHED
+ *
+ * 返回: 0 成功, -1 失败（调用方应回退到 TCP）
+ *
+ * 注意: 此函数同步阻塞直到 RDMA 连接建立或超时（10s）
+ */
+int repl_rdma_start_fullsync(conn_t *c) {
+    struct sockaddr_in addr;
+    struct rdma_cm_event *event = NULL;
+    struct rdma_conn_param param;
+    long long deadline = kvs_now_ms() + 10000;  /* 10s 超时 */
+    (void)c;
+
+    /* 如果已连接，直接返回成功 */
+    if (g_repl_rdma_ctx.connected) return 0;
+
+    /* 重置残留状态 */
+    repl_rdma_reset_ctx();
+
+    repl_rdma_log("fullsync_start", "begin");
+
+    /* 创建 event channel */
+    g_repl_rdma_ctx.ec = rdma_create_event_channel();
+    if (!g_repl_rdma_ctx.ec) {
+        repl_rdma_log("fullsync_start", "event channel create failed");
+        return -1;
+    }
+
+    /* Master 侧: 创建 listener */
+    if (rdma_create_id(g_repl_rdma_ctx.ec, &g_repl_rdma_ctx.listen_id,
+                       NULL, RDMA_PS_TCP) != 0) {
+        repl_rdma_log("fullsync_start", "create listen id failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    {
+        int rdma_port = g_cfg.rdma_port > 0 ? g_cfg.rdma_port : g_cfg.port + 1;
+        addr.sin_port = htons((uint16_t)rdma_port);
+    }
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (rdma_bind_addr(g_repl_rdma_ctx.listen_id,
+                       (struct sockaddr *)&addr) != 0) {
+        repl_rdma_log("fullsync_start", "bind failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    if (rdma_listen(g_repl_rdma_ctx.listen_id, 4) != 0) {
+        repl_rdma_log("fullsync_start", "listen failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    repl_rdma_log("fullsync_start", "listening for slave RDMA connect");
+
+    /* 等待 slave 的 CONNECT_REQUEST（超时 10s） */
+    {
+        struct pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = g_repl_rdma_ctx.ec->fd;
+        pfd.events = POLLIN;
+
+        while (kvs_now_ms() < deadline) {
+            if (poll(&pfd, 1, 1000) <= 0) {
+                if (kvs_now_ms() >= deadline) {
+                    repl_rdma_log("fullsync_start", "timeout waiting for CONNECT_REQUEST");
+                    repl_rdma_reset_ctx();
+                    return -1;
+                }
+                continue;
+            }
+            if (rdma_get_cm_event(g_repl_rdma_ctx.ec, &event) != 0) {
+                repl_rdma_log("fullsync_start", "get_cm_event failed");
+                repl_rdma_reset_ctx();
+                return -1;
+            }
+            break;
+        }
+
+        if (!event) {
+            repl_rdma_log("fullsync_start", "no event received");
+            repl_rdma_reset_ctx();
+            return -1;
+        }
+
+        if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+            repl_rdma_log("fullsync_start", "unexpected event");
+            rdma_ack_cm_event(event);
+            repl_rdma_reset_ctx();
+            return -1;
+        }
+    }
+
+    /* 接受连接 */
+    repl_rdma_log("fullsync_start", "connect request received");
+    g_repl_rdma_ctx.accepted_id = event->id;
+    rdma_ack_cm_event(event);
+    g_repl_rdma_ctx.id = g_repl_rdma_ctx.accepted_id;
+
+    /* 创建 PD / CQ / QP / buffers */
+    g_repl_rdma_ctx.comp_chan = ibv_create_comp_channel(
+        g_repl_rdma_ctx.id->verbs);
+    if (!g_repl_rdma_ctx.comp_chan) {
+        repl_rdma_log("fullsync_start", "comp channel create failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    g_repl_rdma_ctx.pd = ibv_alloc_pd(g_repl_rdma_ctx.id->verbs);
+    if (!g_repl_rdma_ctx.pd) {
+        repl_rdma_log("fullsync_start", "alloc pd failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    repl_rdma_refresh_runtime_cfg();
+    g_repl_rdma_ctx.cq = ibv_create_cq(g_repl_rdma_ctx.id->verbs,
+        g_repl_rdma_ctx.active_qp_wr_depth, NULL,
+        g_repl_rdma_ctx.comp_chan, 0);
+    if (!g_repl_rdma_ctx.cq) {
+        repl_rdma_log("fullsync_start", "create cq failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    if (repl_rdma_create_qp() != 0 ||
+        repl_rdma_prepare_buffers() != 0 ||
+        repl_rdma_post_initial_recv() != 0) {
+        repl_rdma_log("fullsync_start", "resource prepare failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    /* rdma_accept → 等待 ESTABLISHED */
+    memset(&param, 0, sizeof(param));
+    param.initiator_depth = 1;
+    param.responder_resources = 1;
+    param.rnr_retry_count = 3;
+
+    if (rdma_accept(g_repl_rdma_ctx.id, &param) != 0) {
+        repl_rdma_log("fullsync_start", "rdma_accept failed");
+        repl_rdma_reset_ctx();
+        return -1;
+    }
+
+    repl_rdma_log("fullsync_start", "accept issued, waiting for ESTABLISHED");
+
+    {
+        struct pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = g_repl_rdma_ctx.ec->fd;
+        pfd.events = POLLIN;
+
+        while (kvs_now_ms() < deadline) {
+            if (poll(&pfd, 1, 1000) <= 0) continue;
+            if (rdma_get_cm_event(g_repl_rdma_ctx.ec, &event) != 0) break;
+            if (event->event == RDMA_CM_EVENT_ESTABLISHED) {
+                rdma_ack_cm_event(event);
+                g_repl_rdma_ctx.connected = 1;
+                repl_rdma_set_state(REPL_RDMA_STATE_ESTABLISHED,
+                                    "fullsync_established");
+                repl_rdma_log("fullsync_start", "established OK");
+
+                /* 启动 CQ 轮询线程 */
+                if (g_repl_rdma_ctx.send_pipeline_enabled) {
+                    repl_rdma_start_cq_poll_thread();
+                }
+
+                /* 设置 master replica conn */
+                memset(&g_rdma_master_replica_conn, 0,
+                       sizeof(g_rdma_master_replica_conn));
+                g_rdma_master_replica_conn.repl_transport_kind =
+                    KVS_REPL_TRANSPORT_RDMA;
+
+                repl_rdma_log("fullsync_start", "RDMA started successfully");
+                return 0;
+            }
+            rdma_ack_cm_event(event);
+        }
+    }
+
+    repl_rdma_log("fullsync_start", "establish timed out");
+    repl_rdma_reset_ctx();
+    return -1;
+}
+
+/**
+ * repl_rdma_stop_fullsync — 全量同步完成后关闭并释放所有 RDMA 资源
+ */
+void repl_rdma_stop_fullsync(void) {
+    if (!g_repl_rdma_ctx.connected &&
+        !g_repl_rdma_ctx.listen_id &&
+        !g_repl_rdma_ctx.id) {
+        return;  /* 没有活跃的 RDMA 连接 */
+    }
+
+    repl_rdma_log("fullsync_stop", "stopping RDMA");
+
+    /* 标记断开 */
+    g_repl_rdma_ctx.connected = 0;
+
+    /* 释放所有 RDMA 资源 */
+    repl_rdma_reset_ctx();
+
+    /* 重置 listener 启动标志 */
+    g_rdma_master_listener_started = 0;
+
+    repl_rdma_log("fullsync_stop", "RDMA stopped");
+}
+#endif

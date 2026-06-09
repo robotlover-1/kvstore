@@ -378,6 +378,7 @@ extern kv_config_t g_cfg;
 extern int g_epfd;
 extern conn_t *g_replicas;
 extern pthread_mutex_t g_repl_lock;
+extern volatile int g_repl_fullsync_in_progress;
 extern int g_aof_fd;
 
 void *kvs_malloc(size_t size);
@@ -431,6 +432,8 @@ void repl_note_send_context(const char *stage, size_t len, unsigned long long of
 void repl_get_last_send_context(char *stage, size_t stage_cap, unsigned long long *len, unsigned long long *offset, char *preview, size_t preview_cap);
 int start_slave_thread(void);
 int start_rdma_master_listener(void);
+int repl_rdma_start_fullsync(conn_t *c);
+void repl_rdma_stop_fullsync(void);
 int repl_slaveof(const char *host, int port);
 int repl_slaveof_noone(void);
 const char *repl_master_link_state_name(void);

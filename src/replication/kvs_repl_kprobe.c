@@ -1107,8 +1107,8 @@ void repl_kprobe_fullsync_done(void) {
  * 数据流:
  *   BPF kretprobe/tcp_recvmsg → client_cache_ringbuf
  *     → client_ringbuf_cb() → 缓存队列 (g_cache_list)
- *     → FULLSYNC_IN_PROGRESS=1: 追加到队列
- *     → FULLSYNC_IN_PROGRESS=0: 直接转发 (通过 repl_broadcast)
+ *     → FULLSYNC_IN_PROGRESS=1: 追加到队列 (L1→L2 spill)
+ *     → FULLSYNC_IN_PROGRESS=0: 直接转发到 slave TCP (新路径)
  *     → queue_snapshot 完成后: repl_client_capture_flush_to_slave()
  */
 
@@ -1119,6 +1119,10 @@ typedef struct client_cache_node_s {
     struct client_cache_node_s *next;
 } client_cache_node_t;
 
+/* L2 磁盘缓存配置 */
+#define CACHE_L1_MAX_BYTES  (4 * 1024 * 1024)   /* L1 内存上限 4MB，超过则 spill 到磁盘 */
+#define CACHE_L2_PATH       "/tmp/kvstore_fs_cache"
+
 /* Client Capture 全局状态 */
 static struct bpf_object *g_client_obj = NULL;
 static int g_client_ctl_fd = -1;
@@ -1127,12 +1131,36 @@ static int g_client_ringbuf_fd = -1;
 static struct ring_buffer *g_client_ringbuf = NULL;
 static volatile int g_client_running = 0;
 
-/* 缓存队列 */
+/* L1 缓存队列 (内存) */
 static client_cache_node_t *g_cache_head = NULL;
 static client_cache_node_t *g_cache_tail = NULL;
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_cache_count = 0;
 static volatile unsigned long long g_cache_bytes = 0;
+
+/* L2 磁盘缓存 (当 L1 超过 CACHE_L1_MAX_BYTES 时启用) */
+static int g_cache_l2_fd = -1;          /* L2 磁盘文件 fd */
+static char g_cache_l2_path[512] = {0}; /* L2 磁盘文件路径 */
+static unsigned long long g_cache_l2_bytes = 0; /* L2 已写入字节数 */
+
+/* 前向声明 */
+static int cache_spill_to_l2(const unsigned char *data, size_t len);
+
+/* ── eBPF+tcp 新路径: INCR 模式直接转发到 slave ── */
+static int forward_to_slave(const unsigned char *data, size_t len) {
+    extern int g_repl_capture_slave_fd;
+    if (g_repl_capture_slave_fd < 0) return -1;
+
+    ssize_t sent = send(g_repl_capture_slave_fd, data, len, MSG_NOSIGNAL);
+    if (sent < 0 || (size_t)sent != len) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            fprintf(stderr, "client_capture: forward send failed fd=%d errno=%d\n",
+                    g_repl_capture_slave_fd, errno);
+        }
+        return -1;
+    }
+    return 0;
+}
 
 /* Ringbuf 回调 — BPF 有客户端数据到达时触发 */
 static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
@@ -1146,7 +1174,15 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
     unsigned char *payload = (unsigned char *)data + 4;
 
     if (g_repl_fullsync_in_progress) {
-        /* 全量同步中 → 缓存到队列 */
+        /* ═══ STATE_FULL: 全量同步中 → 缓存 ═══ */
+
+        /* L1 内存已满 → spill 到 L2 磁盘 */
+        if (g_cache_bytes >= CACHE_L1_MAX_BYTES) {
+            cache_spill_to_l2(payload, payload_len);
+            return 0;
+        }
+
+        /* L1 内存缓存 */
         client_cache_node_t *node = (client_cache_node_t *)
             kvs_malloc(sizeof(client_cache_node_t));
         if (!node) return -1;
@@ -1167,9 +1203,89 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_count++;
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
+    } else {
+        /* ═══ STATE_INCR: 增量同步中 → 直接转发到 slave ═══ */
+        /* 通过 send() 直接将捕获到的 RESP 数据写入 slave TCP 连接 */
+        if (forward_to_slave(payload, payload_len) != 0) {
+            /* 转发失败: 数据走 repl_broadcast 保底，此处不补偿 */
+            fprintf(stderr, "client_capture: forward failed, fallback to broadcast\n");
+        }
     }
-    /* 非全量同步模式下: 数据直接走 repl_broadcast → backlog，无需额外处理 */
     return 0;
+}
+
+/* ── L2 磁盘缓存 ── */
+static int cache_spill_to_l2(const unsigned char *data, size_t len) {
+    /* 首次 spill: 创建 L2 文件 */
+    if (g_cache_l2_fd < 0) {
+        snprintf(g_cache_l2_path, sizeof(g_cache_l2_path), "%s.%d",
+                 CACHE_L2_PATH, getpid());
+        g_cache_l2_fd = open(g_cache_l2_path,
+                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (g_cache_l2_fd < 0) {
+            fprintf(stderr, "client_capture: L2 file create failed: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+        fprintf(stderr, "client_capture: L2 cache opened: %s\n", g_cache_l2_path);
+    }
+
+    /* 写入格式: [4B len][payload] */
+    uint32_t net_len = (uint32_t)len;
+    unsigned char hdr[4];
+    memcpy(hdr, &net_len, 4);
+
+    if (write(g_cache_l2_fd, hdr, 4) != 4) goto write_err;
+    if (write(g_cache_l2_fd, data, len) != (ssize_t)len) goto write_err;
+
+    g_cache_l2_bytes += len;
+    return 0;
+
+write_err:
+    fprintf(stderr, "client_capture: L2 write failed: %s\n", strerror(errno));
+    return -1;
+}
+
+/* 从 L2 磁盘读取所有缓存数据，通过 repl_send_chunked 发送到 slave
+ * 返回: 读取的条目数 */
+static int cache_flush_l2_to_slave(conn_t *c) {
+    if (g_cache_l2_fd < 0) return 0;
+
+    /* 关闭写端，打开读端 */
+    close(g_cache_l2_fd);
+    g_cache_l2_fd = open(g_cache_l2_path, O_RDONLY);
+    if (g_cache_l2_fd < 0) {
+        fprintf(stderr, "client_capture: L2 reopen failed: %s\n", strerror(errno));
+        return 0;
+    }
+
+    int count = 0;
+    unsigned char hdr[4];
+    unsigned char buf[BUFFER_CAP];
+
+    while (read(g_cache_l2_fd, hdr, 4) == 4) {
+        uint32_t len;
+        memcpy(&len, hdr, 4);
+        if (len == 0 || len > BUFFER_CAP) break;
+
+        ssize_t r = read(g_cache_l2_fd, buf, len);
+        if (r != (ssize_t)len) break;
+
+        if (repl_send_chunked(c, buf, len) != 0) {
+            fprintf(stderr, "client_capture: L2 chunk send failed\n");
+            break;
+        }
+        count++;
+    }
+
+    close(g_cache_l2_fd);
+    g_cache_l2_fd = -1;
+    unlink(g_cache_l2_path);
+    g_cache_l2_path[0] = '\0';
+    g_cache_l2_bytes = 0;
+
+    fprintf(stderr, "client_capture: L2 flushed %d entries\n", count);
+    return count;
 }
 
 /* Client capture ringbuf 轮询线程 */
@@ -1281,7 +1397,13 @@ int repl_client_capture_init(void) {
     pthread_detach(g_client_poll_tid);
     g_client_poll_started = 1;
 
-    fprintf(stderr, "client_capture: initialized (pid=%d)\n", getpid());
+    /* 激活 eBPF+tcp 新增量路径 — repl_broadcast 将跳过实时发送 */
+    extern volatile int g_repl_client_capture_active;
+    extern int g_repl_capture_slave_fd;
+    g_repl_client_capture_active = 1;
+    g_repl_capture_slave_fd = -1;
+
+    fprintf(stderr, "client_capture: initialized (pid=%d), capture active\n", getpid());
     return 0;
 }
 
@@ -1298,53 +1420,60 @@ void repl_client_capture_set_fullsync(int in_progress) {
  * 返回: 刷新的条目数（0=无缓存数据, >0=已刷新N条） */
 int repl_client_capture_flush_to_slave(conn_t *c) {
     if (!c) return 0;
+    int total_count = 0;
 
+    /* ── Step 1: Flush L1 内存队列 ── */
     pthread_mutex_lock(&g_cache_lock);
     client_cache_node_t *node = g_cache_head;
     g_cache_head = NULL;
     g_cache_tail = NULL;
-    int count = g_cache_count;
-    unsigned long long bytes = g_cache_bytes;
+    int l1_count = g_cache_count;
+    unsigned long long l1_bytes = g_cache_bytes;
     g_cache_count = 0;
     g_cache_bytes = 0;
     pthread_mutex_unlock(&g_cache_lock);
 
-    if (!node) {
-        fprintf(stderr, "client_capture: no cached data to flush\n");
-        return 0;
-    }
+    if (node) {
+        fprintf(stderr, "client_capture: flushing L1 (%d entries, %llu bytes)\n",
+                l1_count, l1_bytes);
 
-    fprintf(stderr, "client_capture: flushing %d cached entries (%llu bytes) to slave\n",
-            count, bytes);
-
-    /* 通过 repl_send_chunked 发送缓存数据（走 TCP，因为 RDMA 已关闭） */
-    client_cache_node_t *cur = node;
-    int sent_ok = 1;
-    while (cur) {
-        if (repl_send_chunked(c, cur->data, cur->len) != 0) {
-            fprintf(stderr, "client_capture: cache flush send failed\n");
-            sent_ok = 0;
-            break;
-        }
-        client_cache_node_t *next = cur->next;
-        kvs_free(cur->data);
-        kvs_free(cur);
-        cur = next;
-    }
-
-    /* 如果发送失败，清理剩余节点 */
-    if (!sent_ok) {
+        client_cache_node_t *cur = node;
+        int sent_ok = 1;
         while (cur) {
+            if (repl_send_chunked(c, cur->data, cur->len) != 0) {
+                fprintf(stderr, "client_capture: L1 flush send failed\n");
+                sent_ok = 0;
+                break;
+            }
             client_cache_node_t *next = cur->next;
             kvs_free(cur->data);
             kvs_free(cur);
             cur = next;
+            total_count++;
+        }
+        /* 清理剩余（发送失败） */
+        if (!sent_ok) {
+            while (cur) {
+                client_cache_node_t *next = cur->next;
+                kvs_free(cur->data);
+                kvs_free(cur);
+                cur = next;
+            }
         }
     }
 
-    fprintf(stderr, "client_capture: cache flush complete (%d/%llu bytes)\n",
-            count, bytes);
-    return count;
+    /* ── Step 2: Flush L2 磁盘缓存 ── */
+    int l2_count = cache_flush_l2_to_slave(c);
+    total_count += l2_count;
+
+    if (total_count == 0) {
+        fprintf(stderr, "client_capture: no cached data to flush\n");
+        return 0;
+    }
+
+    fprintf(stderr, "client_capture: flush complete (L1=%d L2=%d total=%d)\n",
+            l1_count, l2_count, total_count);
+    return total_count;
 }
 
 /* 清理 client capture 资源 */
@@ -1377,6 +1506,21 @@ void repl_client_capture_cleanup(void) {
     g_cache_count = 0;
     g_cache_bytes = 0;
     pthread_mutex_unlock(&g_cache_lock);
+
+    /* 清理 L2 磁盘缓存 */
+    if (g_cache_l2_fd >= 0) {
+        close(g_cache_l2_fd);
+        g_cache_l2_fd = -1;
+    }
+    if (g_cache_l2_path[0]) {
+        unlink(g_cache_l2_path);
+        g_cache_l2_path[0] = '\0';
+    }
+    g_cache_l2_bytes = 0;
+
+    /* 重置捕获标志 */
+    extern volatile int g_repl_client_capture_active;
+    g_repl_client_capture_active = 0;
 
     fprintf(stderr, "client_capture: cleaned up\n");
 }

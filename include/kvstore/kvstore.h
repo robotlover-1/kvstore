@@ -379,6 +379,8 @@ extern int g_epfd;
 extern conn_t *g_replicas;
 extern pthread_mutex_t g_repl_lock;
 extern volatile int g_repl_fullsync_in_progress;
+extern volatile int g_repl_client_capture_active;
+extern int g_repl_capture_slave_fd;
 extern int g_aof_fd;
 
 void *kvs_malloc(size_t size);

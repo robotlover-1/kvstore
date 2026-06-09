@@ -65,6 +65,12 @@ pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 全量同步进行中标志 — 同步期间跳过实时广播，启停 RDMA */
 volatile int g_repl_fullsync_in_progress = 0;
+
+/* eBPF+tcp 新增量路径标志 — 启用时 client_capture 直接转发到 slave，repl_broadcast 跳过 */
+volatile int g_repl_client_capture_active = 0;
+
+/* Master 侧 slave 的 TCP 连接 fd（供 client_capture 转发引擎使用） */
+int g_repl_capture_slave_fd = -1;
 static pthread_mutex_t g_repl_last_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_repl_last_send_stage[64] = "none";
 static unsigned long long g_repl_last_send_len = 0;
@@ -486,6 +492,11 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
         }
         /* 全量同步期间跳过实时广播（数据通过 backlog + eBPF 缓存处理） */
         if (g_repl_fullsync_in_progress) {
+            pp = &c->next_replica;
+            continue;
+        }
+        /* eBPF+tcp 路径激活时跳过实时发送 — kprobe/tcp_recvmsg 已直接转发到 slave */
+        if (g_repl_client_capture_active) {
             pp = &c->next_replica;
             continue;
         }
@@ -1077,6 +1088,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
+
+        /* eBPF+tcp 路径: 记录 slave fd 供转发引擎使用 */
+        if (g_repl_client_capture_active) {
+            g_repl_capture_slave_fd = c->fd;
+            fprintf(stderr, "client_capture: capture slave fd=%d\n", c->fd);
+        }
         if (can_continue) {
             repl_note_partialsync_result(1);
             repl_backlog_send_continue(c, req_offset);

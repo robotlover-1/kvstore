@@ -103,7 +103,7 @@ BPF_SRCS=$(SRC_DIR)/replication/bpf/repl_sockmap.bpf.c \
           $(SRC_DIR)/replication/bpf/repl_kprobe.bpf.c
 BPF_OBJS=$(patsubst $(SRC_DIR)/%.bpf.c, build/%.bpf.o, $(BPF_SRCS))
 KVS_BPF_OBJS=$(if $(filter 1,$(ENABLE_EBPF)),$(BPF_OBJS),)
-KVS_KPROBE_BPF_OBJS=$(if $(filter 1,$(ENABLE_KPROBE_RDMA)),build/replication/bpf/repl_kprobe.bpf.o,)
+KVS_KPROBE_BPF_OBJS=$(if $(filter 1,$(ENABLE_KPROBE_RDMA)),build/replication/bpf/repl_kprobe.bpf.o build/replication/bpf/repl_client_capture.bpf.o,)
 
 all: build_dir kvstore
 

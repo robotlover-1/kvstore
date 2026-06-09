@@ -1215,21 +1215,27 @@ int repl_client_capture_init(void) {
                  "build/replication/bpf/repl_client_capture.bpf.o");
     }
 
-    /* 设置 libbpf 日志级别 */
+    /* 设置 libbpf 日志级别 — 打印错误信息 */
     libbpf_set_print(NULL);
+
+    fprintf(stderr, "client_capture: opening BPF object: %s\n", obj_path);
 
     /* 打开 BPF 对象 */
     g_client_obj = bpf_object__open_file(obj_path, NULL);
     if (libbpf_get_error(g_client_obj)) {
-        fprintf(stderr, "client_capture: failed to open BPF object: %s\n",
-                obj_path);
+        long err = libbpf_get_error(g_client_obj);
+        fprintf(stderr, "client_capture: failed to open BPF object: %s (err=%ld)\n",
+                obj_path, err);
         g_client_obj = NULL;
         return -1;
     }
 
     /* 加载 BPF 对象 */
     if (bpf_object__load(g_client_obj) != 0) {
-        fprintf(stderr, "client_capture: failed to load BPF object\n");
+        int load_err = -errno;
+        if (load_err == 0) load_err = -1;
+        fprintf(stderr, "client_capture: failed to load BPF object (errno=%d %s)\n",
+                errno, strerror(errno));
         bpf_object__close(g_client_obj);
         g_client_obj = NULL;
         return -1;

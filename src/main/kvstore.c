@@ -483,6 +483,11 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
+        /* 全量同步期间跳过实时广播（数据通过 backlog + eBPF 缓存处理） */
+        if (g_repl_fullsync_in_progress) {
+            pp = &c->next_replica;
+            continue;
+        }
         if (repl_realtime_send(c, raw, rawlen) != 0) {
             if (repl_handle_replica_send_failure(c, pp)) continue;
             pp = &c->next_replica;

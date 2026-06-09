@@ -313,6 +313,9 @@ static int wr_submit_head(int slot) {
 /* ============================================================
  * Ringbuf 回调 — BPF ringbuf 有数据时触发
  * ============================================================ */
+/* REPLDONE 魔法值 — BPF 探测到 REPLDONE 时写入的特殊通知 */
+#define KVS_KPROBE_MAGIC_REPLDONE 0xFFFFFFFF
+
 static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
     (void)ctx;
 
@@ -320,6 +323,16 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
 
     __u32 payload_len;
     memcpy(&payload_len, data, 4);
+
+    /* NEW: 检测 REPLDONE 通知（BPF 探测到 REPLDONE 命令时发送） */
+    if (payload_len == KVS_KPROBE_MAGIC_REPLDONE) {
+        fprintf(stderr, "kprobe: REPLDONE detected via BPF, triggering cache flush\n");
+        /* 通知用户态全量同步完成 */
+        extern volatile int g_repl_fullsync_in_progress;
+        g_repl_fullsync_in_progress = 0;
+        repl_kprobe_fullsync_done();
+        return 0;
+    }
 
     if (payload_len == 0 || payload_len + 4 > size)
         return 0;
@@ -1071,6 +1084,14 @@ int repl_kprobe_rdma_enqueue(const unsigned char *data, size_t len) {
     return 0;  /* 主路径走 kprobe 透明拦截 */
 }
 
+/* REPLDONE 探测回调 — 由 BPF ringbuf 回调或用户态 queue_snapshot 触发
+ * 通知系统全量同步已完成，可以 flush 缓存数据并开始增量同步 */
+void repl_kprobe_fullsync_done(void) {
+    fprintf(stderr, "kprobe: fullsync done callback triggered\n");
+    /* 实际 flush 操作由 queue_snapshot() 中的 repl_client_capture_flush_to_slave()
+     * 完成。此函数主要负责日志和状态标记。 */
+}
+
 #else /* !KVS_ENABLE_KPROBE_RDMA */
 
 /* 编译禁用时的桩实现 */
@@ -1087,5 +1108,6 @@ int repl_kprobe_rdma_set_pid(pid_t p) { (void)p; return -1; }
 int repl_kprobe_rdma_parse_mr_info(const char *r) { (void)r; return -1; }
 int repl_kprobe_rdma_enqueue(const unsigned char *d, size_t l)
     { (void)d; (void)l; return -1; }
+void repl_kprobe_fullsync_done(void) {}
 
 #endif /* KVS_ENABLE_KPROBE_RDMA */

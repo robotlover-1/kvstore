@@ -76,15 +76,17 @@ struct {
 } kprobe_tmpbuf SEC(".maps");
 
 /* ---- Control Keys ---- */
-#define KVS_KPROBE_CTL_ENABLED  0
-#define KVS_KPROBE_CTL_PID      1
+#define KVS_KPROBE_CTL_ENABLED         0
+#define KVS_KPROBE_CTL_PID             1
+#define KVS_KPROBE_CTL_FULLSYNC_DONE   2  /* 写1表示全量同步完成（BPF检测到REPLDONE）*/
 
 /* ---- Stats Keys ---- */
-#define KVS_KPROBE_STAT_HIT      0
-#define KVS_KPROBE_STAT_SKIP_PID 1
-#define KVS_KPROBE_STAT_RB_ERR   2
-#define KVS_KPROBE_STAT_DATA_OVR 3  /* 数据超过单次上限 */
-#define KVS_KPROBE_STAT_READ_ERR 4  /* probe_read 失败 */
+#define KVS_KPROBE_STAT_HIT            0
+#define KVS_KPROBE_STAT_SKIP_PID       1
+#define KVS_KPROBE_STAT_RB_ERR         2
+#define KVS_KPROBE_STAT_DATA_OVR       3  /* 数据超过单次上限 */
+#define KVS_KPROBE_STAT_READ_ERR       4  /* probe_read 失败 */
+#define KVS_KPROBE_STAT_REPLDONE       5  /* REPLDONE 探测计数 */
 
 /* 从 userspace 的 iovec 数组中读取数据拼接到 buf
  * 返回总数据长度（<= max_len），0 表示失败。
@@ -205,7 +207,42 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 6. 更新统计 */
+    /* 6. 检测 REPLDONE 命令 — 匹配后缀 "REPLDONE\r\n" (10字节)
+     * REPLDONE 可能以 RESP 格式 *1\r\n$8\r\nREPLDONE\r\n (15字节)
+     * 或纯文本格式到来，统一匹配末尾10字节 */
+    if (data_len >= 10) {
+        unsigned char *payload = (*entry) + 4;
+        int offset = data_len - 10;
+        if (payload[offset] == 'R' &&
+            payload[offset + 1] == 'E' &&
+            payload[offset + 2] == 'P' &&
+            payload[offset + 3] == 'L' &&
+            payload[offset + 4] == 'D' &&
+            payload[offset + 5] == 'O' &&
+            payload[offset + 6] == 'N' &&
+            payload[offset + 7] == 'E' &&
+            payload[offset + 8] == '\r' &&
+            payload[offset + 9] == '\n') {
+
+            /* 设置 fullsync_done 标志 */
+            __u32 fs_key = KVS_KPROBE_CTL_FULLSYNC_DONE;
+            __u64 fs_val = 1;
+            bpf_map_update_elem(&kprobe_ctl, &fs_key, &fs_val, 0);
+
+            /* 统计 */
+            __u64 *repldone_st = bpf_map_lookup_elem(&kprobe_stats,
+                &(__u32){KVS_KPROBE_STAT_REPLDONE});
+            if (repldone_st) __sync_fetch_and_add(repldone_st, 1);
+
+            /* 写入特殊通知到 ringbuf (payload_len=0xFFFFFFFF 魔法值)
+             * 用户态回调检测到该值后触发缓存 flush */
+            __u32 magic = 0xFFFFFFFF;
+            __builtin_memcpy(*entry, &magic, 4);
+            bpf_ringbuf_output(&repl_ringbuf, *entry, 4, 0);
+        }
+    }
+
+    /* 7. 更新统计 */
     stat = bpf_map_lookup_elem(&kprobe_stats, &(__u32){KVS_KPROBE_STAT_HIT});
     if (stat) __sync_fetch_and_add(stat, 1);
 

@@ -558,6 +558,7 @@ void repl_kprobe_rdma_cleanup(void);
 int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *stats);
 int repl_kprobe_rdma_set_pid(pid_t pid);
 int repl_kprobe_rdma_parse_mr_info(const char *resp);
+void repl_kprobe_fullsync_done(void);
 int repl_kprobe_rdma_get_mr_text(char *buf, size_t cap);
 int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
     size_t total_size, size_t slot_count, size_t slot_capacity);

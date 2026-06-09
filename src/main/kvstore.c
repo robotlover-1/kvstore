@@ -535,10 +535,23 @@ static int queue_snapshot(conn_t *c) {
     size_t total = 0;
     size_t total_bytes = 0;
     int ret = -1;
+    int rdma_ok = 0;
 
     repl_rdma_log("queue_snapshot - begin replid=%s offset=%llu", repl_master_id(), repl_master_offset());
     /* 记录全量同步启动时的 offset，用于后续回放 gap */
     unsigned long long snap_base_offset = repl_master_offset();
+
+    /* NEW: 进入全量同步模式 — 设置标志，尝试启动 RDMA */
+    g_repl_fullsync_in_progress = 1;
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
+        if (repl_rdma_start_fullsync(c) == 0) {
+            rdma_ok = 1;
+            repl_rdma_log("queue_snapshot - RDMA started for fullsync");
+        } else {
+            repl_rdma_log("queue_snapshot - RDMA start failed, falling back to TCP");
+        }
+    }
+
     /* Use a temporary path so we don't overwrite the binary dump file */
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
     fp = fopen(tmp_path, "wb");
@@ -585,6 +598,13 @@ static int queue_snapshot(conn_t *c) {
         }
     }
     c->repl_fullsync_pending = 0;
+
+    /* NEW: 全量同步数据发送完成 — 关闭 RDMA，清除标志 */
+    g_repl_fullsync_in_progress = 0;
+    if (rdma_ok) {
+        repl_rdma_stop_fullsync();
+        repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
+    }
 
     /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset） */
     if (repl_master_offset() > snap_base_offset) {

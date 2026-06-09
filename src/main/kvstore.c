@@ -616,11 +616,13 @@ static int queue_snapshot(conn_t *c) {
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
     }
 
-    /* NEW: Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭） */
-    repl_client_capture_flush_to_slave(c);
+    /* NEW: Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭）
+     * 返回 > 0 表示有缓存数据被刷新，此时跳过 backlog gap replay 避免重复 */
+    int cache_flushed = repl_client_capture_flush_to_slave(c);
 
-    /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset） */
-    if (repl_master_offset() > snap_base_offset) {
+    /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset）
+     * 仅当 eBPF 缓存未启用/无数据时才回放 backlog，避免数据重复 */
+    if (cache_flushed == 0 && repl_master_offset() > snap_base_offset) {
         unsigned long long gap = repl_master_offset() - snap_base_offset;
         repl_rdma_log("queue_snapshot - replaying gap offset=%llu bytes=%llu",
             snap_base_offset, gap);
@@ -629,6 +631,8 @@ static int queue_snapshot(conn_t *c) {
         } else {
             repl_rdma_log("queue_snapshot - gap replay OK");
         }
+    } else if (cache_flushed > 0) {
+        repl_rdma_log("queue_snapshot - backlog gap skipped (cache flushed %d items)", cache_flushed);
     }
 
     ret = 0;

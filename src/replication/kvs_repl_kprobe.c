@@ -1249,9 +1249,10 @@ void repl_client_capture_set_fullsync(int in_progress) {
     fprintf(stderr, "client_capture: fullsync_in_progress=%d\n", in_progress);
 }
 
-/* Flush 缓存的客户端数据到 slave — 通过 TCP 发送 */
+/* Flush 缓存的客户端数据到 slave — 通过 TCP 发送
+ * 返回: 刷新的条目数（0=无缓存数据, >0=已刷新N条） */
 int repl_client_capture_flush_to_slave(conn_t *c) {
-    if (!c) return -1;
+    if (!c) return 0;
 
     pthread_mutex_lock(&g_cache_lock);
     client_cache_node_t *node = g_cache_head;
@@ -1273,9 +1274,11 @@ int repl_client_capture_flush_to_slave(conn_t *c) {
 
     /* 通过 repl_send_chunked 发送缓存数据（走 TCP，因为 RDMA 已关闭） */
     client_cache_node_t *cur = node;
+    int sent_ok = 1;
     while (cur) {
         if (repl_send_chunked(c, cur->data, cur->len) != 0) {
             fprintf(stderr, "client_capture: cache flush send failed\n");
+            sent_ok = 0;
             break;
         }
         client_cache_node_t *next = cur->next;
@@ -1284,9 +1287,19 @@ int repl_client_capture_flush_to_slave(conn_t *c) {
         cur = next;
     }
 
-    fprintf(stderr, "client_capture: cache flush complete (%d/%llu bytes sent)\n",
+    /* 如果发送失败，清理剩余节点 */
+    if (!sent_ok) {
+        while (cur) {
+            client_cache_node_t *next = cur->next;
+            kvs_free(cur->data);
+            kvs_free(cur);
+            cur = next;
+        }
+    }
+
+    fprintf(stderr, "client_capture: cache flush complete (%d/%llu bytes)\n",
             count, bytes);
-    return 0;
+    return count;
 }
 
 /* 清理 client capture 资源 */

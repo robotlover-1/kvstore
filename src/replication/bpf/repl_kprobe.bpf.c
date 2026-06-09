@@ -207,22 +207,22 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 6. 检测 REPLDONE 命令 — 匹配后缀 "REPLDONE\r\n" (10字节)
-     * REPLDONE 可能以 RESP 格式 *1\r\n$8\r\nREPLDONE\r\n (15字节)
-     * 或纯文本格式到来，统一匹配末尾10字节 */
+    /* 6. 检测 REPLDONE 命令 — 匹配 payload 开头 "REPLDONE\r\n" (10字节)
+     * REPLDONE 以 RESP 格式 *1\r\n$8\r\nREPLDONE\r\n (15字节) 发送，
+     * 在 TCP 路径中整个命令在一个 tcp_sendmsg 调用中发送，
+     * 因此检测 payload 开头偏移 0 即可（避免变长偏移导致 verifier 拒绝）。 */
     if (data_len >= 10) {
         unsigned char *payload = (*entry) + 4;
-        int offset = data_len - 10;
-        if (payload[offset] == 'R' &&
-            payload[offset + 1] == 'E' &&
-            payload[offset + 2] == 'P' &&
-            payload[offset + 3] == 'L' &&
-            payload[offset + 4] == 'D' &&
-            payload[offset + 5] == 'O' &&
-            payload[offset + 6] == 'N' &&
-            payload[offset + 7] == 'E' &&
-            payload[offset + 8] == '\r' &&
-            payload[offset + 9] == '\n') {
+        if (payload[0] == 'R' &&
+            payload[1] == 'E' &&
+            payload[2] == 'P' &&
+            payload[3] == 'L' &&
+            payload[4] == 'D' &&
+            payload[5] == 'O' &&
+            payload[6] == 'N' &&
+            payload[7] == 'E' &&
+            payload[8] == '\r' &&
+            payload[9] == '\n') {
 
             /* 设置 fullsync_done 标志 */
             __u32 fs_key = KVS_KPROBE_CTL_FULLSYNC_DONE;

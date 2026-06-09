@@ -198,6 +198,7 @@ kvstore/
 | RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用                |
 | eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速                      |
 | kprobe+RDMA 增量同步         | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR |
+| eBPF+tcp 增量同步（新）     | ✅ 完成   | kprobe/tcp_recvmsg 捕获客户端写入 → ringbuf → 用户态 send() → Slave TCP |
 | TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                                             |
 | 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                                         |
 | 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                                           |
@@ -308,7 +309,7 @@ kvstore/
 | `log_mode`                | `info`             | 日志级别：`debug` / `info` / `warn` / `error` |
 | `appendfsync`             | `always`           | AOF 同步：`always` / `everysec`               |
 | `repl_fullsync_transport` | `rdma`             | 全量同步传输：`rdma` / `tcp`                  |
-| `repl_realtime_transport` | `kprobe-rdma`      | 增量同步传输：`kprobe-rdma` / `ebpf` / `tcp`  |
+| `repl_realtime_transport` | `kprobe-rdma`      | 增量同步传输：`kprobe-rdma`(含eBPF+tcp新路径) / `ebpf` / `tcp`  |
 | `kprobe_enabled`          | `1`                | 启用 kprobe+RDMA 增量同步                     |
 | `rdma_dev`                | `siw0`             | RDMA 设备                                     |
 | `rdma_recv_slots`         | `64`               | RDMA 接收槽位数                               |
@@ -318,6 +319,8 @@ kvstore/
 
 > 命令行参数优先级高于配置文件。启动时只需 `./kvstore kvstore.conf --role master`。
 > **双通道模式**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=kprobe-rdma` 默认启用。
+> 增量同步新增 **eBPF+tcp** 路径：kprobe/tcp_recvmsg 捕获客户端写入 → ringbuf → 用户态直接 send() 到 slave，
+> 数据仅发一份（无TCP+RDMA双份冗余）。自动启用（`client_capture` BPF加载成功后激活）。
 > 完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
 
 ### 命令行参数

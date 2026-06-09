@@ -1,5 +1,6 @@
 
 #include "kvstore/kvstore.h"
+#include "kvstore/replication/repl_kprobe.h"
 #include <signal.h>
 #include <ctype.h>
 #include <strings.h>
@@ -546,8 +547,11 @@ static int queue_snapshot(conn_t *c) {
     /* 记录全量同步启动时的 offset，用于后续回放 gap */
     unsigned long long snap_base_offset = repl_master_offset();
 
-    /* NEW: 进入全量同步模式 — 设置标志，尝试启动 RDMA */
+    /* NEW: 进入全量同步模式 — 设置标志，通知 eBPF 开始缓存客户端数据 */
     g_repl_fullsync_in_progress = 1;
+    repl_client_capture_set_fullsync(1);
+
+    /* 尝试启动 RDMA */
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
         if (repl_rdma_start_fullsync(c) == 0) {
             rdma_ok = 1;
@@ -606,10 +610,14 @@ static int queue_snapshot(conn_t *c) {
 
     /* NEW: 全量同步数据发送完成 — 关闭 RDMA，清除标志 */
     g_repl_fullsync_in_progress = 0;
+    repl_client_capture_set_fullsync(0);
     if (rdma_ok) {
         repl_rdma_stop_fullsync();
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
     }
+
+    /* NEW: Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭） */
+    repl_client_capture_flush_to_slave(c);
 
     /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset） */
     if (repl_master_offset() > snap_base_offset) {
@@ -2195,6 +2203,13 @@ int main(int argc, char **argv) {
             }
         } else if (g_cfg.role == ROLE_SLAVE) {
             repl_kprobe_rdma_slave_init();
+        }
+    }
+
+    /* Client capture 初始化 — 用于全量同步期间缓存客户端写入 */
+    if (g_cfg.kprobe_enabled && g_cfg.role == ROLE_MASTER) {
+        if (repl_client_capture_init() != 0) {
+            fprintf(stderr, "client capture init failed, continuing without cache\n");
         }
     }
 

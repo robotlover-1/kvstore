@@ -1092,6 +1092,237 @@ void repl_kprobe_fullsync_done(void) {
      * 完成。此函数主要负责日志和状态标记。 */
 }
 
+/* ============================================================
+ * Client Capture — 用户态管理
+ * ============================================================
+ *
+ * 数据流:
+ *   BPF kretprobe/tcp_recvmsg → client_cache_ringbuf
+ *     → client_ringbuf_cb() → 缓存队列 (g_cache_list)
+ *     → FULLSYNC_IN_PROGRESS=1: 追加到队列
+ *     → FULLSYNC_IN_PROGRESS=0: 直接转发 (通过 repl_broadcast)
+ *     → queue_snapshot 完成后: repl_client_capture_flush_to_slave()
+ */
+
+/* 缓存队列节点 */
+typedef struct client_cache_node_s {
+    unsigned char *data;
+    size_t len;
+    struct client_cache_node_s *next;
+} client_cache_node_t;
+
+/* Client Capture 全局状态 */
+static struct bpf_object *g_client_obj = NULL;
+static int g_client_ctl_fd = -1;
+static int g_client_stats_fd = -1;
+static int g_client_ringbuf_fd = -1;
+static struct ring_buffer *g_client_ringbuf = NULL;
+static volatile int g_client_running = 0;
+
+/* 缓存队列 */
+static client_cache_node_t *g_cache_head = NULL;
+static client_cache_node_t *g_cache_tail = NULL;
+static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_cache_count = 0;
+static volatile unsigned long long g_cache_bytes = 0;
+
+/* Ringbuf 回调 — BPF 有客户端数据到达时触发 */
+static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
+    (void)ctx;
+    if (size < 4) return 0;
+
+    __u32 payload_len;
+    memcpy(&payload_len, data, 4);
+    if (payload_len == 0 || payload_len + 4 > size) return 0;
+
+    unsigned char *payload = (unsigned char *)data + 4;
+
+    if (g_repl_fullsync_in_progress) {
+        /* 全量同步中 → 缓存到队列 */
+        client_cache_node_t *node = (client_cache_node_t *)
+            kvs_malloc(sizeof(client_cache_node_t));
+        if (!node) return -1;
+
+        node->data = (unsigned char *)kvs_malloc(payload_len);
+        if (!node->data) { kvs_free(node); return -1; }
+        memcpy(node->data, payload, payload_len);
+        node->len = payload_len;
+        node->next = NULL;
+
+        pthread_mutex_lock(&g_cache_lock);
+        if (g_cache_tail) {
+            g_cache_tail->next = node;
+        } else {
+            g_cache_head = node;
+        }
+        g_cache_tail = node;
+        g_cache_count++;
+        g_cache_bytes += payload_len;
+        pthread_mutex_unlock(&g_cache_lock);
+    }
+    /* 非全量同步模式下: 数据直接走 repl_broadcast → backlog，无需额外处理 */
+    return 0;
+}
+
+/* 初始化 client capture BPF */
+int repl_client_capture_init(void) {
+    if (g_client_obj) return 0;  /* 已经初始化 */
+
+    if (!g_cfg.repl_kprobe_obj_path[0]) {
+        fprintf(stderr, "client_capture: missing repl_kprobe_obj_path config\n");
+        return -1;
+    }
+
+    /* 替换对象文件路径: 使用 client_capture BPF 对象 */
+    /* 目前与 kprobe 共用对象文件路径，后续可独立配置 */
+    char obj_path[512];
+    size_t base_len = strlen(g_cfg.repl_kprobe_obj_path);
+    if (base_len > 4 && strcmp(g_cfg.repl_kprobe_obj_path + base_len - 12,
+                                "repl_kprobe.bpf.o") == 0) {
+        /* 在同一目录下查找 client_capture 对象 */
+        snprintf(obj_path, sizeof(obj_path), "%.*srepl_client_capture.bpf.o",
+                 (int)(base_len - 12), g_cfg.repl_kprobe_obj_path);
+    } else {
+        snprintf(obj_path, sizeof(obj_path), "%s",
+                 "build/replication/bpf/repl_client_capture.bpf.o");
+    }
+
+    /* 设置 libbpf 日志级别 */
+    libbpf_set_print(NULL);
+
+    /* 打开 BPF 对象 */
+    g_client_obj = bpf_object__open_file(obj_path, NULL);
+    if (libbpf_get_error(g_client_obj)) {
+        fprintf(stderr, "client_capture: failed to open BPF object: %s\n",
+                obj_path);
+        g_client_obj = NULL;
+        return -1;
+    }
+
+    /* 加载 BPF 对象 */
+    if (bpf_object__load(g_client_obj) != 0) {
+        fprintf(stderr, "client_capture: failed to load BPF object\n");
+        bpf_object__close(g_client_obj);
+        g_client_obj = NULL;
+        return -1;
+    }
+
+    /* 获取 map FDs */
+    g_client_ctl_fd = bpf_object__find_map_fd_by_name(g_client_obj, "client_ctl");
+    g_client_stats_fd = bpf_object__find_map_fd_by_name(g_client_obj, "client_stats");
+    g_client_ringbuf_fd = bpf_object__find_map_fd_by_name(g_client_obj, "client_cache_ringbuf");
+    if (g_client_ctl_fd < 0 || g_client_stats_fd < 0 || g_client_ringbuf_fd < 0) {
+        fprintf(stderr, "client_capture: failed to find BPF maps\n");
+        repl_client_capture_cleanup();
+        return -1;
+    }
+
+    /* 设置 PID 过滤 = 当前进程 */
+    __u32 pid_key = 1;  /* PID */
+    __u64 pid_val = (__u64)getpid();
+    bpf_map_update_elem(g_client_ctl_fd, &pid_key, &pid_val, 0);
+
+    /* 启用 BPF 程序 */
+    __u32 enable_key = 0;  /* ENABLED */
+    __u64 enable_val = 1;
+    bpf_map_update_elem(g_client_ctl_fd, &enable_key, &enable_val, 0);
+
+    /* 创建 ringbuf */
+    g_client_ringbuf = ring_buffer__new(g_client_ringbuf_fd,
+                                         client_ringbuf_cb, NULL, NULL);
+    if (!g_client_ringbuf) {
+        fprintf(stderr, "client_capture: failed to create ring buffer\n");
+        repl_client_capture_cleanup();
+        return -1;
+    }
+
+    fprintf(stderr, "client_capture: initialized (pid=%d)\n", getpid());
+    return 0;
+}
+
+/* 设置全量同步状态 — 通知 BPF 当前是否在全量同步中 */
+void repl_client_capture_set_fullsync(int in_progress) {
+    if (g_client_ctl_fd < 0) return;
+    __u32 key = 3;  /* FULLSYNC_IN_PROGRESS */
+    __u64 val = in_progress ? 1 : 0;
+    bpf_map_update_elem(g_client_ctl_fd, &key, &val, 0);
+    fprintf(stderr, "client_capture: fullsync_in_progress=%d\n", in_progress);
+}
+
+/* Flush 缓存的客户端数据到 slave — 通过 TCP 发送 */
+int repl_client_capture_flush_to_slave(conn_t *c) {
+    if (!c) return -1;
+
+    pthread_mutex_lock(&g_cache_lock);
+    client_cache_node_t *node = g_cache_head;
+    g_cache_head = NULL;
+    g_cache_tail = NULL;
+    int count = g_cache_count;
+    unsigned long long bytes = g_cache_bytes;
+    g_cache_count = 0;
+    g_cache_bytes = 0;
+    pthread_mutex_unlock(&g_cache_lock);
+
+    if (!node) {
+        fprintf(stderr, "client_capture: no cached data to flush\n");
+        return 0;
+    }
+
+    fprintf(stderr, "client_capture: flushing %d cached entries (%llu bytes) to slave\n",
+            count, bytes);
+
+    /* 通过 repl_send_chunked 发送缓存数据（走 TCP，因为 RDMA 已关闭） */
+    client_cache_node_t *cur = node;
+    while (cur) {
+        if (repl_send_chunked(c, cur->data, cur->len) != 0) {
+            fprintf(stderr, "client_capture: cache flush send failed\n");
+            break;
+        }
+        client_cache_node_t *next = cur->next;
+        kvs_free(cur->data);
+        kvs_free(cur);
+        cur = next;
+    }
+
+    fprintf(stderr, "client_capture: cache flush complete (%d/%llu bytes sent)\n",
+            count, bytes);
+    return 0;
+}
+
+/* 清理 client capture 资源 */
+void repl_client_capture_cleanup(void) {
+    g_client_running = 0;
+
+    if (g_client_ringbuf) {
+        ring_buffer__free(g_client_ringbuf);
+        g_client_ringbuf = NULL;
+    }
+    if (g_client_obj) {
+        bpf_object__close(g_client_obj);
+        g_client_obj = NULL;
+    }
+    g_client_ctl_fd = -1;
+    g_client_stats_fd = -1;
+    g_client_ringbuf_fd = -1;
+
+    /* 清理残留缓存节点 */
+    pthread_mutex_lock(&g_cache_lock);
+    client_cache_node_t *cur = g_cache_head;
+    while (cur) {
+        client_cache_node_t *next = cur->next;
+        kvs_free(cur->data);
+        kvs_free(cur);
+        cur = next;
+    }
+    g_cache_head = NULL;
+    g_cache_tail = NULL;
+    g_cache_count = 0;
+    g_cache_bytes = 0;
+    pthread_mutex_unlock(&g_cache_lock);
+
+    fprintf(stderr, "client_capture: cleaned up\n");
+}
+
 #else /* !KVS_ENABLE_KPROBE_RDMA */
 
 /* 编译禁用时的桩实现 */
@@ -1109,5 +1340,9 @@ int repl_kprobe_rdma_parse_mr_info(const char *r) { (void)r; return -1; }
 int repl_kprobe_rdma_enqueue(const unsigned char *d, size_t l)
     { (void)d; (void)l; return -1; }
 void repl_kprobe_fullsync_done(void) {}
+int repl_client_capture_init(void) { return -1; }
+void repl_client_capture_set_fullsync(int p) { (void)p; }
+int repl_client_capture_flush_to_slave(conn_t *c) { (void)c; return 0; }
+void repl_client_capture_cleanup(void) {}
 
 #endif /* KVS_ENABLE_KPROBE_RDMA */

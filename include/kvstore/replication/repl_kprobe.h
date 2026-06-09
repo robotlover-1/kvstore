@@ -56,4 +56,10 @@ int repl_kprobe_rdma_set_pid(pid_t pid);
 /* 设置 kprobe fd 过滤 */
 int repl_kprobe_rdma_set_fd(int fd);
 
+/* ---- Client capture 接口 ---- */
+int repl_client_capture_init(void);
+void repl_client_capture_set_fullsync(int in_progress);
+int repl_client_capture_flush_to_slave(conn_t *c);
+void repl_client_capture_cleanup(void);
+
 #endif /* REPL_KPROBE_H */

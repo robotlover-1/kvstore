@@ -495,9 +495,9 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* eBPF 路径激活时跳过实时广播 — client_capture BPF 内核态直接
-         * 捕获客户端写入并转发到 slave。ebpf/sockmap/tcp 均走此路径。 */
-        if (g_repl_client_capture_active) {
+        /* eBPF 路径激活且 slave 已连接时跳过实时广播 —
+         * client_capture BPF 内核态直接捕获客户端写入并转发到 slave。 */
+        if (g_repl_client_capture_active && g_repl_capture_slave_fd >= 0) {
             pp = &c->next_replica;
             continue;
         }

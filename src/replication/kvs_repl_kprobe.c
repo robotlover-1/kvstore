@@ -1411,9 +1411,30 @@ int repl_client_capture_init(void) {
 void repl_client_capture_set_fullsync(int in_progress) {
     if (g_client_ctl_fd < 0) return;
     __u32 key = 3;  /* FULLSYNC_IN_PROGRESS */
+    __u64 prev = 0;
     __u64 val = in_progress ? 1 : 0;
+
+    /* 读取 BPF map 当前值，检查是否已被 kprobe 清除 */
+    if (!in_progress && g_client_ctl_fd >= 0) {
+        bpf_map_lookup_elem(g_client_ctl_fd, &key, &prev);
+    }
+
     bpf_map_update_elem(g_client_ctl_fd, &key, &val, 0);
-    fprintf(stderr, "client_capture: fullsync_in_progress=%d\n", in_progress);
+
+    /* 读取 REPLDONE 探测统计 */
+    __u64 detect_count = 0;
+    if (!in_progress && g_client_stats_fd >= 0) {
+        __u32 stat_key = 7;  /* REPLDONE_DETECT */
+        bpf_map_lookup_elem(g_client_stats_fd, &stat_key, &detect_count);
+    }
+
+    if (!in_progress && prev == 0) {
+        fprintf(stderr, "client_capture: fullsync_in_progress=0 "
+                "(already_cleared_by_bpf, repldone_detect=%llu)\n",
+                (unsigned long long)detect_count);
+    } else {
+        fprintf(stderr, "client_capture: fullsync_in_progress=%d\n", in_progress);
+    }
 }
 
 /* Flush 缓存的客户端数据到 slave — 通过 TCP 发送

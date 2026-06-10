@@ -62,13 +62,14 @@ struct {
 } client_ctl SEC(".maps");
 
 /* Stats Map:
- * [0]: HIT           — 总命中次数
- * [1]: SKIP_PID      — PID 不匹配跳过
- * [2]: RB_ERR        — ringbuf 写入错误
- * [3]: DATA_OVR      — 数据超过上限
- * [4]: READ_ERR      — probe_read 失败
- * [5]: CACHED        — 缓存条目数
- * [6]: RETPROBE_MISS — kretprobe 未找到 entry 保存的 msg 指针
+ * [0]: HIT              — 总命中次数
+ * [1]: SKIP_PID         — PID 不匹配跳过
+ * [2]: RB_ERR           — ringbuf 写入错误
+ * [3]: DATA_OVR         — 数据超过上限
+ * [4]: READ_ERR         — probe_read 失败
+ * [5]: CACHED           — 缓存条目数
+ * [6]: RETPROBE_MISS    — kretprobe 未找到 entry 保存的 msg 指针
+ * [7]: REPLDONE_DETECT  — tcp_sendmsg 探测到 REPLDONE
  */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -243,6 +244,86 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
     }
 
     return 0;
+}
+
+/* ──── kprobe: 探测 REPLDONE 发送 → 自动关闭全量同步标志 ────
+ *
+ * Hook tcp_sendmsg，拦截 Master 发出的数据。
+ * 当检测到 REPLDONE 时，自动清除 client_ctl[3] (FULLSYNC_IN_PROGRESS)。
+ *
+ * 这比用户态 queue_snapshot() 中调用 repl_client_capture_set_fullsync(0)
+ * 更早一步——REPLDONE 报文刚发出，BPF 就切到 INCR 模式。
+ *
+ * x86_64 调用约定 (tcp_sendmsg):
+ *   struct sock *sk   = di (PT_REGS_PARM1)
+ *   struct msghdr *msg = si (PT_REGS_PARM2)
+ *   size_t size        = dx (PT_REGS_PARM3)
+ */
+SEC("kprobe/tcp_sendmsg")
+int kprobe_client_sendmsg(struct pt_regs *ctx)
+{
+	__u64 *enabled, *target_pid;
+
+	/* 1. 检查开关 */
+	enabled = bpf_map_lookup_elem(&client_ctl, &(__u32){0});
+	if (!enabled || !*enabled)
+		return 0;
+
+	/* 2. PID 过滤 — 只关注 Master 进程发出的数据 */
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	target_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
+	if (!target_pid || pid != (__u32)(*target_pid))
+		return 0;
+
+	/* 3. 只在全量同步进行中才探测 REPLDONE */
+	__u64 *in_progress = bpf_map_lookup_elem(&client_ctl, &(__u32){3});
+	if (!in_progress || !*in_progress)
+		return 0;
+
+	/* 4. 获取 msg 指针 (si = PT_REGS_PARM2) */
+	unsigned long msg_ptr = (unsigned long)ctx->si;
+	if (!msg_ptr)
+		return 0;
+
+	/* 5. 读取发送数据到临时缓冲区 */
+	__u32 map_key = 0;
+	unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
+	entry = bpf_map_lookup_elem(&client_tmpbuf, &map_key);
+	if (!entry) return 0;
+
+	int data_len = read_recv_data(msg_ptr, *entry, CLIENT_ENTRY_MAX_LEN);
+	if (data_len < 8)  /* "REPLDONE" 至少 8 字节 */
+		return 0;
+
+	/* 6. 在前 64 字节中扫描 "REPLDONE" 子串
+	 * 64 字节足够覆盖 RESP 头 (*1\r\n$8\r\n 最多 10 字节) + 数据
+	 * 使用固定上限 + pragma unroll 保证 verifier 接受 */
+	int found = 0;
+#pragma unroll
+	for (int i = 0; i < 64; i++) {
+		if (!found && i + 8 <= data_len &&
+		    (*entry)[i] == 'R' && (*entry)[i+1] == 'E' &&
+		    (*entry)[i+2] == 'P' && (*entry)[i+3] == 'L' &&
+		    (*entry)[i+4] == 'D' && (*entry)[i+5] == 'O' &&
+		    (*entry)[i+6] == 'N' && (*entry)[i+7] == 'E') {
+			found = 1;
+		}
+	}
+
+	if (!found)
+		return 0;
+
+	/* 7. 检测到 REPLDONE → 自动清除 FULLSYNC_IN_PROGRESS
+	 * 此后 BPF 内核态已知全量同步结束，用户态 flush 后即可转发 */
+	__u32 ctl_key = 3;
+	__u64 zero = 0;
+	bpf_map_update_elem(&client_ctl, &ctl_key, &zero, 0);
+
+	/* 8. 统计 */
+	__u64 *stat = bpf_map_lookup_elem(&client_stats, &(__u32){7}); /* REPLDONE_DETECT */
+	if (stat) __sync_fetch_and_add(stat, 1);
+
+	return 0;
 }
 
 char _license[] SEC("license") = "GPL";

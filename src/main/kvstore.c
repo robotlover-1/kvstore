@@ -609,23 +609,28 @@ static int queue_snapshot(conn_t *c) {
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
     c->repl_last_send_ms = kvs_now_ms();
+
+    /* 控制命令 REPLDONE 走 TCP 发送，不走 RDMA
+     * 这样 BPF kprobe/tcp_sendmsg 可以探测到 REPLDONE，自动
+     * 清除 FULLSYNC_IN_PROGRESS 标志 */
+    if (rdma_ok) {
+        repl_rdma_stop_fullsync();
+        repl_rdma_log("queue_snapshot - RDMA stopped before REPLDONE (control cmd via TCP)");
+        rdma_ok = 0;
+    }
     {
         size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
         repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
-        if (repl_send_chunked(c, buf, done) != 0) {
+        if (queue_bytes(c, buf, done) != 0) {
             repl_rdma_log("queue_snapshot - REPLDONE send failed");
             goto out;
         }
     }
     c->repl_fullsync_pending = 0;
 
-    /* NEW: 全量同步数据发送完成 — 关闭 RDMA，清除标志 */
+    /* 全量同步完成 — 清除标志，刷新 eBPF 缓存 */
     g_repl_fullsync_in_progress = 0;
     repl_client_capture_set_fullsync(0);
-    if (rdma_ok) {
-        repl_rdma_stop_fullsync();
-        repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
-    }
 
     /* NEW: Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭）
      * 返回 > 0 表示有缓存数据被刷新，此时跳过 backlog gap replay 避免重复 */

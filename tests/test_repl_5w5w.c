@@ -533,7 +533,7 @@ static int run_test(void) {
     printf("  或:\n");
     printf("    sudo ./kvstore --port %d --role slave --master-host %s --master-port %d \\\n",
            g_opt.slave_port, g_opt.master_host, g_opt.master_port);
-    printf("        --repl-fullsync-transport rdma --repl-realtime-transport kprobe-rdma\n");
+    printf("        --repl-fullsync-transport rdma --repl-realtime-transport tcp\n");
     printf("\n  等待 Slave 连接...\n");
 
     int slave_ready = 0;
@@ -1018,7 +1018,7 @@ static int run_test(void) {
         } else if (active == 0) {
             printf("  %s⚠ client_capture 未激活%s\n", ANSI_YELLOW, ANSI_RESET);
             printf("    可能原因: BPF client_capture 加载失败（需 root 权限）\n");
-            printf("    或 kprobe_enabled=0 / repl_realtime_transport 不为 kprobe-rdma\n");
+            printf("    或 repl_realtime_transport 不为 tcp（当前不是 ebpf+tcp 路径）\n");
         } else {
             printf("  %s✗ 无法获取 client_capture 状态%s\n", ANSI_RED, ANSI_RESET);
         }

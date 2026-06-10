@@ -33,7 +33,7 @@ kv_config_t g_cfg = {
     .net_backend = "reactor",
     .repl_transport_backend = "tcp",
     .repl_fullsync_transport = "rdma",
-    .repl_realtime_transport = "kprobe-rdma",
+    .repl_realtime_transport = "tcp",
     .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
     .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
     .ebpf_enabled = 0,
@@ -496,9 +496,11 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             continue;
         }
         /* eBPF+tcp 路径激活时跳过实时发送 — client_capture BPF (tcp_recvmsg)
-         * 已直接转发客户端写入到 slave。仅在 ebpf/sockmap 为实时传输时生效。 */
+         * 已直接转发客户端写入到 slave。仅在 tcp/ebpf/sockmap 为实时传输时生效。
+         * kprobe-rdma 不受影响（数据走 TCP → kprobe 拦截 → RDMA WRITE）。 */
         if (g_repl_client_capture_active &&
-            (!strcasecmp(repl_realtime_transport_name(), "ebpf") ||
+            (!strcasecmp(repl_realtime_transport_name(), "tcp") ||
+             !strcasecmp(repl_realtime_transport_name(), "ebpf") ||
              !strcasecmp(repl_realtime_transport_name(), "sockmap"))) {
             pp = &c->next_replica;
             continue;
@@ -1092,6 +1094,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             c->repl_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
             /* kprobe 透明拦截，fd 注册在主进程初始化时已完成 */
             fprintf(stderr, "repl: replica transport set to kprobe-rdma\n");
+        }
+        if (c && !strcasecmp(g_cfg.repl_realtime_transport, "tcp")) {
+            c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+            /* ebpf+tcp 路径: client_capture BPF 在 tcp_recvmsg 拦截，
+             * 全量同步期间缓存，完成后直接转发到 slave fd */
+            fprintf(stderr, "repl: replica transport set to tcp (ebpf+tcp path)\n");
         }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
@@ -2247,8 +2255,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Client capture 初始化 — 用于全量同步期间缓存客户端写入 */
-    if (g_cfg.kprobe_enabled && g_cfg.role == ROLE_MASTER) {
+    /* ebpf+tcp (路径4) client_capture 初始化
+     * repl_realtime_transport=tcp 时启用: BPF 拦截 tcp_recvmsg，
+     * 全量同步期间缓存客户端写入，完成后转发到 slave。 */
+    if (g_cfg.role == ROLE_MASTER &&
+        !strcasecmp(g_cfg.repl_realtime_transport, "tcp")) {
         if (repl_client_capture_init() != 0) {
             fprintf(stderr, "client capture init failed, continuing without cache\n");
         }

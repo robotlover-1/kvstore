@@ -1443,8 +1443,10 @@ const char *repl_transport_configured_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
     int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    int use_tcp_realtime = !strcasecmp(repl_realtime_transport_name(), "tcp");
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
+    if (use_rdma_fullsync && use_tcp_realtime) return "rdma+tcp";
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
     if (!strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma")) return "kprobe-rdma";
@@ -1455,8 +1457,10 @@ const char *repl_transport_active_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
     int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    int use_tcp_realtime = !strcasecmp(repl_realtime_transport_name(), "tcp");
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
+    if (use_rdma_fullsync && use_tcp_realtime) return "rdma+tcp";
     return g_repl_transport_active[0] ? g_repl_transport_active : repl_transport_configured_name();
 }
 
@@ -1528,8 +1532,10 @@ const char *repl_transport_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
     int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    int use_tcp_realtime = !strcasecmp(repl_realtime_transport_name(), "tcp");
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
+    if (use_rdma_fullsync && use_tcp_realtime) return "rdma+tcp";
     return repl_transport_active_name();
 }
 
@@ -2201,11 +2207,12 @@ static void *slave_thread(void *arg) {
             continue;
         }
 
-        /* ---- Hybrid dual-transport: RDMA for fullsync + kprobe-rdma for realtime ---- */
+        /* ---- Hybrid dual-transport: RDMA for fullsync + kprobe-rdma/tcp for realtime ---- */
         int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma") && KVS_ENABLE_RDMA;
         int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
+        int use_tcp_realtime = !strcasecmp(repl_realtime_transport_name(), "tcp");
 
-        if (use_rdma_fullsync && use_kprobe_realtime) {
+        if (use_rdma_fullsync && (use_kprobe_realtime || use_tcp_realtime)) {
             int tcp_fd = repl_transport_tcp_connect_slave(host, port);
             if (tcp_fd < 0) {
                 repl_set_link_state(0);
@@ -2232,8 +2239,13 @@ static void *slave_thread(void *arg) {
                 }
             }
 #endif
-            g_slave_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
-            repl_transport_mark_active("kprobe-rdma");
+            if (use_kprobe_realtime) {
+                g_slave_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
+                repl_transport_mark_active("kprobe-rdma");
+            } else {
+                g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+                repl_transport_mark_active("tcp");
+            }
             rdma_fail_streak = 0;
 
             /* 立即发送 REPLSYNC（不等待 RDMA） */

@@ -629,11 +629,14 @@ static int queue_snapshot(conn_t *c) {
     }
     c->repl_fullsync_pending = 0;
 
-    /* 全量同步完成 — 清除标志，刷新 eBPF 缓存 */
+    /* 全量同步完成 — 先清除标志（新 BPF 事件走 INCR 转发），
+     * 再 flush eBPF 缓存（旧缓存数据发送到 slave）。
+     * 顺序很重要: 先清标志确保 flush 期间的新事件不会被缓存到
+     * 已清空的链表，避免数据丢失。 */
     g_repl_fullsync_in_progress = 0;
     repl_client_capture_set_fullsync(0);
 
-    /* NEW: Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭）
+    /* Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭）
      * 返回 > 0 表示有缓存数据被刷新，此时跳过 backlog gap replay 避免重复 */
     int cache_flushed = repl_client_capture_flush_to_slave(c);
 

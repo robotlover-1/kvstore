@@ -1181,13 +1181,40 @@ static int forward_to_slave(const unsigned char *data, size_t len) {
     extern int g_repl_capture_slave_fd;
     if (g_repl_capture_slave_fd < 0) return -1;
 
-    ssize_t sent = send(g_repl_capture_slave_fd, data, len, MSG_NOSIGNAL);
-    if (sent < 0 || (size_t)sent != len) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "client_capture: forward send failed fd=%d errno=%d\n",
-                    g_repl_capture_slave_fd, errno);
+    size_t total_sent = 0;
+    int err_count = 0;
+
+    while (total_sent < len) {
+        ssize_t sent = send(g_repl_capture_slave_fd, data + total_sent,
+                            len - total_sent, MSG_NOSIGNAL);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* 非阻塞 socket 的 EAGAIN — 短暂退避后重试 */
+                if (++err_count > 100) {
+                    static long long last_stuck_warn = 0;
+                    long long now = kvs_now_ms();
+                    if (now - last_stuck_warn > 5000) {
+                        last_stuck_warn = now;
+                        fprintf(stderr, "client_capture: forward stuck (EAGAIN x%d) fd=%d\n",
+                                err_count, g_repl_capture_slave_fd);
+                    }
+                    return -1;
+                }
+                usleep(1000);
+                continue;
+            }
+            /* 真实错误: 限频打印 */
+            static long long last_err_ms = 0;
+            long long now = kvs_now_ms();
+            if (now - last_err_ms > 5000) {
+                last_err_ms = now;
+                fprintf(stderr, "client_capture: forward send error fd=%d errno=%d\n",
+                        g_repl_capture_slave_fd, errno);
+            }
+            return -1;
         }
-        return -1;
+        total_sent += (size_t)sent;
+        err_count = 0;
     }
     return 0;
 }
@@ -1235,14 +1262,14 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_count++;
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
-    } else {
-        /* ═══ STATE_INCR: 增量同步中 → 直接转发到 slave ═══ */
+    } else if (g_repl_capture_slave_fd >= 0) {
+        /* ═══ STATE_INCR: slave 已连接 → 直接转发到 slave ═══ */
         /* 通过 send() 直接将捕获到的 RESP 数据写入 slave TCP 连接 */
-        if (forward_to_slave(payload, payload_len) != 0) {
-            /* 转发失败: 数据走 repl_broadcast 保底，此处不补偿 */
-            fprintf(stderr, "client_capture: forward failed, fallback to broadcast\n");
-        }
+        forward_to_slave(payload, payload_len);
+        /* forward_to_slave 内部已打印错误，此处不做额外处理 */
     }
+    /* else: Phase 1 (slave 未连接) — 数据由 repl_broadcast 处理，
+     *       此处不操作，不打印 */
     return 0;
 }
 

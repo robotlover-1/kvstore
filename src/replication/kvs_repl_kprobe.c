@@ -1064,6 +1064,11 @@ int repl_kprobe_rdma_parse_mr_info_direct(uint32_t rkey, uint64_t addr,
     return 0;
 }
 
+/* ── client_capture 统计变量（前向声明，定义在 Client Capture 区域）── */
+static int g_client_stats_fd = -1;
+static unsigned long long g_client_l1_flushed = 0;
+static unsigned long long g_client_l2_flushed = 0;
+
 /* 获取统计信息 */
 int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *stats) {
     if (!stats) return -1;
@@ -1080,6 +1085,27 @@ int repl_kprobe_rdma_get_stats(kvs_repl_kprobe_stats_t *stats) {
     __u64 val = 0;
     if (kprobe_get_stat(0, &val) == 0)  /* KVS_KPROBE_STAT_HIT */
         stats->kprobe_hits = (unsigned long long)val;
+
+    /* ── client_capture (eBPF+tcp 路径4) 统计 ── */
+    extern volatile int g_repl_client_capture_active;
+    stats->client_capture_active = g_repl_client_capture_active;
+
+    /* 从 client_capture BPF map 读取统计 */
+    if (g_client_stats_fd >= 0) {
+        __u64 bpf_val = 0;
+        if (bpf_map_lookup_elem(g_client_stats_fd, &(__u32){0}, &bpf_val) == 0)
+            stats->client_capture_hits = (unsigned long long)bpf_val;      /* HIT */
+        bpf_val = 0;
+        if (bpf_map_lookup_elem(g_client_stats_fd, &(__u32){5}, &bpf_val) == 0)
+            stats->client_capture_cached = (unsigned long long)bpf_val;    /* CACHED */
+        bpf_val = 0;
+        if (bpf_map_lookup_elem(g_client_stats_fd, &(__u32){7}, &bpf_val) == 0)
+            stats->client_capture_repldone_detect = (unsigned long long)bpf_val; /* REPLDONE_DETECT */
+    }
+
+    /* 用户态持久计数 */
+    stats->client_cache_l1_flushed = g_client_l1_flushed;
+    stats->client_cache_l2_flushed = g_client_l2_flushed;
 
     return 0;
 }
@@ -1126,7 +1152,6 @@ typedef struct client_cache_node_s {
 /* Client Capture 全局状态 */
 static struct bpf_object *g_client_obj = NULL;
 static int g_client_ctl_fd = -1;
-static int g_client_stats_fd = -1;
 static int g_client_ringbuf_fd = -1;
 static struct ring_buffer *g_client_ringbuf = NULL;
 static volatile int g_client_running = 0;
@@ -1142,6 +1167,11 @@ static volatile unsigned long long g_cache_bytes = 0;
 static int g_cache_l2_fd = -1;          /* L2 磁盘文件 fd */
 static char g_cache_l2_path[512] = {0}; /* L2 磁盘文件路径 */
 static unsigned long long g_cache_l2_bytes = 0; /* L2 已写入字节数 */
+
+/* 持久统计（存活于单次全量同步之外，供 INFO 查询） */
+static unsigned long long g_client_hits = 0;        /* ringbuf 回调总事件数 */
+static unsigned long long g_client_cached = 0;       /* 全量同步期间缓存条目数 */
+/* g_client_l1_flushed / g_client_l2_flushed 定义在文件上部（供 repl_kprobe_rdma_get_stats 使用） */
 
 /* 前向声明 */
 static int cache_spill_to_l2(const unsigned char *data, size_t len);
@@ -1172,9 +1202,11 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
     if (payload_len == 0 || payload_len + 4 > size) return 0;
 
     unsigned char *payload = (unsigned char *)data + 4;
+    g_client_hits++;  /* 持久计数 */
 
     if (g_repl_fullsync_in_progress) {
         /* ═══ STATE_FULL: 全量同步中 → 缓存 ═══ */
+        g_client_cached++;  /* 持久计数 */
 
         /* L1 内存已满 → spill 到 L2 磁盘 */
         if (g_cache_bytes >= CACHE_L1_MAX_BYTES) {
@@ -1486,6 +1518,10 @@ int repl_client_capture_flush_to_slave(conn_t *c) {
     /* ── Step 2: Flush L2 磁盘缓存 ── */
     int l2_count = cache_flush_l2_to_slave(c);
     total_count += l2_count;
+
+    /* 持久计数（供 INFO 统计） */
+    g_client_l1_flushed += (unsigned long long)l1_count;
+    g_client_l2_flushed += (unsigned long long)l2_count;
 
     if (total_count == 0) {
         fprintf(stderr, "client_capture: no cached data to flush\n");

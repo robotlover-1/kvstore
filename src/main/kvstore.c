@@ -495,8 +495,11 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* eBPF+tcp 路径激活时跳过实时发送 — kprobe/tcp_recvmsg 已直接转发到 slave */
-        if (g_repl_client_capture_active) {
+        /* eBPF+tcp 路径激活时跳过实时发送 — client_capture BPF (tcp_recvmsg)
+         * 已直接转发客户端写入到 slave。仅在 ebpf/sockmap 为实时传输时生效。 */
+        if (g_repl_client_capture_active &&
+            (!strcasecmp(repl_realtime_transport_name(), "ebpf") ||
+             !strcasecmp(repl_realtime_transport_name(), "sockmap"))) {
             pp = &c->next_replica;
             continue;
         }
@@ -1229,6 +1232,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "kprobe_ringbuf_bytes:%llu\n"
             "kprobe_rdma_writes:%llu\n"
             "kprobe_rdma_errors:%llu\n"
+            "client_capture_active:%d\n"
+            "client_capture_hits:%llu\n"
+            "client_capture_cached:%llu\n"
+            "client_capture_repldone_detect:%llu\n"
+            "client_cache_l1_flushed:%llu\n"
+            "client_cache_l2_flushed:%llu\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -1304,6 +1313,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             kprobe_stats.total_bytes,
             kprobe_stats.rdma_writes,
             kprobe_stats.rdma_errors,
+            kprobe_stats.client_capture_active,
+            kprobe_stats.client_capture_hits,
+            kprobe_stats.client_capture_cached,
+            kprobe_stats.client_capture_repldone_detect,
+            kprobe_stats.client_cache_l1_flushed,
+            kprobe_stats.client_cache_l2_flushed,
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));

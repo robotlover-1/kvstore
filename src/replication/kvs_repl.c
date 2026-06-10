@@ -2270,25 +2270,10 @@ static void *slave_thread(void *arg) {
 
                 int had_new_data = 0;
 
-                /* TCP recv 控制消息（全量数据通过 RDMA arrival 通知触达） */
-                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
-                if (r > 0) {
-                    blen += (size_t)r;
-                    had_new_data = 1;
-                    parse_resp_stream(NULL, buf, &blen, 1);
-                    repl_slave_ack_heartbeat();
-                    repl_set_link_state(1);
-                } else if (r == 0) {
-                    break;
-                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    break;
-                }
-
-                if (blen > 0) {
-                    parse_resp_stream(NULL, buf, &blen, 1);
-                }
-
-                /* 也轮询 RDMA 全量数据 */
+                /* ═══ 先处理 RDMA 全量数据，再处理 TCP 控制消息 ═══
+                 * 顺序很关键: TCP 通道承载 REPLDONE 控制命令，如果在 RDMA
+                 * 数据收完之前处理 REPLDONE，会提前结束全量同步，导致 RDMA
+                 * CQ 中尚未消费的 chunk 数据全部丢失。 */
 #if KVS_ENABLE_RDMA
                 if (g_repl_rdma_ctx.connected) {
                     int recv_slot = -1;
@@ -2316,13 +2301,29 @@ static void *slave_thread(void *arg) {
                 }
 #endif
 
+                /* RDMA 数据立即解析，释放缓冲区后继续收更多 RDMA chunk */
                 if (had_new_data && blen > 0) {
                     parse_resp_stream(NULL, buf, &blen, 1);
                     repl_slave_ack_heartbeat();
                     repl_set_link_state(1);
-                } else if (had_new_data) {
+                }
+
+                /* TCP recv 控制消息（REPLDONE 等）— 在 RDMA 之后处理 */
+                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
+                if (r > 0) {
+                    blen += (size_t)r;
+                    had_new_data = 1;
+                    parse_resp_stream(NULL, buf, &blen, 1);
                     repl_slave_ack_heartbeat();
                     repl_set_link_state(1);
+                } else if (r == 0) {
+                    break;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
+                }
+
+                if (blen > 0) {
+                    parse_resp_stream(NULL, buf, &blen, 1);
                 }
             }
 
@@ -2396,29 +2397,9 @@ static void *slave_thread(void *arg) {
 
                 int had_new_data = 0;
 
-                /* TCP recv is non-blocking; FULLRESYNC header arrives via RDMA
-                 * alongside snapshot data, so we don't block waiting for TCP. */
-                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
-                if (r > 0) {
-                    blen += (size_t)r;
-                    had_new_data = 1;
-                    /* Parse TCP data immediately to free buffer space for RDMA */
-                    parse_resp_stream(NULL, buf, &blen, 1);
-                    repl_slave_ack_heartbeat();
-                    repl_set_link_state(1);
-                } else if (r == 0) {
-                    break;
-                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    break;
-                }
-
-                /* Parse any leftover from previous RDMA chunk to maximize
-                 * buffer space before checking for new RDMA data */
-                if (blen > 0) {
-                    parse_resp_stream(NULL, buf, &blen, 1);
-                }
-
-                /* Also check RDMA for fullsync data */
+                /* ═══ 先处理 RDMA 全量数据，再处理 TCP 控制消息 ═══
+                 * 顺序很关键: TCP 通道承载 REPLDONE，如果在 RDMA 数据
+                 * 收完之前处理 REPLDONE，会提前结束全量同步导致数据丢失。 */
 #if KVS_ENABLE_RDMA
                 if (g_repl_rdma_ctx.connected) {
                     int recv_slot = -1;
@@ -2431,15 +2412,13 @@ static void *slave_thread(void *arg) {
                         payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
                         if (payload) {
                             if (repl_rdma_repost_recv(recv_slot) == 0) {
-                                fprintf(stderr, "repl rdma: slave_debug_rdma - recv_slot=%d rdma_blen=%zu blen_before=%zu buf_size=%zu\n",
-                                    recv_slot, rdma_blen, blen, sizeof(buf));
                                 if (blen + rdma_blen <= sizeof(buf)) {
                                     memcpy(buf + blen, payload, rdma_blen);
                                     blen += rdma_blen;
                                     had_new_data = 1;
                                 } else {
-                                    fprintf(stderr, "repl rdma: slave_debug_rdma - BUFFER OVERFLOW! blen=%zu rdma_blen=%zu sizeof(buf)=%zu\n",
-                                        blen, rdma_blen, sizeof(buf));
+                                    fprintf(stderr, "repl rdma: slave buffer overflow blen=%zu rdma=%zu\n",
+                                        blen, rdma_blen);
                                 }
                             }
                             kvs_free(payload);
@@ -2448,19 +2427,29 @@ static void *slave_thread(void *arg) {
                 }
 #endif
 
-                /* Only parse when new data was added to avoid busy-loop
-                 * on incomplete data. */
+                /* RDMA 数据立即解析，释放缓冲区 */
                 if (had_new_data && blen > 0) {
-                    size_t before = blen;
                     parse_resp_stream(NULL, buf, &blen, 1);
-                    fprintf(stderr, "repl rdma: slave_debug_parse - before=%zu after=%zu consumed=%zu\n",
-                        before, blen, before - blen);
                     repl_slave_ack_heartbeat();
                     repl_set_link_state(1);
-                } else if (had_new_data) {
-                    /* TCP had data but parse_resp_stream consumed it all */
+                }
+
+                /* TCP recv — REPLDONE 等控制消息在 RDMA 之后处理 */
+                ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
+                if (r > 0) {
+                    blen += (size_t)r;
+                    had_new_data = 1;
+                    parse_resp_stream(NULL, buf, &blen, 1);
                     repl_slave_ack_heartbeat();
                     repl_set_link_state(1);
+                } else if (r == 0) {
+                    break;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
+                }
+
+                if (blen > 0) {
+                    parse_resp_stream(NULL, buf, &blen, 1);
                 }
             }
 

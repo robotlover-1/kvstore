@@ -1399,6 +1399,44 @@ int repl_client_capture_init(void) {
         return -1;
     }
 
+    /* Attach kprobe/kretprobe — BPF 程序需显式 attach 才能触发
+     * (libbpf 0.5.0 不支持 kprobe auto-attach) */
+    {
+        struct bpf_program *prog;
+        struct bpf_link *link;
+
+        /* 1. kprobe/tcp_recvmsg — 捕获客户端写入数据 (entry) */
+        prog = bpf_object__find_program_by_name(g_client_obj, "kprobe_client_recv_entry");
+        if (!prog) {
+            fprintf(stderr, "client_capture: program not found: kprobe_client_recv_entry\n");
+            repl_client_capture_cleanup();
+            return -1;
+        }
+        link = bpf_program__attach_kprobe(prog, false, "tcp_recvmsg");
+        if (libbpf_get_error(link)) {
+            fprintf(stderr, "client_capture: failed to attach kprobe/tcp_recvmsg\n");
+            repl_client_capture_cleanup();
+            return -1;
+        }
+
+        /* 2. kretprobe/tcp_recvmsg — 捕获客户端写入数据 (return, 读取 iov) */
+        prog = bpf_object__find_program_by_name(g_client_obj, "kprobe_client_recv_return");
+        if (!prog) {
+            fprintf(stderr, "client_capture: program not found: kprobe_client_recv_return\n");
+            repl_client_capture_cleanup();
+            return -1;
+        }
+        link = bpf_program__attach_kprobe(prog, true, "tcp_recvmsg");
+        if (libbpf_get_error(link)) {
+            fprintf(stderr, "client_capture: failed to attach kretprobe/tcp_recvmsg\n");
+            repl_client_capture_cleanup();
+            return -1;
+        }
+
+        /* REPLDONE 探测由用户态 repl_client_capture_set_fullsync(0) 同步完成，
+         * 不需要 BPF kprobe/tcp_sendmsg 冗余拦截 */
+    }
+
     /* 设置 PID 过滤 = 当前进程 */
     __u32 pid_key = 1;  /* PID */
     __u64 pid_val = (__u64)getpid();

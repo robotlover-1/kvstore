@@ -495,13 +495,9 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* eBPF+tcp 路径激活时跳过实时发送 — client_capture BPF (tcp_recvmsg)
-         * 已直接转发客户端写入到 slave。仅在 tcp/ebpf/sockmap 为实时传输时生效。
-         * kprobe-rdma 不受影响（数据走 TCP → kprobe 拦截 → RDMA WRITE）。 */
-        if (g_repl_client_capture_active &&
-            (!strcasecmp(repl_realtime_transport_name(), "tcp") ||
-             !strcasecmp(repl_realtime_transport_name(), "ebpf") ||
-             !strcasecmp(repl_realtime_transport_name(), "sockmap"))) {
+        /* eBPF 路径激活时跳过实时广播 — client_capture BPF 内核态直接
+         * 捕获客户端写入并转发到 slave。ebpf/sockmap/tcp 均走此路径。 */
+        if (g_repl_client_capture_active) {
             pp = &c->next_replica;
             continue;
         }
@@ -1097,15 +1093,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         }
         if (c && !strcasecmp(g_cfg.repl_realtime_transport, "tcp")) {
             c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
-            /* ebpf+tcp 路径: client_capture BPF 在 tcp_recvmsg 拦截，
-             * 全量同步期间缓存，完成后直接转发到 slave fd */
-            fprintf(stderr, "repl: replica transport set to tcp (ebpf+tcp path)\n");
+            /* tcp 实时传输: 全量同步走 RDMA，增量数据走 TCP 广播 */
+            fprintf(stderr, "repl: replica transport set to tcp\n");
         }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
 
-        /* eBPF+tcp 路径: 记录 slave fd 供转发引擎使用 */
+        /* eBPF+tcp/ebpf/sockmap 路径: 记录 slave fd 供 client_capture 转发引擎使用 */
         if (g_repl_client_capture_active) {
             g_repl_capture_slave_fd = c->fd;
             fprintf(stderr, "client_capture: capture slave fd=%d\n", c->fd);
@@ -2255,11 +2250,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ebpf+tcp (路径4) client_capture 初始化
-     * repl_realtime_transport=tcp 时启用: BPF 拦截 tcp_recvmsg，
-     * 全量同步期间缓存客户端写入，完成后转发到 slave。 */
+    /* eBPF+tcp / ebpf / sockmap 路径 client_capture 初始化
+     * BPF 拦截 tcp_recvmsg 捕获客户端写入，全量同步期间缓存，
+     * 全量完成后 (REPLDONE 通过 tcp_sendmsg 探测) 转发到 slave。 */
     if (g_cfg.role == ROLE_MASTER &&
-        !strcasecmp(g_cfg.repl_realtime_transport, "tcp")) {
+        (!strcasecmp(g_cfg.repl_realtime_transport, "tcp") ||
+         !strcasecmp(g_cfg.repl_realtime_transport, "ebpf") ||
+         !strcasecmp(g_cfg.repl_realtime_transport, "sockmap"))) {
         if (repl_client_capture_init() != 0) {
             fprintf(stderr, "client capture init failed, continuing without cache\n");
         }

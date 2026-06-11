@@ -32,6 +32,11 @@ static long long g_aof_last_flush_ms = 0;
 
 static int g_aof_disabled = 0;
 
+/* AOF write buffer: batch small RESP commands into larger io_uring writes */
+#define AOF_BUF_SIZE 65536
+static unsigned char g_aof_buf[AOF_BUF_SIZE];
+static size_t g_aof_buf_len = 0;
+
 int persist_aof_disable(void) {
     g_aof_disabled = 1;
     return 0;
@@ -132,9 +137,71 @@ int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long
     return 0;
 }
 
+/* batch write + fsync: submit both SQEs, wait once (halves kernel round-trips) */
+static int persist_write_and_fsync_uring(int fd, const unsigned char *buf, size_t len,
+                                          off_t *offset) {
+    struct io_uring_sqe *sqe_w, *sqe_f;
+    struct io_uring_cqe *cqe;
+    int rc;
+
+    if (persist_uring_init_once() != 0) return -1;
+
+    /* submit write SQE */
+    sqe_w = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_w) return -1;
+    io_uring_prep_write(sqe_w, fd, buf, len, offset ? *offset : -1);
+
+    /* submit fsync SQE (ordered after write in the SQ) */
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_f) return -1;
+    io_uring_prep_fsync(sqe_f, fd, 0);
+
+    /* wait for both completions */
+    rc = io_uring_submit_and_wait(&g_persist_uring, 2);
+    if (rc < 0) return -1;
+
+    /* collect write CQE */
+    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
+    if (rc < 0 || !cqe) return -1;
+    rc = cqe->res;
+    io_uring_cqe_seen(&g_persist_uring, cqe);
+    if (rc <= 0) return -1;
+    if (offset) *offset += rc;
+
+    /* collect fsync CQE */
+    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
+    if (rc < 0 || !cqe) return -1;
+    rc = cqe->res;
+    io_uring_cqe_seen(&g_persist_uring, cqe);
+    return rc < 0 ? -1 : 0;
+}
+
 static int persist_fsync_fd_best_effort(int fd) {
     if (persist_fsync_fd_uring(fd) == 0) return 0;
     return fsync(fd);
+}
+
+/* flush AOF buffer to disk: write + fsync as one io_uring batch */
+static int persist_aof_flush_buffer(void) {
+    off_t off;
+    int rc;
+
+    if (g_aof_buf_len == 0 || g_aof_fd < 0) return 0;
+
+    off = (off_t)g_aof_write_offset;
+    rc = persist_write_and_fsync_uring(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
+    if (rc != 0) {
+        /* fallback: pwrite + fsync */
+        rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
+        if (rc != 0) return -1;
+        rc = persist_fsync_fd_best_effort(g_aof_fd);
+        if (rc != 0) return -1;
+    }
+    g_aof_write_offset = (long long)off;
+    g_aof_buf_len = 0;
+    g_aof_dirty = 0;
+    g_aof_last_flush_ms = kvs_now_ms();
+    return 0;
 }
 
 int persist_fsync_fd(int fd) {
@@ -470,18 +537,31 @@ const char *persist_aof_policy_name(void) {
 
 int persist_force_aof_flush(void) {
     if (g_aof_fd < 0) return -1;
-    if (persist_flush_aof_fd(g_aof_fd) != 0) return -1;
-    g_aof_dirty = 0;
-    g_aof_last_flush_ms = kvs_now_ms();
+    if (persist_aof_flush_buffer() != 0) return -1;
     return 0;
 }
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
-    long long off;
     if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;
-    off = g_aof_write_offset;
-    if (persist_write_raw_fd(g_aof_fd, buf, len, &off) != 0) return -1;
-    g_aof_write_offset = off;
+
+    /* if single command exceeds buffer, flush first then write directly */
+    if (len >= AOF_BUF_SIZE) {
+        if (persist_aof_flush_buffer() != 0) return -1;
+        off_t off = (off_t)g_aof_write_offset;
+        if (persist_write_and_fsync_uring(g_aof_fd, buf, len, &off) != 0) {
+            if (persist_write_fd_sync(g_aof_fd, buf, len, &off) != 0) return -1;
+        }
+        g_aof_write_offset = (long long)off;
+    } else {
+        /* buffer the write */
+        if (g_aof_buf_len + len > AOF_BUF_SIZE) {
+            if (persist_aof_flush_buffer() != 0) return -1;
+        }
+        memcpy(g_aof_buf + g_aof_buf_len, buf, len);
+        g_aof_buf_len += len;
+        /* offset updated in persist_aof_flush_buffer after actual write */
+    }
+
     g_aof_dirty = 1;
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);

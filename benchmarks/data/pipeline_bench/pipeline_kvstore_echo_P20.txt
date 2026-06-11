@@ -1,12 +1,13 @@
-echo: 0.00echo: 1000079.75echo: 937840.31echo: 983302.25echo: 998165.81====== echo ======
-  1000000 requests completed in 1.00 seconds
+echo: -nanecho: 1172280.00echo: 1157756.00echo: 1122714.62====== echo ======
+  1000000 requests completed in 0.88 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-97.01% <= 1 milliseconds
-99.76% <= 2 milliseconds
-99.89% <= 3 milliseconds
-100.00% <= 3 milliseconds
-999000.94 requests per second
+98.57% <= 1 milliseconds
+99.79% <= 2 milliseconds
+99.94% <= 3 milliseconds
+100.00% <= 4 milliseconds
+100.00% <= 4 milliseconds
+1142857.12 requests per second
 

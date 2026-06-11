@@ -614,6 +614,8 @@ static int queue_snapshot(conn_t *c) {
             repl_rdma_log("queue_snapshot - REPLDONE send failed");
             goto out;
         }
+        /* 通知 client_capture: REPLDONE 已发送（用户态路径，eBPF+tcp 不经过 kprobe） */
+        repl_client_capture_note_repldone();
     }
     c->repl_fullsync_pending = 0;
 

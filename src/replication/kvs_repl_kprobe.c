@@ -1099,9 +1099,16 @@ int repl_kprobe_rdma_enqueue(const unsigned char *data, size_t len) {
 /* REPLDONE 探测回调 — 由 BPF ringbuf 回调或用户态 queue_snapshot 触发
  * 通知系统全量同步已完成，可以 flush 缓存数据并开始增量同步 */
 void repl_kprobe_fullsync_done(void) {
-    fprintf(stderr, "kprobe: fullsync done callback triggered\n");
+    g_cc_repldone_detect++;
+    fprintf(stderr, "kprobe: fullsync done callback triggered (count=%d)\n",
+        g_cc_repldone_detect);
     /* 实际 flush 操作由 queue_snapshot() 中的 repl_client_capture_flush_to_slave()
      * 完成。此函数主要负责日志和状态标记。 */
+}
+
+/* 用户态通知 REPLDONE（eBPF+tcp 路径不走 kprobe，由 queue_snapshot 调用） */
+void repl_client_capture_note_repldone(void) {
+    g_cc_repldone_detect++;
 }
 
 /* ============================================================
@@ -1675,6 +1682,7 @@ int repl_client_capture_init(void) { return -1; }
 void repl_client_capture_set_fullsync(int p) { (void)p; }
 int repl_client_capture_flush_to_slave(conn_t *c) { (void)c; return 0; }
 void repl_client_capture_cleanup(void) {}
+void repl_client_capture_note_repldone(void) {}
 int repl_client_capture_get_stats(unsigned long long *hits,
     unsigned long long *cached, int *repldone_detect,
     int *l1_flushed, int *l2_flushed)

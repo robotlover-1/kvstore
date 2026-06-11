@@ -5,6 +5,18 @@
 #include <ctype.h>
 #include <strings.h>
 
+/* pre-encoded RESP literals — avoid snprintf on hot path */
+#define RESP_OK     "+OK\r\n"
+#define RESP_OK_LEN 5
+#define RESP_ONE    ":1\r\n"
+#define RESP_ONE_LEN 4
+#define RESP_ZERO   ":0\r\n"
+#define RESP_ZERO_LEN 4
+#define RESP_ERR_NF "-ERR not found or exists\r\n"
+#define RESP_ERR_NF_LEN 25
+#define RESP_ERR_FAIL "-ERR operation failed\r\n"
+#define RESP_ERR_FAIL_LEN 22
+
 /* kvs_repl.c 中的 static 变量，KPROBEMR 响应需要 */
 extern int g_slave_fd;
 
@@ -1718,7 +1730,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     }
 
     if (rc == 0) {
-        n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        memcpy(resp, RESP_OK, RESP_OK_LEN);
+        n = RESP_OK_LEN;
         if (!strcmp(op, "SET") || !strcmp(op, "MOD")) {
             kvs_expire_persist(&global_expire, engine, argv[1]);
         }
@@ -1749,10 +1762,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             }
         }
     } else if (rc == 1 && should_reply_missing) {
-        if (!strcmp(op, "SET")) n = resp_simple_string(resp, BUFFER_CAP, "OK");
-        else n = resp_error(resp, BUFFER_CAP, "not found or exists");
+        if (!strcmp(op, "SET")) {
+            memcpy(resp, RESP_OK, RESP_OK_LEN);
+            n = RESP_OK_LEN;
+        } else {
+            memcpy(resp, RESP_ERR_NF, RESP_ERR_NF_LEN);
+            n = RESP_ERR_NF_LEN;
+        }
     } else {
-        n = resp_error(resp, BUFFER_CAP, "operation failed");
+        memcpy(resp, RESP_ERR_FAIL, RESP_ERR_FAIL_LEN);
+        n = RESP_ERR_FAIL_LEN;
     }
     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;

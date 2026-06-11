@@ -51,7 +51,8 @@ int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
     else c->out_head = n;
     c->out_tail = n;
 
-    mod_events(c, EPOLLIN | EPOLLOUT);
+    /* event re-arm deferred to on_read() / reactor loop to avoid
+     * per-command epoll_ctl() syscalls during pipeline processing */
     return 0;
 }
 
@@ -117,6 +118,8 @@ static void on_accept(conn_t *lc) {
     }
 }
 
+static void on_write(conn_t *c);
+
 static void on_read(conn_t *c) {
     while (1) {
         if (c->in_len >= sizeof(c->inbuf)) {
@@ -144,6 +147,11 @@ static void on_read(conn_t *c) {
         close_conn(c);
         return;
     }
+
+    /* try immediate write after processing pipeline batch:
+     * if parse_resp_stream queued multiple responses, send()
+     * them now instead of waiting for next epoll_wait→EPOLLOUT */
+    if (c->out_head) on_write(c);
 
     if (c->out_head) mod_events(c, EPOLLIN | EPOLLOUT);
     else mod_events(c, EPOLLIN);

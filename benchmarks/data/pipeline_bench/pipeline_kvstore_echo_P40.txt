@@ -1,0 +1,15 @@
+echo: -nanecho: 48200.00echo: 48100.00echo: 45400.00echo: 46003.99echo: 44963.23echo: 45336.44echo: 44780.12echo: 45002.50echo: 44660.15echo: 44894.08echo: 45047.24echo: 44746.50echo: 44898.52echo: 45061.38echo: 44788.17echo: 44948.79echo: 44742.54echo: 44843.44echo: 45001.05echo: 44759.14echo: 44898.16echo: 44690.17echo: 44834.00echo: 44871.75echo: 44759.99echo: 44829.34echo: 44726.98echo: 44815.82echo: 44837.33echo: 44766.79echo: 44788.37echo: 44723.89echo: 44807.37echo: 44788.57echo: 44762.39echo: 44759.00echo: 44725.01echo: 44781.69echo: 44732.14echo: 44762.62echo: 44705.02echo: 44722.51echo: 44784.75echo: 44718.77echo: 44748.58echo: 44687.12echo: 44720.14echo: 44684.77echo: 44693.64echo: 44663.79echo: 44706.77echo: 44717.86echo: 44677.10echo: 44717.95echo: 44649.59echo: 44700.88echo: 44640.58echo: 44679.16echo: 44711.02echo: 44659.20echo: 44706.07echo: 44730.80echo: 44688.75echo: 44730.46echo: 44667.57echo: 44705.63echo: 44644.99echo: 44682.27echo: 44718.32echo: 44667.35echo: 44707.45echo: 44651.05echo: 44687.37echo: 44635.62echo: 44659.13echo: 44616.80echo: 44652.41echo: 44611.25echo: 44637.93echo: 44595.97echo: 44624.16echo: 44583.39echo: 44609.12echo: 44569.51echo: 44600.23echo: 44623.47echo: 44588.27echo: 44547.07echo: 44575.06====== echo ======
+  1000000 requests completed in 22.43 seconds
+  50 parallel clients
+  64 bytes payload
+  keep alive: 1
+
+67.49% <= 1 milliseconds
+93.86% <= 2 milliseconds
+98.94% <= 3 milliseconds
+99.78% <= 4 milliseconds
+99.89% <= 5 milliseconds
+99.96% <= 6 milliseconds
+100.00% <= 6 milliseconds
+44589.11 requests per second
+

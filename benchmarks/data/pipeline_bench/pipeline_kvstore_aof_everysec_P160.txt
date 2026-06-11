@@ -1,37 +1,34 @@
-HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 876160.00HSET key:__rand_int__ value: 847040.00HSET key:__rand_int__ value: 829653.31HSET key:__rand_int__ value: 803360.00====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 1.21 seconds
+HSET key:__rand_int__ value: 0.00HSET key:__rand_int__ value: 894342.69HSET key:__rand_int__ value: 859401.25HSET key:__rand_int__ value: 872636.50HSET key:__rand_int__ value: 858181.75====== HSET key:__rand_int__ value ======
+  1000000 requests completed in 1.14 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-1.02% <= 1 milliseconds
-1.36% <= 2 milliseconds
-1.58% <= 3 milliseconds
-1.76% <= 4 milliseconds
-2.02% <= 5 milliseconds
-3.09% <= 6 milliseconds
-3.76% <= 7 milliseconds
-12.21% <= 8 milliseconds
-56.59% <= 9 milliseconds
-79.87% <= 10 milliseconds
-89.41% <= 11 milliseconds
-93.28% <= 12 milliseconds
-94.03% <= 13 milliseconds
-94.77% <= 14 milliseconds
-95.58% <= 15 milliseconds
-96.80% <= 16 milliseconds
-98.59% <= 17 milliseconds
-99.34% <= 18 milliseconds
-99.62% <= 19 milliseconds
-99.79% <= 20 milliseconds
-99.86% <= 21 milliseconds
-99.87% <= 22 milliseconds
-99.90% <= 23 milliseconds
+1.36% <= 1 milliseconds
+1.41% <= 2 milliseconds
+1.60% <= 3 milliseconds
+1.73% <= 4 milliseconds
+2.05% <= 5 milliseconds
+3.10% <= 6 milliseconds
+4.24% <= 7 milliseconds
+33.34% <= 8 milliseconds
+76.86% <= 9 milliseconds
+86.02% <= 10 milliseconds
+91.73% <= 11 milliseconds
+93.63% <= 12 milliseconds
+94.45% <= 13 milliseconds
+95.10% <= 14 milliseconds
+95.60% <= 15 milliseconds
+97.90% <= 16 milliseconds
+99.12% <= 17 milliseconds
+99.57% <= 18 milliseconds
+99.76% <= 19 milliseconds
+99.81% <= 20 milliseconds
+99.89% <= 21 milliseconds
+99.90% <= 22 milliseconds
 99.92% <= 26 milliseconds
-99.94% <= 27 milliseconds
 99.95% <= 29 milliseconds
-99.97% <= 30 milliseconds
-99.98% <= 32 milliseconds
-100.00% <= 32 milliseconds
-826446.25 requests per second
+99.98% <= 31 milliseconds
+100.00% <= 31 milliseconds
+876424.19 requests per second
 

@@ -1,15 +1,15 @@
-HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 477480.00HSET key:__rand_int__ value: 449620.00HSET key:__rand_int__ value: 428346.66HSET key:__rand_int__ value: 426260.00HSET key:__rand_int__ value: 422192.00HSET key:__rand_int__ value: 420486.66HSET key:__rand_int__ value: 418988.56HSET key:__rand_int__ value: 414325.00HSET key:__rand_int__ value: 417155.56====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 2.39 seconds
+HSET key:__rand_int__ value: 0.00HSET key:__rand_int__ value: 499243.06HSET key:__rand_int__ value: 458043.94HSET key:__rand_int__ value: 444274.31HSET key:__rand_int__ value: 444055.94HSET key:__rand_int__ value: 443453.22HSET key:__rand_int__ value: 438780.81HSET key:__rand_int__ value: 432952.59HSET key:__rand_int__ value: 435137.44HSET key:__rand_int__ value: 440710.81====== HSET key:__rand_int__ value ======
+  1000000 requests completed in 2.27 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-28.18% <= 1 milliseconds
-97.02% <= 2 milliseconds
-99.64% <= 3 milliseconds
-99.91% <= 4 milliseconds
-99.96% <= 5 milliseconds
-100.00% <= 6 milliseconds
-100.00% <= 6 milliseconds
-419111.50 requests per second
+33.46% <= 1 milliseconds
+97.74% <= 2 milliseconds
+99.80% <= 3 milliseconds
+99.93% <= 4 milliseconds
+99.95% <= 5 milliseconds
+100.00% <= 7 milliseconds
+100.00% <= 7 milliseconds
+441306.25 requests per second
 

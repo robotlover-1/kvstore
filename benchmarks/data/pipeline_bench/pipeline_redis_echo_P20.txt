@@ -1,11 +1,10 @@
-echo: -nanecho: 2119760.00====== echo ======
+echo: -nanecho: 2131040.00====== echo ======
   1000000 requests completed in 0.47 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-99.45% <= 1 milliseconds
-99.91% <= 3 milliseconds
-100.00% <= 3 milliseconds
-2123142.25 requests per second
+99.53% <= 1 milliseconds
+100.00% <= 1 milliseconds
+2118644.00 requests per second
 

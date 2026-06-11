@@ -1,35 +1,34 @@
-HSET key:__rand_int__ value: 0.00HSET key:__rand_int__ value: 956812.81HSET key:__rand_int__ value: 927425.19HSET key:__rand_int__ value: 897755.00HSET key:__rand_int__ value: 883916.06====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 1.12 seconds
+HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 1020800.00HSET key:__rand_int__ value: 975680.00HSET key:__rand_int__ value: 956373.31HSET key:__rand_int__ value: 948000.00====== HSET key:__rand_int__ value ======
+  1000000 requests completed in 1.05 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-1.36% <= 1 milliseconds
-1.46% <= 2 milliseconds
-1.89% <= 3 milliseconds
-2.56% <= 4 milliseconds
-3.25% <= 5 milliseconds
-4.93% <= 6 milliseconds
-7.02% <= 7 milliseconds
-35.02% <= 8 milliseconds
-80.19% <= 9 milliseconds
-90.16% <= 10 milliseconds
-92.18% <= 11 milliseconds
-93.55% <= 12 milliseconds
-94.58% <= 13 milliseconds
-95.09% <= 14 milliseconds
-95.71% <= 15 milliseconds
-97.30% <= 16 milliseconds
-99.22% <= 17 milliseconds
-99.65% <= 18 milliseconds
-99.84% <= 19 milliseconds
-99.87% <= 20 milliseconds
-99.89% <= 21 milliseconds
-99.90% <= 22 milliseconds
-99.92% <= 26 milliseconds
-99.95% <= 27 milliseconds
-99.97% <= 30 milliseconds
+1.39% <= 1 milliseconds
+1.65% <= 2 milliseconds
+2.14% <= 3 milliseconds
+3.98% <= 4 milliseconds
+5.47% <= 5 milliseconds
+6.99% <= 6 milliseconds
+14.00% <= 7 milliseconds
+65.74% <= 8 milliseconds
+88.42% <= 9 milliseconds
+91.84% <= 10 milliseconds
+93.10% <= 11 milliseconds
+93.92% <= 12 milliseconds
+94.96% <= 13 milliseconds
+95.57% <= 14 milliseconds
+96.46% <= 15 milliseconds
+98.14% <= 16 milliseconds
+99.60% <= 17 milliseconds
+99.76% <= 18 milliseconds
+99.82% <= 19 milliseconds
+99.84% <= 20 milliseconds
+99.86% <= 21 milliseconds
+99.87% <= 24 milliseconds
+99.89% <= 26 milliseconds
+99.90% <= 27 milliseconds
 99.98% <= 32 milliseconds
 100.00% <= 32 milliseconds
-891265.62 requests per second
+952381.00 requests per second
 

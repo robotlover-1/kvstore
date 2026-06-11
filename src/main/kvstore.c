@@ -1901,33 +1901,25 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                 incomplete = 1;
                 break;
             }
-            argv[i] = (char *)kvs_malloc((size_t)blen + 1);
-            if (!argv[i]) {
+            /* verify \r\n terminator before writing in-place null */
+            if (!(buf[p + (size_t)blen] == '\r' && buf[p + (size_t)blen + 1] == '\n')) {
                 malformed = 1;
                 break;
             }
-            memcpy(argv[i], buf + p, (size_t)blen);
-            argv[i][blen] = 0;
+            /* zero-copy: point argv into inbuf, null-term in place */
+            argv[i] = (char *)(buf + p);
+            buf[p + (size_t)blen] = '\0';
             argl[i] = (size_t)blen;
-            p += (size_t)blen;
-            if (!(buf[p] == '\r' && buf[p + 1] == '\n')) {
-                malformed = 1;
-                break;
-            }
-            p += 2;
+            p += (size_t)blen + 2;
         }
-        if (incomplete) {
-            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
-            break;
-        }
+        if (incomplete) { break; }
         if (malformed) {
-            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
             if (p > start) pos = p;
             else break;
             continue;
         }
         handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
-        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+        /* argv[i] points into inbuf (zero-copy) — no free needed */
         pos = p;
     }
     if (pos > 0 && pos < *len) {

@@ -115,3 +115,23 @@ strace 证实 Redis `appendfsync always` 每条命令都调 `fdatasync()`（100 
 - 绕过协程层直接在 socket 可写时发送响应
 - 预分配 deferred_resp_t 池（消除 malloc）
 - 内核侧 io_uring 路径优化
+
+## 最终状态 (Phase 6 之后)
+
+经过 Pipeline Phase 1 (output ring buffer) 重构，AOF always 性能受 ring buffer 间接影响：
+
+| 配置 | 初始 | 最终 | 提升 |
+|------|------|------|------|
+| kvstore_aof_always (P=1) | 14,697 | 41,850 | 2.8× |
+| kvstore_aof_everysec (P=1) | 122,941 | 126,582 | +3% |
+| kvstore_aof_disable (P=1) | 127,016 | 128,932 | +1.5% |
+| redis_aof_always (P=1) | 119,962 | 120,453 | baseline |
+
+AOF always pipeline 性能（受 group commit fsync 串行瓶颈）：
+| P | kvstore (cmd/s) | Redis (cmd/s) |
+|---|-----------------|---------------|
+| 10 | 111,528 | 12,224,939 |
+| 160 | 28,338,648 | 465,116,280 |
+
+> AOF always 的 pipeline 差距来自 group commit 在每批次必须 fsync，
+> 无法像 disable 模式那样利用 pipeline 批量。参见 `docs/pipeline-optimization.md`。

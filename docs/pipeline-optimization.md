@@ -93,11 +93,36 @@ HSET P=160: 1.04M→1.09M (+4.7%)
 | 10 HSET | 0.11M | 4.4M | 12.4M | 35% |
 | 160 HSET | 28.3M | 174.9M | 457M | 38% |
 
+## 最终 vs Redis 对比
+
+| P | kvstore Echo | Redis Echo | kv/redis | kvstore HSET | Redis HSET | kv/redis |
+|---|-------------|-----------|----------|-------------|-----------|----------|
+| 1 | 131,527 | 118,315 | **111%** | 128,932 | 119,204 | **108%** |
+| 10 | 9.7M | 10.6M | **91%** | 5.9M | 11.9M | 50% |
+| 160 | 252M | 567M | 44% | 197M | 455M | 43% |
+
+- **单命令（P=1）**: kvstore 快 8-11%
+- **小 pipeline（P=10 Echo）**: 达 Redis 91%
+- **大 pipeline（P=160 HSET）**: 差距 2.3×
+- **AOF always pipeline**: 差距 111×（group commit 瓶颈，见 `docs/aof-group-commit.md`）
+
+## Phase 7: Micro-Optimizations (未合并)
+
+尝试 `-O3`、`__attribute__((hot))`、inline 快速路径等微优化，
+均无正向收益（详见 `docs/superpowers/plans/2026-06-12-pipeline-phase7-micro.md`）。
+结论：剩余 2.3× 差距来自数十个微小 CPU 开销累积，非单一瓶颈可突破。
+
 ## 待优化方向
 
-- `_create_node`: 每 HSET 3 次 malloc (node+key+value)，可考虑 slab 分配器
-- `_rehash_step`: 每次操作迁移 10 桶，pipeline 时可提高步长
-- AOF always pipeline: group commit fsync 串行瓶颈 (仅 0.11M cmd/s)
+- AOF always pipeline: group commit fsync 串行瓶颈 (仅 0.11M cmd/s at P=10)
+- Hash 引擎批量 rehash: pipeline 时可提高 `REHASH_STEP_BUCKETS`
+- 长期: 协程模型 → 紧凑事件循环（类似 Redis 单线程架构）
+
+## 相关文档
+
+- `docs/aof-group-commit.md` — AOF always 优化记录
+- `docs/save-benchmark.md` — SAVE 持久化基准
+- `docs/superpowers/plans/2026-06-12-pipeline-phase7-micro.md` — Phase 7 计划（未合并）
 
 ## 待优化方向
 

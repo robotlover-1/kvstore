@@ -1009,12 +1009,24 @@ static int split_inline_argv(char *line, char **argv, int maxargc) {
     return argc;
 }
 
+/* ensure resp has at least 'need' bytes; fall back to heap if stack buffer too small */
+static int resp_ensure(char **resp, char *resp_small, int *allocated, size_t need) {
+    (void)resp_small;
+    if (*allocated || need <= 1024) return 0;
+    char *big = (char *)kvs_malloc(BUFFER_CAP);
+    if (!big) return -1;
+    *resp = big;
+    *allocated = 1;
+    return 0;
+}
+
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication) {
 
     int rc_ret = 0;
     int n = 0;
-    char *resp = (char *)kvs_malloc(BUFFER_CAP);
-    if (!resp) return -1;
+    char resp_small[1024];
+    char *resp = resp_small;
+    int resp_allocated = 0;
 
     (void)argl;
     if (argc <= 0) {
@@ -1335,12 +1347,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             cc_repld, cc_l1, cc_l2,
             recover_n >= 0 ? recover : "");
 
+        resp_ensure(&resp, resp_small, &resp_allocated, strlen(info) + 32);
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;
     }
     if (!strcmp(cmd, "MEMSTAT")) {
+        resp_ensure(&resp, resp_small, &resp_allocated, 2048);
         char *info = (char *)kvs_malloc(BUFFER_CAP);
         n = build_memstat_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "memstat build failed");
@@ -1405,6 +1419,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULES")) {
+        resp_ensure(&resp, resp_small, &resp_allocated, 2048);
         char *info = (char *)kvs_malloc(BUFFER_CAP);
         n = persist_build_autosnap_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "snaprules build failed");
@@ -1700,7 +1715,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                     argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
             }
 #endif
-            n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
+            if (v) {
+                size_t vlen = strlen(v);
+                if (vlen > 1000) resp_ensure(&resp, resp_small, &resp_allocated, vlen + 32);
+                n = resp_bulk(resp, BUFFER_CAP, v, vlen);
+            } else {
+                n = resp_null_bulk(resp, BUFFER_CAP);
+            }
             if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
             goto out;
         }
@@ -1802,7 +1823,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
     out:
-    kvs_free(resp);
+    if (resp != resp_small) kvs_free(resp);
     return rc_ret;
 }
 

@@ -1,21 +1,16 @@
-echo: -nanecho: 192200.00echo: 183748.00echo: 181400.00echo: 182930.00echo: 181288.00echo: 181366.67echo: 180600.00echo: 180025.00echo: 180287.11echo: 179348.00echo: 180381.81echo: 179746.67echo: 179805.53echo: 179305.72echo: 179293.53echo: 178847.80echo: 179583.62echo: 179241.95echo: 179206.48echo: 179109.38echo: 178870.69echo: 178623.89====== echo ======
-  1000000 requests completed in 5.59 seconds
+echo: -nanecho: 1336676.00echo: 1345936.00====== echo ======
+  1000000 requests completed in 0.70 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-48.65% <= 1 milliseconds
-78.24% <= 2 milliseconds
-93.81% <= 3 milliseconds
-97.71% <= 4 milliseconds
-98.54% <= 5 milliseconds
-98.75% <= 6 milliseconds
-98.83% <= 7 milliseconds
-98.94% <= 8 milliseconds
-99.22% <= 9 milliseconds
-99.41% <= 10 milliseconds
-99.63% <= 11 milliseconds
-99.95% <= 12 milliseconds
-100.00% <= 12 milliseconds
-178890.88 requests per second
+28.93% <= 1 milliseconds
+53.01% <= 2 milliseconds
+80.06% <= 3 milliseconds
+97.23% <= 4 milliseconds
+99.07% <= 5 milliseconds
+99.63% <= 6 milliseconds
+99.98% <= 7 milliseconds
+100.00% <= 7 milliseconds
+1434720.12 requests per second
 

@@ -31,28 +31,21 @@ static int mod_events(conn_t *c, uint32_t events) {
 }
 
 int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
+    size_t tail, first_chunk;
+
     if (!c || !buf || len == 0) return -1;
+    if (len > OUT_RING_SIZE - c->out_ring_len) return -1;
 
-    out_node_t *n = (out_node_t *)kvs_malloc(sizeof(*n));
-    if (!n) return -1;
-
-    n->data = (unsigned char *)kvs_malloc(len);
-    if (!n->data) {
-        kvs_free(n);
-        return -1;
+    tail = c->out_ring_tail;
+    first_chunk = OUT_RING_SIZE - tail;
+    if (len <= first_chunk) {
+        memcpy(c->out_ring + tail, buf, len);
+    } else {
+        memcpy(c->out_ring + tail, buf, first_chunk);
+        memcpy(c->out_ring, buf + first_chunk, len - first_chunk);
     }
-
-    memcpy(n->data, buf, len);
-    n->len = len;
-    n->sent = 0;
-    n->next = NULL;
-
-    if (c->out_tail) c->out_tail->next = n;
-    else c->out_head = n;
-    c->out_tail = n;
-
-    /* event re-arm deferred to on_read() / reactor loop to avoid
-     * per-command epoll_ctl() syscalls during pipeline processing */
+    c->out_ring_tail = (tail + len) & (OUT_RING_SIZE - 1);
+    c->out_ring_len += len;
     return 0;
 }
 
@@ -69,14 +62,6 @@ void close_conn(conn_t *c) {
 
     if (c->fd >= 0 && c->fd < (int)(sizeof(fdmap) / sizeof(fdmap[0]))) {
         fdmap[c->fd] = NULL;
-    }
-
-    out_node_t *n = c->out_head;
-    while (n) {
-        out_node_t *next = n->next;
-        kvs_free(n->data);
-        kvs_free(n);
-        n = next;
     }
 
     kvs_free(c);
@@ -135,7 +120,7 @@ static void on_read(conn_t *c) {
         }
 
         if (n == 0) {
-            if (c->out_head) {
+            if (c->out_ring_len > 0) {
                 mod_events(c, EPOLLOUT);
                 return;
             }
@@ -151,17 +136,21 @@ static void on_read(conn_t *c) {
     /* try immediate write after processing pipeline batch:
      * if parse_resp_stream queued multiple responses, send()
      * them now instead of waiting for next epoll_wait→EPOLLOUT */
-    if (c->out_head) on_write(c);
+    if (c->out_ring_len > 0) on_write(c);
 
-    if (c->out_head) mod_events(c, EPOLLIN | EPOLLOUT);
+    if (c->out_ring_len > 0) mod_events(c, EPOLLIN | EPOLLOUT);
     else mod_events(c, EPOLLIN);
 }
 
 static void on_write(conn_t *c) {
-    while (c->out_head) {
-        out_node_t *n = c->out_head;
+    while (c->out_ring_len > 0) {
+        size_t head = c->out_ring_head;
+        size_t chunk = OUT_RING_SIZE - head;
+        ssize_t w;
 
-        ssize_t w = send(c->fd, n->data + n->sent, n->len - n->sent, 0);
+        if (chunk > c->out_ring_len) chunk = c->out_ring_len;
+
+        w = send(c->fd, c->out_ring + head, chunk, 0);
         if (w < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             close_conn(c);
@@ -169,24 +158,17 @@ static void on_write(conn_t *c) {
         }
         if (w == 0) break;
 
-        n->sent += (size_t)w;
-        if (n->sent == n->len) {
-            c->out_head = n->next;
-            if (!c->out_head) c->out_tail = NULL;
-            kvs_free(n->data);
-            kvs_free(n);
-        } else {
-            break;
-        }
+        c->out_ring_head = (head + (size_t)w) & (OUT_RING_SIZE - 1);
+        c->out_ring_len -= (size_t)w;
     }
 
-    if (c->out_head) mod_events(c, EPOLLIN | EPOLLOUT);
+    if (c->out_ring_len > 0) mod_events(c, EPOLLIN | EPOLLOUT);
     else mod_events(c, EPOLLIN);
 }
 
 /* attempt immediate non-blocking write of queued output */
 void flush_conn_output(conn_t *c) {
-    if (c && c->out_head) on_write(c);
+    if (c && c->out_ring_len > 0) on_write(c);
 }
 
 int reactor_start(void) {
@@ -269,16 +251,16 @@ int reactor_start(void) {
             }
 
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                if (c->out_head) {
+                if (c->out_ring_len > 0) {
                     on_write(c);
-                    if (fdmap[fd] == c && !c->out_head) close_conn(c);
+                    if (fdmap[fd] == c && c->out_ring_len == 0) close_conn(c);
                 } else {
                     close_conn(c);
                 }
                 continue;
             }
 
-            if ((events[i].events & EPOLLOUT) && c->out_head) {
+            if ((events[i].events & EPOLLOUT) && c->out_ring_len > 0) {
                 on_write(c);
                 if (fdmap[fd] != c) continue;
             }
@@ -288,7 +270,7 @@ int reactor_start(void) {
                 if (fdmap[fd] != c) continue;
             }
 
-            if ((events[i].events & EPOLLOUT) && fdmap[fd] == c && c->out_head) {
+            if ((events[i].events & EPOLLOUT) && fdmap[fd] == c && c->out_ring_len > 0) {
                 on_write(c);
             }
         }

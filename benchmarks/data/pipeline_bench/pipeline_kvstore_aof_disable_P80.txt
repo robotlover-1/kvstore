@@ -1,20 +1,26 @@
-HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 96200.00HSET key:__rand_int__ value: 90952.00HSET key:__rand_int__ value: 90733.34HSET key:__rand_int__ value: 90850.00HSET key:__rand_int__ value: 89640.00HSET key:__rand_int__ value: 90060.00HSET key:__rand_int__ value: 89352.00HSET key:__rand_int__ value: 89785.00HSET key:__rand_int__ value: 90013.34HSET key:__rand_int__ value: 89460.00HSET key:__rand_int__ value: 89647.27HSET key:__rand_int__ value: 89483.34HSET key:__rand_int__ value: 89393.84HSET key:__rand_int__ value: 89725.80HSET key:__rand_int__ value: 89376.17HSET key:__rand_int__ value: 89487.76HSET key:__rand_int__ value: 89513.17HSET key:__rand_int__ value: 89514.55HSET key:__rand_int__ value: 89520.30HSET key:__rand_int__ value: 89380.38HSET key:__rand_int__ value: 89482.20HSET key:__rand_int__ value: 89456.76HSET key:__rand_int__ value: 89296.14HSET key:__rand_int__ value: 89388.73HSET key:__rand_int__ value: 89384.39HSET key:__rand_int__ value: 89292.85HSET key:__rand_int__ value: 89410.80HSET key:__rand_int__ value: 89381.96HSET key:__rand_int__ value: 89400.49HSET key:__rand_int__ value: 89524.25HSET key:__rand_int__ value: 89351.47HSET key:__rand_int__ value: 89398.02HSET key:__rand_int__ value: 89258.81HSET key:__rand_int__ value: 89325.27HSET key:__rand_int__ value: 89296.56HSET key:__rand_int__ value: 89251.70HSET key:__rand_int__ value: 89226.53HSET key:__rand_int__ value: 89294.10HSET key:__rand_int__ value: 89327.15HSET key:__rand_int__ value: 89270.11HSET key:__rand_int__ value: 89262.95HSET key:__rand_int__ value: 89217.66HSET key:__rand_int__ value: 89300.92HSET key:__rand_int__ value: 89219.66====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 11.20 seconds
+HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 902720.00HSET key:__rand_int__ value: 863200.00HSET key:__rand_int__ value: 852168.00HSET key:__rand_int__ value: 812480.00====== HSET key:__rand_int__ value ======
+  1000000 requests completed in 1.22 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-52.33% <= 1 milliseconds
-82.74% <= 2 milliseconds
-95.29% <= 3 milliseconds
-98.45% <= 4 milliseconds
-99.06% <= 5 milliseconds
-99.26% <= 6 milliseconds
-99.40% <= 7 milliseconds
-99.66% <= 8 milliseconds
-99.80% <= 9 milliseconds
-99.91% <= 10 milliseconds
-99.96% <= 11 milliseconds
-100.00% <= 11 milliseconds
-89301.66 requests per second
+2.14% <= 1 milliseconds
+2.64% <= 2 milliseconds
+3.23% <= 3 milliseconds
+12.73% <= 4 milliseconds
+85.30% <= 5 milliseconds
+92.74% <= 6 milliseconds
+93.85% <= 7 milliseconds
+95.12% <= 8 milliseconds
+98.65% <= 9 milliseconds
+99.66% <= 10 milliseconds
+99.81% <= 11 milliseconds
+99.85% <= 12 milliseconds
+99.86% <= 13 milliseconds
+99.87% <= 14 milliseconds
+99.93% <= 15 milliseconds
+99.95% <= 16 milliseconds
+99.98% <= 17 milliseconds
+100.00% <= 17 milliseconds
+820344.56 requests per second
 

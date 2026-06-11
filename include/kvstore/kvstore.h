@@ -243,12 +243,7 @@ typedef struct kvs_expire_table_s {
 } kvs_expire_table_t;
 extern kvs_expire_table_t global_expire;
 
-typedef struct out_node_s {
-    unsigned char *data;
-    size_t len;
-    size_t sent;
-    struct out_node_s *next;
-} out_node_t;
+#define OUT_RING_SIZE 65536
 
 typedef struct conn_s {
     int fd;
@@ -264,8 +259,10 @@ typedef struct conn_s {
     long long repl_last_send_ms;
     unsigned char inbuf[BUFFER_CAP];
     size_t in_len;
-    out_node_t *out_head;
-    out_node_t *out_tail;
+    unsigned char out_ring[OUT_RING_SIZE];  /* ring buffer for batched output */
+    size_t out_ring_head;                   /* read position */
+    size_t out_ring_tail;                   /* write position */
+    size_t out_ring_len;                    /* pending bytes */
     struct conn_s *next_replica;
 } conn_t;
 

@@ -34,13 +34,6 @@ static void close_conn_uring(conn_t *c) {
     repl_ebpf_unregister_fd(c->fd);
     close(c->fd);
 
-    out_node_t *n = c->out_head;
-    while (n) {
-        out_node_t *next = n->next;
-        kvs_free(n->data);
-        kvs_free(n);
-        n = next;
-    }
     kvs_free(c);
 }
 
@@ -97,9 +90,13 @@ static int submit_read(struct io_uring *ring, conn_t *c) {
 }
 
 static int submit_write(struct io_uring *ring, conn_t *c) {
-    if (!c || !c->out_head) return -1;
+    size_t head, chunk;
 
-    out_node_t *n = c->out_head;
+    if (!c || c->out_ring_len == 0) return -1;
+
+    head = c->out_ring_head;
+    chunk = OUT_RING_SIZE - head;
+    if (chunk > c->out_ring_len) chunk = c->out_ring_len;
 
     uring_req_t *req = (uring_req_t *)kvs_calloc(1, sizeof(*req));
     if (!req) return -1;
@@ -114,7 +111,7 @@ static int submit_write(struct io_uring *ring, conn_t *c) {
         return -1;
     }
 
-    io_uring_prep_send(sqe, c->fd, n->data + n->sent, n->len - n->sent, 0);
+    io_uring_prep_send(sqe, c->fd, c->out_ring + head, chunk, 0);
     io_uring_sqe_set_data(sqe, req);
     return 0;
 }
@@ -207,7 +204,7 @@ int proactor_start(unsigned short port) {
             if (!c) {
                 /* ignore */
             } else if (res <= 0) {
-                if (c->out_head) {
+                if (c->out_ring_len > 0) {
                     if (submit_write(&ring, c) != 0) close_conn_uring(c);
                 } else {
                     close_conn_uring(c);
@@ -216,7 +213,7 @@ int proactor_start(unsigned short port) {
                 c->in_len += (size_t)res;
                 parse_resp_stream(c, c->inbuf, &c->in_len, 0);
 
-                if (c->out_head) {
+                if (c->out_ring_len > 0) {
                     if (submit_write(&ring, c) != 0) close_conn_uring(c);
                 } else {
                     if (submit_read(&ring, c) != 0) close_conn_uring(c);
@@ -224,22 +221,15 @@ int proactor_start(unsigned short port) {
             }
         } else if (req->event == KVS_EVENT_WRITE) {
             conn_t *c = req->conn;
-            if (!c || !c->out_head) {
+            if (!c || c->out_ring_len == 0) {
                 /* ignore */
             } else if (res <= 0) {
                 close_conn_uring(c);
             } else {
-                out_node_t *n = c->out_head;
-                n->sent += (size_t)res;
+                c->out_ring_head = (c->out_ring_head + (size_t)res) & (OUT_RING_SIZE - 1);
+                c->out_ring_len -= (size_t)res;
 
-                if (n->sent >= n->len) {
-                    c->out_head = n->next;
-                    if (!c->out_head) c->out_tail = NULL;
-                    kvs_free(n->data);
-                    kvs_free(n);
-                }
-
-                if (c->out_head) {
+                if (c->out_ring_len > 0) {
                     if (submit_write(&ring, c) != 0) close_conn_uring(c);
                 } else {
                     if (submit_read(&ring, c) != 0) close_conn_uring(c);

@@ -1,24 +1,35 @@
-HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 174920.00HSET key:__rand_int__ value: 176100.00HSET key:__rand_int__ value: 174766.98HSET key:__rand_int__ value: 176017.97HSET key:__rand_int__ value: 176649.36HSET key:__rand_int__ value: 176651.14HSET key:__rand_int__ value: 176923.52HSET key:__rand_int__ value: 177204.28HSET key:__rand_int__ value: 176860.11HSET key:__rand_int__ value: 177733.00HSET key:__rand_int__ value: 176872.50HSET key:__rand_int__ value: 176904.09HSET key:__rand_int__ value: 176835.53HSET key:__rand_int__ value: 176954.91HSET key:__rand_int__ value: 177189.67HSET key:__rand_int__ value: 176875.61HSET key:__rand_int__ value: 176898.44HSET key:__rand_int__ value: 176703.66HSET key:__rand_int__ value: 176969.50HSET key:__rand_int__ value: 176857.14HSET key:__rand_int__ value: 176633.30HSET key:__rand_int__ value: 176924.61====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 5.66 seconds
+HSET key:__rand_int__ value: 0.00HSET key:__rand_int__ value: 956812.81HSET key:__rand_int__ value: 927425.19HSET key:__rand_int__ value: 897755.00HSET key:__rand_int__ value: 883916.06====== HSET key:__rand_int__ value ======
+  1000000 requests completed in 1.12 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-37.04% <= 1 milliseconds
-68.14% <= 2 milliseconds
-86.61% <= 3 milliseconds
-94.72% <= 4 milliseconds
-97.28% <= 5 milliseconds
-98.21% <= 6 milliseconds
-98.56% <= 7 milliseconds
-98.77% <= 8 milliseconds
-98.85% <= 9 milliseconds
-98.91% <= 10 milliseconds
-98.96% <= 11 milliseconds
-99.09% <= 12 milliseconds
-99.36% <= 13 milliseconds
-99.63% <= 14 milliseconds
-99.90% <= 15 milliseconds
-100.00% <= 15 milliseconds
-176709.67 requests per second
+1.36% <= 1 milliseconds
+1.46% <= 2 milliseconds
+1.89% <= 3 milliseconds
+2.56% <= 4 milliseconds
+3.25% <= 5 milliseconds
+4.93% <= 6 milliseconds
+7.02% <= 7 milliseconds
+35.02% <= 8 milliseconds
+80.19% <= 9 milliseconds
+90.16% <= 10 milliseconds
+92.18% <= 11 milliseconds
+93.55% <= 12 milliseconds
+94.58% <= 13 milliseconds
+95.09% <= 14 milliseconds
+95.71% <= 15 milliseconds
+97.30% <= 16 milliseconds
+99.22% <= 17 milliseconds
+99.65% <= 18 milliseconds
+99.84% <= 19 milliseconds
+99.87% <= 20 milliseconds
+99.89% <= 21 milliseconds
+99.90% <= 22 milliseconds
+99.92% <= 26 milliseconds
+99.95% <= 27 milliseconds
+99.97% <= 30 milliseconds
+99.98% <= 32 milliseconds
+100.00% <= 32 milliseconds
+891265.62 requests per second
 

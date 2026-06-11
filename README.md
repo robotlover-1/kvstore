@@ -71,17 +71,17 @@ make clean && make
 
 ### 启动
 
-> **权限说明**: kprobe+RDMA 增量同步需要加载 BPF 程序，必须用 `sudo` 启动。
-> 如不需要 kprobe（纯 TCP 同步），无需 `sudo`，kprobe 加载失败后自动禁用。
+> **权限说明**: eBPF+tcp 增量同步需加载 client_capture BPF（kprobe/tcp_recvmsg），必须用 `sudo` 启动 Master。
+> Slave 不需要 BPF，无需 `sudo`。BPF 加载失败时自动降级为纯 TCP 同步。
 
 ```bash
-# ── 启用 kprobe+RDMA（需 root）──
-sudo ./kvstore kvstore.conf --role master    # Master
-sudo ./kvstore kvstore.conf --role slave     # Slave
+# ── RDMA 全量 + eBPF+tcp 增量（推荐，需 root 启动 Master）──
+sudo ./kvstore kvstore.conf --role master    # Master（需 root 加载 BPF）
+./kvstore kvstore.conf --role slave          # Slave（无需 root）
 
 # ── 纯 TCP 模式（无需 root）──
-./kvstore kvstore.conf --role master
-./kvstore kvstore.conf --role slave
+./kvstore kvstore.conf --role master --repl-fullsync-transport tcp --repl-realtime-transport tcp
+./kvstore kvstore.conf --role slave  --repl-fullsync-transport tcp --repl-realtime-transport tcp
 
 # ── 命令行覆盖单个选项 ──
 ./kvstore --config kvstore.conf --port 6380 --mem jemalloc
@@ -198,7 +198,7 @@ kvstore/
 | RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用                |
 | eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速                      |
 | kprobe+RDMA 增量同步         | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR |
-| eBPF+tcp 增量同步（新）     | ✅ 完成   | kprobe/tcp_recvmsg 捕获客户端写入 + kprobe/tcp_sendmsg 探测 REPLDONE → ringbuf → 全量同步期间 L1+L2 缓存 → INCR 直接 send() 到 Slave TCP |
+| eBPF+tcp 增量同步         | ✅ 完成   | kprobe/tcp_recvmsg 捕获客户端写入 → 全量同步期间 L1+L2 缓存 → REPLDONE 后 Master 主动切换增量 → repl_broadcast TCP 发送 |
 | TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                                             |
 | 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                                         |
 | 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                                           |
@@ -319,11 +319,16 @@ kvstore/
 
 > 命令行参数优先级高于配置文件。启动时只需 `./kvstore kvstore.conf --role master`。
 > **双通道模式（推荐）**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=ebpf+tcp`。
-> RDMA 负责全量快照传输（低延迟大块数据），eBPF+tcp 负责增量同步（kprobe 捕获客户端写入）。
-> - **全量同步期间**：eBPF client_capture 自动缓存客户端写入（L1 内存 4MB + L2 磁盘）
-> - **REPLDONE 后**：master 关闭 RDMA，flush 缓存数据到 slave，开始增量同步
-> - **增量同步**：repl_broadcast 通过 TCP 可靠发送，eBPF kprobe 持续监控
-> - **自动回退**：RDMA 不可用时自动降级为 TCP 全量同步；eBPF 加载失败时自动降级为纯 TCP
+> RDMA 负责全量快照传输，eBPF+tcp 负责增量同步。**REPLDONE 是分界线**：
+> ```
+>        ← 全量同步 (RDMA) →|← 增量同步 (repl_broadcast TCP) →
+>  Master: 发送快照 → 发送 REPLDONE → flush eBPF 缓存 → 实时广播
+>  Slave:  接收快照 → 收到 REPLDONE → 应用缓存数据 → 接收实时增量
+> ```
+> - **全量同步期间**：eBPF client_capture（kprobe/tcp_recvmsg）缓存客户端写入到 L1(4MB)+L2(磁盘)
+> - **REPLDONE 后**：Master 关闭 RDMA，flush 缓存到 slave，`g_repl_fullsync_in_progress=0` 触发增量同步
+> - **增量同步**：repl_broadcast 通过 TCP 发送；Master 自知 REPLDONE 时机，无需 BPF 探测
+> - **自动回退**：RDMA 不可用 → TCP 全量；BPF 加载失败 → 纯 TCP 增量
 > 完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
 
 ### 命令行参数
@@ -2709,7 +2714,28 @@ int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
 
 ---
 
-#### 4. kprobe+RDMA WRITE（单边最低延迟增量同步）
+#### 4. eBPF+tcp（kprobe 捕获 + TCP 转发，推荐增量同步路径）
+
+**核心思想**：kprobe/kretprobe 挂载 `tcp_recvmsg` 捕获客户端→Master 的写入数据。
+全量同步期间缓存（L1内存+L2磁盘），REPLDONE 后 Master 主动切换增量，
+通过 `repl_broadcast` TCP 可靠发送到 Slave。
+
+**数据流**：
+```
+Client → Master(tcp_recvmsg) → kprobe capture → client_cache_ringbuf
+                                                    │
+                          ┌─ FULLSYNC_IN_PROGRESS=1: L1/L2 缓存
+                          │
+                          └─ FULLSYNC_IN_PROGRESS=0: repl_broadcast → TCP → Slave
+```
+
+**REPLDONE 边界**（Master 主动控制，无需 BPF 探测）：
+```
+← RDMA 全量同步 →│← TCP 增量同步 →
+           REPLDONE
+```
+
+#### 5. kprobe+RDMA WRITE（单边最低延迟增量同步）
 
 **核心思想**：利用 kprobe 拦截 master 的 `tcp_sendmsg` 系统调用，
 通过 BPF ringbuf 将数据传递到用户态，再通过 RDMA WRITE（单边操作）

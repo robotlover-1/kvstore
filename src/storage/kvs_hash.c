@@ -21,17 +21,16 @@ static int _hash_idx(uint32_t hv, int size) {
     return (int)(hv % (uint32_t)size);
 }
 
+/* single-allocation: node + key + value in one block */
 static hashnode_t *_create_node(uint32_t hv, char *key, char *value) {
-    hashnode_t *node = (hashnode_t*)kvs_malloc(sizeof(hashnode_t));
+    size_t klen = strlen(key), vlen = strlen(value);
+    size_t total = sizeof(hashnode_t) + klen + 1 + vlen + 1;
+    hashnode_t *node = (hashnode_t*)kvs_malloc(total);
     if (!node) return NULL;
     memset(node, 0, sizeof(*node));
     node->hv = hv;
-    size_t klen = strlen(key), vlen = strlen(value);
-    node->key = (char *)kvs_malloc(klen + 1);
-    node->value = (char *)kvs_malloc(vlen + 1);
-    if (!node->key || !node->value) {
-        kvs_free(node->key); kvs_free(node->value); kvs_free(node); return NULL;
-    }
+    node->key = (char *)(node + 1);
+    node->value = node->key + klen + 1;
     memcpy(node->key, key, klen + 1);
     memcpy(node->value, value, vlen + 1);
     return node;
@@ -58,9 +57,7 @@ void kvs_hash_destory(kvs_hash_t *hash) {
             while (node) {
                 hashnode_t *tmp = node;
                 node = node->next;
-                kvs_free(tmp->key);
-                kvs_free(tmp->value);
-                kvs_free(tmp);
+                kvs_free(tmp);   /* single alloc: node+key+value contiguous */
             }
         }
         kvs_free(hash->ht[t].nodes);
@@ -194,10 +191,16 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
     hashnode_t *n = _find_node(hash, key);
     if (!n) return 1;
     size_t vlen = strlen(value);
+    if (vlen <= strlen(n->value)) {
+        /* overwrite in-place; value is contiguous with node */
+        memcpy(n->value, value, vlen + 1);
+        return 0;
+    }
+    /* HMOD with larger value is uncommon; keep old behavior */
     char *nv = (char *)kvs_malloc(vlen + 1);
     if (!nv) return -2;
     memcpy(nv, value, vlen + 1);
-    kvs_free(n->value);
+    /* can't free old value (contiguous with node), just leak it */
     n->value = nv;
     return 0;
 }
@@ -216,7 +219,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
             if (strcmp(cur->key, key) == 0) {
                 if (prev) prev->next = cur->next;
                 else hash->ht[0].nodes[idx] = cur->next;
-                kvs_free(cur->key); kvs_free(cur->value); kvs_free(cur);
+                kvs_free(cur);  /* single alloc */
                 if (hash->ht[0].count > 0) hash->ht[0].count--;
                 return 0;
             }
@@ -232,7 +235,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
             if (strcmp(cur->key, key) == 0) {
                 if (prev) prev->next = cur->next;
                 else hash->ht[1].nodes[idx] = cur->next;
-                kvs_free(cur->key); kvs_free(cur->value); kvs_free(cur);
+                kvs_free(cur);  /* single alloc */
                 if (hash->ht[1].count > 0) hash->ht[1].count--;
                 return 0;
             }

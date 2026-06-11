@@ -73,3 +73,45 @@ kvstore 58k vs Redis 116k (~2x)。可能原因：
 - `persist_defer_response` 每条命令 malloc+memcpy（~50B）
 - io_uring 对小写入的固定开销仍高于原生 write()+fsync()
 - epoll_wait 100ms timeout 在无事件时延迟发送
+
+## 迭代 3: 内嵌数据 + 立即写出 + 最大批量 (4ec3e90)
+
+### 优化
+
+1. **deferred_resp_t 数据内嵌**: `unsigned char data[128]` 替代 `unsigned char *data`
+   - 消除每条响应的 malloc+memcpy（原 2 次 malloc → 1 次）
+   
+2. **移除 8KB 内联阈值**: persist_append_raw 中仅保留 2ms 时间阈值
+   - 依赖 reactor 循环结束时的 persist_flush_deferred 统一 flush
+   - 最大化每批次的命令数量
+
+3. **立即 flush_conn_output**: persist_flush_deferred 中 queue_bytes 后立刻调用 on_write
+   - 减少一次 epoll_wait 周期（不等 EPOLLOUT 事件）
+   - 响应在 socket buffer 有空闲时立即发出
+
+4. **尝试 pwrite+fdatasync**: 替代 io_uring write+fsync
+   - 结果: 41k QPS（比 io_uring 65k 更差）
+   - 结论: io_uring batch write+fsync 比 pwrite+fdatasync 快 1.56×
+
+### 效果
+
+| 配置 | 初始 | 迭代1 | 迭代2 | 迭代3 |
+|------|------|-------|-------|-------|
+| kvstore_aof_always | 14,697 | 58,059 | 61,667 | **65,548** |
+| kvstore_aof_everysec | 122,941 | 126,630 | 124,177 | 126,582 |
+| redis_aof_always | 119,962 | — | — | 120,453 |
+
+### 最终分析
+
+strace 证实 Redis `appendfsync always` 每条命令都调 `fdatasync()`（100 SET = 100 次 fdatasync），仍达 120k QPS。
+
+剩余 ~2x 差距（65k vs 120k）原因：
+- **io_uring ring buffer 开销**: get_sqe×2 + prep + submit_and_wait + wait_cqe×2，每条批次的固定开销无法消除
+- **Reactor + 协程模型**: kvstore 的 NtyCo 协程调度、epoll_wait 循环、deferred response 链表遍历有固有开销
+- **Redis 15 年优化**: Redis 单线程紧凑事件循环，write()+fdatasync() 直接 syscall，无中间层
+- **pwrite+fdatasync 对比**: kvstore 的 pwrite+fdatasync (41k) < io_uring (65k) < Redis write+fdatasync (120k)。说明 kvstore 的非 fsync 路径也有开销
+
+进一步优化方向（需更大改动）：
+- 绕过协程层直接在 socket 可写时发送响应
+- 预分配 deferred_resp_t 池（消除 malloc）
+- 内核侧 io_uring 路径优化

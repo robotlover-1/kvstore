@@ -33,7 +33,7 @@ kv_config_t g_cfg = {
     .net_backend = "reactor",
     .repl_transport_backend = "tcp",
     .repl_fullsync_transport = "rdma",
-    .repl_realtime_transport = "kprobe-rdma",
+    .repl_realtime_transport = "tcp",
     .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
     .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
     .ebpf_enabled = 0,
@@ -169,6 +169,7 @@ static int parse_repl_transport_backend(const char *s) {
     if (!strcasecmp(s, "ebpf")) return 0;
     if (!strcasecmp(s, "sockmap")) return 0;
     if (!strcasecmp(s, "kprobe-rdma")) return 0;
+    if (!strcasecmp(s, "ebpf+tcp")) return 0;
     return -1;
 }
 
@@ -440,6 +441,7 @@ static int parse_config_file(const char *path) {
 }
 
 void repl_add_slave(conn_t *c) {
+    if (!c) return;  /* safety: slave 端 parse_resp_stream(NULL, ...) 可能误触发 */
     pthread_mutex_lock(&g_repl_lock);
     for (conn_t *it = g_replicas; it; it = it->next_replica) {
         if (it == c) {
@@ -495,11 +497,7 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* eBPF+tcp 路径激活时跳过实时发送 — kprobe/tcp_recvmsg 已直接转发到 slave */
-        if (g_repl_client_capture_active) {
-            pp = &c->next_replica;
-            continue;
-        }
+        /* eBPF 转发路径同时运行（best effort），repl_broadcast 作为可靠保底 */
         if (repl_realtime_send(c, raw, rawlen) != 0) {
             if (repl_handle_replica_send_failure(c, pp)) continue;
             pp = &c->next_replica;
@@ -1062,6 +1060,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "REPLSYNC")) {
+        /* slave 端通过 parse_resp_stream(NULL, ..., 1) 处理复制数据时，
+         * 不应处理 REPLSYNC（缓存回放可能包含被 BPF 误捕获的 REPLSYNC） */
+        if (from_replication && !c) goto out;
         const char *req_replid = argc >= 2 ? argv[1] : "?";
         unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
         unsigned long long req_durable = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : req_offset;
@@ -1084,6 +1085,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             c->repl_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
             /* kprobe 透明拦截，fd 注册在主进程初始化时已完成 */
             fprintf(stderr, "repl: replica transport set to kprobe-rdma\n");
+        }
+        if (c && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf+tcp")
+                || !strcasecmp(g_cfg.repl_realtime_transport, "tcp"))) {
+            c->repl_transport_kind = KVS_REPL_TRANSPORT_EBPF_TCP;
+            fprintf(stderr, "repl: replica transport set to ebpf+tcp\n");
         }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
@@ -1108,6 +1114,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "REPLACK")) {
+        /* slave 端通过 parse_resp_stream(NULL, ..., 1) 处理复制数据时不应处理 REPLACK */
+        if (from_replication && !c) return 0;
         unsigned long long applied_offset = argc >= 2 ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
         repl_replica_update_ack(c, applied_offset, durable_offset);

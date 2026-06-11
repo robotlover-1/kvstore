@@ -46,6 +46,7 @@
 #define KVS_REPL_TRANSPORT_RDMA 2
 #define KVS_REPL_TRANSPORT_EBPF 3
 #define KVS_REPL_TRANSPORT_KPROBE_RDMA 4
+#define KVS_REPL_TRANSPORT_EBPF_TCP 5
 
 /* Replication send context: which transport to use */
 #define KVS_REPL_SEND_FULLSYNC  1   /* bulk existing data: RDMA */

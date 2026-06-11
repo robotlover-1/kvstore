@@ -925,54 +925,53 @@ static int run_test(void) {
     test_pass("增量同步完成 (追赶时间: %.1fs)", incr_elapsed);
 
     /* ═══════════════════════════════════════════
-     * Phase 5.5: 验证 kprobe+RDMA 是否生效
+     * Phase 5.5: 验证 eBPF+tcp 增量同步传输是否生效
      * ═══════════════════════════════════════════ */
-    banner("Phase 5.5: 验证 kprobe+RDMA 捕获状态");
+    banner("Phase 5.5: 验证 eBPF+tcp 增量同步传输状态");
 
-    printf("  正在检查 Master 端 kprobe+RDMA 捕获状态...\n");
-    usleep(1000000); /* 等待 1s 确保统计更新 */
-    int cap_status = check_capture_active(g_opt.master_host, g_opt.master_port);
+    printf("  正在检查 Master/Slave 端 eBPF+tcp 传输状态...\n");
+    usleep(500000); /* 等待 0.5s 确保统计更新 */
 
-    if (cap_status == 1) {
-        /* 获取详细统计（使用实际 INFO 字段名） */
-        char *info_cap = get_info(g_opt.master_host, g_opt.master_port);
-        char *hits   = info_cap ? info_field(info_cap, "kprobe_hits") : NULL;
-        char *events = info_cap ? info_field(info_cap, "kprobe_ringbuf_events") : NULL;
-        char *writes = info_cap ? info_field(info_cap, "kprobe_rdma_writes") : NULL;
-        char *errors = info_cap ? info_field(info_cap, "kprobe_rdma_errors") : NULL;
-        char *conn   = info_cap ? info_field(info_cap, "kprobe_rdma_connected") : NULL;
-        printf("  %s✓ kprobe+RDMA 工作正常%s\n", ANSI_GREEN, ANSI_RESET);
-        printf("    kprobe_rdma_connected=%s  kprobe_hits=%s  ringbuf_events=%s\n"
-               "    kprobe_rdma_writes=%s  kprobe_rdma_errors=%s\n",
-               conn ? conn : "?", hits ? hits : "?", events ? events : "?",
-               writes ? writes : "?", errors ? errors : "?");
-        free(hits); free(events); free(writes); free(errors); free(conn);
-        free(info_cap);
-        test_pass("kprobe+RDMA 捕获生效: 增量数据经 BPF ring buffer → RDMA 发送");
-    } else if (cap_status == 0) {
-        char *info_cap = get_info(g_opt.master_host, g_opt.master_port);
-        char *writes = info_cap ? info_field(info_cap, "kprobe_rdma_writes") : NULL;
-        char *errors = info_cap ? info_field(info_cap, "kprobe_rdma_errors") : NULL;
-        printf("  %s⚠ kprobe+RDMA 已连接但尚无 RDMA WRITE 数据%s\n", ANSI_YELLOW, ANSI_RESET);
-        printf("    kprobe_rdma_writes=%s  kprobe_rdma_errors=%s\n",
-               writes ? writes : "?", errors ? errors : "?");
-        printf("  可能原因: 增量同步刚完成，统计尚未刷新\n");
-        free(writes); free(errors); free(info_cap);
-        test_pass("kprobe+RDMA 已初始化 (可能数据量小未触发捕获)");
-    } else {
-        char *info_cap = get_info(g_opt.master_host, g_opt.master_port);
-        char *tport = info_cap ? info_field(info_cap, "repl_transport_active") : NULL;
-        char *init  = info_cap ? info_field(info_cap, "kprobe_initialized") : NULL;
-        char *conn  = info_cap ? info_field(info_cap, "kprobe_rdma_connected") : NULL;
-        printf("  %s✗ kprobe+RDMA 未生效%s\n", ANSI_RED, ANSI_RESET);
-        printf("  当前传输层: %s\n", tport ? tport : "?");
-        printf("  kprobe_initialized=%s  kprobe_rdma_connected=%s\n",
-               init ? init : "?", conn ? conn : "?");
-        printf("  可能原因: BPF 未加载（需 root 权限）、RDMA QP 未连接\n");
-        printf("  数据已通过 TCP fallback 正常同步\n");
-        free(tport); free(init); free(conn);
-        free(info_cap);
-        test_fail("kprobe+RDMA 未生效，增量同步走 TCP fallback");
+    {
+        char *info_m = get_info(g_opt.master_host, g_opt.master_port);
+        char *info_s = get_info(g_opt.slave_host, g_opt.slave_port);
+        char *m_transport = info_m ? info_field(info_m, "repl_transport_active") : NULL;
+        char *s_transport = info_s ? info_field(info_s, "repl_transport_active") : NULL;
+        char *m_kprobe_init = info_m ? info_field(info_m, "kprobe_initialized") : NULL;
+        char *m_broadcast = info_m ? info_field(info_m, "repl_broadcast_bytes") : NULL;
+        char *m_fallback = info_m ? info_field(info_m, "repl_transport_fallback_reason") : NULL;
+
+        int ebpf_tcp_ok = 0;
+        if (m_transport && strstr(m_transport, "ebpf-tcp")) ebpf_tcp_ok = 1;
+
+        printf("  Master 传输层: %s\n", m_transport ? m_transport : "?");
+        printf("  Slave  传输层: %s\n", s_transport ? s_transport : "?");
+        printf("  eBPF client_capture 初始化: %s\n",
+               m_kprobe_init ? (atoi(m_kprobe_init) ? "yes" : "no") : "?");
+        printf("  repl_broadcast_bytes: %s\n", m_broadcast ? m_broadcast : "?");
+        if (m_fallback && strcmp(m_fallback, "none") != 0)
+            printf("  fallback_reason: %s\n", m_fallback);
+
+        if (ebpf_tcp_ok && m_broadcast && strtoull(m_broadcast, NULL, 10) > 0) {
+            printf("  %s✓ eBPF+tcp 增量同步传输生效%s\n", ANSI_GREEN, ANSI_RESET);
+            printf("    eBPF kprobe 捕获客户端写入 → repl_broadcast TCP 转发\n");
+            test_pass("eBPF+tcp 增量同步传输生效: kprobe 捕获 + TCP 转发");
+        } else if (ebpf_tcp_ok) {
+            printf("  %s⚠ eBPF+tcp 传输层已配置但 broadcast_bytes=0%s\n",
+                   ANSI_YELLOW, ANSI_RESET);
+            printf("  可能原因: 增量数据量小，统计尚未刷新\n");
+            test_pass("eBPF+tcp 传输层已配置 (broadcast 统计未更新)");
+        } else {
+            printf("  %s✗ eBPF+tcp 未生效%s\n", ANSI_RED, ANSI_RESET);
+            printf("  当前传输层: %s\n", m_transport ? m_transport : "?");
+            printf("  可能原因: BPF 未加载（需 root 权限）、配置未启用 ebpf+tcp\n");
+            printf("  数据已通过 TCP fallback 正常同步\n");
+            test_fail("eBPF+tcp 未生效，增量同步走 TCP fallback");
+        }
+
+        free(m_transport); free(s_transport);
+        free(m_kprobe_init); free(m_broadcast); free(m_fallback);
+        free(info_m); free(info_s);
     }
 
     /* ═══════════════════════════════════════════

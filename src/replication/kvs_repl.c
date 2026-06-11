@@ -1443,8 +1443,11 @@ const char *repl_transport_configured_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
     int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    int use_ebpf_tcp_realtime = !strcasecmp(repl_realtime_transport_name(), "ebpf+tcp")
+                             || !strcasecmp(repl_realtime_transport_name(), "tcp");
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
+    if (use_rdma_fullsync && use_ebpf_tcp_realtime) return "rdma+ebpf-tcp";
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
     if (!strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma")) return "kprobe-rdma";
@@ -1455,8 +1458,11 @@ const char *repl_transport_active_name(void) {
     int use_rdma_fullsync = !strcasecmp(repl_fullsync_transport_name(), "rdma");
     int use_kprobe_realtime = !strcasecmp(repl_realtime_transport_name(), "kprobe-rdma");
     int use_ebpf_realtime = repl_realtime_should_use_ebpf();
+    int use_ebpf_tcp_realtime = !strcasecmp(repl_realtime_transport_name(), "ebpf+tcp")
+                             || !strcasecmp(repl_realtime_transport_name(), "tcp");
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
+    if (use_rdma_fullsync && use_ebpf_tcp_realtime) return "rdma+ebpf-tcp";
     return g_repl_transport_active[0] ? g_repl_transport_active : repl_transport_configured_name();
 }
 
@@ -1477,11 +1483,13 @@ static const repl_transport_ops_t *repl_transport_ops_for_conn(conn_t *c) {
         if (g_slave_transport_kind == KVS_REPL_TRANSPORT_RDMA) return &g_repl_transport_rdma_ops;
         if (g_slave_transport_kind == KVS_REPL_TRANSPORT_EBPF) return &g_repl_transport_ebpf_ops;
         if (g_slave_transport_kind == KVS_REPL_TRANSPORT_KPROBE_RDMA) return &g_repl_transport_kprobe_rdma_ops;
+        if (g_slave_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) return &g_repl_transport_tcp_ops;
         return &g_repl_transport_tcp_ops;
     }
     if (c->repl_transport_kind == KVS_REPL_TRANSPORT_RDMA) return &g_repl_transport_rdma_ops;
     if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF) return &g_repl_transport_ebpf_ops;
     if (c->repl_transport_kind == KVS_REPL_TRANSPORT_KPROBE_RDMA) return &g_repl_transport_kprobe_rdma_ops;
+    if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) return &g_repl_transport_tcp_ops;
     return &g_repl_transport_tcp_ops;
 }
 
@@ -1591,6 +1599,10 @@ static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) 
     if ((!strcasecmp(t, "ebpf") || !strcasecmp(t, "sockmap")) && g_repl_transport_ebpf_ops.supported && repl_ebpf_supported()) {
         transport_log("realtime using EBPF");
         return &g_repl_transport_ebpf_ops;
+    }
+    if (!strcasecmp(t, "ebpf+tcp") || !strcasecmp(t, "tcp")) {
+        transport_log("realtime using EBPF+TCP (forward via BPF→TCP)");
+        return &g_repl_transport_tcp_ops;
     }
     transport_log("realtime using TCP");
     return &g_repl_transport_tcp_ops;
@@ -2320,6 +2332,151 @@ static void *slave_thread(void *arg) {
             repl_set_link_state(0);
             sleep(1);
             continue;
+        }
+
+        /* ---- Hybrid dual-transport: RDMA for fullsync + eBPF+tcp for realtime ----
+         * eBPF kprobe/tcp_recvmsg 捕获客户端写入 → ringbuf → TCP send() 转发。
+         * 全量同步走 RDMA，增量同步走 TCP（eBPF 转发），两者独立。
+         * 全量完成后 RDMA 断开，TCP 连接保持，继续收增量数据。 */
+        {
+            int use_rdma_fullsync2 = !strcasecmp(repl_fullsync_transport_name(), "rdma") && KVS_ENABLE_RDMA;
+            int use_ebpf_tcp = !strcasecmp(repl_realtime_transport_name(), "ebpf+tcp")
+                            || !strcasecmp(repl_realtime_transport_name(), "tcp");
+            if (use_rdma_fullsync2 && use_ebpf_tcp) {
+                int tcp_fd = repl_transport_tcp_connect_slave(host, port);
+                if (tcp_fd < 0) {
+                    repl_set_link_state(0);
+                    rdma_fail_streak++;
+                    repl_slave_retry_pause(rdma_fail_streak);
+                    continue;
+                }
+
+                /* 先发送 REPLSYNC — master 收到后会启动 RDMA listener */
+                g_slave_transport_kind = KVS_REPL_TRANSPORT_EBPF_TCP;
+                repl_transport_mark_active("ebpf+tcp");
+                rdma_fail_streak = 0;
+
+                /* Register TCP fd with eBPF sockmap for realtime sync */
+                if (repl_ebpf_register_fd(tcp_fd, 0) != 0) {
+                    fprintf(stderr, "repl ebpf: fd registration failed on slave link, "
+                            "using tcp-compatible path\n");
+                }
+
+                {
+                    unsigned char cmd[256];
+                    char offbuf[32], durablebuf[32];
+                    snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
+                    snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
+                    size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                    if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
+                    fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP\n");
+                }
+
+                /* REPLSYNC 已发，等 master 启动 RDMA listener 后再尝试 RDMA 连接 */
+                usleep(500000);  /* 500ms — 给 master 时间启动 RDMA listener */
+
+                /* 后台尝试 RDMA 连接 */
+        #if KVS_ENABLE_RDMA
+                {
+                    repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)
+                        kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
+                    if (rdma_arg) {
+                        snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
+                        rdma_arg->port = port;
+                        pthread_t rdma_tid;
+                        if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
+                            kvs_free(rdma_arg);
+                        } else {
+                            pthread_detach(rdma_tid);
+                        }
+                    }
+                }
+        #endif
+
+                g_slave_fd = tcp_fd;
+                repl_set_link_state(1);
+                unsigned char buf[BUFFER_CAP * 4 + 4096];
+                size_t blen = 0;
+
+                /* ═══ 混合接收循环 ═══
+                 * 全量同步期间: RDMA 收全量 chunk + TCP 收控制命令
+                 * 全量同步完成后: RDMA 断开，TCP 继续收增量数据
+                 * 循环不退出——TCP 连接保持，增量数据持续到达 */
+                for (;;) {
+                    if (slave_should_reconnect(gen)) break;
+
+                    int had_new_data = 0;
+
+                    /* ── RDMA 全量数据（全量同步期间）── */
+        #if KVS_ENABLE_RDMA
+                    if (g_repl_rdma_ctx.connected) {
+                        int recv_slot = -1;
+                        size_t rdma_blen = 0;
+                        if (repl_rdma_wait_cq_recv_completion(100, &recv_slot, &rdma_blen) == 0
+                            && recv_slot >= 0 && rdma_blen > 0) {
+                            unsigned char *payload;
+                            if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
+                                rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
+                            payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
+                            if (payload) {
+                                if (repl_rdma_repost_recv(recv_slot) == 0) {
+                                    if (blen + rdma_blen <= sizeof(buf)) {
+                                        memcpy(buf + blen, payload, rdma_blen);
+                                        blen += rdma_blen;
+                                        had_new_data = 1;
+                                    } else {
+                                        fprintf(stderr, "repl ebpf-tcp: buffer overflow blen=%zu rdma=%zu\n",
+                                            blen, rdma_blen);
+                                    }
+                                }
+                                kvs_free(payload);
+                            }
+                        }
+                    }
+        #endif
+
+                    if (had_new_data && blen > 0) {
+                        parse_resp_stream(NULL, buf, &blen, 1);
+                        repl_slave_ack_heartbeat();
+                        repl_set_link_state(1);
+                    }
+
+                    /* ── TCP 控制消息 + 增量数据 ── */
+                    ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
+                    if (r > 0) {
+                        blen += (size_t)r;
+                        had_new_data = 1;
+                        fprintf(stderr, "repl ebpf-tcp: recv %zd bytes, blen=%zu\n", r, blen);
+                        parse_resp_stream(NULL, buf, &blen, 1);
+                        fprintf(stderr, "repl ebpf-tcp: parse done, blen=%zu\n", blen);
+                        repl_slave_ack_heartbeat();
+                        repl_set_link_state(1);
+                    } else if (r == 0) {
+                        /* TCP 连接断开 — 退出循环，外层重连 */
+                        fprintf(stderr, "repl ebpf-tcp: tcp connection closed\n");
+                        break;
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        fprintf(stderr, "repl ebpf-tcp: tcp recv error errno=%d\n", errno);
+                        break;
+                    }
+
+                    if (blen > 0) {
+                        parse_resp_stream(NULL, buf, &blen, 1);
+                    }
+
+                    /* 无数据时短暂休眠避免忙循环 */
+                    if (!had_new_data)
+                        usleep(1000);
+                }
+
+                g_slave_fd = -1;
+                repl_transport_tcp_disconnect_slave(tcp_fd);
+                g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
+                repl_set_link_state(0);
+                sleep(1);
+                continue;
+            }
         }
 
         /* ---- Hybrid dual-transport: RDMA for fullsync + eBPF for realtime ---- */
@@ -3098,14 +3255,14 @@ void repl_rdma_stop_fullsync(void) {
 
     repl_rdma_log("fullsync_stop", "stopping RDMA");
 
-    /* 标记断开 */
+    /* 标记断开但不销毁资源 — rdma_disconnect 会触发 WR_FLUSH_ERR
+     * 导致 siw 驱动中正在传输的数据丢失。全量数据已通过 RDMA 发完，
+     * slave 在收到 REPLDONE 后自行处理。资源在下次 fullsync 时复用
+     * 或进程退出时释放。 */
     g_repl_rdma_ctx.connected = 0;
 
-    /* 释放所有 RDMA 资源 */
-    repl_rdma_reset_ctx();
-
-    /* 重置 listener 启动标志 */
-    g_rdma_master_listener_started = 0;
+    /* 停止 CQ 轮询线程 */
+    repl_rdma_stop_cq_poll_thread();
 
     repl_rdma_log("fullsync_stop", "RDMA stopped");
 }

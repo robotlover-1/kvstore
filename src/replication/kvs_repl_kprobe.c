@@ -1130,6 +1130,8 @@ static int g_client_stats_fd = -1;
 static int g_client_ringbuf_fd = -1;
 static struct ring_buffer *g_client_ringbuf = NULL;
 static volatile int g_client_running = 0;
+static struct bpf_link *g_client_links[4] = {NULL};
+static int g_client_link_count = 0;
 
 /* L1 缓存队列 (内存) */
 static client_cache_node_t *g_cache_head = NULL;
@@ -1151,13 +1153,52 @@ static int forward_to_slave(const unsigned char *data, size_t len) {
     extern int g_repl_capture_slave_fd;
     if (g_repl_capture_slave_fd < 0) return -1;
 
-    ssize_t sent = send(g_repl_capture_slave_fd, data, len, MSG_NOSIGNAL);
-    if (sent < 0 || (size_t)sent != len) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "client_capture: forward send failed fd=%d errno=%d\n",
-                    g_repl_capture_slave_fd, errno);
+    /* 过滤复制控制命令 — BPF 捕获了 slave→master 的控制消息（REPLSYNC/REPLACK），
+     * 若转发回 slave 会导致解析错误和 buffer 堆积 */
+    if (len >= 7) {
+        const char *p = (const char *)data;
+        size_t scan = len < 128 ? len : 128;
+        /* 简单扫描 — RESP 命令名格式: $N\r\n<CMD>\r\n，只需匹配 CMD 部分 */
+        for (size_t i = 0; i + 8 <= scan; i++) {
+            if ((memcmp(p + i, "REPLSYNC", 8) == 0) ||
+                (memcmp(p + i, "REPLACK", 7) == 0)) {
+                return 0;  /* 静默丢弃 */
+            }
         }
-        return -1;
+    }
+
+    size_t total_sent = 0;
+    int err_count = 0;
+
+    while (total_sent < len) {
+        ssize_t sent = send(g_repl_capture_slave_fd, data + total_sent,
+                            len - total_sent, MSG_NOSIGNAL);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (++err_count > 100) {
+                    static long long last_stuck_warn = 0;
+                    long long now = kvs_now_ms();
+                    if (now - last_stuck_warn > 5000) {
+                        last_stuck_warn = now;
+                        fprintf(stderr, "client_capture: forward stuck (EAGAIN x%d) fd=%d\n",
+                                err_count, g_repl_capture_slave_fd);
+                    }
+                    return -1;
+                }
+                usleep(1000);
+                continue;
+            }
+            static long long last_err_ms = 0;
+            long long now = kvs_now_ms();
+            if (now - last_err_ms > 5000) {
+                last_err_ms = now;
+                fprintf(stderr, "client_capture: forward send error fd=%d errno=%d\n",
+                        g_repl_capture_slave_fd, errno);
+            }
+            return -1;
+        }
+        total_sent += (size_t)sent;
+        err_count = 0;
     }
     return 0;
 }
@@ -1172,6 +1213,18 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
     if (payload_len == 0 || payload_len + 4 > size) return 0;
 
     unsigned char *payload = (unsigned char *)data + 4;
+
+    /* 过滤复制控制命令 — BPF 捕获了 slave→master 的数据（REPLSYNC/REPLACK），
+     * 无论是增量转发还是全量缓存，都静默丢弃，防止 slave 收到后解析失败 */
+    if (payload_len >= 7) {
+        size_t scan = payload_len < 128 ? payload_len : 128;
+        for (size_t i = 0; i + 7 <= scan; i++) {
+            if ((scan - i >= 8 && memcmp(payload + i, "REPLSYNC", 8) == 0) ||
+                memcmp(payload + i, "REPLACK", 7) == 0) {
+                return 0;  /* 静默丢弃 */
+            }
+        }
+    }
 
     if (g_repl_fullsync_in_progress) {
         /* ═══ STATE_FULL: 全量同步中 → 缓存 ═══ */
@@ -1203,14 +1256,9 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_count++;
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
-    } else {
-        /* ═══ STATE_INCR: 增量同步中 → 直接转发到 slave ═══ */
-        /* 通过 send() 直接将捕获到的 RESP 数据写入 slave TCP 连接 */
-        if (forward_to_slave(payload, payload_len) != 0) {
-            /* 转发失败: 数据走 repl_broadcast 保底，此处不补偿 */
-            fprintf(stderr, "client_capture: forward failed, fallback to broadcast\n");
-        }
     }
+    /* STATE_INCR: 增量同步 — 数据由 repl_broadcast 可靠发送（TCP），
+     * eBPF 转发因 bpf_probe_read_user 不可靠而禁用 */
     return 0;
 }
 
@@ -1357,6 +1405,47 @@ int repl_client_capture_init(void) {
         return -1;
     }
 
+    /* ═══ Attach kprobe/kretprobe 到 tcp_recvmsg ═══
+     * libbpf 0.5.0 的 bpf_object__load() 不会自动 attach，
+     * 必须显式调用 bpf_program__attach_kprobe()。 */
+    {
+        struct bpf_program *prog;
+
+        prog = bpf_object__find_program_by_name(g_client_obj,
+                                                "kprobe_client_recv_entry");
+        if (prog) {
+            struct bpf_link *link = bpf_program__attach_kprobe(
+                prog, false /* kprobe */, "tcp_recvmsg");
+            if (!libbpf_get_error(link) && g_client_link_count < 4) {
+                g_client_links[g_client_link_count++] = link;
+                fprintf(stderr, "client_capture: attached kprobe/tcp_recvmsg\n");
+            } else {
+                fprintf(stderr, "client_capture: failed to attach kprobe/tcp_recvmsg (err=%ld)\n",
+                        libbpf_get_error(link));
+            }
+        }
+
+        prog = bpf_object__find_program_by_name(g_client_obj,
+                                                "kprobe_client_recv_return");
+        if (prog) {
+            struct bpf_link *link = bpf_program__attach_kprobe(
+                prog, true /* kretprobe */, "tcp_recvmsg");
+            if (!libbpf_get_error(link) && g_client_link_count < 4) {
+                g_client_links[g_client_link_count++] = link;
+                fprintf(stderr, "client_capture: attached kretprobe/tcp_recvmsg\n");
+            } else {
+                fprintf(stderr, "client_capture: failed to attach kretprobe/tcp_recvmsg (err=%ld)\n",
+                        libbpf_get_error(link));
+            }
+        }
+
+        if (g_client_link_count == 0) {
+            fprintf(stderr, "client_capture: no BPF programs attached\n");
+            repl_client_capture_cleanup();
+            return -1;
+        }
+    }
+
     /* 获取 map FDs */
     g_client_ctl_fd = bpf_object__find_map_fd_by_name(g_client_obj, "client_ctl");
     g_client_stats_fd = bpf_object__find_map_fd_by_name(g_client_obj, "client_stats");
@@ -1479,6 +1568,15 @@ int repl_client_capture_flush_to_slave(conn_t *c) {
 /* 清理 client capture 资源 */
 void repl_client_capture_cleanup(void) {
     g_client_running = 0;
+
+    /* 先销毁 BPF links（必须在 bpf_object__close 之前） */
+    for (int i = 0; i < g_client_link_count; i++) {
+        if (g_client_links[i]) {
+            bpf_link__destroy(g_client_links[i]);
+            g_client_links[i] = NULL;
+        }
+    }
+    g_client_link_count = 0;
 
     if (g_client_ringbuf) {
         ring_buffer__free(g_client_ringbuf);

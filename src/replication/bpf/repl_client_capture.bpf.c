@@ -29,7 +29,7 @@
 #endif
 
 #define CLIENT_ENTRY_HDR_SZ    4
-#define CLIENT_ENTRY_MAX_LEN   500
+#define CLIENT_ENTRY_MAX_LEN   8192
 
 /* x86_64 pt_regs */
 struct pt_regs {

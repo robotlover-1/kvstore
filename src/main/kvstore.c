@@ -1639,91 +1639,117 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     const char *op = strip_prefix(cmd);
     int rc = -1;
     int should_reply_missing = 0;
+    size_t oplen = argl[0];
+    /* strip engine prefix (H/R/X) — op already points past it */
+    if (op != argv[0]) oplen--;
 
-    if (!strcmp(op, "SET") && argc == 3) {
-        try_expire(engine, argv[1]);
-        rc = engine_set(engine, argv[1], argv[2]);
-        should_reply_missing = 1;
-    }
-    else if (!strcmp(op, "MSET")) {
-        try_expire(engine, argv[1]);
-        rc = handle_multi_set(engine, argc, argv);
-    }
-    else if (!strcmp(op, "MOD") && argc == 3) {
-        try_expire(engine, argv[1]);
-        rc = engine_mod(engine, argv[1], argv[2]);
-        should_reply_missing = 1;
-    }
-    else if (!strcmp(op, "DEL") && argc == 2) {
-        try_expire(engine, argv[1]);
-        rc = engine_del(engine, argv[1]);
-        kvs_expire_del(&global_expire, engine, argv[1]);
-        should_reply_missing = 1;
-    }
-    else if (!strcmp(op, "GET") && argc == 2) {
-        try_expire(engine, argv[1]);
-        char *v = engine_get(engine, argv[1]);
-#if KVS_ENABLE_RDMA
-        if (g_cfg.role == ROLE_SLAVE && !from_replication && repl_is_soak_key(argv[1])) {
-            repl_rdma_log("slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
-                argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
+    /* fast dispatch by first char + length (zero-copy argv) */
+    switch (op[0]) {
+    case 'S': /* SET */
+        if (oplen == 3 && argc == 3) {
+            try_expire(engine, argv[1]);
+            rc = engine_set(engine, argv[1], argv[2]);
+            should_reply_missing = 1;
         }
-#endif
-        n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-        goto out;
-        return 0;
-    } else if (!strcmp(op, "MGET")) {
-        n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
+        break;
+    case 'M':
+        if (op[1] == 'S') { /* MSET */
+            if (argc >= 3 && (argc & 1)) {
+                try_expire(engine, argv[1]);
+                rc = handle_multi_set(engine, argc, argv);
+            }
+        } else if (op[1] == 'O') { /* MOD */
+            if (argc == 3) {
+                try_expire(engine, argv[1]);
+                rc = engine_mod(engine, argv[1], argv[2]);
+                should_reply_missing = 1;
+            }
+        } else if (op[1] == 'G') { /* MGET */
+            n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
 #if KVS_ENABLE_RDMA
-        if (g_cfg.role == ROLE_SLAVE && !from_replication) {
-            for (int i = 1; i < argc; ++i) {
-                if (repl_is_soak_key(argv[i])) {
-                    char *mv = engine_get(engine, argv[i]);
-                    repl_rdma_log("slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
-                        argv[i], mv ? 1 : 0, mv ? mv : "(null)", repl_slave_offset(), repl_master_link_state_name());
+            if (g_cfg.role == ROLE_SLAVE && !from_replication) {
+                for (int i = 1; i < argc; ++i) {
+                    if (repl_is_soak_key(argv[i])) {
+                        char *mv = engine_get(engine, argv[i]);
+                        repl_rdma_log("slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
+                            argv[i], mv ? 1 : 0, mv ? mv : "(null)", repl_slave_offset(), repl_master_link_state_name());
+                    }
+                }
+            }
+#endif
+            if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+            goto out;
+        }
+        break;
+    case 'D': /* DEL */
+        if (oplen == 3 && argc == 2) {
+            try_expire(engine, argv[1]);
+            rc = engine_del(engine, argv[1]);
+            kvs_expire_del(&global_expire, engine, argv[1]);
+            should_reply_missing = 1;
+        }
+        break;
+    case 'G': /* GET */
+        if (oplen == 3 && argc == 2) {
+            try_expire(engine, argv[1]);
+            char *v = engine_get(engine, argv[1]);
+#if KVS_ENABLE_RDMA
+            if (g_cfg.role == ROLE_SLAVE && !from_replication && repl_is_soak_key(argv[1])) {
+                repl_rdma_log("slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
+                    argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
+            }
+#endif
+            n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+            goto out;
+        }
+        break;
+    case 'E':
+        if (op[1] == 'X') {
+            if (op[2] == 'I') { /* EXIST */
+                if (argc == 2) {
+                    try_expire(engine, argv[1]);
+                    n = resp_integer(resp, BUFFER_CAP, engine_exist(engine, argv[1]) == 0 ? 1 : 0);
+                    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+                    goto out;
+                }
+            } else if (op[2] == 'P') { /* EXPIRE */
+                if (argc == 3) {
+                    try_expire(engine, argv[1]);
+                    if (engine_exist(engine, argv[1]) != 0) rc = 1;
+                    else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
+                    should_reply_missing = 1;
                 }
             }
         }
-#endif
-        if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-        goto out;
-        return 0;
-    } else if (!strcmp(op, "EXIST") && argc == 2) {
-        try_expire(engine, argv[1]);
-        n = resp_integer(resp, BUFFER_CAP, engine_exist(engine, argv[1]) == 0 ? 1 : 0);
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-        goto out;
-        return 0;
-    } else if (!strcmp(op, "EXPIRE") && argc == 3) {
-        try_expire(engine, argv[1]);
-        if (engine_exist(engine, argv[1]) != 0) rc = 1;
-        else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
-        should_reply_missing = 1;
-    } else if (!strcmp(op, "TTL") && argc == 2) {
-        try_expire(engine, argv[1]);
-        if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, BUFFER_CAP, -2);
-        else {
-            long long ttl = kvs_expire_ttl(&global_expire, engine, argv[1]);
-            n = resp_integer(resp, BUFFER_CAP, ttl);
+        break;
+    case 'T': /* TTL */
+        if (oplen == 3 && argc == 2) {
+            try_expire(engine, argv[1]);
+            if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, BUFFER_CAP, -2);
+            else {
+                long long ttl = kvs_expire_ttl(&global_expire, engine, argv[1]);
+                n = resp_integer(resp, BUFFER_CAP, ttl);
+            }
+            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+            goto out;
         }
-        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-        goto out;
-        return 0;
-    } else if (!strcmp(op, "PERSIST") && argc == 2) {
-        try_expire(engine, argv[1]);
-        if (engine_exist(engine, argv[1]) != 0) rc = 1;
-        else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
-        should_reply_missing = 1;
-    } else {
-        int expected_argc = 0;
-        if (!strcmp(op, "SET") || !strcmp(op, "MOD") || !strcmp(op, "EXPIRE")) expected_argc = 3;
-        else if (!strcmp(op, "GET") || !strcmp(op, "DEL") || !strcmp(op, "EXIST") || !strcmp(op, "TTL") || !strcmp(op, "PERSIST")) expected_argc = 2;
-        if (expected_argc > 0 && argc != expected_argc)
-            n = resp_error(resp, BUFFER_CAP, "wrong number of arguments");
-        else
-            n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
+        break;
+    case 'P': /* PERSIST */
+        if (oplen == 7 && argc == 2) {
+            try_expire(engine, argv[1]);
+            if (engine_exist(engine, argv[1]) != 0) rc = 1;
+            else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
+            should_reply_missing = 1;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (rc < 0 && n <= 0) {
+        n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;

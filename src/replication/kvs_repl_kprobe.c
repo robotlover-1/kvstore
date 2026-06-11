@@ -91,6 +91,9 @@ static unsigned long long g_total_events = 0;
 static unsigned long long g_total_bytes = 0;
 static unsigned long long g_rdma_writes = 0;
 static unsigned long long g_rdma_errors = 0;
+static volatile int g_cc_repldone_detect = 0;   /* REPLDONE 探测次数 */
+static volatile int g_cc_l1_flushed = 0;        /* L1 flush 次数 */
+static volatile int g_cc_l2_flushed = 0;        /* L2 flush 条目数 */
 
 /* ============================================================
  * 内部函数声明
@@ -326,6 +329,7 @@ static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
 
     /* NEW: 检测 REPLDONE 通知（BPF 探测到 REPLDONE 命令时发送） */
     if (payload_len == KVS_KPROBE_MAGIC_REPLDONE) {
+        g_cc_repldone_detect++;
         fprintf(stderr, "kprobe: REPLDONE detected via BPF, triggering cache flush\n");
         /* 通知用户态全量同步完成 */
         extern volatile int g_repl_fullsync_in_progress;
@@ -1335,6 +1339,7 @@ static int cache_flush_l2_to_slave(conn_t *c) {
     g_cache_l2_path[0] = '\0';
     g_cache_l2_bytes = 0;
 
+    g_cc_l2_flushed += count;
     fprintf(stderr, "client_capture: L2 flushed %d entries\n", count);
     return count;
 }
@@ -1526,6 +1531,7 @@ int repl_client_capture_flush_to_slave(conn_t *c) {
     pthread_mutex_unlock(&g_cache_lock);
 
     if (node) {
+        g_cc_l1_flushed++;
         fprintf(stderr, "client_capture: flushing L1 (%d entries, %llu bytes)\n",
                 l1_count, l1_bytes);
 
@@ -1626,6 +1632,27 @@ void repl_client_capture_cleanup(void) {
     fprintf(stderr, "client_capture: cleaned up\n");
 }
 
+/* ── client_capture 统计查询（供 INFO 命令使用）── */
+int repl_client_capture_get_stats(unsigned long long *hits,
+    unsigned long long *cached, int *repldone_detect,
+    int *l1_flushed, int *l2_flushed)
+{
+    /* BPF stats: read HIT counter from BPF map */
+    unsigned long long bpf_hits = 0;
+    if (g_client_stats_fd >= 0) {
+        __u32 key = 0;  /* HIT */
+        __u64 val = 0;
+        if (bpf_map_lookup_elem(g_client_stats_fd, &key, &val) == 0)
+            bpf_hits = (unsigned long long)val;
+    }
+    if (hits)    *hits    = bpf_hits;
+    if (cached)  *cached  = (unsigned long long)g_cache_count;
+    if (repldone_detect) *repldone_detect = g_cc_repldone_detect;
+    if (l1_flushed) *l1_flushed = g_cc_l1_flushed;
+    if (l2_flushed) *l2_flushed = g_cc_l2_flushed;
+    return (g_client_obj != NULL && g_client_running) ? 1 : 0;
+}
+
 #else /* !KVS_ENABLE_KPROBE_RDMA */
 
 /* 编译禁用时的桩实现 */
@@ -1648,5 +1675,14 @@ int repl_client_capture_init(void) { return -1; }
 void repl_client_capture_set_fullsync(int p) { (void)p; }
 int repl_client_capture_flush_to_slave(conn_t *c) { (void)c; return 0; }
 void repl_client_capture_cleanup(void) {}
+int repl_client_capture_get_stats(unsigned long long *hits,
+    unsigned long long *cached, int *repldone_detect,
+    int *l1_flushed, int *l2_flushed)
+{
+    if (hits) *hits = 0; if (cached) *cached = 0;
+    if (repldone_detect) *repldone_detect = 0;
+    if (l1_flushed) *l1_flushed = 0; if (l2_flushed) *l2_flushed = 0;
+    return 0;
+}
 
 #endif /* KVS_ENABLE_KPROBE_RDMA */

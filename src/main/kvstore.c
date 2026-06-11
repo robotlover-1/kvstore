@@ -1147,9 +1147,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
+        unsigned long long cc_hits = 0, cc_cached = 0;
+        int cc_active = 0, cc_repld = 0, cc_l1 = 0, cc_l2 = 0;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         repl_ebpf_get_stats(&ebpf_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
+        cc_active = repl_client_capture_get_stats(
+            &cc_hits, &cc_cached, &cc_repld, &cc_l1, &cc_l2);
 
         unsigned long long max_replica_applied = 0;
         unsigned long long max_replica_durable = 0;
@@ -1232,6 +1236,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "kprobe_ringbuf_bytes:%llu\n"
             "kprobe_rdma_writes:%llu\n"
             "kprobe_rdma_errors:%llu\n"
+            "client_capture_active:%d\n"
+            "client_capture_hits:%llu\n"
+            "client_capture_cached:%llu\n"
+            "client_capture_repldone_detect:%d\n"
+            "client_cache_l1_flushed:%d\n"
+            "client_cache_l2_flushed:%d\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -1307,6 +1317,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             kprobe_stats.total_bytes,
             kprobe_stats.rdma_writes,
             kprobe_stats.rdma_errors,
+            cc_active, cc_hits, cc_cached,
+            cc_repld, cc_l1, cc_l2,
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));

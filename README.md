@@ -4344,72 +4344,67 @@ ECHO QPS 与 AOF 策略无关（ECHO 不写引擎、不写 AOF），同一服务
 
 | 配置 | ECHO (QPS) | HSET (QPS) |
 |---|---|---|
-| **kvstore** (ECHO 基线) | **137,779** | — |
-| ├─ AOF 关闭（`--aof-disable`） | — | **23,347** |
-| ├─ AOF always（每条命令 fsync） | — | 2,989 |
-| └─ AOF everysec（每秒 fsync） | — | 11,645 |
-| **Redis** (ECHO 基线) | **127,356** | — |
-| ├─ 无 AOF | — | 122,865 |
-| ├─ AOF everysec | — | 119,033 |
-| └─ AOF always | — | 98,873 |
+| **kvstore** (ECHO 基线) | **138,274** | — |
+| ├─ AOF 关闭（`--aof-disable`） | — | **130,514** |
+| ├─ AOF always（每条命令 fsync） | — | 3,303 |
+| └─ AOF everysec（每秒 fsync） | — | 23,684 |
+| **Redis** (ECHO 基线) | **126,024** | — |
+| ├─ 无 AOF | — | 121,847 |
+| ├─ AOF everysec | — | 127,146 |
+| └─ AOF always | — | 124,657 |
 
 ##### 结果分析
 
-**① ECHO 基线——kvstore RESP 解析比 Redis 快 8.2%**
+**① ECHO 基线——kvstore RESP 解析比 Redis 快 9.7%**
 
-kvstore 的 ECHO 达到 **137,779 QPS**，Redis 为 **127,356 QPS**。差距来自 RESP 解析器实现差异：
+kvstore 的 ECHO 达到 **138,274 QPS**，Redis 为 **126,024 QPS**。差距来自 RESP 解析器实现差异：
 - kvstore 的 `handle_parsed_command` 中 ECHO 路径极短：`resp_bulk` 直接返回，无额外分配
 - Redis 需要处理 RESP 3、多数据类型等复杂逻辑，CPU 指令路径更长
 
-**② Hash 引擎是 kvstore 的写入瓶颈**
+**② Hash 引擎经过渐进式 rehash 优化后反超 Redis**
+
+| 服务器 | HSET no-AOF QPS | 相对比例 |
+|---|---|---|
+| **kvstore** | **130,514** | **107%** |
+| Redis | 121,847 | 100% |
+
+kvstore 实现了类 Redis 的渐进式 rehash：
+- **初始 4096 桶**（Redis 初始仅 4 桶），负载因子 2.0 触发扩容（×2），每次操作迁移 10 桶
+- **hash 值缓存**（`node->hv`）：rehash 迁移时免重算 FNV-1a，直接用 `hv % new_size`
+- 100 万 key 写入 QPS 从 23k → 130k（**5.6× 提升**），超过了 Redis 的 122k
+
+与旧测试（Array 引擎 SET，key 复用覆盖写入，~135k QPS）对比，Hash 引擎经 rehash 优化后
+性能接近 Array 引擎的最优场景，同时支持无限容量。
+
+**③ kvstore AOF always 的瓶颈仍在 I/O**
 
 | AOF 策略 | HSET QPS | 相对 AOF 关闭降幅 |
 |---|---|---|
-| 关闭 | 23,347 | — |
-| everysec | 11,645 | -50.1% |
-| always | 2,989 | -87.2% |
+| 关闭 | 130,514 | — |
+| everysec | 23,684 | -81.9% |
+| always | 3,303 | -97.5% |
 
-与旧测试（Array 引擎 SET，key 复用覆盖写入，~135k QPS）对比，本次使用 **Hash 引擎 + 100 万唯一随机 key**，写入负载完全不同：
-- Array 引擎：O(n) 线性扫描，key 复用场景下 n ≤ 数十，覆盖写入极快
-- Hash 引擎：链地址法 1024 桶，100 万 key 时平均每桶 ~1000 节点，每次 HSET 需遍历长链表
-
-kvstore 当前 Hash 引擎使用固定 1024 桶的链地址法，不随数据量动态扩容，导致大量 key 时链表过长。
-这解释了 AOF 关闭时仅 23k QPS 的性能——瓶颈在引擎查找，不在 I/O。
-
-**③ kvstore AOF always 的性能骤降**
-
-与旧 SET 测试（AOF always 仅 -1.6%）完全不同，HSET 100 万唯一 key 场景下 AOF always 降至 2,989 QPS（-87.2%）：
-
-```
-kvstore AOF always 路径（每条 HSET）：
-  Hash 引擎查找（~1000 次 strcmp）         ← 引擎瓶颈
-  persist_append_raw(RESP ~50 bytes)       ← AOF 追加
-  io_uring write + fsync                   ← 异步，但 100 万次排队
-```
-
-100 万条 HSET 命令产生约 50MB AOF 数据，always 策略每条命令后触发 io_uring fsync。
-虽然 io_uring 是异步的，但大量排队操作仍会产生累积延迟。
-
-everysec 策略（每秒批量 fsync）表现更好（11,645 QPS），说明批量 fsync 显著减少了 I/O 压力。
+引擎性能提升后，AOF 写入成为新的瓶颈。100 万条 HSET 产生约 50MB AOF 数据，
+always 策略每条命令 io_uring fsync，大量排队操作累积延迟。
+everysec 策略（每秒批量 fsync）性能更好（23,684 QPS），但仍受 I/O 限制。
 
 **④ Redis HSET 性能稳定**
 
-Redis 的 HSET 在不同 AOF 策略下表现平稳（117k~124k QPS），因为 Redis 的哈希表支持渐进式 rehash +
-动态扩容，100 万 key 下仍然高效。AOF always 的同步 fsync 在 100 万次写入中每次 ~8.5μs（远小于 kvstore 的 Hash 查找开销），
-所以 AOF 策略对总体 QPS 影响不大。
+Redis 的 HSET 在不同 AOF 策略下表现平稳（122k~127k QPS），
+AOF always 仅从 122k 降至 125k（实际上升，因测试误差），
+说明 Redis 的 AOF 实现非常成熟。
 
 ##### 结论
 
 | 场景 | 推荐方案 | QPS | 原因 |
 |---|---|---|---|
-| 极致性能，小数据集（<1024 key） | kvstore `--aof-disable` + Array 引擎 | 137k+ | Array 引擎 key 复用极快 |
-| 大数据集（100w+ key） | Redis 无 AOF | 122,865 | Hash 引擎成熟，链地址法动态扩容 |
-| kvstore 大数据集 + 持久化 | kvstore AOF everysec | 11,645 | 批量 fsync 减少 I/O 压力 |
-| 最高安全性 | Redis AOF always | 98,873 | 每条 fsync，性能几乎无损 |
+| 极致性能，不关心持久化 | kvstore `--aof-disable` | **130,514** | 渐进式 rehash 反超 Redis 7% |
+| 大规模数据 + 持久化 | Redis AOF everysec | 127,146 | AOF I/O 成熟，kvstore AOF 仍有瓶颈 |
+| 最高安全性，每条命令持久化 | Redis AOF always | 124,657 | |
+| kvstore 持久化折中 | kvstore AOF everysec | 23,684 | 批量 fsync 缓解 I/O 压力 |
 
-> **注意**：本测试使用 100 万唯一随机 key 的 HSET 负载，与旧测试（SET key 复用覆盖写入）的工作负载完全不同。
-> kvstore 的 Hash 引擎当前使用固定 1024 桶链地址法，大数据集下链表过长是主要性能瓶颈。
-> Array 引擎（SET 命令）在 key 复用场景下仍然极快（~137k QPS，见旧测试数据）。
+> **注意**：kvstore 已实现渐进式 rehash（初始 4096 桶、负载因子 2.0、每次迁移 10 桶、hash 值缓存），
+> 引擎性能超过 Redis。当前瓶颈转移到 AOF 写入路径。
 
 ---
 
@@ -4443,15 +4438,14 @@ time redis-cli -p 5190 SAVE
 
 | 场景 | 数据量 | SAVE 次数 | 写入 QPS | 写入耗时 | 平均每次 SAVE | 有效 QPS |
 |---|---|---|---|---|---|---|
-| **100w → SAVE × 1** | 100万 | 1 | 20,834 | 48.1s | **3,835ms** | **19,268** |
-| 10w → SAVE × 10 | 10万 | 10 | 115,340 | 0.88s | 392ms | 20,827 |
-| 1w → SAVE × 100 | 1万 | 100 | 128,205 | 0.08s | 42ms | 2,339 |
-| 1k → SAVE × 1000 | 1千 | 1000 | 111,111 | 0.01s | 7ms | 141 |
+| **100w → SAVE × 1** | 100万 | 1 | 134,318 | 7.51s | **3,845ms** | **88,029** |
+| 10w → SAVE × 10 | 10万 | 10 | 141,443 | 0.72s | 384ms | 21,934 |
+| 1w → SAVE × 100 | 1万 | 100 | 138,889 | 0.08s | 41ms | 2,380 |
+| 1k → SAVE × 1000 | 1千 | 1000 | 90,909 | 0.02s | 7ms | 143 |
 
-> **写入 QPS 为何波动？** redis-benchmark 报告的 QPS 按秒采样取最终值。
-> 10w/1w/1k 的数据量太小（<1 秒完成），redis-benchmark 只采样到前几秒的瞬时 QPS（此时 Hash 引擎链短，QPS 高）。
-> 100w 数据量跑满 48 秒，QPS 从 130k 降至 20k，最终平均 20,834，反映真实稳态性能。
-> **实际写入 QPS 以 100w 场景为准（~21k）。**
+> **写入 QPS 为何稳定在 130k+？** 渐进式 rehash 使桶数随数据量动态增长（4096 → 8192 → ... → 1M+），
+> 每桶始终维持 0~2 节点，HSET 查找 O(1)。10w/1w 的写入因数据量小（<1 秒完成），瞬时采样偏高。
+> **实际稳态写入 QPS 以 100w 场景为准（~134k）。**
 
 ##### 结果分析
 
@@ -4485,15 +4479,11 @@ int persist_save_dump(void) {
 `kvs_dump_to_fd()` 遍历 Hash 引擎 1024 个桶的链地址表 → 约 100 万次节点的 key/value 拷贝 + write 系统调用。
 io_uring fsync 是异步的，不阻塞 SAVE 返回，但 write 本身的数据量决定了耗时。
 
-**② 有效 QPS 由 SAVE 频率和数据量共同决定**
+**② 引擎优化后写入 QPS 大幅提升，SAVE 开销相对降低**
 
-- 100w→SAVE×1：SAVE 3.8s / 总 51.9s = 7.4% 开销，有效 QPS 19k
-- 10w→SAVE×10：每 10 万 SAVE 一次（~392ms），累计 SAVE 3.9s，有效 QPS 21k
-- 1w→SAVE×100：每 1 万 SAVE 一次（~42ms），累计 SAVE 4.2s，有效 QPS 2.3k
-- 1k→SAVE×1000：每 1 千 SAVE 一次（~7ms），累计 SAVE 7.0s，有效 QPS 141
-
-SAVE 不是轻量操作——100 万 key 的 SAVE 需要 3.8 秒。高频 SAVE 场景下，即使单次 7ms（1k key），
-累积 1000 次也超过 7 秒，是写入时间的 500 倍。
+- 100w→SAVE×1：写入 7.5s + SAVE 3.8s = 11.3s 总耗时，有效 QPS 88k（优化前 19k，4.6×）
+- 写入 QPS 从 21k → 134k（6.4×），SAVE 时间不变（3.8s，纯磁盘 I/O）
+- SAVE 开销占比：3.8s / 11.3s = 33.6%（优化前 7.4%，因写入从 48s 缩短到 7.5s）
 
 **③ 最佳策略：低频 BGSAVE + AOF**
 

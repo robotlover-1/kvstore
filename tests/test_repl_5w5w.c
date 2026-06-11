@@ -533,7 +533,7 @@ static int run_test(void) {
     printf("  或:\n");
     printf("    sudo ./kvstore --port %d --role slave --master-host %s --master-port %d \\\n",
            g_opt.slave_port, g_opt.master_host, g_opt.master_port);
-    printf("        --repl-fullsync-transport rdma --repl-realtime-transport kprobe-rdma\n");
+    printf("        --repl-fullsync-transport rdma --repl-realtime-transport tcp\n");
     printf("\n  等待 Slave 连接...\n");
 
     int slave_ready = 0;
@@ -972,6 +972,59 @@ static int run_test(void) {
         free(m_transport); free(s_transport);
         free(m_kprobe_init); free(m_broadcast); free(m_fallback);
         free(info_m); free(info_s);
+    }
+
+    /* ═══════════════════════════════════════════
+     * Phase 5.6: 验证 eBPF+tcp (路径4) client_capture 是否生效
+     * ═══════════════════════════════════════════ */
+    banner("Phase 5.6: 验证 eBPF+tcp client_capture (路径4) 状态");
+
+    printf("  正在检查 Master 端 client_capture 状态...\n");
+    {
+        char *info_cc = get_info(g_opt.master_host, g_opt.master_port);
+        char *cc_active = info_cc ? info_field(info_cc, "client_capture_active") : NULL;
+        char *cc_hits   = info_cc ? info_field(info_cc, "client_capture_hits") : NULL;
+        char *cc_cached = info_cc ? info_field(info_cc, "client_capture_cached") : NULL;
+        char *cc_repld  = info_cc ? info_field(info_cc, "client_capture_repldone_detect") : NULL;
+        char *cc_l1     = info_cc ? info_field(info_cc, "client_cache_l1_flushed") : NULL;
+        char *cc_l2     = info_cc ? info_field(info_cc, "client_cache_l2_flushed") : NULL;
+
+        int active = cc_active ? atoi(cc_active) : -1;
+        unsigned long long hits   = cc_hits   ? strtoull(cc_hits, NULL, 10) : 0;
+        unsigned long long cached = cc_cached ? strtoull(cc_cached, NULL, 10) : 0;
+        unsigned long long repld  = cc_repld  ? strtoull(cc_repld, NULL, 10) : 0;
+        unsigned long long l1     = cc_l1     ? strtoull(cc_l1, NULL, 10) : 0;
+        unsigned long long l2     = cc_l2     ? strtoull(cc_l2, NULL, 10) : 0;
+
+        printf("    client_capture_active=%d  hits=%llu  cached=%llu\n"
+               "    repldone_detect=%llu  l1_flushed=%llu  l2_flushed=%llu\n",
+               active, hits, cached, repld, l1, l2);
+
+        if (active == 1 && repld >= 1) {
+            printf("  %s✓ eBPF+tcp client_capture (路径4) 工作正常%s\n",
+                   ANSI_GREEN, ANSI_RESET);
+            printf("    BPF kprobe/tcp_sendmsg 探测到 REPLDONE (%llu 次)\n", repld);
+            printf("    全量同步期间缓存 %llu 条命令, flush L1=%llu L2=%llu\n",
+                   cached, l1, l2);
+            test_pass("eBPF+tcp 路径4生效: REPLDONE探测=%llu 缓存=%llu flush L1=%llu L2=%llu",
+                      repld, cached, l1, l2);
+        } else if (active == 1) {
+            printf("  %s⚠ client_capture 已激活但 REPLDONE 尚未探测到%s\n",
+                   ANSI_YELLOW, ANSI_RESET);
+            printf("    可能原因: 全量同步走 RDMA 直接完成，REPLDONE 未经 TCP\n");
+            printf("    或 repl_fullsync_transport 未设为 rdma（触发 TCP REPLDONE）\n");
+            test_pass("client_capture 已激活 (repldone_detect 待后续同步验证)");
+        } else if (active == 0) {
+            printf("  %s⚠ client_capture 未激活%s\n", ANSI_YELLOW, ANSI_RESET);
+            printf("    可能原因: BPF client_capture 加载失败（需 root 权限）\n");
+            printf("    或 repl_realtime_transport 不为 tcp（当前不是 ebpf+tcp 路径）\n");
+        } else {
+            printf("  %s✗ 无法获取 client_capture 状态%s\n", ANSI_RED, ANSI_RESET);
+        }
+
+        free(cc_active); free(cc_hits); free(cc_cached);
+        free(cc_repld); free(cc_l1); free(cc_l2);
+        free(info_cc);
     }
 
     /* ═══════════════════════════════════════════

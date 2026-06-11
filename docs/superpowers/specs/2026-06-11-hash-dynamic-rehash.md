@@ -73,7 +73,52 @@ set 操作：
 
 ### dump 遍历
 
-遍历 `ht[0].nodes` 所有桶的所有节点。如果 `rehash_idx >= 0`，额外遍历 `ht[1].nodes` 已迁移的桶。避免重复计数。
+rehash 期间 key 分布在两张表中，但每个 key 只存在于其中一张表：
+- 已迁移的 key 在 `ht[1]`，`ht[0]` 中对应桶已清空
+- set 操作在 rehash 期间新插入的 key 直接进 `ht[1]`
+
+因此遍历逻辑：遍历 `ht[0].nodes` 的全部桶 + 如果 `rehash_idx >= 0`，遍历 `ht[1].nodes` 的**全部**桶（不只是已迁移的）。无需去重 —— 每个 key 只在其中一个表中。
+
+### 节点创建 (`_create_node`)
+
+```c
+// 计算并缓存完整 32-bit FNV-1a hash 值
+static uint32_t _hash_raw(const char *key) {
+    uint32_t sum = 2166136261u;
+    for (int i = 0; key[i] != 0; ++i) {
+        sum ^= (unsigned char)key[i];
+        sum *= 16777619u;
+    }
+    return sum;
+}
+
+static hashnode_t *_create_node(char *key, char *value) {
+    // ...malloc...
+    node->hv = _hash_raw(key);   // 缓存 hash 值，rehash 时直接用 node->hv % max_slots
+    // ...
+}
+```
+
+rehash 迁移时 `hv` 非零直接用；若为 0（兼容旧数据或异常），退化重算 `_hash_raw(key)`。
+
+### destroy 双表清理
+
+`kvs_hash_destory` 需释放 `ht[0]` 和 `ht[1]` 两张表。若 rehash 中途 shutdown，`ht[1]` 也持有已迁移数据，必须清理。
+
+### `global_hash` 类型变更影响面
+
+`kvs_hash_t` 从 `typedef hashtable_t` 变为含 `ht[2]` 的包容器，所有直接访问 `.nodes` / `.max_slots` / `.count` 的代码需改为 `ht[0].nodes` / `ht[0].max_slots` / `ht[0].count`。
+
+受影响的所有引用点：
+```c
+// kvstore.c — dump (2 处) + memstat (1 处)
+global_hash.nodes      → global_hash.ht[0].nodes
+global_hash.max_slots  → global_hash.ht[0].max_slots
+
+// kvs_repl.c — 全量同步 (1 处)
+global_hash.nodes      → global_hash.ht[0].nodes
+global_hash.max_slots  → global_hash.ht[0].max_slots
+```
 
 ### 恢复兼容性
 

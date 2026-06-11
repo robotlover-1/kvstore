@@ -309,7 +309,7 @@ kvstore/
 | `log_mode`                | `info`             | 日志级别：`debug` / `info` / `warn` / `error` |
 | `appendfsync`             | `always`           | AOF 同步：`always` / `everysec`               |
 | `repl_fullsync_transport` | `rdma`             | 全量同步传输：`rdma` / `tcp`（控制命令 REPLDONE 始终走 TCP） |
-| `repl_realtime_transport` | `kprobe-rdma`      | 增量同步传输：`kprobe-rdma`(含eBPF+tcp新路径) / `ebpf` / `tcp`  |
+| `repl_realtime_transport` | `ebpf+tcp`         | 增量同步传输：`ebpf+tcp`(推荐) / `kprobe-rdma` / `ebpf` / `tcp` |
 | `kprobe_enabled`          | `1`                | 启用 kprobe+RDMA 增量同步                     |
 | `rdma_dev`                | `siw0`             | RDMA 设备                                     |
 | `rdma_recv_slots`         | `64`               | RDMA 接收槽位数                               |
@@ -318,10 +318,12 @@ kvstore/
 | `sentinel`                | `0`                | 启用哨兵模式                                  |
 
 > 命令行参数优先级高于配置文件。启动时只需 `./kvstore kvstore.conf --role master`。
-> **双通道模式**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=kprobe-rdma` 默认启用。
-> 增量同步新增 **eBPF+tcp** 路径：kprobe/tcp_recvmsg 捕获客户端写入 → ringbuf → 用户态直接 send() 到 slave，
-> 数据仅发一份（无TCP+RDMA双份冗余）。全量同步期间自动切换为 L1+L2 缓存模式，kprobe/tcp_sendmsg 探测到
-> REPLDONE（通过 TCP 发送）后自动清除全量同步标志，flush 缓存后无缝切换到增量转发。自动启用（`client_capture` BPF加载成功后激活）。
+> **双通道模式（推荐）**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=ebpf+tcp`。
+> RDMA 负责全量快照传输（低延迟大块数据），eBPF+tcp 负责增量同步（kprobe 捕获客户端写入）。
+> - **全量同步期间**：eBPF client_capture 自动缓存客户端写入（L1 内存 4MB + L2 磁盘）
+> - **REPLDONE 后**：master 关闭 RDMA，flush 缓存数据到 slave，开始增量同步
+> - **增量同步**：repl_broadcast 通过 TCP 可靠发送，eBPF kprobe 持续监控
+> - **自动回退**：RDMA 不可用时自动降级为 TCP 全量同步；eBPF 加载失败时自动降级为纯 TCP
 > 完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
 
 ### 命令行参数
@@ -3545,12 +3547,12 @@ redis-cli -p 5160 INFO
 运行: tests/test_repl_5w5w [选项]
 ```
 
-测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(kprobe+RDMA) → 验证 Slave 最终 10w 条数据一致性。
+测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF+tcp) → 验证 eBPF+tcp 传输状态 → 验证 Slave 最终 10w 条数据一致性。
 
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
 
 ```bash
-# ── 方式一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）──
+# ── 方式一: RDMA 全量 + eBPF+tcp 增量（双虚拟机，推荐，需 root）──
 
 # 终端 1 (VM1, 先启动 Master):
 sudo rm -f kvstore_transport.log kvstore.aof
@@ -3563,7 +3565,10 @@ sudo ./kvstore kvstore.conf --role master
 sudo rm -f kvstore.dump kvstore.aof
 sudo ./kvstore kvstore.conf --role slave
 
-# ── 方式二: TCP 全量 + TCP 增量（单机，无需 root）──
+# ── 方式二: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）──
+# 同方式一，但 repl_realtime_transport=kprobe-rdma
+
+# ── 方式三: TCP 全量 + TCP 增量（单机，无需 root）──
 
 # 终端 1 (先启动 Master):
 ./kvstore --port 5160 --role master \
@@ -3593,8 +3598,16 @@ rm -f kvstore.dump kvstore.aof
 | `--batch SIZE`       | 1000      | 每批写入量           |
 | `--poll MS`          | 500       | 轮询间隔毫秒         |
 
-**kprobe+RDMA 验证**: 测试 Phase 5.5 自动通过 `INFO` 命令检查以下字段确认 kprobe+RDMA 路径是否生效：
+**eBPF+tcp 传输验证**: 测试 Phase 5.5 自动通过 `INFO` 命令检查以下字段确认 eBPF+tcp 路径是否生效：
 
+| INFO 字段                  | 预期               | 含义                                    |
+| -------------------------- | ------------------ | --------------------------------------- |
+| `repl_transport_active`    | `rdma+ebpf-tcp`    | 全量 RDMA + 增量 eBPF+tcp 双通道已激活  |
+| `kprobe_initialized`       | 1                  | client_capture BPF 已加载并 attach      |
+| `repl_broadcast_bytes`     | > 0                | TCP 增量数据已发送                      |
+| `repl_transport_fallback_reason` | `none`       | 无降级，传输层正常工作                  |
+
+**kprobe+RDMA 验证** (使用 `repl_realtime_transport=kprobe-rdma` 时):
 
 | INFO 字段               | 预期 | 含义                                    |
 | ----------------------- | ---- | --------------------------------------- |
@@ -3602,8 +3615,6 @@ rm -f kvstore.dump kvstore.aof
 | `kprobe_rdma_connected` | 1    | RDMA QP 已建立连接                      |
 | `kprobe_rdma_writes`    | > 0  | RDMA WRITE 成功次数                     |
 | `kprobe_rdma_errors`    | 0    | RDMA WRITE 错误次数                     |
-
-如果 `kprobe_rdma_writes > 0` 且 `errors == 0`，说明增量数据确实经过了 **kprobe → ringbuf → RDMA WRITE** 路径，而非仅走 TCP 保底。
 
 **验证**: 测试通过后，确认主从数据一致：
 

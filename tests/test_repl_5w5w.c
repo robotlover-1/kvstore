@@ -1,5 +1,5 @@
 /*
- * test_repl_5w5w.c — 主从同步 5w+5w 测试用例 (RDMA 全量 + kprobe+RDMA 增量)
+ * test_repl_5w5w.c — 主从同步 5w+5w 测试用例 (RDMA 全量 + eBPF+tcp 增量)
  *
  * 编译:
  *   make test_repl_5w5w
@@ -11,9 +11,12 @@
  *   3. 看到 "等待 Slave 连接..." 提示后，再启动 Slave
  * ═══════════════════════════════════════════════════════════════
  *
- * 用法一: RDMA 全量 + kprobe+RDMA 增量（双虚拟机部署，推荐）
- *   数据路径: 全量(rdma) + 增量(kprobe捕获TCP→ring buf→RDMA pipeline)
- *             自动回退: 若kprobe不可用 → eBPF sockmap → TCP fallback
+ * 用法一: RDMA 全量 + eBPF+tcp 增量（双虚拟机部署，推荐）
+ *   数据路径: 全量(rdma) + 增量(eBPF kprobe捕获客户端写入→TCP转发)
+ *   eBPF client_capture: kprobe/kretprobe 挂载 tcp_recvmsg
+ *     全量同步期间: L1内存(4MB)+L2磁盘缓存
+ *     REPLDONE 后: flush 缓存 + repl_broadcast TCP 增量发送
+ *     自动回退: eBPF 不可用→TCP, RDMA 不可用→TCP
  *
  *   # 终端 1 (VM1): 启动 master（需 root 加载 BPF）
  *   sudo ./kvstore kvstore.conf --role master
@@ -24,11 +27,11 @@
  *   # 看到 "等待 Slave 连接..." 后，在终端 3 (VM2) 启动 slave
  *   sudo ./kvstore kvstore.conf --role slave
  *
- * 用法二: eBPF sockmap 增量（双虚拟机，kprobe不可用时自动回退至此）
- *   与用法一相同，区别在于内核不支持 kprobe 附件（如 kprobe_events 不可写）
- *   自动走 sk_msg → bpf_msg_redirect_map → TCP 路径
+ * 用法二: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）
+ *   数据路径: 全量(rdma) + 增量(kprobe捕获TCP→ring buf→RDMA pipeline)
+ *   配置: repl_realtime_transport=kprobe-rdma
  *
- * 用法三: TCP 全量（单机，无 RDMA/eBPF）
+ * 用法三: TCP 全量 + TCP 增量（单机，无 RDMA/eBPF）
  *   # 终端 1: 启动 master
  *   ./kvstore --port 5160 --role master \
  *       --repl-fullsync-transport tcp --repl-realtime-transport tcp
@@ -51,11 +54,11 @@
  *
  * 流程:
  *   Phase 1:   预存数据到 Master
- *   Phase 2:   等待 Slave 连接 (轮询 slave_fullsync_loading)
+ *   Phase 2:   等待 Slave 连接 (轮询 slave INFO)
  *   Phase 3:   监控全量同步进度 (RDMA)
  *   Phase 4:   全量完成后，再存数据到 Master (增量)
- *   Phase 5:   监控增量同步进度 (kprobe+RDMA / eBPF sockmap / TCP)
- *   Phase 5.5: 验证 kprobe+RDMA 捕获是否生效 (kprobe_initialized=1, rdma_writes>0)
+ *   Phase 5:   监控增量同步进度 (eBPF+tcp / kprobe+RDMA / TCP)
+ *   Phase 5.5: 验证 eBPF+tcp 传输状态 (repl_transport_active + broadcast_bytes)
  *   Phase 6:   验证 Slave 数据一致性
  */
 #include <stdio.h>

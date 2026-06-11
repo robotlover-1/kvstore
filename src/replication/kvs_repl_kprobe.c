@@ -1148,7 +1148,10 @@ static unsigned long long g_cache_l2_bytes = 0; /* L2 已写入字节数 */
 /* 前向声明 */
 static int cache_spill_to_l2(const unsigned char *data, size_t len);
 
-/* ── eBPF+tcp 新路径: INCR 模式直接转发到 slave ── */
+/* ── eBPF+tcp 新路径: INCR 模式直接转发到 slave ──
+ * 当前禁用: bpf_probe_read_user 在内核 5.15 上可靠性不足，
+ * 增量数据改由 repl_broadcast (TCP) 可靠发送。保留此函数供未来修复后启用。 */
+__attribute__((unused))
 static int forward_to_slave(const unsigned char *data, size_t len) {
     extern int g_repl_capture_slave_fd;
     if (g_repl_capture_slave_fd < 0) return -1;

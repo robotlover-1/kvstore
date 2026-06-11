@@ -87,7 +87,14 @@ fi
 cleanup_all() {
     pkill -f "kvstore.*--port $KVSTORE_PORT" 2>/dev/null || true
     pkill -f "redis-server.*$REDIS_PORT" 2>/dev/null || true
-    sleep 1
+    # 等待端口真正释放
+    for ((i=1; i<=30; i++)); do
+        if ! ss -tlnp "sport = :$KVSTORE_PORT" 2>/dev/null | grep -q ":$KVSTORE_PORT" && \
+           ! ss -tlnp "sport = :$REDIS_PORT" 2>/dev/null | grep -q ":$REDIS_PORT"; then
+            break
+        fi
+        sleep 0.5
+    done
 }
 trap cleanup_all EXIT
 
@@ -104,6 +111,12 @@ start_kvstore() {
     local extra="$1"
     cleanup_all
     rm -f kvstore.dump kvstore.aof
+    # 确保端口已释放，否则退出
+    if ss -tlnp "sport = :$KVSTORE_PORT" 2>/dev/null | grep -q ":$KVSTORE_PORT"; then
+        echo "  FAIL: 端口 $KVSTORE_PORT 仍被占用，cleanup_all 未能释放"
+        echo "  占用进程: $(ss -tlnp "sport = :$KVSTORE_PORT" 2>/dev/null)"
+        exit 1
+    fi
     $BIN --port $KVSTORE_PORT --role master --mem libc --net reactor $extra \
         > "$TMPDIR/kvstore.log" 2>&1 &
     if ! wait_port $KVSTORE_PORT; then
@@ -228,6 +241,8 @@ baseline_out="$OUTDIR/aof_kvstore_write_baseline.txt"
 redis-benchmark -p "$KVSTORE_PORT" $BENCH_ARGS HSET key:__rand_int__ value > "$baseline_out" 2>&1 || true
 BASELINE_QPS=$(grep -oP '[\d.]+(?= requests per second)' "$baseline_out" | tail -1 || echo "0")
 echo "  基线 QPS: $BASELINE_QPS"
+# 基线跑完必须杀 kvstore，否则 save_scenario 的 start_kvstore 可能连到旧进程
+cleanup_all
 
 save_scenario() {
     local scenario="$1" data_size="$2" save_count="$3"
@@ -242,7 +257,7 @@ save_scenario() {
     echo "  写入 ${data_size} keys (redis-benchmark) ..."
     write_start=$(date +%s%N)
     redis-benchmark -p "$KVSTORE_PORT" -n "$data_size" -c 50 -P 1 -d 64 -r "$data_size" \
-        "HSET key:__rand_int__ value" > "$outfile" 2>&1 || true
+        HSET key:__rand_int__ value > "$outfile" 2>&1 || true
     write_end=$(date +%s%N)
 
     local write_ns=$((write_end - write_start))

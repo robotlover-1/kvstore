@@ -1,0 +1,12 @@
+echo: 0.00echo: 140625.50echo: 142127.75echo: 141973.38echo: 141819.17echo: 141478.02echo: 141351.77echo: 141379.20echo: 141480.77echo: 141775.22echo: 141616.16echo: 141658.67echo: 141597.80echo: 141567.52echo: 141679.81echo: 141790.72echo: 141787.81echo: 141628.56echo: 141629.64echo: 141361.41echo: 141169.38echo: 140911.06echo: 140716.59echo: 140381.84echo: 140311.28echo: 140190.22echo: 140194.59echo: 140141.77echo: 140039.28====== echo ======
+  1000000 requests completed in 7.14 seconds
+  50 parallel clients
+  64 bytes payload
+  keep alive: 1
+
+99.88% <= 1 milliseconds
+99.98% <= 2 milliseconds
+100.00% <= 3 milliseconds
+100.00% <= 3 milliseconds
+139997.20 requests per second
+

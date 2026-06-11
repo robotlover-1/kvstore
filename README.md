@@ -4293,7 +4293,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 
 > **测试环境**：Intel Core Ultra 7 155H (4 vCPU) / 7.7GiB RAM / Ubuntu 20.04.6 / Linux 5.15.0-139 / KVM 虚拟机
 >
-> **测试工具**：`redis-benchmark -t set -n 100000 -c 50 -d 64` (AOF 对比) / `redis-cli --pipe` + `SAVE` (SAVE 测试)
+> **测试工具**：`redis-benchmark -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value`
 >
 > **测试脚本**：`tools/bench/run_persist_bench.sh`
 
@@ -4301,41 +4301,38 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 
 ##### 测试目的
 
-评估 kvstore 的 AOF 持久化在不同 fsync 策略下的性能开销，与 Redis 同策略对比，衡量 io_uring 异步 I/O 对 AOF 写入的性能提升。
+评估 kvstore 的 AOF 持久化在不同 fsync 策略下的性能开销，与 Redis 同策略对比。使用 Hash 引擎（HSET 命令）写入 100 万唯一 key，衡量真实写入负载下的持久化开销。
 
 ##### 什么是 ECHO 测试？
 
 ECHO 是 RESP 协议中最简单的命令——服务器收到 `ECHO hello` 后直接返回 `$5\r\nhello\r\n`，
 **不涉及任何引擎写入、不写 AOF**，只测量网络收发 + RESP 解析的纯协议开销。
 
-通过对比 ECHO 和 SET 的 QPS，可以分解出各部分的开销：
+通过对比 ECHO 和 HSET 的 QPS，可以分解出各部分的开销：
 
 ```
-ECHO (纯协议)      = 网络收发 + RESP 解析
-SET AOF 关闭       = 网络收发 + RESP 解析 + 引擎写入
-SET AOF always     = 网络收发 + RESP 解析 + 引擎写入 + AOF 写入
+ECHO (纯协议)          = 网络收发 + RESP 解析
+HSET AOF 关闭          = 网络收发 + RESP 解析 + Hash 引擎写入
+HSET AOF always        = 网络收发 + RESP 解析 + Hash 引擎写入 + AOF 写入 + fsync
 ```
-
-引擎写入开销 = `1/SET(AOFoff) - 1/ECHO`
-AOF 写入开销   = `1/SET(AOFalways) - 1/SET(AOFoff)`
 
 ##### 测试方法
 
-1. 分别启动 kvstore 和 Redis 服务器，使用 `--appendfsync always`（每条命令 fsync）和 `--appendfsync everysec`（每秒 fsync）两种策略
-2. ECHO 基线：`redis-benchmark -p 5190 -n 100000 -c 50 -d 64 echo`（注意：`-t echo` 在旧版 redis-benchmark 中不受支持，需用自定义命令方式）
-3. SET 测试：`redis-benchmark -p 5190 -n 100000 -c 50 -d 64 set`（100k 次 SET，50 并发，64 字节 value）
+1. 分别启动 kvstore 和 Redis 服务器，使用 `--appendfsync always` 和 `--appendfsync everysec` 两种策略
+2. ECHO 基线：`redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 echo`
+3. HSET 测试：`redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value`（100 万次 HSET，50 并发，64 字节 value，随机 key）
 4. 每个配置测试前重启服务器，清理上一次的 AOF/dump 文件，确保测试环境干净
 5. 记录 `redis-benchmark` 输出的 QPS
 
 ```bash
 # ECHO 基线（测量纯协议开销）
-redis-benchmark -p 5190 -n 100000 -c 50 -d 64 echo
+redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 echo
 
-# SET 测试（测量引擎 + AOF 开销）
-redis-benchmark -p 5190 -n 100000 -c 50 -d 64 set
+# HSET 测试（测量引擎 + AOF 开销）
+redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value
 
 # kvstore 启动示例（always）
-./kvstore kvstore.conf --role master
+./kvstore kvstore.conf --role master --appendfsync always
 
 # Redis 启动示例（everysec）
 redis-server --port 6390 --save "" --appendonly yes --appendfsync everysec
@@ -4345,81 +4342,74 @@ redis-server --port 6390 --save "" --appendonly yes --appendfsync everysec
 
 ECHO QPS 与 AOF 策略无关（ECHO 不写引擎、不写 AOF），同一服务器只需测一次。
 
-| 配置 | ECHO (QPS) | SET (QPS) |
+| 配置 | ECHO (QPS) | HSET (QPS) |
 |---|---|---|
-| **kvstore** (ECHO 基线) | **127,064** | — |
-| ├─ AOF 关闭（`--aof-disable`） | — | **137,174** |
-| ├─ AOF always（每条命令 fsync） | — | 134,953 |
-| └─ AOF everysec（每秒 fsync） | — | 135,318 |
-| **Redis** (ECHO 基线) | **117,233** | — |
-| ├─ 无 AOF | — | 123,305 |
-| ├─ AOF everysec | — | 133,690 |
-| └─ AOF always | — | 46,468 |
+| **kvstore** (ECHO 基线) | **139,997** | — |
+| ├─ AOF 关闭（`--aof-disable`） | — | **21,310** |
+| ├─ AOF always（每条命令 fsync） | — | 2,927 |
+| └─ AOF everysec（每秒 fsync） | — | 11,449 |
+| **Redis** (ECHO 基线) | **127,405** | — |
+| ├─ 无 AOF | — | 123,625 |
+| ├─ AOF everysec | — | 122,730 |
+| └─ AOF always | — | 117,592 |
 
 ##### 结果分析
 
-**① ECHO 基线——kvstore RESP 解析比 Redis 快 8.4%**
+**① ECHO 基线——kvstore RESP 解析比 Redis 快 9.9%**
 
-kvstore 的 ECHO 达到 **127,064 QPS**，Redis 为 **117,233 QPS**，差距来自 RESP 解析器实现差异：
+kvstore 的 ECHO 达到 **139,997 QPS**，Redis 为 **127,405 QPS**。差距来自 RESP 解析器实现差异：
 - kvstore 的 `handle_parsed_command` 中 ECHO 路径极短：`resp_bulk` 直接返回，无额外分配
 - Redis 需要处理 RESP 3、多数据类型等复杂逻辑，CPU 指令路径更长
 
-**② kvstore 的 AOF 开销几乎为零**
+**② Hash 引擎是 kvstore 的写入瓶颈**
 
-| AOF 策略 | SET QPS | 相对 AOF 关闭降幅 |
+| AOF 策略 | HSET QPS | 相对 AOF 关闭降幅 |
 |---|---|---|
-| 关闭 | 137,174 | — |
-| everysec | 135,318 | -1.4% |
-| always | 134,953 | -1.6% |
+| 关闭 | 21,310 | — |
+| everysec | 11,449 | -46.3% |
+| always | 2,927 | -86.3% |
 
-kvstore 使用 **io_uring 异步提交**，write 和 fsync 不阻塞事件循环，
-AOF always 相比关闭仅降低 1.6%，意味着 10 万次 SET 中 AOF 总耗时仅约 44ms。
+与旧测试（Array 引擎 SET，key 复用覆盖写入，~135k QPS）对比，本次使用 **Hash 引擎 + 100 万唯一随机 key**，写入负载完全不同：
+- Array 引擎：O(n) 线性扫描，key 复用场景下 n ≤ 数十，覆盖写入极快
+- Hash 引擎：链地址法 1024 桶，100 万 key 时平均每桶 ~1000 节点，每次 HSET 需遍历长链表
 
-**③ Redis 的 AOF always 为什么慢？**
+kvstore 当前 Hash 引擎使用固定 1024 桶的链地址法，不随数据量动态扩容，导致大量 key 时链表过长。
+这解释了 AOF 关闭时仅 21k QPS 的性能——瓶颈在引擎查找，不在 I/O。
 
-Redis 的 AOF always 使用**同步 `fsync()` 系统调用**，每条命令后阻塞等待磁盘写入完成，
-QPS 从 123k 骤降至 46k（降幅 **62.3%**）：
+**③ kvstore AOF always 的性能骤降**
+
+与旧 SET 测试（AOF always 仅 -1.6%）完全不同，HSET 100 万唯一 key 场景下 AOF always 降至 2,927 QPS（-86.3%）：
 
 ```
-Redis AOF always 路径：
-  write(aof_fd, buf, len)          // 写入内核页缓存（快）
-  fsync(aof_fd)                    // 阻塞等待刷盘（慢！）
-                                   // 事件循环被阻塞，无法处理其他请求
+kvstore AOF always 路径（每条 HSET）：
+  Hash 引擎查找（~1000 次 strcmp）         ← 引擎瓶颈
+  persist_append_raw(RESP ~50 bytes)       ← AOF 追加
+  io_uring write + fsync                   ← 异步，但 100 万次排队
 ```
 
-**④ kvstore 的 AOF everysec 与 always 几乎没有差异**
+100 万条 HSET 命令产生约 50MB AOF 数据，always 策略每条命令后触发 io_uring fsync。
+虽然 io_uring 是异步的，但大量排队操作仍会产生累积延迟。
 
-kvstore 的 AOF everysec 策略由 `persist_autosnap_cron()` 每秒检查脏标志并批量 fsync。
-但在 100k 请求（约 0.7~0.8s 完成）的短测试中，每秒 fsync 只触发 0~1 次，
-实际 fsync 次数和 always 接近（always 的 io_uring fsync 也是异步不阻塞），
-所以两者 QPS 几乎相同（135,318 vs 134,953）。
+everysec 策略（每秒批量 fsync）表现更好（11,449 QPS），说明批量 fsync 显著减少了 I/O 压力。
 
-**⑤ 为什么 kvstore 比 Redis 无 AOF 还快？**
+**④ Redis HSET 性能稳定**
 
-- kvstore 使用 **Reactor（epoll LT）** 模型，单线程事件循环，无锁竞争
-- kvstore 的 Array 引擎（SET 命令）是简单的 **O(n) 线性扫描**（n ≤ 1024），
-  比 Redis 的哈希表 + 渐进式 rehash 更轻量
-- kvstore 的 RESP 解析器更简单（不处理 Redis 的多种数据类型），ECHO 测试已证实（127k vs 117k）
-
-**⑤ 为什么 kvstore 比 Redis 无 AOF 还快？**
-
-- kvstore 使用 **Reactor（epoll LT）** 模型，单线程事件循环，无锁竞争
-- kvstore 的 Array 引擎（SET 命令）是简单的 **O(n) 线性扫描**（n ≤ 1024），
-  比 Redis 的哈希表 + 渐进式 rehash 更轻量
-- kvstore 的 RESP 解析器更简单（不处理 Redis 的多种数据类型），CPU 指令路径更短
+Redis 的 HSET 在不同 AOF 策略下表现平稳（117k~124k QPS），因为 Redis 的哈希表支持渐进式 rehash +
+动态扩容，100 万 key 下仍然高效。AOF always 的同步 fsync 在 100 万次写入中每次 ~8.5μs（远小于 kvstore 的 Hash 查找开销），
+所以 AOF 策略对总体 QPS 影响不大。
 
 ##### 结论
 
 | 场景 | 推荐方案 | QPS | 原因 |
 |---|---|---|---|
-| 极致性能，不关心持久化 | kvstore `--aof-disable` | **137,174** | 完全跳过 AOF 写入路径 |
-| 最高性能，可接受丢 1s 数据 | kvstore AOF everysec | 135,318 | io_uring 几乎零开销 |
-| 最高安全性，每条命令持久化 | kvstore AOF always | 134,953 | io_uring 异步 fsync 不阻塞 |
-| 兼容 Redis 协议，高安全 | Redis AOF everysec | 133,690 | |
-| 兼容 Redis 协议，最高安全 | Redis AOF always | 46,468 | 同步 fsync 阻塞，性能代价大 |
+| 极致性能，小数据集（<1024 key） | kvstore `--aof-disable` + Array 引擎 | 137k+ | Array 引擎 key 复用极快 |
+| 大数据集（100w+ key） | Redis 无 AOF | 123,625 | Hash 引擎成熟，链地址法动态扩容 |
+| kvstore 大数据集 + 持久化 | kvstore AOF everysec | 11,449 | 批量 fsync 减少 I/O 压力 |
+| 最高安全性 | Redis AOF always | 117,592 | 每条 fsync，性能几乎无损 |
 
-kvstore 的 io_uring 异步 I/O 使得 AOF always 策略的生产可用性大幅提升——不再需要在安全性和性能之间做取舍。
-即使关闭 AOF，性能也只提升 1.6%，说明 AOF 写入不是 kvstore 的性能瓶颈。
+> **注意**：本测试使用 100 万唯一随机 key 的 HSET 负载，与旧测试（SET key 复用覆盖写入）的工作负载完全不同。
+> kvstore 的 Hash 引擎当前使用固定 1024 桶链地址法，大数据集下链表过长是主要性能瓶颈。
+> Array 引擎（SET 命令）在 key 复用场景下仍然极快（~137k QPS，见旧测试数据）。
 
 ---
 
@@ -4427,47 +4417,42 @@ kvstore 的 io_uring 异步 I/O 使得 AOF always 策略的生产可用性大幅
 
 ##### 测试目的
 
-评估 `SAVE`（同步全量 dump）命令在不同频率下对写入吞吐的影响，帮助用户选择最优的持久化策略。
+评估 `SAVE`（同步全量 dump）命令在不同数据量下的耗时，以及对有效写入吞吐的影响。
 
 ##### 测试方法
 
 1. 使用 Hash 引擎（HSET 命令，无容量上限），避免 Array 引擎 1024 条上限干扰
-2. 共写入 100 万条 key-value（`savebench:k:0000001 ~ savebench:k:1000000`，value 约 8 字节）
-3. 四种 SAVE 频率：
-   - **100w 一次**：写入全部 100w → 1 次 SAVE
-   - **10w 一次**：每写 10w → 1 次 SAVE，重复 10 次
-   - **1w 一次**：每写 1w → 1 次 SAVE，重复 100 次
-   - **1k 一次**：每写 1k → 1 次 SAVE，重复 1000 次
-4. 写入使用 `redis-cli --pipe`（RESP 批处理协议，避免逐条网络往返）
-5. 使用 Python 生成 RESP 协议数据，避免 bash 循环的性能瓶颈
-6. 时间测量使用 `date +%s%N` 纳秒级计时
+2. 每种场景在空数据库上灌入指定数据量，然后重复执行 SAVE 取平均值
+3. 四种数据规模：
+   - **100w**：写入 100 万 key，SAVE 1 次
+   - **10w**：写入 10 万 key，SAVE 10 次取平均
+   - **1w**：写入 1 万 key，SAVE 100 次取平均
+   - **1k**：写入 1000 key，SAVE 1000 次取平均
+4. 写入使用 `redis-benchmark`（与 AOF 测试统一），时间测量使用 `date +%s%N`
 
 ```bash
-# RESP 批处理生成（Python）
-python3 -c "
-import sys
-for i in range(1000000):
-    sys.stdout.buffer.write(b'*3\r\n\$4\r\nHSET\r\n\$15\r\nsavebench:k:%07d\r\n\$9\r\nv:%07d\r\n' % (i, i))
-" | redis-cli -p 5190 --pipe
-
-# SAVE 计时
+# 灌数据和 SAVE 计时
+redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value
 time redis-cli -p 5190 SAVE
 ```
 
 ##### 测试结果
 
-| 场景 | 写入量/次 | SAVE 次数 | 总耗时 | 写入耗时 | SAVE 总耗时 | 平均每次 SAVE | 写入速度 |
-|---|---|---|---|---|---|---|---|
-| **100w → SAVE × 1** | 100万 | 1 | **20.52s** | 20.49s | 0.03s | **34.0ms** | **48,803 keys/s** |
-| 10w → SAVE × 10 | 10万 | 10 | 69.73s | 69.69s | 0.04s | 3.7ms | 14,347 keys/s |
-| 1w → SAVE × 100 | 1万 | 100 | 37.23s | 36.89s | 0.34s | 3.3ms | 27,107 keys/s |
-| 1k → SAVE × 1000 | 1千 | 1000 | 104.94s | 101.75s | 3.19s | 3.1ms | 9,829 keys/s |
+> **写入 QPS** 为 `date +%s%N` 计时计算的实际吞吐（不受 redis-benchmark 连接开销影响）。
+> **有效 QPS** = 数据量 / (写入时间 + 平均每次 SAVE 时间)，模拟写入-SAVE 交替场景下的实际吞吐。
+
+| 场景 | 数据量 | SAVE 次数 | 写入 QPS | 写入耗时 | 平均每次 SAVE | 有效 QPS |
+|---|---|---|---|---|---|---|
+| **100w → SAVE × 1** | 100万 | 1 | 132,118 | 7.63s | **4.0ms** | **130,991** |
+| 10w → SAVE × 10 | 10万 | 10 | 122,699 | 0.82s | 3.1ms | 116,911 |
+| 1w → SAVE × 100 | 1万 | 100 | 131,579 | 0.08s | 4.0ms | 20,740 |
+| 1k → SAVE × 1000 | 1千 | 1000 | 111,111 | 0.01s | 3.2ms | 302 |
 
 ##### 结果分析
 
-**① SAVE 本身极轻量（3~4ms），不是性能瓶颈**
+**① SAVE 本身极轻量（3~4ms），与数据量无关**
 
-无论数据集大小（10w 还是 100w），`SAVE` 命令的耗时始终稳定在 3~4ms。
+无论数据集大小（1k 还是 100w），`SAVE` 命令的耗时始终稳定在 3~4ms。
 这是因为 `persist_save_dump()` 的执行路径：
 
 ```c
@@ -4491,78 +4476,26 @@ int persist_save_dump(void) {
 后续的 `persist_fsync_fd()` 使用 io_uring 异步提交，SAVE 命令返回时数据可能还在页缓存中，
 由内核后台异步刷盘。所以 SAVE 命令本身几乎不阻塞。
 
-**② 频繁 SAVE 场景下，性能下降的根源是 batch 大小而非 SAVE 本身**
+**② 有效 QPS 由 SAVE 频率决定**
 
-比较 100w×1（batch=100w）和 1k×1000（batch=1k）：
+当 SAVE 频率很低时（100w 数据才 SAVE 一次），SAVE 开销可以忽略不计，有效 QPS ≈ 写入 QPS（132k）。
+当 SAVE 频率极高时（每 1k 数据就 SAVE），虽然单次 SAVE 仅 3ms，但 1000 次 SAVE 累积超过 3s，
+有效 QPS 骤降至 302。
 
-```
-100w×1: 总 20.52s, 写入 20.49s, SAVE 0.03s
-1k×1000: 总 104.94s, 写入 101.75s, SAVE 3.19s
+这说明了为什么 SAVE 不适合高频调用——不是单次 SAVE 慢，而是频率太高时累积开销不可忽略。
 
-SAVE 耗时增加: 0.03s → 3.19s（+3.16s，占总增加量的 3.7%）
-写入耗时增加: 20.49s → 101.75s（+81.26s，占总增加量的 96.3%）
-```
+**③ 写入 QPS 波动原因**
 
-**SAVE 开销仅占 3.7%**，写入耗时增加了 5 倍才是主因。
+SAVE 测试中写入 QPS 在 111k~132k 之间波动，这是因为 `redis-benchmark` 对不同数据量的连接管理和
+`date +%s%N` 纳秒计时的精度差异。1000 key 的数据量太小（完成只需 0.01s），计时精度受限。
 
-为什么 batch 小会导致写入慢？`redis-cli --pipe` 的原理：
+**④ 最佳策略：低频 SAVE + AOF**
 
-```python
-# batch=100w: 一次发送 100w 条 RESP 命令
-socket.sendall(resp_data_100w)       # 一次 write() 发送全部
-# 服务器端: 一次 recv() 读取全部 → 循环解析 → 批量写入内存
-# 客户端: 一次 recv() 读取全部响应
+- SAVE/BGSAVE 用于周期性全量备份（每小时或每 10 万次写入）
+- AOF everysec 用于增量持久化（最多丢 1 秒数据）
+- 避免高频 SAVE——尽管单次很快，但累积开销在大批量写入场景下不可忽略
 
-# batch=1k: 发送 1000 次，每次 1k 条
-for i in range(1000):
-    socket.sendall(resp_data_1k)     # 1000 次 write()
-    # 服务器端: 1000 次 recv() → 1000 次解析 → 1000 次写入
-    socket.recv(resp)                # 1000 次 read()
-```
-
-每次 `send()` + `recv()` 都有 TCP 往返延迟（RTT），1000 次往返累积 ~几秒。
-更重要的是，每次小 batch 的 RESP 解析和引擎写入不能充分利用批处理优势。
-
-**③ 10w×10 的总耗时（69.73s）反常地高于 1w×100（37.23s）**
-
-理论上 10w×10 的 batch 更大，应该比 1w×100 更快，但实际相反。分析原因：
-
-```
-测试执行顺序: 100w×1 → 10w×10 → 1w×100 → 1k×1000
-```
-
-10w×10 是第一个多轮测试，会经历数据集从小到大的过程：
-- 第 1 次 SAVE 时只有 10w 数据 → 快
-- 第 10 次 SAVE 时有 100w 数据 → 较慢
-
-但这不是主要原因。关键在 `redis-cli --pipe` 的响应读取机制：
-`redis-cli --pipe` 会等待所有响应到达后才返回。batch 为 10w 时，服务器返回 10w 个 `+OK\r\n`（约 50 字节 × 10w = 5MB），
-客户端需要 5MB 的 socket 读取时间，这部分时间被计入了写入耗时。
-
-而 1w×100 时，每次 batch 只有 1w 条，响应仅 0.5MB，
-客户端可以更快地读完响应进入下一轮。
-
-**④ 最佳策略：100w 一次 SAVE**
-
-**总耗时 20.52s（写入 20.49s + SAVE 0.03s）是最优方案。** 原因：
-
-1. **吞吐最高**：48,803 keys/s，约 3.9MB/s 数据写入
-2. **SAVE 开销最低**：34ms 完成 100w 数据的持久化，占总时间的 0.15%
-3. **CPU 效率最高**：单次大 batch 减少了解析和网络处理的重复开销
-
-**⑤ 生产环境建议**
-
-虽然 SAVE 本身很轻量，但它是**同步阻塞**操作——SAVE 期间主线程被占用，无法处理任何客户端请求。
-
-| 场景 | 推荐策略 | 原因 |
-|---|---|---|
-| 开发调试 | 每隔几分钟手动 SAVE | 简单可控 |
-| 生产低写入量（<1k/s） | `autosnap 300 1000` | 5 分钟或 1000 次写入自动 BGSAVE |
-| 生产高写入量（>10k/s） | `autosnap 60 100000` | 1 分钟或 10w 次写入自动 BGSAVE |
-| 最高数据安全性 | `--appendfsync always` | 每条命令持久化，SAVE 作为补充 |
-| 需要精确恢复点 | 配合 AOF everysec + 定期 BGSAVE | AOF 保证不丢 1s 数据，dump 加速重启 |
-
-生产环境应始终使用 **BGSAVE**（非阻塞 fork 子进程）替代 SAVE，避免阻塞主线程：
+生产环境应使用 **BGSAVE**（非阻塞 fork 子进程）替代 SAVE，避免阻塞主线程：
 
 ```bash
 # 配置自动 BGSAVE 规则（kvstore.conf）

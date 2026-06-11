@@ -487,9 +487,11 @@ void repl_remove_slave(conn_t *c) {
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
-    repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
+    /* fast path: no replicas, skip lock */
+    if (!g_replicas) return;
+    repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     pthread_mutex_lock(&g_repl_lock);
     conn_t **pp = &g_replicas;
     while (*pp) {

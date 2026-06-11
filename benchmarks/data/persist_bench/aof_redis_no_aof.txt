@@ -1,14 +1,13 @@
-HSET key:__rand_int__ value: 0.00HSET key:__rand_int__ value: 127816.74HSET key:__rand_int__ value: 127213.58HSET key:__rand_int__ value: 125077.23HSET key:__rand_int__ value: 125773.22HSET key:__rand_int__ value: 125743.40HSET key:__rand_int__ value: 126062.62HSET key:__rand_int__ value: 126262.13HSET key:__rand_int__ value: 125965.52HSET key:__rand_int__ value: 125957.80HSET key:__rand_int__ value: 125862.86HSET key:__rand_int__ value: 125795.71HSET key:__rand_int__ value: 125792.74HSET key:__rand_int__ value: 125815.13HSET key:__rand_int__ value: 126062.84HSET key:__rand_int__ value: 125970.68HSET key:__rand_int__ value: 125934.02HSET key:__rand_int__ value: 125991.53HSET key:__rand_int__ value: 125971.12HSET key:__rand_int__ value: 126059.99HSET key:__rand_int__ value: 125991.00HSET key:__rand_int__ value: 126008.57HSET key:__rand_int__ value: 126041.27HSET key:__rand_int__ value: 125919.84HSET key:__rand_int__ value: 125825.53HSET key:__rand_int__ value: 125883.22HSET key:__rand_int__ value: 125844.80HSET key:__rand_int__ value: 125668.20HSET key:__rand_int__ value: 125553.78HSET key:__rand_int__ value: 125490.00HSET key:__rand_int__ value: 125478.87HSET key:__rand_int__ value: 125406.14====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 7.97 seconds
+HSET key:__rand_int__ value: 0.00HSET key:__rand_int__ value: 126752.99HSET key:__rand_int__ value: 127411.18HSET key:__rand_int__ value: 127019.98HSET key:__rand_int__ value: 125352.64HSET key:__rand_int__ value: 123637.88HSET key:__rand_int__ value: 123464.35HSET key:__rand_int__ value: 123103.37HSET key:__rand_int__ value: 123027.99HSET key:__rand_int__ value: 123222.12HSET key:__rand_int__ value: 122772.09HSET key:__rand_int__ value: 122728.47HSET key:__rand_int__ value: 122387.54HSET key:__rand_int__ value: 122079.98HSET key:__rand_int__ value: 121793.49HSET key:__rand_int__ value: 121624.10HSET key:__rand_int__ value: 121254.69HSET key:__rand_int__ value: 121159.49HSET key:__rand_int__ value: 121071.09HSET key:__rand_int__ value: 120960.64HSET key:__rand_int__ value: 120976.01HSET key:__rand_int__ value: 120956.96HSET key:__rand_int__ value: 120903.84HSET key:__rand_int__ value: 121046.43HSET key:__rand_int__ value: 120994.84HSET key:__rand_int__ value: 121041.12HSET key:__rand_int__ value: 121145.52HSET key:__rand_int__ value: 121246.78HSET key:__rand_int__ value: 121336.81HSET key:__rand_int__ value: 121351.54HSET key:__rand_int__ value: 121445.67HSET key:__rand_int__ value: 121454.91HSET key:__rand_int__ value: 121566.92====== HSET key:__rand_int__ value ======
+  1000000 requests completed in 8.23 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-99.87% <= 1 milliseconds
-99.99% <= 2 milliseconds
-99.99% <= 3 milliseconds
+99.62% <= 1 milliseconds
+99.92% <= 2 milliseconds
+99.96% <= 3 milliseconds
+99.99% <= 4 milliseconds
 100.00% <= 4 milliseconds
-100.00% <= 5 milliseconds
-100.00% <= 5 milliseconds
-125391.85 requests per second
+121462.41 requests per second
 

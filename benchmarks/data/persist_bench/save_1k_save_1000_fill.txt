@@ -6,5 +6,5 @@ HSET key:__rand_int__ value: -nan====== HSET key:__rand_int__ value ======
 
 95.10% <= 1 milliseconds
 100.00% <= 1 milliseconds
-142857.14 requests per second
+111111.12 requests per second
 

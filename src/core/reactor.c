@@ -176,6 +176,11 @@ static void on_write(conn_t *c) {
     else mod_events(c, EPOLLIN);
 }
 
+/* attempt immediate non-blocking write of queued output */
+void flush_conn_output(conn_t *c) {
+    if (c && c->out_head) on_write(c);
+}
+
 int reactor_start(void) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) return -1;

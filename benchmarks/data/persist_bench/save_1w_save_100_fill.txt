@@ -4,7 +4,7 @@ HSET key:__rand_int__ value: -nan====== HSET key:__rand_int__ value ======
   64 bytes payload
   keep alive: 1
 
-99.15% <= 1 milliseconds
+99.51% <= 1 milliseconds
 100.00% <= 1 milliseconds
-133333.33 requests per second
+128205.12 requests per second
 

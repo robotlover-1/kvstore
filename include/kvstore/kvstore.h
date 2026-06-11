@@ -413,6 +413,7 @@ int proactor_start(unsigned short port);
 int ntyco_start(unsigned short port);
 
 int queue_bytes(conn_t *c, const unsigned char *buf, size_t len);
+void flush_conn_output(conn_t *c);
 void close_conn(conn_t *c);
 int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication);
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication);

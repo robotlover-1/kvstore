@@ -38,10 +38,12 @@ static unsigned char g_aof_buf[AOF_BUF_SIZE];
 static size_t g_aof_buf_len = 0;
 static long long g_aof_buffered_since_ms = 0;
 
-/* deferred response queue for group commit (ALWAYS mode) */
+/* deferred response queue for group commit (ALWAYS mode)
+ * responses are small ("+OK\r\n", ":1\r\n", etc.) — inline to avoid malloc */
+#define DEFERRED_DATA_MAX 128
 typedef struct deferred_resp_s {
     conn_t *c;
-    unsigned char *data;
+    unsigned char data[DEFERRED_DATA_MAX];
     size_t len;
     struct deferred_resp_s *next;
 } deferred_resp_t;
@@ -166,7 +168,7 @@ static int persist_write_and_fsync_uring(int fd, const unsigned char *buf, size_
     /* submit fsync SQE (ordered after write in the SQ) */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_f) return -1;
-    io_uring_prep_fsync(sqe_f, fd, 0);
+    io_uring_prep_fsync(sqe_f, fd, IORING_FSYNC_DATASYNC);
 
     /* wait for both completions */
     rc = io_uring_submit_and_wait(&g_persist_uring, 2);
@@ -225,10 +227,9 @@ int persist_fsync_fd(int fd) {
 void persist_defer_response(conn_t *c, const unsigned char *data, size_t len) {
     deferred_resp_t *dr;
     if (!c || !data || len == 0) return;
+    if (len > DEFERRED_DATA_MAX) return; /* oversized, shouldn't happen for write cmds */
     dr = (deferred_resp_t *)kvs_malloc(sizeof(*dr));
     if (!dr) return;
-    dr->data = (unsigned char *)kvs_malloc(len);
-    if (!dr->data) { kvs_free(dr); return; }
     memcpy(dr->data, data, len);
     dr->len = len;
     dr->c = c;
@@ -247,12 +248,13 @@ void persist_flush_deferred(void) {
         persist_aof_flush_buffer();
     }
 
-    /* deliver all deferred responses */
+    /* deliver all deferred responses, attempt immediate write to avoid
+     * extra epoll_wait cycle waiting for EPOLLOUT */
     dr = g_deferred_head;
     while (dr) {
         next = dr->next;
         queue_bytes(dr->c, dr->data, dr->len);
-        kvs_free(dr->data);
+        flush_conn_output(dr->c);
         kvs_free(dr);
         dr = next;
     }
@@ -627,10 +629,10 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    /* ALWAYS mode: group commit — flush only when buffer threshold reached,
-     * otherwise caller defers response until persist_flush_deferred() */
+    /* ALWAYS mode: group commit — rely on reactor batch flush (persist_flush_deferred);
+     * only inline-flush on time threshold as latency ceiling */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        if (g_aof_buf_len >= 8192 || (kvs_now_ms() - g_aof_buffered_since_ms >= 2)) {
+        if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
             persist_aof_flush_buffer();
             g_aof_buffered_since_ms = 0;
         }

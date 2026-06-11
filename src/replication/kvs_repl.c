@@ -1913,9 +1913,10 @@ void repl_slave_finish_fullsync(void) {
             extern kv_config_t g_cfg;
             extern kvs_hash_t global_hash;
             int cnt = 0;
-            if (global_hash.nodes) {
-                for (int i = 0; i < global_hash.max_slots; ++i) {
-                    for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
+            for (int t = 0; t < 2; t++) {
+                if (!global_hash.ht[t].nodes) continue;
+                for (int i = 0; i < global_hash.ht[t].max_slots; ++i) {
+                    for (hashnode_t *node = global_hash.ht[t].nodes[i]; node; node = node->next) {
                         cnt++;
                     }
                 }

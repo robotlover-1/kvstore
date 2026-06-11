@@ -1989,11 +1989,13 @@ static int snapshot_array_sink(snapshot_sink_t *sink) {
 }
 
 static int snapshot_hash_sink(snapshot_sink_t *sink) {
-    if (!global_hash.nodes) return 0;
-    for (int i = 0; i < global_hash.max_slots; ++i) {
-        for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
-            if (emit_cmd3_sink(sink, "HSET", node->key, node->value) != 0) return -1;
-            if (maybe_emit_expire_sink(sink, KVS_ENGINE_HASH, node->key) != 0) return -1;
+    for (int t = 0; t < 2; t++) {
+        if (!global_hash.ht[t].nodes) continue;
+        for (int i = 0; i < global_hash.ht[t].max_slots; ++i) {
+            for (hashnode_t *node = global_hash.ht[t].nodes[i]; node; node = node->next) {
+                if (emit_cmd3_sink(sink, "HSET", node->key, node->value) != 0) return -1;
+                if (maybe_emit_expire_sink(sink, KVS_ENGINE_HASH, node->key) != 0) return -1;
+            }
         }
     }
     return 0;
@@ -2098,9 +2100,10 @@ int kvs_dump_to_fd(int fd, unsigned long long aof_offset) {
 } while(0)
 
     /* iterate all hash entries */
-    if (global_hash.nodes) {
-        for (int i = 0; i < global_hash.max_slots; ++i) {
-            for (hashnode_t *node = global_hash.nodes[i]; node; node = node->next) {
+    for (int t = 0; t < 2; t++) {
+        if (!global_hash.ht[t].nodes) continue;
+        for (int i = 0; i < global_hash.ht[t].max_slots; ++i) {
+            for (hashnode_t *node = global_hash.ht[t].nodes[i]; node; node = node->next) {
                 DUMP_WRITE_KV(KVS_ENGINE_HASH, node->key, node->value);
             }
         }

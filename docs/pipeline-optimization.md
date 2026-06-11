@@ -61,6 +61,20 @@ Pipeline 性能极差：P=10 echo 仅 11k QPS（0.11M cmd/s），vs Redis 1.27M 
 ### 效果
 Phase 3 累计: HSET P=160 952k→1.04M (+9.7%)
 
+## Phase 4A: Stack-Allocated Resp Buffer (1180c1e)
+
+### 问题
+`handle_parsed_command` 每命令 `kvs_malloc(BUFFER_CAP=65536)` 分配 64KB，
+写命令仅用 5B（"+OK\r\n"），然后 `kvs_free`。100 万命令 = 64GB malloc 流量。
+
+### 改动
+- `char resp_small[1024]` 栈分配替代 heap 分配
+- 大响应 (INFO/MEMSTAT/SNAPRULES/GET >1KB value) `resp_ensure()` 回退 malloc
+- 99% 命令不触发 heap 分配
+
+### 效果
+HSET P=160: 1.04M→1.09M (+4.7%)
+
 ## 总结
 
 | 阶段 | 优化 | Echo P=10 | HSET P=160 | 核心改动 |
@@ -70,13 +84,20 @@ Phase 3 累计: HSET P=160 952k→1.04M (+9.7%)
 | P2 | Zero-copy parsing | 956,938 | 952,381 | argv 指入 inbuf |
 | P3A | RESP literals | — | 1,029,866 | 静态字面量 |
 | P3B | Fast dispatch | — | 1,043,841 | switch 首字符 |
+| P4A | Stack resp | — | 1,092,896 | 栈分 配1024B |
 
 | P | 初始 kv | 优化后 kv | redis | kv/redis |
 |---|---------|-----------|-------|----------|
 | 10 echo | 0.11M | 9.6M | 12.7M | 75% |
 | 160 echo | 28.6M | 230.6M | 541M | 43% |
 | 10 HSET | 0.11M | 4.4M | 12.4M | 35% |
-| 160 HSET | 28.3M | 167M | 457M | 37% |
+| 160 HSET | 28.3M | 174.9M | 457M | 38% |
+
+## 待优化方向
+
+- `_create_node`: 每 HSET 3 次 malloc (node+key+value)，可考虑 slab 分配器
+- `_rehash_step`: 每次操作迁移 10 桶，pipeline 时可提高步长
+- AOF always pipeline: group commit fsync 串行瓶颈 (仅 0.11M cmd/s)
 
 ## 待优化方向
 

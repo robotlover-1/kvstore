@@ -18,7 +18,6 @@ BENCH_C=50
 BENCH_P=1
 BENCH_D=64
 BENCH_R=1000000
-BENCH_CMD="HSET key:__rand_int__ value"
 BENCH_ARGS="-n $BENCH_N -c $BENCH_C -P $BENCH_P -d $BENCH_D -r $BENCH_R"
 
 FAIL_COUNT=0
@@ -27,7 +26,7 @@ echo "============================================"
 echo " 持久化性能基准测试 v2"
 echo " 日期: $(date)"
 echo " Host: $(hostname) CPU: $(nproc) cores"
-echo " redis-benchmark: -n $BENCH_N -c $BENCH_C -P $BENCH_P -d $BENCH_D -r $BENCH_R $BENCH_CMD"
+echo " redis-benchmark: -n $BENCH_N -c $BENCH_C -P $BENCH_P -d $BENCH_D -r $BENCH_R HSET key:__rand_int__ value"
 echo "============================================"
 
 # ==================== Phase 1: 环境检查 ====================
@@ -74,8 +73,8 @@ check_port_free() {
 }
 
 PORT_OK=0
-check_port_free $KVSTORE_PORT "kvstore" || PORT_OK=1
-check_port_free $REDIS_PORT "redis"     || PORT_OK=1
+check_port_free "$KVSTORE_PORT" "kvstore" || PORT_OK=1
+check_port_free "$REDIS_PORT" "redis"     || PORT_OK=1
 
 if [ "$PORT_OK" -eq 1 ]; then
     echo ""
@@ -94,7 +93,7 @@ trap cleanup_all EXIT
 
 wait_port() {
     local port=$1
-    for i in $(seq 1 60); do
+    for ((i=1; i<=60; i++)); do
         if redis-cli -p "$port" PING >/dev/null 2>&1; then return 0; fi
         sleep 1
     done
@@ -132,12 +131,12 @@ start_redis() {
 }
 
 run_bench() {
-    local label="$1" port="$2" cmd="${3:-$BENCH_CMD}"
+    local label="$1" port="$2"
+    shift 2
     local outfile="$OUTDIR/aof_${label}.txt"
 
-    echo "  运行 redis-benchmark (port=$port, cmd=$cmd) ..."
-    redis-benchmark -p "$port" -n "$BENCH_N" -c "$BENCH_C" -P "$BENCH_P" -d "$BENCH_D" -r "$BENCH_R" "$cmd" \
-        > "$outfile" 2>&1 || true
+    echo "  [$label] redis-benchmark -p $port $BENCH_ARGS $*"
+    redis-benchmark -p "$port" $BENCH_ARGS "$@" > "$outfile" 2>&1 || true
 
     local qps
     qps=$(grep -oP '[\d.]+(?= requests per second)' "$outfile" | tail -1 || echo "")
@@ -176,42 +175,42 @@ cleanup_all
 echo ""
 echo "--- 3/8: kvstore_aof_disable ---"
 start_kvstore "--aof-disable" || exit 1
-run_bench "kvstore_aof_disable" $KVSTORE_PORT "$BENCH_CMD"
+run_bench "kvstore_aof_disable" $KVSTORE_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # 4. kvstore aof_always
 echo ""
 echo "--- 4/8: kvstore_aof_always ---"
 start_kvstore "--appendfsync always" || exit 1
-run_bench "kvstore_aof_always" $KVSTORE_PORT "$BENCH_CMD"
+run_bench "kvstore_aof_always" $KVSTORE_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # 5. kvstore aof_everysec
 echo ""
 echo "--- 5/8: kvstore_aof_everysec ---"
 start_kvstore "--appendfsync everysec" || exit 1
-run_bench "kvstore_aof_everysec" $KVSTORE_PORT "$BENCH_CMD"
+run_bench "kvstore_aof_everysec" $KVSTORE_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # 6. redis no_aof (RDB 关闭, 无 AOF)
 echo ""
 echo "--- 6/8: redis_no_aof ---"
 start_redis "" || exit 1
-run_bench "redis_no_aof" $REDIS_PORT "$BENCH_CMD"
+run_bench "redis_no_aof" $REDIS_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # 7. redis aof_always
 echo ""
 echo "--- 7/8: redis_aof_always ---"
 start_redis "--appendonly yes --appendfsync always" || exit 1
-run_bench "redis_aof_always" $REDIS_PORT "$BENCH_CMD"
+run_bench "redis_aof_always" $REDIS_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # 8. redis aof_everysec
 echo ""
 echo "--- 8/8: redis_aof_everysec ---"
 start_redis "--appendonly yes --appendfsync everysec" || exit 1
-run_bench "redis_aof_everysec" $REDIS_PORT "$BENCH_CMD"
+run_bench "redis_aof_everysec" $REDIS_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # ==================== Phase 3: SAVE 性能测试 ====================
@@ -226,7 +225,7 @@ echo ""
 echo "--- SAVE 写入基线 (HSET 100w, no AOF, no SAVE) ---"
 start_kvstore "--aof-disable" || exit 1
 baseline_out="$OUTDIR/aof_kvstore_write_baseline.txt"
-redis-benchmark -p $KVSTORE_PORT $BENCH_ARGS $BENCH_CMD > "$baseline_out" 2>&1 || true
+redis-benchmark -p "$KVSTORE_PORT" $BENCH_ARGS HSET key:__rand_int__ value > "$baseline_out" 2>&1 || true
 BASELINE_QPS=$(grep -oP '[\d.]+(?= requests per second)' "$baseline_out" | tail -1 || echo "0")
 echo "  基线 QPS: $BASELINE_QPS"
 
@@ -236,17 +235,7 @@ save_scenario() {
     echo "--- $scenario: data_size=$data_size save_count=$save_count ---"
 
     # 重启 kvstore fresh (无持久化)
-    cleanup_all
-    rm -f kvstore.dump kvstore.aof
-    $BIN --port $KVSTORE_PORT --role master --mem libc --net reactor --aof-disable \
-        > "$TMPDIR/kvstore_save.log" 2>&1 &
-    wait_port $KVSTORE_PORT || {
-        echo "FAIL: kvstore 启动超时 ($scenario)"
-        echo "--- 日志尾部 ---"
-        tail -30 "$TMPDIR/kvstore_save.log"
-        exit 1
-    }
-    sleep 1
+    start_kvstore "--aof-disable" || exit 1
 
     # 基线写入
     local outfile="$OUTDIR/save_${scenario}_fill.txt"
@@ -263,15 +252,12 @@ save_scenario() {
     # 提取写入 QPS
     local write_qps
     write_qps=$(grep -oP '[\d.]+(?= requests per second)' "$outfile" | tail -1 || echo "N/A")
-    if [ -z "$write_qps" ]; then
-        write_qps="N/A"
-    fi
     echo "  写入完成: ${write_sec}s, QPS=$write_qps"
 
     # 多次 SAVE 计时（带 3 次重试）
     local total_save_ms=0
     local save_fail=0
-    for i in $(seq 1 $save_count); do
+    for ((i=1; i<=save_count; i++)); do
         local st0 st1 sd saved=0
         for attempt in 1 2 3; do
             st0=$(date +%s%N)

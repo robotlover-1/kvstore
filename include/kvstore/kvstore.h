@@ -133,6 +133,7 @@ int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
 
 #if ENABLE_HASH
 typedef struct hashnode_s {
+    uint32_t hv;              // cached FNV-1a hash (32-bit, not modulo-reduced)
 #if ENABLE_KEY_POINTER
     char *key;
     char *value;
@@ -149,11 +150,15 @@ typedef struct hashtable_s {
     int count;
 } hashtable_t;
 
-typedef struct hashtable_s kvs_hash_t;
+typedef struct kvs_hash_s {
+    hashtable_t ht[2];        // ht[0]: active, ht[1]: expansion target
+    int rehash_idx;           // next bucket to migrate, -1 = no rehash in progress
+} kvs_hash_t;
+
 extern kvs_hash_t global_hash;
 int kvs_hash_create(kvs_hash_t *hash);
 void kvs_hash_destory(kvs_hash_t *hash);
-int kvs_hash_set(hashtable_t *hash, char *key, char *value);
+int kvs_hash_set(kvs_hash_t *hash, char *key, char *value);
 char *kvs_hash_get(kvs_hash_t *hash, char *key);
 int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);

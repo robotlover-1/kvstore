@@ -36,6 +36,18 @@ static int g_aof_disabled = 0;
 #define AOF_BUF_SIZE 65536
 static unsigned char g_aof_buf[AOF_BUF_SIZE];
 static size_t g_aof_buf_len = 0;
+static long long g_aof_buffered_since_ms = 0;
+
+/* deferred response queue for group commit (ALWAYS mode) */
+typedef struct deferred_resp_s {
+    conn_t *c;
+    unsigned char *data;
+    size_t len;
+    struct deferred_resp_s *next;
+} deferred_resp_t;
+
+static deferred_resp_t *g_deferred_head = NULL;
+static deferred_resp_t *g_deferred_tail = NULL;
 
 int persist_aof_disable(void) {
     g_aof_disabled = 1;
@@ -201,11 +213,57 @@ static int persist_aof_flush_buffer(void) {
     g_aof_buf_len = 0;
     g_aof_dirty = 0;
     g_aof_last_flush_ms = kvs_now_ms();
+    g_aof_buffered_since_ms = 0;
     return 0;
 }
 
 int persist_fsync_fd(int fd) {
     return persist_fsync_fd_best_effort(fd);
+}
+
+/* queue a response for deferred delivery after next AOF group flush */
+void persist_defer_response(conn_t *c, const unsigned char *data, size_t len) {
+    deferred_resp_t *dr;
+    if (!c || !data || len == 0) return;
+    dr = (deferred_resp_t *)kvs_malloc(sizeof(*dr));
+    if (!dr) return;
+    dr->data = (unsigned char *)kvs_malloc(len);
+    if (!dr->data) { kvs_free(dr); return; }
+    memcpy(dr->data, data, len);
+    dr->len = len;
+    dr->c = c;
+    dr->next = NULL;
+    if (g_deferred_tail) g_deferred_tail->next = dr;
+    else g_deferred_head = dr;
+    g_deferred_tail = dr;
+}
+
+/* flush AOF buffer (if pending) and deliver all deferred responses */
+void persist_flush_deferred(void) {
+    deferred_resp_t *dr, *next;
+
+    /* only group-commit flush in ALWAYS mode; everysec has its own timer */
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
+        persist_aof_flush_buffer();
+    }
+
+    /* deliver all deferred responses */
+    dr = g_deferred_head;
+    while (dr) {
+        next = dr->next;
+        queue_bytes(dr->c, dr->data, dr->len);
+        kvs_free(dr->data);
+        kvs_free(dr);
+        dr = next;
+    }
+    g_deferred_head = NULL;
+    g_deferred_tail = NULL;
+}
+
+/* returns 1 if there is buffered AOF data waiting for group flush
+ * (only meaningful in ALWAYS mode; everysec flushes on its own timer) */
+int persist_aof_has_pending(void) {
+    return (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) ? 1 : 0;
 }
 
 static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
@@ -562,12 +620,21 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
         /* offset updated in persist_aof_flush_buffer after actual write */
     }
 
+    /* track when first byte was buffered for group-commit time threshold */
+    if (g_aof_buffered_since_ms == 0) g_aof_buffered_since_ms = kvs_now_ms();
+
     g_aof_dirty = 1;
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
+    /* ALWAYS mode: group commit — flush only when buffer threshold reached,
+     * otherwise caller defers response until persist_flush_deferred() */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        if (persist_force_aof_flush() != 0) return -1;
+        if (g_aof_buf_len >= 8192 || (kvs_now_ms() - g_aof_buffered_since_ms >= 2)) {
+            persist_aof_flush_buffer();
+            g_aof_buffered_since_ms = 0;
+        }
+        /* else: response deferred by caller, flush in persist_flush_deferred() */
     }
     return 0;
 }
@@ -866,6 +933,14 @@ int persist_autosnap_cron(void) {
         long long now = kvs_now_ms();
         if (now - g_aof_last_flush_ms >= 1000) {
             persist_force_aof_flush();
+        }
+    }
+
+    /* ALWAYS mode: flush pending buffered data if timeout exceeded,
+     * ensures deferred responses are delivered even without new commands */
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
+        if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
+            persist_flush_deferred();
         }
     }
 

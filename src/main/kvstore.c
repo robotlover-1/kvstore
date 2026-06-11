@@ -1742,6 +1742,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             persist_note_write();
             persist_append_raw(raw, rawlen);
             if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            /* group commit: if data was buffered (not flushed), defer response */
+            if (c && persist_aof_has_pending()) {
+                persist_defer_response(c, (unsigned char *)resp, (size_t)n);
+                goto out;
+            }
         }
     } else if (rc == 1 && should_reply_missing) {
         if (!strcmp(op, "SET")) n = resp_simple_string(resp, BUFFER_CAP, "OK");

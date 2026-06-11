@@ -279,6 +279,9 @@ int reactor_start(void) {
                 on_write(c);
             }
         }
+
+        /* flush any deferred AOF responses from group commit */
+        persist_flush_deferred();
     }
 
     return 0;

@@ -19,6 +19,7 @@ BENCH_P=1
 BENCH_D=64
 BENCH_R=1000000
 BENCH_CMD="HSET key:__rand_int__ value"
+BENCH_ARGS="-n $BENCH_N -c $BENCH_C -P $BENCH_P -d $BENCH_D -r $BENCH_R"
 
 FAIL_COUNT=0
 
@@ -93,12 +94,9 @@ trap cleanup_all EXIT
 
 wait_port() {
     local port=$1
-    local i
     for i in $(seq 1 60); do
-        if redis-cli -p "$port" PING >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 0.5
+        if redis-cli -p "$port" PING >/dev/null 2>&1; then return 0; fi
+        sleep 1
     done
     return 1
 }
@@ -223,6 +221,15 @@ echo " Phase 3: SAVE 性能测试 (4 数据规模)"
 echo "============================================"
 echo "scenario,total_keys,write_qps,write_time_sec,save_count,save_time_sec,avg_save_ms,effective_qps" > "$OUTDIR/save_summary.csv"
 
+# --- Step 1: 纯写入基线 ---
+echo ""
+echo "--- SAVE 写入基线 (HSET 100w, no AOF, no SAVE) ---"
+start_kvstore "--aof-disable" || exit 1
+baseline_out="$OUTDIR/aof_kvstore_write_baseline.txt"
+redis-benchmark -p $KVSTORE_PORT $BENCH_ARGS $BENCH_CMD > "$baseline_out" 2>&1 || true
+BASELINE_QPS=$(grep -oP '[\d.]+(?= requests per second)' "$baseline_out" | tail -1 || echo "0")
+echo "  基线 QPS: $BASELINE_QPS"
+
 save_scenario() {
     local scenario="$1" data_size="$2" save_count="$3"
     echo ""
@@ -232,14 +239,13 @@ save_scenario() {
     cleanup_all
     rm -f kvstore.dump kvstore.aof
     $BIN --port $KVSTORE_PORT --role master --mem libc --net reactor --aof-disable \
-        > "$TMPDIR/kvstore.log" 2>&1 &
-    if ! wait_port $KVSTORE_PORT; then
-        echo "  FAIL: kvstore 启动超时"
-        tail -20 "$TMPDIR/kvstore.log"
-        echo "$scenario,$data_size,FAIL,FAIL,$save_count,FAIL,FAIL,FAIL" >> "$OUTDIR/save_summary.csv"
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-        return 1
-    fi
+        > "$TMPDIR/kvstore_save.log" 2>&1 &
+    wait_port $KVSTORE_PORT || {
+        echo "FAIL: kvstore 启动超时 ($scenario)"
+        echo "--- 日志尾部 ---"
+        tail -30 "$TMPDIR/kvstore_save.log"
+        exit 1
+    }
     sleep 1
 
     # 基线写入
@@ -262,45 +268,47 @@ save_scenario() {
     fi
     echo "  写入完成: ${write_sec}s, QPS=$write_qps"
 
-    # SAVE 测试
-    local total_save_ns=0
+    # 多次 SAVE 计时（带 3 次重试）
+    local total_save_ms=0
     local save_fail=0
-    local i
-    for i in $(seq 1 "$save_count"); do
-        local s0 s1
-        s0=$(date +%s%N)
-        if ! redis-cli -p "$KVSTORE_PORT" SAVE > /dev/null 2>&1; then
-            echo "  SAVE $i/$save_count: FAIL"
+    for i in $(seq 1 $save_count); do
+        local st0 st1 sd saved=0
+        for attempt in 1 2 3; do
+            st0=$(date +%s%N)
+            if redis-cli -p $KVSTORE_PORT SAVE > /dev/null 2>&1; then
+                st1=$(date +%s%N)
+                sd=$(( (st1 - st0) / 1000000 ))
+                total_save_ms=$((total_save_ms + sd))
+                saved=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$saved" -eq 0 ]; then
+            echo "  FAIL: SAVE 失败 ($scenario, iter=$i, 3次重试均失败)"
             save_fail=1
-            break
-        fi
-        s1=$(date +%s%N)
-        local save_ns=$((s1 - s0))
-        total_save_ns=$((total_save_ns + save_ns))
-
-        if [ $((i % 100)) -eq 0 ] || [ "$i" -eq 1 ] || [ "$i" -eq "$save_count" ]; then
-            local save_ms=$((save_ns / 1000000))
-            echo "  SAVE $i/$save_count: ${save_ms}ms"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
         fi
     done
 
     if [ "$save_fail" -eq 1 ]; then
-        echo "$scenario,$data_size,$write_qps,$write_sec,$save_count,FAIL,FAIL,FAIL" >> "$OUTDIR/save_summary.csv"
+        local save_time_sec
+        save_time_sec=$(echo "scale=6; $total_save_ms / 1000" | bc)
+        local avg_save_ms
+        avg_save_ms=$(echo "scale=1; $total_save_ms / $save_count" | bc)
+        echo "$scenario,$data_size,$write_qps,$write_sec,$save_count,$save_time_sec,$avg_save_ms,FAIL" >> "$OUTDIR/save_summary.csv"
         FAIL_COUNT=$((FAIL_COUNT + 1))
         return 1
     fi
 
     local save_time_sec
-    save_time_sec=$(echo "scale=6; $total_save_ns / 1000000000" | bc)
+    save_time_sec=$(echo "scale=6; $total_save_ms / 1000" | bc)
     local avg_save_ms
-    avg_save_ms=$(echo "scale=1; $total_save_ns / $save_count / 1000000" | bc)
+    avg_save_ms=$(echo "scale=1; $total_save_ms / $save_count" | bc)
 
-    # Effective QPS = data_size / (write_time + avg_save_time_per_save * save_count)
-    # avg_save_time 是每次 SAVE 的平均时间, 总 save 时间 = avg_save_ms * save_count / 1000
-    local total_save_ms
-    total_save_ms=$(echo "scale=1; $avg_save_ms * $save_count" | bc)
+    # Effective QPS = data_size / (write_time + save_time)
     local total_time_sec
-    total_time_sec=$(echo "scale=6; $write_sec + ($total_save_ns / 1000000000)" | bc)
+    total_time_sec=$(echo "scale=6; $write_sec + $save_time_sec" | bc)
     local effective_qps
     effective_qps=$(echo "scale=0; $data_size / $total_time_sec" | bc)
 

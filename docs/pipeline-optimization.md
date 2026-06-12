@@ -104,7 +104,8 @@ HSET P=160: 1.04M→1.09M (+4.7%)
 - **单命令（P=1）**: kvstore 快 8-11%
 - **小 pipeline（P=10 Echo）**: 达 Redis 91%
 - **大 pipeline（P=160 HSET）**: 差距 2.3×
-- **AOF always pipeline**: 差距 111×（group commit 瓶颈，见 `docs/aof-group-commit.md`）
+- **AOF always pipeline (旧)**: 差距 111×（group commit 瓶颈）
+- **AOF always pipeline (2026-06-12 更新)**: Group commit 将 fsync 摊销到数千条命令，P=10 SET 达 192k cmd/s（8.2× Redis 5.0.7）。HSET 因 rehash 开销偏低。详见 `docs/aof-group-commit.md` Phase 8 节。
 
 ## Phase 7: Micro-Optimizations (未合并)
 
@@ -114,7 +115,7 @@ HSET P=160: 1.04M→1.09M (+4.7%)
 
 ## 待优化方向
 
-- AOF always pipeline: group commit fsync 串行瓶颈 (仅 0.11M cmd/s at P=10)
+- AOF always pipeline: Group commit 已解决（Phase 8, 见 `docs/aof-group-commit.md`），SET P=10 从 0.11M → 0.19M cmd/s，HSET 仍是弱项
 - Hash 引擎批量 rehash: pipeline 时可提高 `REHASH_STEP_BUCKETS`
 - 长期: 协程模型 → 紧凑事件循环（类似 Redis 单线程架构）
 

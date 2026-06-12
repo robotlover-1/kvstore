@@ -135,3 +135,66 @@ AOF always pipeline 性能（受 group commit fsync 串行瓶颈）：
 
 > AOF always 的 pipeline 差距来自 group commit 在每批次必须 fsync，
 > 无法像 disable 模式那样利用 pipeline 批量。参见 `docs/pipeline-optimization.md`。
+
+---
+
+## Phase 8: strace 系统调用级分析 + 最新基准 (2026-06-12)
+
+### strace 对比
+
+使用 `sudo strace -f -c` 对 Redis 5.0.7 和 kvstore 做 10000 次 SET 的 syscall 分布对比：
+
+| syscall | Redis 5.0.7 | kvstore | 说明 |
+|---------|------------|---------|------|
+| **数据落盘** | `fdatasync` ×10,001 (707ms, 70µs/次) | `io_uring_enter` ×2 (282µs) | kvstore group commit 将 10000 次 fsync 压缩为 2 次 io_uring 批量提交 |
+| **网络写** | `write` ×20,009 (485ms) | `sendto` ×10,001 (273ms) | Redis 比 kvstore 多 1 次 write/命令 |
+| **网络读** | `read` ×39,534 (642ms) | `recvfrom` ×20,004 (221ms) | Redis 多次 read，kvstore 分批 recv |
+| **epoll** | `epoll_wait` ×19,712 (516ms) | `epoll_wait` ×10,211 + `epoll_ctl` ×20,007 (334ms) | kvstore 频繁切换 EPOLLIN/OUT |
+| **文件打开** | `openat` ×9,828 + `close` ×9,824 (496ms) | 0 | **Redis 5.0.7 每条 SET 重开 AOF 文件** |
+| **总 syscall** | 118,947 | 60,409 | kvstore 少 49% |
+| **strace 下吞吐** | 1,102 req/s | 2,254 req/s | kvstore 2× 快（syscall 少） |
+
+**关键发现：**
+
+1. **Redis 5.0.7 的致命缺陷**：`appendfsync always` 下每条 SET 都会 `openat` + `close` AOF 文件（~9800 次/10000 SET），占总耗时 11%。Redis 6+ 已修复此问题（复用 fd）。
+
+2. **kvstore 的 io_uring group commit 极端高效**：10000 条 SET 仅需 2 次 `io_uring_enter(7, 2, 2, IORING_ENTER_GETEVENTS)` —— 每次提交 write+fsync 两个 SQE，每次摊销 ~5000 条命令。
+
+3. **fdatasync 延迟 ~70µs**（本机 NVMe），Redis 每条命令付一次，kvstore 每 5000 条付一次。
+
+### 最新 Pipeline 基准 (redis-benchmark -c 1 -P <N>, 100k ops)
+
+> 测试日期: 2026-06-12
+> 测试工具: `redis-benchmark -n 100000 -c 1 -P <N>`
+
+#### SET
+
+| P | Redis 5.0.7 always | kvstore always | kvstore/Redis | Redis everysec | kvstore everysec | Redis no-AOF | kvstore no-AOF |
+|---|-------------------|----------------|---------------|----------------|------------------|--------------|----------------|
+| 1 | 2,283 | **20,467** | **9.0×** | 21,450 | 20,471 | 22,119 | 20,781 |
+| 10 | 23,474 | **192,308** | **8.2×** | 172,414 | 204,082 | 175,439 | 185,185 |
+| 20 | 46,729 | **384,615** | **8.2×** | 312,500 | 357,143 | 357,143 | 416,667 |
+| 40 | 92,593 | **625,000** | **6.8×** | 416,667 | 625,000 | 625,000 | 625,000 |
+| 80 | 156,250 | **1,250,000** | **8.0×** | 625,000 | 1,250,000 | 1,250,000 | 625,000 |
+| 160 | 250,000 | **1,000,000** | **4.0×** | 1,000,000 | — | 1,000,000 | 1,000,000 |
+
+#### HSET
+
+| P | Redis 5.0.7 always | kvstore always | kvstore/Redis | Redis everysec | kvstore everysec | Redis no-AOF | kvstore no-AOF |
+|---|-------------------|----------------|---------------|----------------|------------------|--------------|----------------|
+| 1 | 2,290 | **14,537** | **6.3×** | 20,354 | 15,223 | 21,236 | 15,768 |
+| 10 | 20,161 | **35,211** | **1.7×** | 158,730 | 36,900 | 156,250 | 36,496 |
+| 20 | 42,735 | 42,373 | 1.0× | 294,118 | 48,544 | 294,118 | 50,505 |
+| 40 | 83,333 | 53,191 | 0.6× | 416,667 | 54,348 | 416,667 | 53,191 |
+
+### 分析
+
+1. **kvstore AOF always 在 SET 下全面超越 Redis 5.0.7**：P=1 时 9×，P=10~80 时 6-8×。核心原因是 group commit 将 fsync 摊销到数千条命令，而 Redis 5.0.7 每条命令独立 fdatasync + openat/close。
+
+2. **HSET 是 kvstore 的弱项**：P=1 时仍领先 6.3×，但到 P=40 反而落后。Hash 引擎的渐进式 rehash 在大批量写入时触发扩容，造成额外延迟。SET 使用 Array 引擎无此开销。
+
+3. **AOF always 对 kvstore 几乎零开销**：P=1 SET always (20,467) vs no-AOF (20,781) 仅差 1.5%。group commit 将 fsync 成本完全隐藏。
+
+4. **Redis 5.0.7 always vs disabled**：P=1 SET 2,283 vs 22,119——AOF always 在 Redis 5.0.7 上有 **10× 开销**。主要来自 per-command fdatasync (~70µs) + openat/close。
+
+5. **与旧测试差异**：旧测试用 `-c 50 -P 1`（50 并发，无 pipeline），新测试用 `-c 1 -P <N>`（单连接，可变 pipeline）。两种场景的压力模式完全不同，不可直接对比。

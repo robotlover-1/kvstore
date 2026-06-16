@@ -25,6 +25,8 @@ typedef struct small_chunk_s {
 typedef struct slab_page_s {
     void *mem;
     size_t size;
+    size_t chunks_total;
+    size_t chunks_in_use;
     struct slab_page_s *next;
 } slab_page_t;
 
@@ -230,6 +232,8 @@ static int slab_grow_locked(int class_idx) {
     }
     page->mem = mem;
     page->size = alloc_size;
+    page->chunks_total = (size_t)count;
+    page->chunks_in_use = 0;
     page->next = g_mem.classes[class_idx].pages;
     g_mem.classes[class_idx].pages = page;
     g_mem.classes[class_idx].page_count++;
@@ -248,6 +252,8 @@ static int slab_grow_locked(int class_idx) {
     return 0;
 }
 
+static slab_page_t *find_page_for_chunk(small_class_t *cls, small_chunk_t *chunk);
+
 static void *custom_malloc(size_t size) {
     if (size == 0) size = 1;
     if (size <= SMALL_MAX_SIZE) {
@@ -265,6 +271,9 @@ static void *custom_malloc(size_t size) {
         }
         g_mem.classes[idx].free_list = chunk->next;
         chunk->next = NULL;
+        /* 追踪所属 page 的 chunks_in_use */
+        slab_page_t *pg = find_page_for_chunk(&g_mem.classes[idx], chunk);
+        if (pg) pg->chunks_in_use++;
         chunk->request_size = (uint32_t)size;
         g_mem.small_alloc_calls++;
         g_mem.current_small_inuse += g_mem.classes[idx].size;
@@ -323,6 +332,49 @@ static size_t custom_ptr_size(const void *ptr, int *kind_out) {
     return 0;
 }
 
+static slab_page_t *find_page_for_chunk(small_class_t *cls, small_chunk_t *chunk) {
+    unsigned char *c = (unsigned char *)chunk;
+    for (slab_page_t *pg = cls->pages; pg; pg = pg->next) {
+        if (c >= (unsigned char *)pg->mem &&
+            c <  (unsigned char *)pg->mem + pg->size)
+            return pg;
+    }
+    return NULL;
+}
+
+static void try_reclaim_page_locked(small_class_t *cls, slab_page_t *target) {
+    /* 阈值保护：至少保留 2 页的 free chunk 缓冲，防止颠簸 */
+    size_t free_chunks = count_free_chunks(cls->free_list);
+    if (free_chunks < target->chunks_total * 2) return;
+
+    /* 从 free_list 中移除属于 target 页的所有 chunk */
+    unsigned char *page_start = (unsigned char *)target->mem;
+    unsigned char *page_end   = page_start + target->size;
+    small_chunk_t **prev = &cls->free_list;
+    while (*prev) {
+        unsigned char *c = (unsigned char *)(*prev);
+        if (c >= page_start && c < page_end) {
+            *prev = (*prev)->next;
+            cls->total_chunks--;
+        } else {
+            prev = &(*prev)->next;
+        }
+    }
+
+    /* 从 page 链表中移除 */
+    slab_page_t **pp = &cls->pages;
+    while (*pp) {
+        if (*pp == target) { *pp = target->next; break; }
+        pp = &(*pp)->next;
+    }
+    cls->page_count--;
+    cls->page_bytes -= target->size;
+
+    g_mem.total_small_page_bytes -= target->size;
+    munmap(target->mem, target->size);
+    free(target);
+}
+
 static void custom_free(void *ptr) {
     if (!ptr) return;
     small_chunk_t *chunk = ((small_chunk_t *)ptr) - 1;
@@ -336,6 +388,14 @@ static void custom_free(void *ptr) {
         if (g_mem.current_small_inuse >= g_mem.classes[idx].size) g_mem.current_small_inuse -= g_mem.classes[idx].size;
         else g_mem.current_small_inuse = 0;
         account_live_free_locked(requested, g_mem.classes[idx].size);
+        /* 追踪 page 的 chunks_in_use，完全空闲时尝试回收 */
+        slab_page_t *pg = find_page_for_chunk(&g_mem.classes[idx], chunk);
+        if (pg && pg->chunks_in_use > 0) {
+            pg->chunks_in_use--;
+            if (pg->chunks_in_use == 0) {
+                try_reclaim_page_locked(&g_mem.classes[idx], pg);
+            }
+        }
         pthread_mutex_unlock(&g_mem.lock);
         return;
     }

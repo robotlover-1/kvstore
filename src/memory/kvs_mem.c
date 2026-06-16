@@ -15,24 +15,25 @@
 #define KVS_JEMALLOC_ACTIVE_ENV "KVS_MEM_JEMALLOC_ACTIVE"
 
 typedef struct small_chunk_s {
-    struct small_chunk_s *next;  // 8 bytes
     uint16_t request_size;       // 2 bytes (max: SMALL_MAX_SIZE=1024)
     uint8_t  magic;              // 1 byte
     uint8_t  class_idx;          // 1 byte
-} small_chunk_t;                 // sizeof = 16 (vs old 24)
+} small_chunk_t;                 // sizeof = 4
 
 typedef struct slab_page_s {
     void *mem;
     size_t size;
     size_t chunks_total;
     size_t chunks_in_use;
+    uint16_t *free_stack;        // free chunk index stack (LIFO)
+    size_t   free_top;           // stack top (0 = empty)
     struct slab_page_s *next;
 } slab_page_t;
 
 typedef struct {
     size_t size;
-    small_chunk_t *free_list;
     slab_page_t *pages;
+    slab_page_t *active_page;    // last alloc page (cache)
     size_t total_chunks;
     size_t page_count;
     size_t page_bytes;
@@ -187,12 +188,6 @@ static void account_live_free_locked(size_t requested, size_t allocated) {
     else g_mem.current_allocated_bytes = 0;
 }
 
-static size_t count_free_chunks(small_chunk_t *head) {
-    size_t n = 0;
-    for (; head; head = head->next) n++;
-    return n;
-}
-
 static void custom_account_fallback_alloc(size_t requested, size_t allocated) {
     pthread_mutex_lock(&g_mem.lock);
     g_mem.fallback_alloc_calls++;
@@ -242,20 +237,29 @@ static int slab_grow_locked(int class_idx) {
     page->size = alloc_size;
     page->chunks_total = (size_t)count;
     page->chunks_in_use = 0;
+    page->free_stack = (uint16_t *)malloc((size_t)count * sizeof(uint16_t));
+    if (!page->free_stack) {
+        free(page);
+        munmap(mem, alloc_size);
+        return -1;
+    }
+    /* init free stack: all chunks free, indices 0..count-1 */
+    for (int i = 0; i < count; ++i) page->free_stack[i] = (uint16_t)i;
+    page->free_top = (size_t)count;
     page->next = g_mem.classes[class_idx].pages;
     g_mem.classes[class_idx].pages = page;
+    g_mem.classes[class_idx].active_page = page;
     g_mem.classes[class_idx].page_count++;
     g_mem.classes[class_idx].page_bytes += alloc_size;
     g_mem.classes[class_idx].total_chunks += (size_t)count;
     g_mem.total_small_page_bytes += alloc_size;
 
+    /* set magic + class_idx on all chunks (persistent per-chunk metadata) */
     unsigned char *p = (unsigned char *)mem;
     for (int i = 0; i < count; ++i) {
         small_chunk_t *chunk = (small_chunk_t *)(p + i * chunk_total);
         chunk->magic = (uint8_t)CHUNK_MAGIC;
         chunk->class_idx = (uint8_t)class_idx;
-        chunk->next = g_mem.classes[class_idx].free_list;
-        g_mem.classes[class_idx].free_list = chunk;
     }
     return 0;
 }
@@ -268,25 +272,35 @@ static void *custom_malloc(size_t size) {
         int idx = class_index_for(size);
         if (idx < 0) return fallback_malloc(size);
         pthread_mutex_lock(&g_mem.lock);
-        if (!g_mem.classes[idx].free_list && slab_grow_locked(idx) != 0) {
-            pthread_mutex_unlock(&g_mem.lock);
-            return fallback_malloc(size);
+
+        small_class_t *cls = &g_mem.classes[idx];
+        slab_page_t *pg = cls->active_page;
+        if (!pg || pg->free_top == 0) {
+            /* find a page with free slots */
+            pg = NULL;
+            for (slab_page_t *p = cls->pages; p; p = p->next) {
+                if (p->free_top > 0) { pg = p; break; }
+            }
+            if (!pg) {
+                if (slab_grow_locked(idx) != 0) {
+                    pthread_mutex_unlock(&g_mem.lock);
+                    return fallback_malloc(size);
+                }
+                pg = cls->pages; /* new page at head */
+            }
+            cls->active_page = pg;
         }
-        small_chunk_t *chunk = g_mem.classes[idx].free_list;
-        if (!chunk) {
-            pthread_mutex_unlock(&g_mem.lock);
-            return fallback_malloc(size);
-        }
-        g_mem.classes[idx].free_list = chunk->next;
-        chunk->next = NULL;
-        /* 追踪所属 page 的 chunks_in_use */
-        slab_page_t *pg = find_page_for_chunk(&g_mem.classes[idx], chunk);
-        if (pg) pg->chunks_in_use++;
+
+        size_t chunk_total = sizeof(small_chunk_t) + cls->size;
+        size_t ci = pg->free_stack[--pg->free_top];
+        small_chunk_t *chunk = (small_chunk_t *)((unsigned char *)pg->mem + ci * chunk_total);
         chunk->request_size = (uint16_t)size;
+        pg->chunks_in_use++;
+
         g_mem.small_alloc_calls++;
-        g_mem.current_small_inuse += g_mem.classes[idx].size;
+        g_mem.current_small_inuse += cls->size;
         update_peak_ull(&g_mem.peak_small_inuse, g_mem.current_small_inuse);
-        account_live_alloc_locked(size, g_mem.classes[idx].size);
+        account_live_alloc_locked(size, cls->size);
         pthread_mutex_unlock(&g_mem.lock);
         return (void *)(chunk + 1);
     }
@@ -351,23 +365,12 @@ static slab_page_t *find_page_for_chunk(small_class_t *cls, small_chunk_t *chunk
 }
 
 static void try_reclaim_page_locked(small_class_t *cls, slab_page_t *target) {
-    /* 阈值保护：至少保留 2 页的 free chunk 缓冲，防止颠簸 */
-    size_t free_chunks = count_free_chunks(cls->free_list);
+    /* 阈值保护：保留 ≥2 页的 free chunk 缓冲（排除 target 自身） */
+    size_t free_chunks = 0;
+    for (slab_page_t *p = cls->pages; p; p = p->next)
+        free_chunks += p->free_top;
+    free_chunks -= target->free_top; /* target 的 chunks 不算缓冲 */
     if (free_chunks < target->chunks_total * 2) return;
-
-    /* 从 free_list 中移除属于 target 页的所有 chunk */
-    unsigned char *page_start = (unsigned char *)target->mem;
-    unsigned char *page_end   = page_start + target->size;
-    small_chunk_t **prev = &cls->free_list;
-    while (*prev) {
-        unsigned char *c = (unsigned char *)(*prev);
-        if (c >= page_start && c < page_end) {
-            *prev = (*prev)->next;
-            cls->total_chunks--;
-        } else {
-            prev = &(*prev)->next;
-        }
-    }
 
     /* 从 page 链表中移除 */
     slab_page_t **pp = &cls->pages;
@@ -375,10 +378,13 @@ static void try_reclaim_page_locked(small_class_t *cls, slab_page_t *target) {
         if (*pp == target) { *pp = target->next; break; }
         pp = &(*pp)->next;
     }
+    if (cls->active_page == target) cls->active_page = NULL;
     cls->page_count--;
     cls->page_bytes -= target->size;
+    cls->total_chunks -= target->chunks_total;
 
     g_mem.total_small_page_bytes -= target->size;
+    free(target->free_stack);
     munmap(target->mem, target->size);
     free(target);
 }
@@ -390,18 +396,24 @@ static void custom_free(void *ptr) {
         int idx = chunk->class_idx;
         size_t requested = chunk->request_size;
         pthread_mutex_lock(&g_mem.lock);
-        chunk->next = g_mem.classes[idx].free_list;
-        g_mem.classes[idx].free_list = chunk;
+
+        small_class_t *cls = &g_mem.classes[idx];
+        slab_page_t *pg = find_page_for_chunk(cls, chunk);
+
+        /* compute chunk index from address offset */
+        size_t chunk_total = sizeof(small_chunk_t) + cls->size;
+        size_t ci = ((unsigned char *)chunk - (unsigned char *)pg->mem) / chunk_total;
+        pg->free_stack[pg->free_top++] = (uint16_t)ci;
+
         g_mem.small_free_calls++;
-        if (g_mem.current_small_inuse >= g_mem.classes[idx].size) g_mem.current_small_inuse -= g_mem.classes[idx].size;
+        if (g_mem.current_small_inuse >= cls->size) g_mem.current_small_inuse -= cls->size;
         else g_mem.current_small_inuse = 0;
-        account_live_free_locked(requested, g_mem.classes[idx].size);
-        /* 追踪 page 的 chunks_in_use，完全空闲时尝试回收 */
-        slab_page_t *pg = find_page_for_chunk(&g_mem.classes[idx], chunk);
+        account_live_free_locked(requested, cls->size);
+
         if (pg && pg->chunks_in_use > 0) {
             pg->chunks_in_use--;
             if (pg->chunks_in_use == 0) {
-                try_reclaim_page_locked(&g_mem.classes[idx], pg);
+                try_reclaim_page_locked(cls, pg);
             }
         }
         pthread_mutex_unlock(&g_mem.lock);
@@ -552,7 +564,11 @@ int kvs_mem_get_stats(kvs_mem_stats_t *stats) {
     for (size_t i = 0; i < SMALL_CLASS_COUNT; ++i) {
         stats->class_sizes[i] = g_mem.classes[i].size;
         stats->class_total_chunks[i] = g_mem.classes[i].total_chunks;
-        stats->class_free_chunks[i] = count_free_chunks(g_mem.classes[i].free_list);
+        {
+            size_t fc = 0;
+            for (slab_page_t *p = g_mem.classes[i].pages; p; p = p->next) fc += p->free_top;
+            stats->class_free_chunks[i] = fc;
+        }
         stats->class_page_count[i] = g_mem.classes[i].page_count;
         stats->class_bytes_in_pages[i] = g_mem.classes[i].page_bytes;
     }

@@ -200,20 +200,20 @@ kvstore/
 | | 释放 50% | 50w | 96,260 | 61,540 | 63.9% |
 | | 释放 80% | 20w | 96,260 | 35,028 | 36.4% |
 | | 释放 100% | 0 | 96,260 | 18,652 | 19.4% |
-| **custom** | 基线 | 0 | 5,528 | 3,764 | 68.1% |
-| | 写入 1% | 1w | 7,292 | 4,880 | 66.9% |
-| | 写入 10% | 10w | 14,076 | 12,312 | 87.5% |
-| | 写入 50% | 50w | 43,772 | 42,008 | 96.0% |
-| | **写入 100%（峰值）** | **100w** | **80,956** | **79,192** | **97.8%** |
-| | 释放 50% | 50w | 48,828 | 47,064 | 96.4% |
-| | 释放 80% | 20w | 28,092 | 26,328 | 93.7% |
-| | 释放 100% | 0 | **14,012** | **12,248** | **87.4%** |
+| **custom** | 基线 | 0 | 5,528 | 3,744 | 67.7% |
+| | 写入 1% | 1w | 7,228 | 4,796 | 66.4% |
+| | 写入 10% | 10w | 13,056 | 11,260 | 86.2% |
+| | 写入 50% | 50w | 38,808 | 37,024 | 95.4% |
+| | **写入 100%（峰值）** | **100w** | **71,224** | **69,392** | **97.4%** |
+| | 释放 50% | 50w | 44,984 | 43,152 | 95.9% |
+| | 释放 80% | 20w | 27,448 | 25,616 | 93.3% |
+| | 释放 100% | 0 | **15,992** | **14,160** | **88.5%** |
 
 ##### 结果分析
 
-**① 峰值内存效率：libc 最优（73 MB），custom 居中（81 MB），jemalloc 最高（96 MB）**
+**① 峰值内存效率：custom 最优（71 MB），libc 居中（73 MB），jemalloc 最高（96 MB）**
 
-libc（ptmalloc2）使用 sbrk + mmap 混合策略，arena 内碎片较少，100w key 仅需 73 MB 虚拟内存（~75 bytes/条目）。custom 经过密集 slab class（17 级，~1.25× 间距）+ 压缩 chunk header（24B → 16B）后降至 81 MB（~83 bytes/条目），与 libc 差距从最初 32% 缩小到 11%。jemalloc 基于 mmap 页面粒度分配，虚拟内存偏高（~99 bytes/条目）。
+libc（ptmalloc2）使用 sbrk + mmap 混合策略，100w key 需 73 MB（~75 bytes/条目）。custom 经过四轮优化后降至 71 MB（~73 bytes/条目），**反超 libc 2.3%**。jemalloc 基于 mmap 页面粒度分配，虚拟内存偏高（~99 bytes/条目）。
 
 **② 物理内存释放：custom 最彻底（87%），jemalloc 次之（75%），libc 最差（43%）**
 
@@ -221,11 +221,11 @@ libc（ptmalloc2）使用 sbrk + mmap 混合策略，arena 内碎片较少，100
 |------|-----------|-------------|--------|
 | **libc** | 71,164 KB | 40,384 KB | **43.3%** |
 | **jemalloc** | 73,560 KB | 18,652 KB | **74.6%** |
-| **custom** | 79,192 KB | 12,248 KB | **84.5%** |
+| **custom** | 69,392 KB | 14,160 KB | **79.6%** |
 
 - **libc**：free 后通过 arena 收缩归还部分物理页，但 VmRSS 仍保留 57%（40 MB），释放最保守。VmSize 完全不降（sbrk 堆区不归还）。
 - **jemalloc**：后台线程主动 purge dirty pages，释放率 75%。释放过程最平滑——free_50% 已降至 61,540 KB（60 MB），free_80% 降至 35,028 KB（34 MB），逐步归还。VmSize 保持不变（mmap 保留地址空间）。
-- **custom**：17 级 slab class（~1.25× 间距）+ 压缩 `small_chunk_t`（24B→16B，去 reserved + 字段缩窄）。唯一同时归还虚拟内存的后端——munmap 整页时 VmSize 随 VmRSS 同步下降（80,956 → 14,012 KB）。释放率 84.5%，但呈阶梯状。峰值 81 MB（~83 bytes/条目），与 libc（73 MB）差距 11%。每条目 `chunk_total = 16B (header) + 56B (class) = 72B`，剩余差距来自 16B header 中 next 指针（8B）和 magic/class_idx/request_size（4B）的固有开销（libc malloc 元数据仅 ~8B）。
+- **custom**：四轮优化后峰值内存最低（71 MB），**反超 libc**。唯一同时归还虚拟内存的后端——munmap 整页时 VmSize 随 VmRSS 同步下降。释放率 80%，呈阶梯状。每条目 `chunk_total = 4B (header) + 56B (class) = 60B`，header 仅 4 字节（request_size:2 + magic:1 + class_idx:1），比 libc 的 ~8B malloc 元数据更紧凑。
 
 **③ 三种后端的适用场景**
 
@@ -307,10 +307,13 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 | 初始 (8 class, 24B header, 无回收) | 96,592 KB | +32% | 98.9 | 0% |
 | P1: 空闲页回收 | 96,592 KB | +32% | 98.9 | 86% |
 | P2: 17 级密集 class | 88,764 KB | +22% | 90.9 | 86% |
-| **P3: 压缩 header 24→16B** | **80,956 KB** | **+11%** | **82.9** | **85%** |
+| P3: 压缩 header 24→16B | 80,956 KB | +11% | 82.9 | 85% |
+| **P4: free_stack 索引 16→4B** | **71,224 KB** | **-2.3%** | **72.9** | **80%** |
 | *libc 基线* | *72,900 KB* | — | *74.6* | *43%* |
 
-*剩余差距*（81 MB vs 73 MB）：chunk header 中的 8 字节 `next` 指针是 free list 链表的核心数据结构，libc 的 malloc 元数据仅 ~8B。要进一步缩小差距需将 free list 替换为 per-page bitmap 索引（header 可缩至 4B），但改动较大。
+*P4 已反超 libc*（71 MB < 73 MB，73 bytes/条目 < 75 bytes/条目）。用 per-page `uint16_t` 索引栈（LIFO）替代链表 `next` 指针，`small_chunk_t` 从 16B 压缩到 4B（request_size:2 + magic:1 + class_idx:1）。每条目 `chunk_total = 4 + 56 = 60B`，比 libc 的 malloc 元数据更紧凑。释放后残留 ~14 MB（基线 ~4 MB），来自 free_stack 元数据 + 阈值缓冲页。
+
+**Phase 4 原理**：free list 链表将空闲 chunk 链接起来，每个 chunk 需要 8 字节 `next` 指针。用 per-page `uint16_t free_stack[]` 替代——slab 页最多 ~1000 chunks，2 字节足够索引。分配时 `free_stack[--free_top]` 弹出索引，释放时 `free_stack[free_top++] = ci` 压入索引，均为 O(1)。额外收益：`total_free_chunks = Σ page->free_top`（O(page_count)，比遍历链表 O(free_chunks) 快得多）。
 
 ### 网络模型
 

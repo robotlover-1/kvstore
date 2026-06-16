@@ -349,11 +349,11 @@ typedef struct {
     unsigned long long small_page_used_bytes;
     unsigned int internal_fragment_ppm;
     unsigned int page_utilization_ppm;
-    size_t class_sizes[16];
-    size_t class_total_chunks[16];
-    size_t class_free_chunks[16];
-    size_t class_page_count[16];
-    size_t class_bytes_in_pages[16];
+    size_t class_sizes[24];
+    size_t class_total_chunks[24];
+    size_t class_free_chunks[24];
+    size_t class_page_count[24];
+    size_t class_bytes_in_pages[24];
 } kvs_mem_stats_t;
 
 typedef struct {

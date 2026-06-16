@@ -7,7 +7,7 @@
 #define KVS_MEM_JEMALLOC 1
 #define KVS_MEM_CUSTOM 2
 
-#define SMALL_CLASS_COUNT 8
+#define SMALL_CLASS_COUNT 17
 #define SMALL_MAX_SIZE 1024
 #define CHUNK_MAGIC 0xC0DEC0DEu
 #define LARGE_MAGIC 0xC0DEC0DFu
@@ -87,13 +87,22 @@ static kvs_mem_state_t g_mem = {
     .initialized = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .classes = {
-        {32, NULL, NULL, 0, 0, 0},
-        {64, NULL, NULL, 0, 0, 0},
-        {128, NULL, NULL, 0, 0, 0},
-        {256, NULL, NULL, 0, 0, 0},
-        {384, NULL, NULL, 0, 0, 0},
-        {512, NULL, NULL, 0, 0, 0},
-        {768, NULL, NULL, 0, 0, 0},
+        {16,   NULL, NULL, 0, 0, 0},
+        {24,   NULL, NULL, 0, 0, 0},
+        {32,   NULL, NULL, 0, 0, 0},
+        {40,   NULL, NULL, 0, 0, 0},
+        {56,   NULL, NULL, 0, 0, 0},
+        {72,   NULL, NULL, 0, 0, 0},
+        {96,   NULL, NULL, 0, 0, 0},
+        {128,  NULL, NULL, 0, 0, 0},
+        {160,  NULL, NULL, 0, 0, 0},
+        {200,  NULL, NULL, 0, 0, 0},
+        {256,  NULL, NULL, 0, 0, 0},
+        {320,  NULL, NULL, 0, 0, 0},
+        {400,  NULL, NULL, 0, 0, 0},
+        {512,  NULL, NULL, 0, 0, 0},
+        {640,  NULL, NULL, 0, 0, 0},
+        {800,  NULL, NULL, 0, 0, 0},
         {1024, NULL, NULL, 0, 0, 0},
     }
 };

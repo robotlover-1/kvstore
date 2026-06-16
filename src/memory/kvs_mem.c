@@ -9,18 +9,17 @@
 
 #define SMALL_CLASS_COUNT 17
 #define SMALL_MAX_SIZE 1024
-#define CHUNK_MAGIC 0xC0DEC0DEu
-#define LARGE_MAGIC 0xC0DEC0DFu
+#define CHUNK_MAGIC   0xCCu
+#define LARGE_MAGIC   0xC0DEC0DFu
 #define FALLBACK_MAGIC 0xC0DEC0E0u
 #define KVS_JEMALLOC_ACTIVE_ENV "KVS_MEM_JEMALLOC_ACTIVE"
 
 typedef struct small_chunk_s {
-    uint32_t magic;
-    uint16_t class_idx;
-    uint16_t reserved;
-    uint32_t request_size;
-    struct small_chunk_s *next;
-} small_chunk_t;
+    struct small_chunk_s *next;  // 8 bytes
+    uint16_t request_size;       // 2 bytes (max: SMALL_MAX_SIZE=1024)
+    uint8_t  magic;              // 1 byte
+    uint8_t  class_idx;          // 1 byte
+} small_chunk_t;                 // sizeof = 16 (vs old 24)
 
 typedef struct slab_page_s {
     void *mem;
@@ -253,8 +252,8 @@ static int slab_grow_locked(int class_idx) {
     unsigned char *p = (unsigned char *)mem;
     for (int i = 0; i < count; ++i) {
         small_chunk_t *chunk = (small_chunk_t *)(p + i * chunk_total);
-        chunk->magic = CHUNK_MAGIC;
-        chunk->class_idx = (uint16_t)class_idx;
+        chunk->magic = (uint8_t)CHUNK_MAGIC;
+        chunk->class_idx = (uint8_t)class_idx;
         chunk->next = g_mem.classes[class_idx].free_list;
         g_mem.classes[class_idx].free_list = chunk;
     }
@@ -283,7 +282,7 @@ static void *custom_malloc(size_t size) {
         /* 追踪所属 page 的 chunks_in_use */
         slab_page_t *pg = find_page_for_chunk(&g_mem.classes[idx], chunk);
         if (pg) pg->chunks_in_use++;
-        chunk->request_size = (uint32_t)size;
+        chunk->request_size = (uint16_t)size;
         g_mem.small_alloc_calls++;
         g_mem.current_small_inuse += g_mem.classes[idx].size;
         update_peak_ull(&g_mem.peak_small_inuse, g_mem.current_small_inuse);

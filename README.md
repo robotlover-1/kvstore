@@ -211,7 +211,7 @@ kvstore/
 
 libc（ptmalloc2）使用 sbrk + mmap 混合策略，arena 内碎片较少，100w key 仅需 73 MB 虚拟内存（~75 bytes/条目）。jemalloc 和 custom 均基于 mmap，页面粒度分配导致虚拟内存偏高（~99 bytes/条目）。
 
-**② 物理内存释放：jemalloc 最彻底（75%），custom 优化后接近（87%），libc 居中（43%）**
+**② 物理内存释放：custom 最彻底（87%），jemalloc 次之（75%），libc 最差（43%）**
 
 | 后端 | 峰值 VmRSS | 释放后 VmRSS | 释放率 |
 |------|-----------|-------------|--------|
@@ -219,9 +219,9 @@ libc（ptmalloc2）使用 sbrk + mmap 混合策略，arena 内碎片较少，100
 | **jemalloc** | 73,560 KB | 18,652 KB | **74.6%** |
 | **custom** | 94,856 KB | 12,296 KB | **87.0%** |
 
-- **libc**：free 后 malloc 通过 `malloc_trim()` 或 arena 收缩归还部分内存，但不彻底（保留 57%）。
-- **jemalloc**：后台线程主动 purge dirty pages，渐进归还物理内存。在 free_50% 时 VmRSS 已开始下降，释放最主动。
-- **custom**：已实现空闲页回收（`try_reclaim_page_locked`），当一页内所有 chunk 都空闲且该类 free chunk 超过阈值（2 页缓冲）时 munmap 整页。释放过程渐进：free_50% 降至 55 MB，free_80% 降至 29 MB，free_100% 降至 12 MB（仅比基线高 ~8 MB——阈值缓冲页 + 元数据残留）。
+- **libc**：free 后通过 arena 收缩归还部分内存，但保留超过一半（57%），释放最保守。
+- **jemalloc**：后台线程主动 purge dirty pages，释放率 75%。优势在于释放过程最平滑——free_50% 时 VmRSS 已开始下降。
+- **custom**：空闲页回收生效后释放率最高（87%），但释放呈阶梯状——必须整页完全空闲才 munmap。free_50% 才降到 55 MB，free_80% 降到 29 MB，最终 12 MB（仅比基线高 ~8 MB，来自阈值缓冲页 + 元数据）。
 
 **③ 三种后端的适用场景**
 

@@ -225,7 +225,7 @@ libc（ptmalloc2）使用 sbrk + mmap 混合策略，arena 内碎片较少，100
 
 - **libc**：free 后通过 arena 收缩归还部分物理页，但 VmRSS 仍保留 57%（40 MB），释放最保守。VmSize 完全不降（sbrk 堆区不归还）。
 - **jemalloc**：后台线程主动 purge dirty pages，释放率 75%。释放过程最平滑——free_50% 已降至 61,540 KB（60 MB），free_80% 降至 35,028 KB（34 MB），逐步归还。VmSize 保持不变（mmap 保留地址空间）。
-- **custom**：17 级 slab class（16-1024B，~1.25× 间距）将内部碎片控制在 ≤25%。唯一同时归还虚拟内存的后端——munmap 整页时 VmSize 随 VmRSS 同步下降（88,764 → 13,884 KB）。释放率最高（86%），但呈阶梯状——必须整页完全空闲才触发回收。峰值 VmSize 比 libc 高 22%（~91 bytes/条目 vs ~75 bytes/条目），差距主要来自 `small_chunk_t` 的 12 字节 header 开销。
+- **custom**：17 级 slab class（16-1024B，~1.25× 间距）将内部碎片控制在 ≤25%。唯一同时归还虚拟内存的后端——munmap 整页时 VmSize 随 VmRSS 同步下降（88,764 → 13,884 KB）。释放率最高（86%），但呈阶梯状——必须整页完全空闲才触发回收。峰值 VmSize 比 libc 高 22%（~91 bytes/条目 vs ~75 bytes/条目）。每条目实际分配 `chunk_total = sizeof(small_chunk_t)(24B) + class_size(56B) = 80B`，其中 24B chunk header（magic/class_idx/request_size/next+padding）是 libc 的 ~8B malloc 元数据的 3 倍，这是剩余差距的主要来源。
 
 **③ 三种后端的适用场景**
 

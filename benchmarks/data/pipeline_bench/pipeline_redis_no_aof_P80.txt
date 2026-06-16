@@ -1,12 +1,0 @@
-HSET key:__rand_int__ value: -nanHSET key:__rand_int__ value: 2674240.00====== HSET key:__rand_int__ value ======
-  1000000 requests completed in 0.37 seconds
-  50 parallel clients
-  64 bytes payload
-  keep alive: 1
-
-5.52% <= 1 milliseconds
-98.28% <= 2 milliseconds
-99.66% <= 3 milliseconds
-100.00% <= 3 milliseconds
-2680965.25 requests per second
-

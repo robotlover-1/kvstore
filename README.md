@@ -176,6 +176,62 @@ kvstore/
 | `jemalloc` | 高性能分配器，减少碎片                  |
 | `custom`   | 自研 slab + mmap 分配器，可观测碎片统计 |
 
+##### 内存占用测试（2026-06-16）
+
+> **测试方法**：启动 kvstore → 写入 100w 条 HSET → 释放 100w 条 HDEL，在 1%/10%/50%/80%/100% 进度点采样 `/proc/<pid>/status` 的 VmSize（虚拟内存）和 VmRSS（物理内存）。AOF 关闭，Hash 引擎，非 sudo。
+>
+> 测试脚本：`tools/bench/mem_pool_bench.py`
+
+| 后端 | 阶段 | 数据量 | VmSize (KB) | VmRSS (KB) | RSS/Size |
+|------|------|--------|-------------|------------|----------|
+| **libc** | 基线 | 0 | 5,344 | 3,600 | 67.4% |
+| | 写入 1% | 1w | 7,120 | 4,652 | 65.3% |
+| | 写入 10% | 10w | 13,216 | 11,268 | 85.3% |
+| | 写入 50% | 50w | 39,700 | 37,756 | 95.1% |
+| | **写入 100%（峰值）** | **100w** | **72,900** | **71,164** | **97.6%** |
+| | 释放 100% | 0 | 72,900 | 40,384 | 55.4% |
+| **jemalloc** | 基线 | 0 | 19,460 | 5,736 | 29.5% |
+| | 写入 1% | 1w | 22,020 | 6,784 | 30.8% |
+| | 写入 10% | 10w | 25,092 | 11,764 | 46.9% |
+| | 写入 50% | 50w | 59,396 | 40,116 | 67.5% |
+| | **写入 100%（峰值）** | **100w** | **96,260** | **73,560** | **76.4%** |
+| | 释放 100% | 0 | 96,260 | 18,652 | 19.4% |
+| **custom** | 基线 | 0 | 5,548 | 3,752 | 67.6% |
+| | 写入 1% | 1w | 7,440 | 4,996 | 67.2% |
+| | 写入 10% | 10w | 15,632 | 13,836 | 88.5% |
+| | 写入 50% | 50w | 51,536 | 49,740 | 96.5% |
+| | **写入 100%（峰值）** | **100w** | **96,592** | **94,796** | **98.1%** |
+| | 释放 100% | 0 | **96,592** | **94,796** | **98.1%** |
+
+##### 结果分析
+
+**① 峰值内存效率：libc 最优（73 MB），jemalloc/custom 相近（~96 MB）**
+
+libc（ptmalloc2）使用 sbrk + mmap 混合策略，arena 内碎片较少，100w key 仅需 73 MB 虚拟内存（~75 bytes/条目）。jemalloc 和 custom 均基于 mmap，页面粒度分配导致虚拟内存偏高（~99 bytes/条目）。
+
+**② 物理内存释放：jemalloc 最彻底，custom 完全不释放，libc 居中**
+
+| 后端 | 峰值 VmRSS | 释放后 VmRSS | 释放率 |
+|------|-----------|-------------|--------|
+| **libc** | 71,164 KB | 40,384 KB | **43.3%** |
+| **jemalloc** | 73,560 KB | 18,652 KB | **74.6%** |
+| **custom** | 94,796 KB | 94,796 KB | **0%** |
+
+- **libc**：free 后 malloc 通过 `malloc_trim()` 或 arena 收缩归还部分内存，但不彻底（保留 57%）。
+- **jemalloc**：后台线程主动 purge dirty pages，渐进归还物理内存。在 free_50% 时 VmRSS 已开始下降，释放最主动。
+- **custom**：slab 页通过 mmap 一次性映射，释放时仅将 chunk 放回 free_list，**整页从不 munmap**。这是 slab 分配器的设计取舍——以内存换分配速度。小对象（≤1024B）分配 O(1)，但内存永不归还 OS。
+
+**③ 三种后端的适用场景**
+
+| 后端 | 适用场景 | 不适用场景 |
+|------|---------|-----------|
+| **libc** | 通用场景，内存占用最低，碎片可控 | 需要主动归还内存（需手动 trim） |
+| **jemalloc** | 长时间运行、内存自动回收需求 | 启动虚拟内存占用偏高（19 MB 基线） |
+| **custom** | 短生命周期、高频 alloc/free（无碎片、O(1)） | 长期运行、数据量波动大（内存只增不减） |
+
+> **注意**：custom 后端的 slab 页永远不会归还 OS。如果写入 100w 后全部删除，94 MB 物理内存会一直被占用，
+> 直到进程退出。生产环境中如果数据量波动大（如定期全量加载+清除），应优先使用 **libc** 或 **jemalloc**。
+
 ### 网络模型
 
 
@@ -4342,40 +4398,62 @@ P=40 时 kvstore HSET (53k) 落后 Redis (83k)。原因：
 
 ---
 
-#### AOF 并发性能对比（`-c 50 -P 1`, 2026-06-12 重测）
+#### AOF 并发性能对比（`-c 50 -P 1`, 2026-06-16 重测）
 
-> **测试工具**：`redis-benchmark -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value`
+> **测试工具**：`redis-benchmark -n 1000000 -c 50 -P 1 -d 64 -r 1000000`
+>
+> **HSET 命令**：`HSET key:__rand_int__ value`（100 万个独立 hash key，每个 1 个 field）
+>
+> **ECHO 命令**：`ECHO`（纯协议往返，不涉及引擎/持久化）
 >
 > **对比版本**：Redis 5.0.7（系统包管理器版本）
+>
+> **注意**：以下均为**非 sudo** 测试。sudo 运行 kvstore 会加载 BPF kprobe 模块（`kprobe/tcp_recvmsg`），每个 TCP 包增加 ~3× 开销（~40k QPS），详见下方"sudo + kprobe 性能影响"节。
 
 ##### 测试结果
 
 | 配置 | ECHO (QPS) | HSET (QPS) |
 |---|---|---|
-| **kvstore** (ECHO 基线) | **131,527** | — |
-| ├─ AOF 关闭（`--aof-disable`） | — | **128,932** |
-| ├─ AOF always（每条命令 fsync） | — | **119,000** |
-| └─ AOF everysec（每秒 fsync） | — | **126,582** |
-| **Redis 5.0.7** (ECHO 基线) | **118,315** | — |
-| ├─ 无 AOF | — | 119,204 |
-| ├─ AOF everysec | — | 117,911 |
-| └─ AOF always | — | **44,000** |
+| **kvstore** (ECHO 基线) | **123,320** | — |
+| ├─ AOF 关闭（`--aof-disable`） | — | **127,323** |
+| ├─ AOF always（每条命令 fsync） | — | **128,766** |
+| └─ AOF everysec（每秒 fsync） | — | **128,833** |
+| **Redis 5.0.7** (ECHO 基线) | **119,062** | — |
+| ├─ 无 AOF | — | **124,285** |
+| └─ AOF always | — | **121,581** |
 
 ##### 分析
 
-**① ECHO 基线——kvstore RESP 解析比 Redis 快 11.2%**（131,527 vs 118,315 QPS）
+**① ECHO 基线——kvstore RESP 解析比 Redis 快 3.6%**（123,320 vs 119,062 QPS）
 
-**② Hash 引擎渐进式 rehash 优化后反超 Redis**（AOF 关闭：128,932 vs 119,204）
+**② Hash 引擎渐进式 rehash 优化后 kvstore 写入反超 Redis**（AOF 关闭：127,323 vs 124,285，+2.4%）
 
-**③ kvstore AOF always 已达 119k，几乎无持久化开销**
-AOF always (119k) vs AOF 关闭 (129k) 仅差 **7.8%**，Group Commit + io_uring 批量 fsync 将持久化开销降至极低。
+**③ kvstore AOF always 无持久化开销**
+AOF always (128,766) vs AOF 关闭 (127,323) **性能持平**（在测试波动范围内），Group Commit + io_uring 批量 fsync 将持久化开销完全隐藏。AOF always 不会拖慢写入。
 
-**④ Redis 5.0.7 AOF always 从 120k 跌至 44k**
-该版本在 `appendfsync always` 下每条 HSET 会 `openat()` + `close()` AOF 文件（strace 证实），导致性能暴跌 63%。Redis 6+ 已修复此问题。
+**④ Redis 5.0.7 AOF always 与 no-AOF 性能相当**（121,581 vs 124,285，仅差 2.2%）
+与之前 README 中报告 44k 的数据不同——之前 44k 是因为测试使用了 `HSET myhash __rand_int__ __rand_int__`（单 key 巨型 hash 表）模式，Redis 5.0.7 在此模式下每条 fdatasync 的开销被单 key 的 hash 扩容放大。用正确的多 key 模式测试，Redis AOF always 性能正常。
 
-**③ AOF always Group Commit 优化提升 4.5×**：14.7k → 65.5k，与 Redis always (120k) 差距从 8× 缩小到 1.8×
+**⑤ kvstore 与 Redis 整体对比**
+两种写入场景（AOF 关闭、AOF always）下 kvstore 均略优于 Redis（+2% ~ +6%），但差距在测试波动范围内，可视为同一性能水平。
 
-**④ Redis HSET 跨策略性能稳定**（118k~120k），AOF 实现成熟
+##### sudo + kprobe 性能影响
+
+`kvstore.conf` 中 `kprobe_enabled=1`（默认）。普通用户运行时 BPF 加载失败（权限不够），静默跳过。**sudo 运行时 BPF kprobe 加载成功**，`kprobe/tcp_recvmsg` + `kretprobe/tcp_recvmsg` 拦截每个 TCP 包，引入 ~3× 开销：
+
+| 配置 | 非 sudo (QPS) | sudo (QPS) | 降幅 |
+|---|---|---|---|
+| kvstore AOF disable | 127,323 | 39,438 | 3.2× |
+| kvstore AOF always | 128,766 | 53,019 | 2.4× |
+| kvstore AOF everysec | 128,833 | 39,981 | 3.2× |
+
+> 如果需要在 sudo 下基准测试，可临时设置 `kprobe_enabled=0`（关闭 kprobe 捕获），或使用非 sudo 运行。
+>
+> 生产环境中如果不需要 kprobe 复制，可将 `kvstore.conf` 中 `kprobe_enabled=0` 以避免 root 运行时的性能损失。
+
+##### 两种 key 模式的影响
+
+上述测试使用 `HSET key:__rand_int__ value`（100 万个独立 hash key）。如果使用 `HSET myhash __rand_int__ __rand_int__`（1 个 hash key，100 万个 field），Redis 5.0.7 AOF always 会因单 key 巨型 hash 表 + per-command fdatasync 的组合效应退化到 **45,666 QPS**，而 **kvstore 不受影响**（120,481 QPS），得益于 group commit 将 fsync 摊销到整批命令。
 
 > 完整优化历程：`docs/aof-group-commit.md`。syscall 级分析见该文档 Phase 8 节。
 
@@ -4406,33 +4484,38 @@ time redis-cli -p 5190 SAVE
 
 ##### 测试结果
 
-> **写入 QPS** 为 redis-benchmark 报告值（反映真实 Hash 引擎吞吐）。
+> **写入 QPS** 为 redis-benchmark 报告值。
+> **写入耗时** 为 `date +%s%N` 实测的灌数据墙钟时间。
+> **平均每次 SAVE** 为 `date +%s%N` 对每次 `redis-cli SAVE` 计时后取平均。
 > **有效 QPS** = 数据量 / (写入时间 + SAVE 总耗时)，模拟写入后 SAVE 的实际吞吐。
+> **dump 大小** 为 `stat --format=%s` 实测。
+>
+> 测试日期：2026-06-16，非 sudo，AOF 关闭。
 
-| 场景 | 数据量 | SAVE 次数 | 写入 QPS | 写入耗时 | 平均每次 SAVE | 有效 QPS |
-|---|---|---|---|---|---|---|
-| **100w → SAVE × 1** | 100万 | 1 | 129,685 | 7.77s | **3,964ms** | **85,232** |
-| 10w → SAVE × 10 | 10万 | 10 | 127,226 | 0.80s | 397ms | 20,976 |
-| 1w → SAVE × 100 | 1万 | 100 | 129,870 | 0.08s | 42ms | 2,313 |
-| 1k → SAVE × 1000 | 1千 | 1000 | 125,000 | 0.01s | 7ms | 141 |
+| 场景 | 数据量 | SAVE 次数 | 写入 QPS | 写入耗时 | 平均每次 SAVE | dump 大小 | 有效 QPS |
+|---|---|---|---|---|---|---|---|
+| **100w → SAVE × 1** | 100万 | 1 | **128,717** | 7.828s | **3,851ms** | 18.1 MB | **85,622** |
+| 10w → SAVE × 10 | 10万 | 10 | **124,224** | 0.813s | **388ms** | 1.8 MB | **21,322** |
+| 1w → SAVE × 100 | 1万 | 100 | **119,048** | 0.090s | **42ms** | 185 KB | **2,345** |
+| 1k → SAVE × 1000 | 1千 | 1000 | **100,000** | 0.015s | **7.4ms** | 18.5 KB | **136** |
 
-> **写入 QPS 为何稳定在 128k+？** 渐进式 rehash 使桶数随数据量动态增长（4096 → 8192 → ... → 1M+），
-> 每桶始终维持 0~2 节点，HSET 查找 O(1)。10w/1w 的写入因数据量小（<1 秒完成），瞬时采样偏高。
-> **实际稳态写入 QPS 以 100w 场景为准（~129k）。**
+> **写入 QPS 为何随数据量变化？** 渐进式 rehash 使桶数随数据量动态增长（4096 → 8192 → ... → 1M+），
+> 每桶始终维持 0~2 节点，HSET 查找 O(1)。1k/1w 场景因数据量小（<0.1 秒完成），
+> 瞬时采样受启动波动影响偏低。**实际稳态写入 QPS 以 100w 场景为准（~129k）。**
 
 ##### 结果分析
 
-**① SAVE 耗时与数据量正相关，不是恒定值**
+**① SAVE 耗时与数据量正相关，呈近似线性**
 
-| 数据量 | 平均 SAVE 耗时 | dump 文件大小 |
-|--------|---------------|-------------|
-| 1000 | 7ms | ~32KB |
-| 1万 | 42ms | ~320KB |
-| 10万 | 397ms | ~3.2MB |
-| 100万 | 3,964ms | ~32MB |
+| 数据量 | 平均 SAVE 耗时 | dump 文件大小 | 每条目 dump 字节 |
+|--------|---------------|-------------|-----------------|
+| 1000 | 7.4ms | 18.5 KB | 19.0 B |
+| 1万 | 42ms | 185 KB | 18.9 B |
+| 10万 | 388ms | 1.8 MB | 18.9 B |
+| 100万 | 3,851ms | 18.1 MB | 19.0 B |
 
-SAVE 耗时与数据量成正比（~1ms/万条），因为 `persist_save_dump()` 遍历 Hash 引擎的全部链地址表，
-将 key-value 写入 KVSD 二进制格式。100 万条数据产生约 32MB dump 文件（含 8 字节 AOF 偏移头 + 1 字节 engine_id + key/value 长度前缀）。
+SAVE 耗时与数据量近似正比（~3.85ms/千条，大样本下线性度 >0.99），因为 `persist_save_dump()` 遍历 Hash 引擎的全部链地址表，
+将 key-value 写入 KVSD 二进制格式。dump 文件约 **19 bytes/条目**（含 8 字节 AOF 偏移头 + 1 字节 engine_id + 4 字节 key/value 长度前缀 + key 字符串 + value 序列化数据）。
 
 ```c
 int persist_save_dump(void) {
@@ -4452,11 +4535,10 @@ int persist_save_dump(void) {
 `kvs_dump_to_fd()` 遍历 Hash 引擎 1024 个桶的链地址表 → 约 100 万次节点的 key/value 拷贝 + write 系统调用。
 io_uring fsync 是异步的，不阻塞 SAVE 返回，但 write 本身的数据量决定了耗时。
 
-**② 引擎优化后写入 QPS 大幅提升，SAVE 开销相对降低**
+**② 写入 QPS 大幅提升后，SAVE 开销相对降低**
 
-- 100w→SAVE×1：写入 7.8s + SAVE 3.96s = 11.7s 总耗时，有效 QPS 85k（优化前 19k，4.5×）
-- 写入 QPS 从 21k → 129k（6.1×），SAVE 时间稳定在 ~3.9s（纯磁盘 I/O）
-- SAVE 开销占比：3.96s / 11.7s = 33.8%
+- 100w→SAVE×1：写入 7.83s + SAVE 3.85s = 11.68s 总耗时，有效 QPS 85.6k
+- SAVE 时间 3.85s（纯磁盘 I/O + 序列化遍历），开销占比 33.0%
 
 **③ 最佳策略：低频 BGSAVE + AOF**
 
@@ -4480,7 +4562,8 @@ redis-cli -p 5000 SNAPRULES
 
 ##### 测试目的
 
-评估 kvstore 的 RESP pipeline 吞吐能力，与 Redis 在不同 pipeline 深度（10/20/40/80/160）下对比。
+评估 kvstore 的 RESP pipeline 吞吐能力，与 Redis 5.0.7 在不同 pipeline 深度（10/20/40/80/160）下对比。
+同时测试 AOF disable / everysec / always 三种持久化策略对 pipeline 吞吐的影响。
 
 ##### 测试方法
 
@@ -4488,99 +4571,105 @@ redis-cli -p 5000 SNAPRULES
 2. 分别测试 ECHO（纯协议）和 HSET（引擎写入）两种负载
 3. 测试 AOF disable / everysec / always 三种模式
 4. 每个配置前重启服务器，清理 AOF/dump 文件
-5. 记录 redis-benchmark 输出 QPS，转换为实际命令吞吐：**cmd/s = QPS × P**
+5. redis-benchmark 报告值为每秒钟完成的**批次数**（batch/s），实际命令吞吐：**cmd/s = QPS × P**
+6. 非 sudo 运行，避免 kprobe 开销
 
 ```bash
-# Pipeline 基准脚本
+# 一键运行全部组合
 bash tools/bench/run_pipeline_bench.sh
 
 # 手动单点测试
 redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand_int__ value
 ```
 
+> 测试日期：2026-06-16，非 sudo，端口 kvstore=5190 / Redis=6390。
+
 ##### 测试结果
 
-**ECHO（纯协议开销）：**
+**ECHO（纯协议开销，无引擎/持久化）：**
 
 | P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
 |--------|-----------------|---------------|----------|
-| 1 | 131,527 | 118,315 | **111%** |
-| 10 | 9,699,321 | 10,615,711 | **91%** |
-| 20 | 22,857,142 | 39,920,160 | 57% |
-| 40 | 55,401,660 | 93,896,710 | 59% |
-| 80 | 106,382,984 | 259,740,260 | 41% |
-| 160 | 252,366,592 | 567,375,880 | 44% |
+| 1 | 123,320 | 119,062 | **104%** |
+| 10 | 10,080,646 | 12,706,480 | 79% |
+| 20 | 24,009,602 | 41,841,005 | 57% |
+| 40 | 48,367,590 | 111,731,840 | 43% |
+| 80 | 103,492,880 | 258,064,520 | 40% |
+| 160 | 240,601,501 | 577,617,328 | 42% |
 
-**HSET disable（引擎写入，无持久化）：**
+**HSET AOF 关闭（引擎写入，无持久化）：**
 
 | P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
 |--------|-----------------|---------------|----------|
-| 1 | 128,932 | 119,204 | **108%** |
-| 10 | 5,948,840 | 11,918,951 | 50% |
-| 20 | 14,124,294 | 35,714,285 | 40% |
-| 40 | 35,906,645 | 86,206,900 | 42% |
-| 80 | 86,862,110 | 214,477,220 | 41% |
-| 160 | 196,560,200 | 454,545,440 | **43%** |
+| 1 | 127,323 | 124,285 | **102%** |
+| 10 | 6,093,845 | 12,515,644 | 49% |
+| 20 | 15,071,590 | 36,968,575 | 41% |
+| 40 | 38,535,645 | 91,743,120 | 42% |
+| 80 | 89,285,685 | 205,128,220 | 44% |
+| 160 | 209,698,560 | 450,704,240 | **47%** |
 
-##### 优化历程
+**HSET AOF everysec（每秒 fsync）：**
 
-Pipeline 性能经过 6 轮优化（详见 `docs/pipeline-optimization.md`）：
+| P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
+|--------|-----------------|---------------|----------|
+| 1 | 128,833 | — | — |
+| 10 | 5,817,336 | 12,360,939 | 47% |
+| 20 | 13,614,704 | 36,166,368 | 38% |
+| 40 | 33,195,020 | 91,743,120 | 36% |
+| 80 | 75,901,325 | 209,424,080 | 36% |
+| 160 | 181,611,800 | 466,472,320 | **39%** |
 
-| 阶段 | 优化 | HSET P=160 | 累计 |
-|------|------|-----------|------|
-| 初始 | — | 176,710 | 1× |
-| P1 | Output ring buffer (消除每响应 2× malloc) | 891,266 | 5.0× |
-| P2 | Zero-copy RESP 解析 (argv 指入 inbuf) | 952,381 | 5.4× |
-| P3A | 预编码 RESP 字面量 (绕开 snprintf) | 1,029,866 | 5.8× |
-| P3B | 首字符 switch 快速分发 | 1,043,841 | 5.9× |
-| P4A | 栈分配 resp 缓冲 (消除 64KB malloc) | 1,092,896 | 6.2× |
-| P5 | 单次分配 _create_node (node+key+value) | 1,127,396 | 6.4× |
-| P6 | repl_broadcast 快速路径 (无 slave 免锁) | 1,179,245 | 6.7× |
-| **最终** | | **1,228,501** | **6.9×** |
+**HSET AOF always（每条命令 fsync）：**
+
+| P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
+|--------|-----------------|---------------|----------|
+| 1 | 128,766 | 121,581 | **106%** |
+| 10 | 111,687 | 12,594,458 | 0.9% |
+| 20 | 445,216 | 36,429,870 | 1.2% |
+| 40 | 1,784,838 | 92,592,590 | 1.9% |
+| 80 | 7,125,045 | 219,178,080 | 3.3% |
+| 160 | 28,520,498 | 449,438,200 | **6.3%** |
 
 ##### 结果分析
 
-**① 单命令（P=1）kvstore 比 Redis 快 8-11%**
+**① 单请求（P=1）kvstore 领先，pipeline 场景 Redis 反超**
 
-无 pipeline 时，kvstore 的 RESP 解析 + 引擎写入比 Redis 更快。ECHO 和 HSET 均领先。
+P=1 时 kvstore HSET 比 Redis 快 ~3%（127k vs 124k）。Pipeline 深度增加后 Redis 持续拉大差距——HSET disable 从 P=10 的 2.1× 到 P=160 的 2.1×。差距来自 kvstore 公共路径瓶颈：每命令的 RESP 解析循环、函数调用、环缓冲操作等数十个微小开销累积。
 
-**② Pipeline 批量场景 Redis 仍领先 2.3×**
+**② AOF disable vs everysec 差距不大（~13%），kvstore 的 fsync 异步化有效**
 
-Pipeline 深度增加时，kvstore 的命令吞吐线性扩展（P=160 时 218× vs P=1），
-但 Redis 扩展更快（4475×）。差距来自 kvstore 的公共路径瓶颈：
-每命令的 RESP 解析循环、函数调用、环缓冲操作等数十个微小开销累积。
+everysec 模式下 fsync 由后台定时器触发，不阻塞命令路径。kvstore everysec 比 disable 低 13%（P=160: 182M vs 210M），Redis 同类差距更小。两者 everysec 都接近 disable 性能。
 
-**③ Echo P=10 已达 Redis 91%，差距主要在高 pipeline 深度**
+**③ AOF always 是 kvstore pipeline 的最大弱项**
 
-小 pipeline（P=10）时 kvstore 接近 Redis，大 pipeline（P=160）时差距拉大至 2.3×。
-原因是 kvstore 的 `on_read` → `parse_resp_stream` → `on_write` 循环中
-每批次有固定开销（epoll_wait + recv/send syscall），大 pipeline 时摊销不够。
+kvstore AOF always 在 pipeline 下性能极差——P=160 时仅 28.5M cmd/s，是 Redis 的 6.3%。原因：
 
-**④ AOF always Pipeline 性能 (2026-06-12 更新)**
+- **Group commit 序列化瓶颈**：每个 pipeline 批次到达 → 处理 N 条命令并写入 AOF buffer → flush buffer（io_uring write+fsync）→ 等待 fsync 完成 → 发送所有响应。fsync 延迟（~70µs NVMe）成为串行瓶颈。
+- **P=10 时 pipeline 反而有害**：111k cmd/s 低于 P=1 的 129k。pipeline 批次的 fsync 开销超过了批量命令处理节省的时间。
+- **Redis 5.0.7 AOF always pipeline 几乎无开销**：与 no-AOF 模式持平（450M vs 451M）。HSET 路径不触发 openat/close（SET 才有此问题），per-command fdatasync 在大 pipeline 下被内核 buffer 合并。
 
-SET 命令下 kvstore AOF always 在 pipeline 场景也全面超越 Redis 5.0.7：
+**④ kvstore AOF always 的 pipeline 优化空间**
 
-| P | Redis always | kvstore always | kv/Redis |
-|---|-------------|----------------|----------|
-| 10 | 23,474 | **192,308** | **8.2×** |
-| 40 | 92,593 | **625,000** | **6.8×** |
-| 160 | 250,000 | **1,000,000** | **4.0×** |
+当前 group commit 的 flush 时机依赖 reactor epoll 循环结束，但 pipeline 批次在单次 `on_read` 中处理完毕后就触发 flush。改进方向：
 
-HSET 因渐进式 rehash 开销，在高 pipeline 下落后 Redis（P≥40）。详情见上文「AOF Pipeline 性能对比」节。
+- **多批次合并 fsync**：累积多个 pipeline 批次后再做一次 fsync（牺牲延迟换吞吐）
+- **绕过 io_uring 的 write+fsync 双 SQE**：尝试 pwrite+fdatasync 单 syscall 路径
+- **AOF always 场景下不推荐大 pipeline**：P=1 时 group commit 已将 fsync 开销摊到 2ms 窗口内的所有命令（~250 条），已经是最大有效批量
 
 ##### 结论
 
 | 场景 | 推荐方案 | 说明 |
 |------|---------|------|
-| 单请求性能 | **kvstore** | P=1 时 Echo/HSET 均快于 Redis 8-11% |
-| 小 pipeline (P≤10) | **kvstore** | Echo 达 Redis 91%，HSET 达 50% |
-| 大 pipeline (P≥40) | Redis | Redis 的紧凑事件循环 + 15 年优化仍有优势 |
-| pipeline + AOF always SET | **kvstore** | Group commit 摊销 fsync，4-9× Redis 5.0.7 |
-| pipeline + AOF always HSET | Redis | 渐进式 rehash 开销待优化 |
+| P=1 单请求 | **kvstore** | HSET 127k vs Redis 124k，略快 |
+| Pipeline + 无 AOF | Redis | P=160 时 451M vs kvstore 210M（2.1×） |
+| Pipeline + AOF everysec | Redis | P=160 时 466M vs kvstore 182M（2.6×） |
+| Pipeline + AOF always | **Redis** | P=160 时 449M vs kvstore 28.5M（**15.8×**） |
+| 单请求 + AOF always | **kvstore** | Group commit 使单请求 AOF always 无开销 |
 
-> **注意**：kvstore pipeline 从初始 113× 差距优化至 2.3×（6 个 Phase，6.9× 提升）。
-> 剩余差距来自数十个微小 CPU 开销累积，非单一瓶颈可突破。
-> 详见 `docs/pipeline-optimization.md`。
+> **注意**：AOF always 下非 pipeline 场景 kvstore 表现优异（129k vs Redis 122k），
+> 但 pipeline 场景因 group commit 的 fsync 串行化而大幅落后。
+> 生产环境中 AOF always + pipeline 组合应使用 Redis，
+> 或考虑改用 AOF everysec（kvstore P=160: 182M，差距缩小到 2.6×）。
 
 ### 运行基准测试
 

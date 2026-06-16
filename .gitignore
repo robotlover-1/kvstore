@@ -76,6 +76,12 @@ Thumbs.db
 .cache/
 
 # ============================================
+# Benchmark generated outputs
+# ============================================
+benchmarks/data/pipeline_bench/*.txt
+benchmarks/data/pipeline_bench/pipeline_summary.csv
+
+# ============================================
 # Environment / config overrides (local only)
 # ============================================
 .env

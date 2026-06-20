@@ -1,0 +1,88 @@
+# Makefile.perf — 独立性能测试（不依赖 kvstore）
+# 用法:
+#   make -f Makefile.perf all           # 编译所有测试
+#   make -f Makefile.perf clean         # 清理
+#   make -f Makefile.perf test-qps      # 运行 eBPF vs userspace QPS 测试
+#   make -f Makefile.perf test-thru     # 运行 RDMA vs sendfile vs iperf3 吞吐量测试
+
+CC       := gcc
+CLANG    := clang
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu
+
+CFLAGS   := -Wall -Wextra -O2 -I/usr/include
+LDFLAGS  := -lpthread
+
+# eBPF 相关
+EBPF_LIBS := -lbpf -lelf -lz
+
+# RDMA 相关
+RDMA_LIBS := -libverbs -lrdmacm
+
+# --- 目标 ---
+ALL := test_ebpf_forward_qps test_rdma_throughput test_sendfile_throughput
+ALL += test_kprobe_echo_qps test_kprobe_repl_qps test_slave_receiver
+BPF_OBJ := ebpf_forward.bpf.o
+KPROBE_BPF_OBJ := kprobe_capture.bpf.o
+
+.PHONY: all clean test-qps test-kprobe test-thru
+
+all: $(ALL)
+
+# --- vmlinux.h (从 BTF 生成，只需一次) ---
+vmlinux.h:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+# --- BPF 对象 ---
+$(BPF_OBJ): ebpf_forward.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+$(KPROBE_BPF_OBJ): kprobe_capture.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+# --- eBPF QPS 测试 ---
+test_ebpf_forward_qps: test_ebpf_forward_qps.c $(BPF_OBJ) common.h
+	$(CC) $(CFLAGS) -o $@ test_ebpf_forward_qps.c $(EBPF_LIBS) $(LDFLAGS)
+
+# --- kprobe echo QPS 测试 ---
+test_kprobe_echo_qps: test_kprobe_echo_qps.c $(KPROBE_BPF_OBJ) common.h
+	$(CC) $(CFLAGS) -o $@ test_kprobe_echo_qps.c $(EBPF_LIBS) $(LDFLAGS)
+
+# --- kprobe 主从转发 QPS 测试 ---
+test_kprobe_repl_qps: test_kprobe_repl_qps.c $(KPROBE_BPF_OBJ) common.h
+	$(CC) $(CFLAGS) -o $@ test_kprobe_repl_qps.c $(EBPF_LIBS) $(LDFLAGS)
+
+# --- 独立 slave receiver ---
+test_slave_receiver: test_slave_receiver.c
+	$(CC) $(CFLAGS) -o $@ test_slave_receiver.c $(LDFLAGS)
+
+# --- RDMA 吞吐量测试 ---
+test_rdma_throughput: test_rdma_throughput.c common.h
+	$(CC) $(CFLAGS) -o $@ test_rdma_throughput.c $(RDMA_LIBS) $(LDFLAGS) -lm
+
+# --- sendfile 吞吐量测试 ---
+test_sendfile_throughput: test_sendfile_throughput.c common.h
+	$(CC) $(CFLAGS) -o $@ test_sendfile_throughput.c $(LDFLAGS)
+
+# --- 运行测试 ---
+test-qps: test_ebpf_forward_qps
+	@echo "=== eBPF sockmap vs userspace proxy QPS 对比 ==="
+	sudo ./test_ebpf_forward_qps --mode both --payload 64 --count 100000
+	@echo ""
+	sudo ./test_ebpf_forward_qps --mode both --payload 256 --count 100000
+	@echo ""
+	sudo ./test_ebpf_forward_qps --mode both --payload 1024 --count 50000
+
+test-kprobe: test_kprobe_echo_qps
+	@echo "=== kprobe capture vs userspace echo QPS 对比 ==="
+	sudo ./test_kprobe_echo_qps --mode both --payload 64 --count 10000
+	@echo ""
+	sudo ./test_kprobe_echo_qps --mode both --payload 256 --count 10000
+	@echo ""
+	sudo ./test_kprobe_echo_qps --mode both --payload 1024 --count 5000
+
+test-thru: test_rdma_throughput test_sendfile_throughput
+	@echo "=== RDMA vs sendfile vs iperf3 吞吐量对比 ==="
+	bash run_throughput_compare.sh
+
+clean:
+	rm -f $(ALL) $(BPF_OBJ) $(KPROBE_BPF_OBJ) vmlinux.h /tmp/perf_test_file

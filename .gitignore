@@ -49,6 +49,18 @@ kvstore.pid
 *.bpf.o
 
 # ============================================
+# Perf test generated files
+# ============================================
+/tests/perf/vmlinux.h
+/tests/perf/test_ebpf_forward_qps
+/tests/perf/test_rdma_throughput
+/tests/perf/test_sendfile_throughput
+/tests/perf/test_kprobe_echo_qps
+/tests/perf/test_kprobe_repl_qps
+/tests/perf/test_slave_receiver
+/tmp/perf_test_file
+
+# ============================================
 # Local logs and debug files
 # ============================================
 *.log

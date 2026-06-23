@@ -447,6 +447,10 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                 perror("connect slave");
                 close(slave_fd);
                 slave_fd = -1;
+            } else {
+                /* 限制发送缓冲区，快速暴露慢消费导致的 write 阻塞 */
+                int sndbuf = 65536; /* 64KB */
+                setsockopt(slave_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
             }
         }
     }

@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 static volatile int g_running = 1;
+static int g_delay_us = 0;
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
@@ -28,13 +29,15 @@ int main(int argc, char **argv) {
 
     struct option long_opts[] = {
         {"port", required_argument, 0, 'p'},
+        {"delay", required_argument, 0, 'd'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
+        case 'd': g_delay_us = atoi(optarg); break;
         case 'h':
             printf("用法: %s [--port PORT]\n", argv[0]);
             return 0;
@@ -59,7 +62,7 @@ int main(int argc, char **argv) {
         perror("listen"); return 1;
     }
 
-    printf("[slave] listening on 0.0.0.0:%d\n", port);
+    printf("[slave] listening on 0.0.0.0:%d, delay=%dus\n", port, g_delay_us);
     fflush(stdout);
 
     long long total_msgs = 0;
@@ -91,6 +94,7 @@ int main(int argc, char **argv) {
         while (1) {
             ssize_t n = read(fd, buf, sizeof(buf));
             if (n <= 0) break;
+            if (g_delay_us > 0) usleep(g_delay_us);
             conn_msgs++;
             conn_bytes += n;
         }

@@ -5113,27 +5113,27 @@ throughput = (actual_iters * size * 8) / elapsed_s   // bps
 
 | 传输方式   | Payload |         吞吐量 | 对比 iperf3 |
 | ---------- | ------- | -------------: | ----------: |
-| iperf3 TCP | —      | **5,340 Mbps** |        基准 |
-| sendfile   | 4KB     | **6,540 Mbps** |     +22.5% |
-| sendfile   | 64KB    |     5,410 Mbps |      +1.3% |
-| sendfile   | 256KB   |     5,570 Mbps |      +4.3% |
-| sendfile   | 1MB     |     5,550 Mbps |      +3.9% |
-| RDMA WRITE | 4KB     |       588 Mbps |     −89.0% |
-| RDMA SEND  | 4KB     |       762 Mbps |     −85.7% |
-| RDMA WRITE | 64KB    |       968 Mbps |     −81.9% |
-| RDMA SEND  | 64KB    |       945 Mbps |     −82.3% |
-| RDMA WRITE | 256KB   |       949 Mbps |     −82.2% |
-| RDMA SEND  | 256KB   |       919 Mbps |     −82.8% |
-| RDMA WRITE | 1MB     | **1,010 Mbps** |     −81.1% |
-| RDMA SEND  | 1MB     |       995 Mbps |     −81.4% |
+| iperf3 TCP | —      | **5,370 Mbps** |        基准 |
+| sendfile   | 4KB     |     5,430 Mbps |      +1.1% |
+| sendfile   | 64KB    |     5,700 Mbps |      +6.1% |
+| sendfile   | 256KB   |     5,620 Mbps |      +4.7% |
+| sendfile   | 1MB     |     5,580 Mbps |      +3.9% |
+| RDMA WRITE | 4KB     |       833 Mbps |     −84.5% |
+| RDMA SEND  | 4KB     |       912 Mbps |     −83.0% |
+| RDMA WRITE | 64KB    |       967 Mbps |     −82.0% |
+| RDMA SEND  | 64KB    |       862 Mbps |     −83.9% |
+| RDMA WRITE | 256KB   |     1,010 Mbps |     −81.2% |
+| RDMA SEND  | 256KB   |       984 Mbps |     −81.7% |
+| RDMA WRITE | 1MB     | **1,020 Mbps** |     −81.0% |
+| RDMA SEND  | 1MB     |       994 Mbps |     −81.5% |
 
-> **2026-06-26 重测**
+> **2026-06-26 重测**（3 次取中位数，4KB 用 15000 iters 保证 ≥60MB 数据量）
 
 **关键发现**
 
-1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：在同一物理宿主机的 KVM 虚拟网络中，Soft-RoCE 将 RDMA 操作封装为 UDP 包（RoCEv2），额外封装层 + 虚拟交换机处理导致吞吐量仅为 TCP 的 ~11-19%
-2. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 吞吐量基本持平（5.4-6.5 Gbps），跨机场景下内核 TCP 栈已充分优化
-3. **RDMA WRITE ≈ RDMA SEND**：两种 RDMA 操作吞吐量接近，瓶颈在底层 RoCEv2 封装的 UDP 路径，而非 RDMA 操作类型
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA 操作通过 RoCEv2 UDP 封装，吞吐量仅为 TCP 的 ~15-19%
+2. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 基本持平（5.4-5.7 Gbps），跨机场景内核 TCP 栈已充分优化
+3. **RDMA WRITE ≈ RDMA SEND**：瓶颈在底层 RoCEv2 UDP 路径，而非 RDMA 操作类型
 4. **本地 RDMA 可达 29 Gbps**（同机 rxe0 loopback，64KB × 500 iters），证明 Soft-RoCE 的内存带宽潜力巨大，瓶颈在网络路径
 
 > **注意**：硬件 RDMA（InfiniBand / 硬件 RoCE）跨机吞吐量预期远超 TCP。Soft-RoCE 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。

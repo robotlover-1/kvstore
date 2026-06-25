@@ -487,11 +487,9 @@ void repl_remove_slave(conn_t *c) {
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
+    repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
-    /* fast path: no replicas, skip lock */
-    if (!g_replicas) return;
-    repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     pthread_mutex_lock(&g_repl_lock);
     conn_t **pp = &g_replicas;
     while (*pp) {
@@ -519,12 +517,6 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
-        if (c->out_ring_len > 0 && g_epfd >= 0 && c->fd >= 0) {
-            struct epoll_event _ev;
-            _ev.events = EPOLLIN | EPOLLOUT;
-            _ev.data.ptr = c;
-            epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &_ev);
-        }
         pp = &c->next_replica;
     }
     pthread_mutex_unlock(&g_repl_lock);

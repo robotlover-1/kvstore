@@ -506,6 +506,24 @@ static void repl_broadcast_argv(int argc, char **argv, size_t *argl) {
     repl_broadcast(buf, pos);
 }
 
+static void repl_broadcast_argv(int argc, char **argv, size_t *argl) {
+    unsigned char buf[4096];
+    size_t pos = 0;
+    int n = snprintf((char *)buf, sizeof(buf), "*%d\r\n", argc);
+    if (n < 0 || (size_t)n >= sizeof(buf)) return;
+    pos = (size_t)n;
+    for (int i = 0; i < argc; i++) {
+        int m = snprintf((char *)buf + pos, sizeof(buf) - pos, "$%zu\r\n", argl[i]);
+        if (m < 0 || pos + (size_t)m + argl[i] + 2 > sizeof(buf)) return;
+        pos += (size_t)m;
+        memcpy(buf + pos, argv[i], argl[i]);
+        pos += argl[i];
+        buf[pos++] = '\r';
+        buf[pos++] = '\n';
+    }
+    repl_broadcast(buf, pos);
+}
+
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
@@ -550,25 +568,13 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
-        /* Try synchronous send first, register EPOLLOUT for remainder */
-        {
-            int _tries = 0;
-            while (c->out_ring_len > 0 && _tries < 3) {
-                size_t _head = (c->out_ring_tail - c->out_ring_len) & (OUT_RING_SIZE - 1);
-                size_t _chunk = OUT_RING_SIZE - _head;
-                if (_chunk > c->out_ring_len) _chunk = c->out_ring_len;
-                ssize_t _ns = send(c->fd, c->out_ring + _head, _chunk,
-                                   MSG_DONTWAIT | MSG_NOSIGNAL);
-                if (_ns < 0) { if (errno != EINTR) break; continue; }
-                c->out_ring_len -= (size_t)_ns;
-                _tries++;
-            }
-            if (c->out_ring_len > 0 && g_epfd >= 0 && c->fd >= 0) {
-                struct epoll_event _ev;
-                _ev.events = EPOLLIN | EPOLLOUT;
-                _ev.data.ptr = c;
-                epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &_ev);
-            }
+        /* 注册 EPOLLOUT — reactor 的 on_write() 会正确更新
+         * out_ring_head + out_ring_len，保证 ring buffer 一致性 */
+        if (c->out_ring_len > 0 && g_epfd >= 0 && c->fd >= 0) {
+            struct epoll_event _ev;
+            _ev.events = EPOLLIN | EPOLLOUT;
+            _ev.data.ptr = c;
+            epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &_ev);
         }
         pp = &c->next_replica;
     }

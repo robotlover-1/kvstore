@@ -4673,7 +4673,7 @@ bash tools/bench/run_pipeline_bench.sh
 redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand_int__ value
 ```
 
-> 测试日期：2026-06-16，非 sudo，端口 kvstore=5190 / Redis=6390。
+> **2026-06-26 重测**（`bash tools/bench/run_pipeline_bench.sh`，非 sudo）
 
 ##### 测试结果
 
@@ -4682,79 +4682,71 @@ redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand
 | P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
 |--------|-----------------|---------------|----------|
 | 1 | 132,820 | 124,285 | **107%** |
-| 10 | 10,080,646 | 12,706,480 | 79% |
-| 20 | 24,009,602 | 41,841,005 | 57% |
-| 40 | 48,367,590 | 111,731,840 | 43% |
-| 80 | 103,492,880 | 258,064,520 | 40% |
-| 160 | 240,601,501 | 577,617,328 | 42% |
+| 10 | 4,909,180 | 12,254,903 | 40% |
+| 20 | 10,309,280 | 42,105,260 | 24% |
+| 40 | 27,453,680 | 107,238,600 | 26% |
+| 80 | 64,000,000 | 261,437,920 | 24% |
+| 160 | 144,144,160 | 559,440,480 | 26% |
 
 **HSET AOF 关闭（引擎写入，无持久化）：**
 
 | P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
 |--------|-----------------|---------------|----------|
 | 1 | 136,295 | 124,409 | **110%** |
-| 10 | 6,093,845 | 12,515,644 | 49% |
-| 20 | 15,071,590 | 36,968,575 | 41% |
-| 40 | 38,535,645 | 91,743,120 | 42% |
-| 80 | 89,285,685 | 205,128,220 | 44% |
-| 160 | 209,698,560 | 450,704,240 | **47%** |
+| 10 | 3,154,570 | 12,886,600 | 24% |
+| 20 | 8,103,720 | 36,563,080 | 22% |
+| 40 | 18,894,680 | 91,743,120 | 21% |
+| 80 | 43,525,600 | 204,081,680 | 21% |
+| 160 | 89,837,120 | 441,988,960 | **20%** |
 
 **HSET AOF everysec（每秒 fsync）：**
 
 | P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
 |--------|-----------------|---------------|----------|
-| 1 | 128,833 | — | — |
-| 10 | 5,817,336 | 12,360,939 | 47% |
-| 20 | 13,614,704 | 36,166,368 | 38% |
-| 40 | 33,195,020 | 91,743,120 | 36% |
-| 80 | 75,901,325 | 209,424,080 | 36% |
-| 160 | 181,611,800 | 466,472,320 | **39%** |
+| 1 | 136,537 | 121,374 | **112%** |
+| 10 | 3,036,740 | 12,738,850 | 24% |
+| 20 | 7,665,780 | 35,778,180 | 21% |
+| 40 | 18,173,560 | 92,807,440 | 20% |
+| 80 | 41,386,480 | 207,792,240 | 20% |
+| 160 | 87,863,840 | 454,545,440 | **19%** |
 
 **HSET AOF always（每条命令 fsync）：**
 
 | P 深度 | kvstore (cmd/s) | Redis (cmd/s) | kv/redis |
 |--------|-----------------|---------------|----------|
 | 1 | 74,610 | 123,533 | **60%** |
-| 10 | 111,687 | 12,594,458 | 0.9% |
-| 20 | 445,216 | 36,429,870 | 1.2% |
-| 40 | 1,784,838 | 92,592,590 | 1.9% |
-| 80 | 7,125,045 | 219,178,080 | 3.3% |
-| 160 | 28,520,498 | 449,438,200 | **6.3%** |
+| 10 | 111,480 | 12,269,940 | 0.9% |
+| 20 | 445,220 | 36,297,640 | 1.2% |
+| 40 | 1,782,280 | 92,165,920 | 1.9% |
+| 80 | 7,099,120 | 206,718,320 | 3.4% |
+| 160 | 28,444,480 | 450,704,320 | **6.3%** |
 
 ##### 结果分析
 
-**① 单请求（P=1）kvstore 领先，pipeline 场景 Redis 反超**
+**① P=1 kvstore 领先，pipeline 场景 Redis 大幅反超**
 
-P=1 时 kvstore HSET 比 Redis 快 ~3%（127k vs 124k）。Pipeline 深度增加后 Redis 持续拉大差距——HSET disable 从 P=10 的 2.1× 到 P=160 的 2.1×。差距来自 kvstore 公共路径瓶颈：每命令的 RESP 解析循环、函数调用、环缓冲操作等数十个微小开销累积。
+P=1 时 kvstore ECHO（132,820）和 HSET（136,295）均领先 Redis。Pipeline 下 Redis 持续拉大差距——HSET disable P=160 时 442M vs 90M（4.9×）。差距来自 kvstore 每命令的 RESP 解析（copy 方式）、环缓冲操作等公共路径开销在 pipeline 批处理中累积。
 
-**② AOF disable vs everysec 差距不大（~13%），kvstore 的 fsync 异步化有效**
+**② AOF disable vs everysec 差距极小**
 
-everysec 模式下 fsync 由后台定时器触发，不阻塞命令路径。kvstore everysec 比 disable 低 13%（P=160: 182M vs 210M），Redis 同类差距更小。两者 everysec 都接近 disable 性能。
+everysec 模式下 fsync 异步触发，不阻塞命令路径。kvstore P=160 时 everysec（87.9M）≈ disable（89.8M），差距仅 2.1%。Redis 同类表现类似。
 
 **③ AOF always 是 kvstore pipeline 的最大弱项**
 
-kvstore AOF always 在 pipeline 下性能极差——P=160 时仅 28.5M cmd/s，是 Redis 的 6.3%。原因：
+kvstore AOF always 在 pipeline 下性能极差——P=160 时仅 28.4M cmd/s，是 Redis 的 6.3%。原因：
 
 - **Group commit 序列化瓶颈**：每个 pipeline 批次到达 → 处理 N 条命令并写入 AOF buffer → flush buffer（io_uring write+fsync）→ 等待 fsync 完成 → 发送所有响应。fsync 延迟（~70µs NVMe）成为串行瓶颈。
-- **P=10 时 pipeline 反而有害**：111k cmd/s 低于 P=1 的 129k。pipeline 批次的 fsync 开销超过了批量命令处理节省的时间。
-- **Redis 5.0.7 AOF always pipeline 几乎无开销**：与 no-AOF 模式持平（450M vs 451M）。HSET 路径不触发 openat/close（SET 才有此问题），per-command fdatasync 在大 pipeline 下被内核 buffer 合并。
-
-**④ kvstore AOF always 的 pipeline 优化空间**
-
-当前 group commit 的 flush 时机依赖 reactor epoll 循环结束，但 pipeline 批次在单次 `on_read` 中处理完毕后就触发 flush。改进方向：
-
-- **多批次合并 fsync**：累积多个 pipeline 批次后再做一次 fsync（牺牲延迟换吞吐）
-- **绕过 io_uring 的 write+fsync 双 SQE**：尝试 pwrite+fdatasync 单 syscall 路径
-- **AOF always 场景下不推荐大 pipeline**：P=1 时 group commit 已将 fsync 开销摊到 2ms 窗口内的所有命令（~250 条），已经是最大有效批量
+- **P=10 时 pipeline 反而有害**：111k cmd/s 低于 P=1 的 74.6k。pipeline 批次的 fsync 开销超过了批量命令处理节省的时间。
+- **Redis 5.0.7 AOF always pipeline 几乎无开销**：与 no-AOF 模式持平（451M vs 442M）。
 
 ##### 结论
 
 | 场景 | 推荐方案 | 说明 |
 |------|---------|------|
-| P=1 单请求 | **kvstore** | HSET 127k vs Redis 124k，略快 |
-| Pipeline + 无 AOF | Redis | P=160 时 451M vs kvstore 210M（2.1×） |
-| Pipeline + AOF everysec | Redis | P=160 时 466M vs kvstore 182M（2.6×） |
-| Pipeline + AOF always | **Redis** | P=160 时 449M vs kvstore 28.5M（**15.8×**） |
+| P=1 单请求 | **kvstore** | HSET 136k vs Redis 124k，略快 |
+| Pipeline + 无 AOF | Redis | P=160 时 442M vs kvstore 90M（4.9×） |
+| Pipeline + AOF everysec | Redis | P=160 时 455M vs kvstore 88M（5.2×） |
+| Pipeline + AOF always | **Redis** | P=160 时 451M vs kvstore 28.4M（**15.9×**） |
 | 单请求 + AOF always | **kvstore** | Group commit 使单请求 AOF always 无开销 |
 
 > **注意**：AOF always 下非 pipeline 场景 kvstore 表现优异（129k vs Redis 122k），

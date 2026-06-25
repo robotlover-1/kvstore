@@ -4762,16 +4762,92 @@ kvstore AOF always 在 pipeline 下性能极差——P=160 时仅 28.5M cmd/s，
 
 ### 运行基准测试
 
-```bash
-# 一键运行全部组合（需 sudo，脚本自动启动/停止 kvstore）
-bash tools/bench/run_all_benchmarks.sh
+#### 一键运行
 
-# 或单独指定参数
+```bash
+bash tools/bench/run_all_benchmarks.sh      # 全部基准
+bash tools/bench/run_pipeline_bench.sh       # Pipeline 批量（SET + HSET，P=10/20/40/80/160）
+bash tools/bench/run_persist_bench.sh        # AOF 持久化（always/everysec/disable + ECHO 基线）
+bash tools/bench/run_save_hset.sh            # SAVE 性能（HSET 写入 + SAVE 耗时）
+bash tools/bench/run_benchmark.sh            # 通用入口
+```
+
+#### Pipeline 批量性能（手动）
+
+```bash
+# 启动 kvstore（按需替换 appendfsync）
+sed -i 's/appendfsync=.*/appendfsync=always/' kvstore.conf  # always / everysec
+sed -i 's/aof_enabled=.*/aof_enabled=0/' kvstore.conf       # 0=关闭 1=开启
+./kvstore kvstore.conf --role master --port 6800 --aof-disable \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp &
+sleep 2
+
+# SET pipeline（单连接，可变 P）
+for P in 1 10 20 40 80 160; do
+  redis-benchmark -p 6800 -n 100000 -c 1 -P $P SET -q
+done
+
+# HSET pipeline（单 key 多 field，避免 rehash 干扰）
+for P in 1 10 20 40; do
+  redis-benchmark -p 6800 -n 100000 -c 1 -P $P HSET myhash __rand_int__ value -q
+done
+
+pkill kvstore
+```
+
+#### AOF 并发性能（手动）
+
+```bash
+# 启动 kvstore
+sed -i 's/appendfsync=.*/appendfsync=always/' kvstore.conf
+./kvstore kvstore.conf --role master --port 6800 \
+    --repl-fullsync-transport tcp --repl-realtime-transport tcp &
+sleep 2
+
+# ECHO 基线（纯协议开销）
+redis-benchmark -p 6800 -n 1000000 -c 50 -P 1 -d 64 ECHO
+
+# HSET 多 key（100 万个独立 key，避免单 key 巨型 hash）
+redis-benchmark -p 6800 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 \
+    HSET key:__rand_int__ value
+
+pkill kvstore
+```
+
+#### 内存后端性能
+
+```bash
+# 分别用三种后端启动，redis-benchmark HSET 写入
 sudo python3 tools/bench/bench_mem_backend.py \
   --binary ./kvstore --base-port 6500 \
   --ops 50000 --value-size 128 \
   --backends libc,jemalloc,custom \
   --csv my_bench.csv
+```
+
+#### SAVE 性能
+
+```bash
+bash tools/bench/run_save_hset.sh
+
+# 或手动:
+# 1. 启动 kvstore（AOF 关闭，Hash 引擎）
+# 2. redis-benchmark 写入 N 条 HSET
+# 3. redis-cli SAVE，记录耗时
+# 4. 检查 dump 文件大小
+```
+
+#### 跨机复制性能
+
+```bash
+# 主机
+sudo ./kvstore kvstore.conf --role master
+
+# 从机
+sudo ./kvstore kvstore.conf --role slave
+
+# 测试（主机 tests/ 目录）
+./test_repl_5w5w --config test.conf
 ```
 
 ### eBPF kprobe 主从转发 QPS 对比（跨虚拟机）

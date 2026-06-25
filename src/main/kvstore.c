@@ -486,6 +486,26 @@ void repl_remove_slave(conn_t *c) {
     pthread_mutex_unlock(&g_repl_lock);
 }
 
+static void repl_broadcast_argv(int argc, char **argv, size_t *argl) {
+    /* Re-encode RESP from argv to avoid zero-copy parser \0 corruption */
+    unsigned char buf[4096];
+    size_t pos = 0;
+    int n = snprintf((char *)buf, sizeof(buf), "*%d\r\n", argc);
+    if (n < 0 || (size_t)n >= sizeof(buf)) return;
+    pos = (size_t)n;
+    for (int i = 0; i < argc; i++) {
+        int m = snprintf((char *)buf + pos, sizeof(buf) - pos,
+                         "$%zu\r\n", argl[i]);
+        if (m < 0 || pos + (size_t)m + argl[i] + 2 > sizeof(buf)) return;
+        pos += (size_t)m;
+        memcpy(buf + pos, argv[i], argl[i]);
+        pos += argl[i];
+        buf[pos++] = '\r';
+        buf[pos++] = '\n';
+    }
+    repl_broadcast(buf, pos);
+}
+
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
@@ -519,6 +539,14 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
+        while (c->out_ring_len > 0) {
+            size_t _head = (c->out_ring_tail - c->out_ring_len) & (OUT_RING_SIZE - 1);
+            size_t _chunk = OUT_RING_SIZE - _head;
+            if (_chunk > c->out_ring_len) _chunk = c->out_ring_len;
+            ssize_t _ns = send(c->fd, c->out_ring + _head, _chunk, MSG_NOSIGNAL);
+            if (_ns < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; break; }
+            c->out_ring_len -= (size_t)_ns;
+        }
         pp = &c->next_replica;
     }
     pthread_mutex_unlock(&g_repl_lock);
@@ -1445,7 +1473,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1463,7 +1491,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1481,7 +1509,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1559,7 +1587,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             }
         } else {
             n = resp_error(resp, BUFFER_CAP, "docset failed");
@@ -1580,7 +1608,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             }
         } else if (drc == 1) {
             n = resp_error(resp, BUFFER_CAP, "doc or field not found");
@@ -1597,7 +1625,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             }
         } else if (drc == 1) {
             n = resp_error(resp, BUFFER_CAP, "doc not found");
@@ -1803,7 +1831,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
             persist_append_raw(raw, rawlen);
-            if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
             /* group commit: if data was buffered (not flushed), defer response */
             if (c && persist_aof_has_pending()) {
                 persist_defer_response(c, (unsigned char *)resp, (size_t)n);

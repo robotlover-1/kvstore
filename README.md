@@ -182,32 +182,33 @@ kvstore/
 >
 > 测试脚本：`tools/bench/mem_pool_bench.py`
 
-| 后端 | 阶段 | 数据量 | VmSize (KB) | VmRSS (KB) | RSS/Size |
-|------|------|--------|-------------|------------|----------|
-| **libc** | 基线 | 0 | 5,344 | 3,600 | 67.4% |
-| | 写入 1% | 1w | 7,120 | 4,652 | 65.3% |
-| | 写入 10% | 10w | 13,216 | 11,268 | 85.3% |
-| | 写入 50% | 50w | 39,700 | 37,756 | 95.1% |
-| | **写入 100%（峰值）** | **100w** | **72,900** | **71,164** | **97.6%** |
-| | 释放 50% | 50w | 72,900 | 71,164 | 97.6% |
-| | 释放 80% | 20w | 72,900 | 71,164 | 97.6% |
-| | 释放 100% | 0 | 72,900 | 40,384 | 55.4% |
-| **jemalloc** | 基线 | 0 | 19,460 | 5,736 | 29.5% |
-| | 写入 1% | 1w | 22,020 | 6,784 | 30.8% |
-| | 写入 10% | 10w | 25,092 | 11,764 | 46.9% |
-| | 写入 50% | 50w | 59,396 | 40,116 | 67.5% |
-| | **写入 100%（峰值）** | **100w** | **96,260** | **73,560** | **76.4%** |
-| | 释放 50% | 50w | 96,260 | 61,540 | 63.9% |
-| | 释放 80% | 20w | 96,260 | 35,028 | 36.4% |
-| | 释放 100% | 0 | 96,260 | 18,652 | 19.4% |
-| **custom** | 基线 | 0 | 5,528 | 3,744 | 67.7% |
-| | 写入 1% | 1w | 7,228 | 4,796 | 66.4% |
-| | 写入 10% | 10w | 13,056 | 11,260 | 86.2% |
-| | 写入 50% | 50w | 38,808 | 37,024 | 95.4% |
-| | **写入 100%（峰值）** | **100w** | **71,224** | **69,392** | **97.4%** |
-| | 释放 50% | 50w | 44,984 | 43,152 | 95.9% |
-| | 释放 80% | 20w | 27,448 | 25,616 | 93.3% |
-| | 释放 100% | 0 | **15,992** | **14,160** | **88.5%** |
+
+| 后端         | 阶段                  | 数据量   | VmSize (KB) | VmRSS (KB) | RSS/Size  |
+| ------------ | --------------------- | -------- | ----------- | ---------- | --------- |
+| **libc**     | 基线                  | 0        | 5,344       | 3,600      | 67.4%     |
+|              | 写入 1%               | 1w       | 7,120       | 4,652      | 65.3%     |
+|              | 写入 10%              | 10w      | 13,216      | 11,268     | 85.3%     |
+|              | 写入 50%              | 50w      | 39,700      | 37,756     | 95.1%     |
+|              | **写入 100%（峰值）** | **100w** | **72,900**  | **71,164** | **97.6%** |
+|              | 释放 50%              | 50w      | 72,900      | 71,164     | 97.6%     |
+|              | 释放 80%              | 20w      | 72,900      | 71,164     | 97.6%     |
+|              | 释放 100%             | 0        | 72,900      | 40,384     | 55.4%     |
+| **jemalloc** | 基线                  | 0        | 19,460      | 5,736      | 29.5%     |
+|              | 写入 1%               | 1w       | 22,020      | 6,784      | 30.8%     |
+|              | 写入 10%              | 10w      | 25,092      | 11,764     | 46.9%     |
+|              | 写入 50%              | 50w      | 59,396      | 40,116     | 67.5%     |
+|              | **写入 100%（峰值）** | **100w** | **96,260**  | **73,560** | **76.4%** |
+|              | 释放 50%              | 50w      | 96,260      | 61,540     | 63.9%     |
+|              | 释放 80%              | 20w      | 96,260      | 35,028     | 36.4%     |
+|              | 释放 100%             | 0        | 96,260      | 18,652     | 19.4%     |
+| **custom**   | 基线                  | 0        | 5,528       | 3,744      | 67.7%     |
+|              | 写入 1%               | 1w       | 7,228       | 4,796      | 66.4%     |
+|              | 写入 10%              | 10w      | 13,056      | 11,260     | 86.2%     |
+|              | 写入 50%              | 50w      | 38,808      | 37,024     | 95.4%     |
+|              | **写入 100%（峰值）** | **100w** | **71,224**  | **69,392** | **97.4%** |
+|              | 释放 50%              | 50w      | 44,984      | 43,152     | 95.9%     |
+|              | 释放 80%              | 20w      | 27,448      | 25,616     | 93.3%     |
+|              | 释放 100%             | 0        | **15,992**  | **14,160** | **88.5%** |
 
 ##### 结果分析
 
@@ -217,11 +218,12 @@ libc（ptmalloc2）使用 sbrk + mmap 混合策略，100w key 需 73 MB（~75 by
 
 **② 物理内存释放：custom 最彻底（87%），jemalloc 次之（75%），libc 最差（43%）**
 
-| 后端 | 峰值 VmRSS | 释放后 VmRSS | 释放率 |
-|------|-----------|-------------|--------|
-| **libc** | 71,164 KB | 40,384 KB | **43.3%** |
-| **jemalloc** | 73,560 KB | 18,652 KB | **74.6%** |
-| **custom** | 69,392 KB | 14,160 KB | **79.6%** |
+
+| 后端         | 峰值 VmRSS | 释放后 VmRSS | 释放率    |
+| ------------ | ---------- | ------------ | --------- |
+| **libc**     | 71,164 KB  | 40,384 KB    | **43.3%** |
+| **jemalloc** | 73,560 KB  | 18,652 KB    | **74.6%** |
+| **custom**   | 69,392 KB  | 14,160 KB    | **79.6%** |
 
 - **libc**：free 后通过 arena 收缩归还部分物理页，但 VmRSS 仍保留 57%（40 MB），释放最保守。VmSize 完全不降（sbrk 堆区不归还）。
 - **jemalloc**：后台线程主动 purge dirty pages，释放率 75%。释放过程最平滑——free_50% 已降至 61,540 KB（60 MB），free_80% 降至 35,028 KB（34 MB），逐步归还。VmSize 保持不变（mmap 保留地址空间）。
@@ -229,11 +231,12 @@ libc（ptmalloc2）使用 sbrk + mmap 混合策略，100w key 需 73 MB（~75 by
 
 **③ 三种后端的适用场景**
 
-| 后端 | 适用场景 | 不适用场景 |
-|------|---------|-----------|
-| **libc** | 通用场景，内存占用最低，碎片可控 | 需要主动归还内存（需手动 trim） |
-| **jemalloc** | 长时间运行、内存自动回收需求 | 启动虚拟内存占用偏高（19 MB 基线） |
-| **custom** | 高频 alloc/free、数据量稳定（O(1) 无碎片） | 数据量波动极大（释放粒度 < 单页 chunk 数时无法回收） |
+
+| 后端         | 适用场景                                   | 不适用场景                                           |
+| ------------ | ------------------------------------------ | ---------------------------------------------------- |
+| **libc**     | 通用场景，内存占用最低，碎片可控           | 需要主动归还内存（需手动 trim）                      |
+| **jemalloc** | 长时间运行、内存自动回收需求               | 启动虚拟内存占用偏高（19 MB 基线）                   |
+| **custom**   | 高频 alloc/free、数据量稳定（O(1) 无碎片） | 数据量波动极大（释放粒度 < 单页 chunk 数时无法回收） |
 
 > **注意**：custom 已实现空闲页回收，释放后内存可归还 OS。但如果数据量在单页 chunk 数（~500-2000 个）范围内波动，
 > 部分页始终无法完全空闲，物理内存不会下降。极端场景下仍建议 **libc** 或 **jemalloc**。
@@ -249,6 +252,7 @@ libc（ptmalloc2）使用 sbrk + mmap 混合策略，100w key 需 73 MB（~75 by
 *方案*：per-page 追踪 `chunks_in_use`，整页空闲时 munmap 归还 OS。
 
 *关键代码*：
+
 ```c
 // slab_page_t 新增字段
 size_t chunks_total;   // 该页总 chunk 数
@@ -270,6 +274,7 @@ if (pg->chunks_in_use == 0)
 *方案*：参考 jemalloc（~1.19× 间距）和 TCMalloc（~1.12× 间距），扩展为 17 级 `{16,24,32,...,1024}`，~1.25× 几何级数，内部碎片上限控制在 25%。
 
 *关键改动*：
+
 ```
 SMALL_CLASS_COUNT  8 → 17
 class sizes:  {32,64,128,...}  →  {16,24,32,40,56,72,96,128,160,200,256,320,400,512,640,800,1024}
@@ -302,14 +307,15 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 
 *效果*：每条目 `chunk_total = 16 + 56 = 72B`（vs 旧 80B），省 8 字节 × 1M = 8 MB。峰值 VmSize 89 MB → **81 MB**（与 libc 差距 11%）。
 
-| 阶段 | 峰值 VmSize | vs libc | bytes/条目 | 释放率 |
-|------|-----------|---------|-----------|--------|
-| 初始 (8 class, 24B header, 无回收) | 96,592 KB | +32% | 98.9 | 0% |
-| P1: 空闲页回收 | 96,592 KB | +32% | 98.9 | 86% |
-| P2: 17 级密集 class | 88,764 KB | +22% | 90.9 | 86% |
-| P3: 压缩 header 24→16B | 80,956 KB | +11% | 82.9 | 85% |
-| **P4: free_stack 索引 16→4B** | **71,224 KB** | **-2.3%** | **72.9** | **80%** |
-| *libc 基线* | *72,900 KB* | — | *74.6* | *43%* |
+
+| 阶段                               | 峰值 VmSize   | vs libc   | bytes/条目 | 释放率  |
+| ---------------------------------- | ------------- | --------- | ---------- | ------- |
+| 初始 (8 class, 24B header, 无回收) | 96,592 KB     | +32%      | 98.9       | 0%      |
+| P1: 空闲页回收                     | 96,592 KB     | +32%      | 98.9       | 86%     |
+| P2: 17 级密集 class                | 88,764 KB     | +22%      | 90.9       | 86%     |
+| P3: 压缩 header 24→16B            | 80,956 KB     | +11%      | 82.9       | 85%     |
+| **P4: free_stack 索引 16→4B**     | **71,224 KB** | **-2.3%** | **72.9**   | **80%** |
+| *libc 基线*                        | *72,900 KB*   | —        | *74.6*     | *43%*   |
 
 *P4 已反超 libc*（71 MB < 73 MB，73 bytes/条目 < 75 bytes/条目）。用 per-page `uint16_t` 索引栈（LIFO）替代链表 `next` 指针，`small_chunk_t` 从 16B 压缩到 4B（request_size:2 + magic:1 + class_idx:1）。每条目 `chunk_total = 4 + 56 = 60B`，比 libc 的 malloc 元数据更紧凑。释放后残留 ~14 MB（基线 ~4 MB），来自 free_stack 元数据 + 阈值缓冲页。
 
@@ -327,22 +333,22 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 ### 功能矩阵
 
 
-| 功能                         | 状态      | 说明                                                              |
-| ---------------------------- | --------- | ----------------------------------------------------------------- |
-| RESP 协议                    | ✅ 完成   | 完整解析与响应                                                    |
-| 全量持久化 (dump)            | ✅ 完成   | 二进制`KVSD` 格式，优先 mmap 恢复                                 |
-| 增量持久化 (AOF)             | ✅ 完成   | RESP 命令格式，优先 io_uring 写入                                 |
-| SAVE / BGSAVE / BGREWRITEAOF | ✅ 完成   | 支持同步/异步持久化                                               |
-| 主从复制                     | ✅ 完成   | FULLRESYNC + partial resync + backlog                             |
-| RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用                |
-| eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速                      |
-| kprobe+RDMA 增量同步         | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR |
-| eBPF+tcp 增量同步         | ✅ 完成   | kprobe/tcp_recvmsg 捕获客户端写入 → 全量同步期间 L1+L2 缓存 → REPLDONE 后 Master 主动切换增量 → repl_broadcast TCP 发送 |
-| TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                                             |
-| 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                                         |
-| 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                                           |
-| 哨兵模式                     | ⚠️ 基础 | 框架已有，自动故障转移待完善                                      |
-| 自动快照                     | ✅ 完成   | 按时间+变化数规则触发                                             |
+| 功能                         | 状态      | 说明                                                                                                                       |
+| ---------------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------- |
+| RESP 协议                    | ✅ 完成   | 完整解析与响应                                                                                                             |
+| 全量持久化 (dump)            | ✅ 完成   | 二进制`KVSD` 格式，优先 mmap 恢复                                                                                          |
+| 增量持久化 (AOF)             | ✅ 完成   | RESP 命令格式，优先 io_uring 写入                                                                                          |
+| SAVE / BGSAVE / BGREWRITEAOF | ✅ 完成   | 支持同步/异步持久化                                                                                                        |
+| 主从复制                     | ✅ 完成   | FULLRESYNC + partial resync + backlog                                                                                      |
+| RDMA 全量同步                | ✅ 完成   | 全量数据通过 RDMA 传输，与 eBPF 实时同步可同时启用                                                                         |
+| eBPF 实时同步                | ✅ 完成   | sockmap 转发路径，实时增量命令通过 eBPF 加速                                                                               |
+| kprobe+RDMA 增量同步         | ✅ 完成   | kprobe 透明拦截 TCP send → BPF ringbuf → RDMA WRITE → Slave MR                                                          |
+| eBPF+tcp 增量同步            | ✅ 完成   | kprobe/tcp_recvmsg 捕获客户端写入 → 全量同步期间 L1+L2 缓存 → REPLDONE 后 Master 主动切换增量 → repl_broadcast TCP 发送 |
+| TTL / 过期                   | ✅ 完成   | 哈希索引 + 最小堆调度                                                                                                      |
+| 文档型 value                 | ✅ 完成   | DOCSET/DOCGET 等 7 个命令                                                                                                  |
+| 分布式锁                     | ✅ 完成   | LOCK/UNLOCK/RENEW/OWNER                                                                                                    |
+| 哨兵模式                     | ⚠️ 基础 | 框架已有，自动故障转移待完善                                                                                               |
+| 自动快照                     | ✅ 完成   | 按时间+变化数规则触发                                                                                                      |
 
 ---
 
@@ -373,13 +379,13 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 ### 持久化
 
 
-| 命令 / 选项               | 说明                      |
-| ------------------------- | ------------------------- |
-| `SAVE`                    | 同步保存 dump             |
-| `BGSAVE`                  | 后台保存 dump             |
-| `BGREWRITEAOF`            | 重写 AOF                  |
-| `APPENDFSYNC policy`      | 设置 AOF 同步策略         |
-| `--aof-disable`           | 启动时禁用 AOF 持久化     |
+| 命令 / 选项          | 说明                  |
+| -------------------- | --------------------- |
+| `SAVE`               | 同步保存 dump         |
+| `BGSAVE`             | 后台保存 dump         |
+| `BGREWRITEAOF`       | 重写 AOF              |
+| `APPENDFSYNC policy` | 设置 AOF 同步策略     |
+| `--aof-disable`      | 启动时禁用 AOF 持久化 |
 
 ### 文档对象
 
@@ -435,40 +441,43 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 
 完整配置见 [`kvstore.conf`](kvstore.conf)，以下为主要选项：
 
-| 配置项                    | 默认值             | 说明                                          |
-| ------------------------- | ------------------ | --------------------------------------------- |
-| `port`                    | `5160`             | 监听端口                                      |
-| `role`                    | `master`           | 角色：`master` / `slave`                      |
-| `master_host`             | `192.168.233.128`  | 主节点地址                                    |
-| `master_port`             | `5160`             | 主节点端口                                    |
-| `dump_path`               | `kvstore.dump`     | dump 文件路径                                 |
-| `aof_path`                | `kvstore.aof`      | AOF 文件路径                                  |
-| `mem_backend`             | `libc`             | 内存后端：`libc` / `jemalloc` / `custom`      |
-| `net_backend`             | `reactor`          | 网络模型：`reactor` / `proactor` / `ntyco`    |
-| `log_mode`                | `info`             | 日志级别：`debug` / `info` / `warn` / `error` |
-| `appendfsync`             | `always`           | AOF 同步：`always` / `everysec`               |
-| `repl_fullsync_transport` | `rdma`             | 全量同步传输：`rdma` / `tcp`（控制命令 REPLDONE 始终走 TCP） |
-| `repl_realtime_transport` | `ebpf+tcp`         | 增量同步传输：`ebpf+tcp`(推荐) / `kprobe-rdma` / `ebpf` / `tcp` |
-| `kprobe_enabled`          | `1`                | 启用 kprobe+RDMA 增量同步                     |
-| `rdma_dev`                | `siw0`             | RDMA 设备                                     |
-| `rdma_recv_slots`         | `64`               | RDMA 接收槽位数                               |
-| `rdma_chunk_size`         | `262144`           | RDMA 分块大小（字节）                         |
-| `autosnap`                | 无                 | 自动快照规则，如`60:1000,300:10`              |
-| `sentinel`                | `0`                | 启用哨兵模式                                  |
+
+| 配置项                    | 默认值            | 说明                                                            |
+| ------------------------- | ----------------- | --------------------------------------------------------------- |
+| `port`                    | `5160`            | 监听端口                                                        |
+| `role`                    | `master`          | 角色：`master` / `slave`                                        |
+| `master_host`             | `192.168.233.128` | 主节点地址                                                      |
+| `master_port`             | `5160`            | 主节点端口                                                      |
+| `dump_path`               | `kvstore.dump`    | dump 文件路径                                                   |
+| `aof_path`                | `kvstore.aof`     | AOF 文件路径                                                    |
+| `mem_backend`             | `libc`            | 内存后端：`libc` / `jemalloc` / `custom`                        |
+| `net_backend`             | `reactor`         | 网络模型：`reactor` / `proactor` / `ntyco`                      |
+| `log_mode`                | `info`            | 日志级别：`debug` / `info` / `warn` / `error`                   |
+| `appendfsync`             | `always`          | AOF 同步：`always` / `everysec`                                 |
+| `repl_fullsync_transport` | `rdma`            | 全量同步传输：`rdma` / `tcp`（控制命令 REPLDONE 始终走 TCP）    |
+| `repl_realtime_transport` | `ebpf+tcp`        | 增量同步传输：`ebpf+tcp`(推荐) / `kprobe-rdma` / `ebpf` / `tcp` |
+| `kprobe_enabled`          | `1`               | 启用 kprobe+RDMA 增量同步                                       |
+| `rdma_dev`                | `siw0`            | RDMA 设备                                                       |
+| `rdma_recv_slots`         | `64`              | RDMA 接收槽位数                                                 |
+| `rdma_chunk_size`         | `262144`          | RDMA 分块大小（字节）                                           |
+| `autosnap`                | 无                | 自动快照规则，如`60:1000,300:10`                                |
+| `sentinel`                | `0`               | 启用哨兵模式                                                    |
 
 > 命令行参数优先级高于配置文件。启动时只需 `./kvstore kvstore.conf --role master`。
 > **双通道模式（推荐）**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=ebpf+tcp`。
 > RDMA 负责全量快照传输，eBPF+tcp 负责增量同步。**REPLDONE 是分界线**：
+>
 > ```
 >        ← 全量同步 (RDMA) →|← 增量同步 (repl_broadcast TCP) →
 >  Master: 发送快照 → 发送 REPLDONE → flush eBPF 缓存 → 实时广播
 >  Slave:  接收快照 → 收到 REPLDONE → 应用缓存数据 → 接收实时增量
 > ```
+>
 > - **全量同步期间**：eBPF client_capture（kprobe/tcp_recvmsg）缓存客户端写入到 L1(4MB)+L2(磁盘)
 > - **REPLDONE 后**：Master 关闭 RDMA，flush 缓存到 slave，`g_repl_fullsync_in_progress=0` 触发增量同步
 > - **增量同步**：repl_broadcast 通过 TCP 发送；Master 自知 REPLDONE 时机，无需 BPF 探测
 > - **自动回退**：RDMA 不可用 → TCP 全量；BPF 加载失败 → 纯 TCP 增量
-> 完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
+>   完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
 
 ### 命令行参数
 
@@ -827,6 +836,7 @@ if (!strcmp(cmd, "DOCSET") && argc == 4) {
 ```
 
 **整体架构优势**：
+
 1. 新增引擎只需实现 6 个函数 + 注册前缀，无需修改命令分发逻辑
 2. 持久化和复制对引擎完全透明——每写一条命令自动写 AOF + 广播
 3. TTL 系统独立于引擎，统一在命令执行前后检查
@@ -1020,6 +1030,7 @@ pos = p;                                         // 前进到下一命令
 ```
 
 **关键设计**：
+
 - **`incomplete` vs `malformed`**：`incomplete` 保留缓冲区等下次 recv，`malformed` 丢弃错误数据继续
 - **`nbuf[32]` / `lbuf[32]` 临时缓冲区**：先拷贝长度文本再解析，避免在 `buf` 中原址解析的越界风险
 - **`argc > 32` 拒绝**：防止恶意大数组耗尽内存
@@ -1346,7 +1357,7 @@ epoll_wait(100ms)
 // src/core/reactor.c
 while (1) {
     int n = epoll_wait(g_epfd, events, MAX_EVENTS, 100);  // 等待事件
-    
+  
     long long now = kvs_now_ms();
     if (now - g_last_expire >= 100) {                      // 每 100ms
         int budget = expire_cycle_budget();                 // 自适应 budget
@@ -1354,7 +1365,7 @@ while (1) {
         persist_autosnap_cron();                           // 自动快照
         g_last_expire = now;
     }
-    
+  
     for (int i = 0; i < n; i++) {
         conn_t *c = fdmap[events[i].data.fd];
         if (events[i].events & EPOLLIN)  on_read(c);      // 可读
@@ -1605,6 +1616,7 @@ static unsigned long long replay_dump_file(const char *path) {
 > 新格式增加 8 字节 `aof_offset` 头和 1 字节 `engine_id`，恢复时按引擎分发到 array/rbtree/hash/skiptable/doc。
 
 **mmap 的优势**：
+
 - **零拷贝**：磁盘数据直接映射到进程地址空间，绕过 `read()` 的内核缓冲区拷贝
 - **按需调页**：只有实际访问的页面才会触发缺页中断加载，大文件无需全部读入内存
 - **操作系统预读**：内核自动预读连续页面，顺序遍历时性能接近顺序读
@@ -1711,6 +1723,7 @@ recover_mmap_bytes=134217728 ← mmap 映射的总字节数
 recover_fread_bytes=0        ← fread 回退读取的字节数
 recover_tail_bytes=0         ← 尾部残留字节数
 ```
+
 ```
 
 #### 增量 AOF — RESP 命令格式
@@ -1970,10 +1983,11 @@ static int persist_flush_aof_fd(int fd) {
 
 **两种 fsync 策略对比**：
 
-| 策略 | 代码 | 行为 | 安全性 | 性能 |
-|---|---|---|---|---|
-| `always` | 每条命令后 `persist_force_aof_flush()` | 每写一条就 fsync | ⭐⭐⭐ 最多丢 1 条 | 最低 |
-| `everysec` | `persist_autosnap_cron()` 每秒检查 | 每秒批量 fsync | ⭐⭐ 最多丢 1 秒数据 | 高 |
+
+| 策略       | 代码                                  | 行为             | 安全性               | 性能 |
+| ---------- | ------------------------------------- | ---------------- | -------------------- | ---- |
+| `always`   | 每条命令后`persist_force_aof_flush()` | 每写一条就 fsync | ⭐⭐⭐ 最多丢 1 条   | 最低 |
+| `everysec` | `persist_autosnap_cron()` 每秒检查    | 每秒批量 fsync   | ⭐⭐ 最多丢 1 秒数据 | 高   |
 
 ```c
 // everysec 策略：每秒由 autosnap_cron 触发
@@ -2021,6 +2035,7 @@ AOF 持久化使用独立的 `g_persist_uring` 实例（队列深度 64），与
 Proactor 网络模型:    g_proactor_uring  ← 处理客户端网络 I/O
 AOF 持久化:           g_persist_uring   ← 处理 AOF 文件 I/O
 ```
+
 ```
 
 #### SAVE / BGSAVE / BGREWRITEAOF — 三种持久化命令详解
@@ -2253,13 +2268,14 @@ autosnap 3600 10000
 
 **SAVE vs BGSAVE 对比**：
 
-| 特性 | SAVE | BGSAVE |
-|---|---|---|
-| 是否阻塞 | ✅ 是（主线程同步写） | ❌ 否（fork 子进程） |
-| 文件替换方式 | 直接写最终路径（O_TRUNC） | 写临时文件 → rename 原子替换 |
-| 实现机制 | 直接调用 `persist_save_dump_to()` | `fork()` + 子进程写 + 父进程 `waitpid` 轮询 |
-| 响应 | 写入完成后返回 `+OK` | 立即返回 `+Background saving started` |
-| 脏计数更新 | `persist_mark_snapshot_success(dirty_counter)` | `persist_mark_snapshot_success(bgsave_base_dirty)` |
+
+| 特性         | SAVE                                           | BGSAVE                                             |
+| ------------ | ---------------------------------------------- | -------------------------------------------------- |
+| 是否阻塞     | ✅ 是（主线程同步写）                          | ❌ 否（fork 子进程）                               |
+| 文件替换方式 | 直接写最终路径（O_TRUNC）                      | 写临时文件 → rename 原子替换                      |
+| 实现机制     | 直接调用`persist_save_dump_to()`               | `fork()` + 子进程写 + 父进程 `waitpid` 轮询        |
+| 响应         | 写入完成后返回`+OK`                            | 立即返回`+Background saving started`               |
+| 脏计数更新   | `persist_mark_snapshot_success(dirty_counter)` | `persist_mark_snapshot_success(bgsave_base_dirty)` |
 
 ---
 
@@ -2269,6 +2285,7 @@ AOF 文件随时间增长会越来越庞大，BGREWRITEAOF 通过 fork 子进程
 生成新的紧凑 AOF 文件，原子替换旧文件。
 
 **与 BGSAVE 的关键区别**：
+
 - BGSAVE 写 **KVSD 二进制格式**（dump 文件）
 - BGREWRITEAOF 写 **RESP 命令格式**（AOF 文件），且需要处理重写期间的增量命令
 
@@ -2520,17 +2537,19 @@ static int finalize_rewrite_parent(void) {
 
 **三个命令的详细对比**：
 
-| 特性 | SAVE | BGSAVE | BGREWRITEAOF |
-|---|---|---|---|
-| 输出格式 | KVSD 二进制 | KVSD 二进制 | RESP 命令文本 |
-| 输出文件 | `kvstore.dump` | `kvstore.dump` | `kvstore.aof` |
-| 是否 fork | ❌ | ✅ fork | ✅ fork |
-| 是否阻塞 | ✅ 阻塞 | ❌ 不阻塞 | ❌ 不阻塞 |
-| 文件替换 | 直接 O_TRUNC | tmp → rename | tmp → rename |
-| 是否需要缓存增量 | 不需要 | 不需要 | ✅ 需要（rewrite_buf 链表） |
-| 目的 | 同步备份 | 异步备份 | 压缩 AOF 文件 |
-| 子进程工作量 | — | 遍历引擎写 KVSD | 遍历引擎写 RESP 命令 |
-| 状态查询 | 完成后返回 | INFO bgsave=ok/running/err | INFO aof_rewrite=ok/running/err |
+
+| 特性             | SAVE           | BGSAVE                     | BGREWRITEAOF                    |
+| ---------------- | -------------- | -------------------------- | ------------------------------- |
+| 输出格式         | KVSD 二进制    | KVSD 二进制                | RESP 命令文本                   |
+| 输出文件         | `kvstore.dump` | `kvstore.dump`             | `kvstore.aof`                   |
+| 是否 fork        | ❌             | ✅ fork                    | ✅ fork                         |
+| 是否阻塞         | ✅ 阻塞        | ❌ 不阻塞                  | ❌ 不阻塞                       |
+| 文件替换         | 直接 O_TRUNC   | tmp → rename              | tmp → rename                   |
+| 是否需要缓存增量 | 不需要         | 不需要                     | ✅ 需要（rewrite_buf 链表）     |
+| 目的             | 同步备份       | 异步备份                   | 压缩 AOF 文件                   |
+| 子进程工作量     | —             | 遍历引擎写 KVSD            | 遍历引擎写 RESP 命令            |
+| 状态查询         | 完成后返回     | INFO bgsave=ok/running/err | INFO aof_rewrite=ok/running/err |
+
 ```
 
 #### 恢复完整流程
@@ -2622,11 +2641,12 @@ redis-cli -p 5160 INFO | grep aof_rewrite
 # 持久化状态查看
 redis-cli -p 5160 INFO | grep -E "(aof|dump|bgsave|dirty)"
 ```
-    T->>T: 等待 kvstore 就绪
-    K->>D: mmap 读取 dump 恢复数据
-    T->>K: HGET persist:dump:00000
-    K-->>T: v0
-    T->>T: 验证 N 条全部正确恢复
+
+T->>T: 等待 kvstore 就绪
+K->>D: mmap 读取 dump 恢复数据
+T->>K: HGET persist:dump:00000
+K-->>T: v0
+T->>T: 验证 N 条全部正确恢复
 ```
 
 ```bash
@@ -2640,7 +2660,6 @@ redis-cli -p 5160 INFO | grep -E "(aof|dump|bgsave|dirty)"
 # AOF 重写验证
 redis-cli -p 5170 BGREWRITEAOF
 ```
-
 ### 主从复制 — 四种传输路径详解
 
 kvstore 的复制系统采用类 Redis 的 RESP-based 复制协议，
@@ -2666,7 +2685,6 @@ int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len) {
     return repl_transport_tcp_send(c, buf, len);  // TCP 保底
 }
 ```
-
 #### 复制握手流程
 
 ```mermaid
@@ -2697,12 +2715,12 @@ sequenceDiagram
         S-->>M: "REPLACK (每秒)"
     end
 ```
-
 ---
 
 #### 1. TCP 传输（通用保底）
 
 **数据路径**：
+
 ```
 repl_broadcast()
   → repl_realtime_send()
@@ -2711,8 +2729,8 @@ repl_broadcast()
         → reactor on_write()            // epoll 可写事件
           → write(c->fd, buf, len)      // 系统调用
 ```
-
 **实现**：
+
 ```c
 // 最简实现：直接写入 socket
 static int repl_transport_tcp_send(conn_t *c, const unsigned char *buf, size_t len) {
@@ -2725,8 +2743,8 @@ static int repl_transport_tcp_connect_slave(const char *host, int port) {
     return fd;
 }
 ```
-
 **特点**：
+
 - 不依赖任何特殊硬件（无需 RDMA 网卡、无需 BPF）
 - 单机测试时走 loopback，双机走物理网卡
 - 失败处理：发送失败标记 `c->repl_draining = 1`，从 replica 链表移除
@@ -2758,8 +2776,8 @@ static int repl_transport_tcp_connect_slave(const char *host, int port) {
 │  ⑧ 启动 CQ 轮询线程         │
 └──────────────────────────────┘
 ```
-
 **CQ 轮询线程**（事件驱动）：
+
 ```c
 static void *repl_rdma_cq_poll_thread(void *arg) {
     while (cq_poll_thread_running && connected) {
@@ -2779,8 +2797,8 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
     }
 }
 ```
-
 **Pipeline 4 槽异步发送**：
+
 ```c
 static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     // 获取空闲 send slot（最多等 5s）
@@ -2798,7 +2816,6 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     return 0;
 }
 ```
-
 **自适应 Pipeline 深度**：根据 `in_flight` 数量动态调整 `send_pipeline_depth`（2~4），
 利用率低时增加深度，饱和时减少。
 
@@ -2811,6 +2828,7 @@ Master 的 `send()` 系统调用触发 `sk_msg` BPF 程序，
 后者调用 `bpf_msg_redirect_map()` 将数据直接重定向到 slave 的 socket。
 
 **数据路径**：
+
 ```
 repl_broadcast()
   → repl_realtime_send()
@@ -2820,8 +2838,8 @@ repl_broadcast()
           → bpf_msg_redirect_map(sock_map, redirect_key)
             → 数据直接注入 slave TCP socket 的接收队列
 ```
-
 **fd 注册**：
+
 ```c
 int repl_ebpf_register_fd(int fd, int is_master) {
     // 将 fd 加入 sock_map
@@ -2833,8 +2851,8 @@ int repl_ebpf_register_fd(int fd, int is_master) {
     bpf_map_update_elem(role_map_fd, &key, &role, BPF_ANY);
 }
 ```
-
 **BPF 程序**（`src/replication/bpf/repl_sockmap.bpf.c`）：
+
 ```c
 SEC("sk_msg")
 int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
@@ -2844,8 +2862,8 @@ int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
     return SK_PASS;
 }
 ```
-
 **特点**：
+
 - 数据在内核态完成转发，无需经过用户态→内核态的来回拷贝
 - 不感知全量同步状态——`repl_broadcast` 在 `repl_fullsync_pending=1` 时
   不会调用 send，eBPF 程序不会被触发
@@ -2860,6 +2878,7 @@ int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
 通过 `repl_broadcast` TCP 可靠发送到 Slave。
 
 **数据流**：
+
 ```
 Client → Master(tcp_recvmsg) → kprobe capture → client_cache_ringbuf
                                                     │
@@ -2867,13 +2886,12 @@ Client → Master(tcp_recvmsg) → kprobe capture → client_cache_ringbuf
                           │
                           └─ FULLSYNC_IN_PROGRESS=0: repl_broadcast → TCP → Slave
 ```
-
 **REPLDONE 边界**（Master 主动控制，无需 BPF 探测）：
+
 ```
 ← RDMA 全量同步 →│← TCP 增量同步 →
            REPLDONE
 ```
-
 #### 5. kprobe+RDMA WRITE（单边最低延迟增量同步）
 
 **核心思想**：利用 kprobe 拦截 master 的 `tcp_sendmsg` 系统调用，
@@ -2920,8 +2938,8 @@ Client → Master(tcp_recvmsg) → kprobe capture → client_cache_ringbuf
 │   read(fd) → parse_resp_stream() → repl_offset 去重        │
 └──────────────────────────────────────────────────────────────┘
 ```
-
 **BPF 侧实现**：
+
 ```c
 // src/replication/bpf/repl_kprobe.bpf.c
 struct {
@@ -2968,8 +2986,8 @@ int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
     return 0;
 }
 ```
-
 **用户态转发**：
+
 ```c
 // ringbuf 回调 → RDMA WRITE
 static int kprobe_ringbuf_cb(void *ctx, void *data, size_t size) {
@@ -2997,8 +3015,8 @@ static int wr_submit_data(int slot, size_t len) {
     return ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
 }
 ```
-
 **Slave 轮询消费**：
+
 ```c
 static void *kprobe_rdma_slave_poll(void *arg) {
     while (g_kprobe_running) {
@@ -3026,8 +3044,8 @@ static void *kprobe_rdma_slave_poll(void *arg) {
     }
 }
 ```
-
 **MR 信息交换**：
+
 ```c
 // Master 发送 KPROBEMR 请求
 // Slave 回复 +KPROBERDMA <rkey> <addr> <size> <slots> <cap>
@@ -3039,8 +3057,8 @@ g_slave_ringbuf_mr = ibv_reg_mr(pd, g_slave_ringbuf,
     KPROBE_RDMA_RINGBUF_SIZE,
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 ```
-
 **TCP 保底 + 去重**：
+
 ```c
 // kprobe-rdma send 始终返回 -1，数据仍通过 TCP 发送
 static int repl_transport_kprobe_rdma_send(conn_t *c, ...) {
@@ -3053,7 +3071,6 @@ static int repl_transport_kprobe_rdma_send(conn_t *c, ...) {
 // RDMA 路径先送达的数据，TCP 路径到达时跳过
 // （handle_parsed_command 中 from_replication 相同，幂等执行）
 ```
-
 ---
 
 #### 5. Slave 侧统一实现
@@ -3079,7 +3096,6 @@ static void *slave_thread(void *arg) {
 //   REPLDONE → repl_slave_finish_fullsync()
 //            → 保存 dump → g_slave_loading_fullsync = 0
 ```
-
 #### 测试验证
 
 ```bash
@@ -3105,7 +3121,6 @@ tests/test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
     --slave-host 192.168.233.129 --slave-port 5161 \
     --pre 50000 --post 50000
 ```
-
 ### TTL 过期 — 哈希索引 + 最小堆
 
 kvstore 的 TTL 系统使用**哈希索引 + 最小堆**双结构，结合**主动扫描 + 惰性删除**两种策略。
@@ -3122,7 +3137,6 @@ kvs_expire_table_t
   ├── count               ← 总节点数 = 有 TTL 的 key 数
   └── size                ← 哈希表桶数（固定 8192）
 ```
-
 #### 核心操作
 
 
@@ -3145,7 +3159,6 @@ if (now - g_last_expire >= 100) {
     g_last_expire = now;
 }
 ```
-
 ```c
 int kvs_active_expire_cycle(int budget) {
     while (removed < budget && heap_size > 0) {
@@ -3157,7 +3170,6 @@ int kvs_active_expire_cycle(int budget) {
     }
 }
 ```
-
 **自适应 budget**（`src/core/reactor.c`）：
 
 ```c
@@ -3170,7 +3182,6 @@ count ≥ 10,000    → budget = 256
 count ≥ 1,000     → budget = 128
 else              → budget = 32
 ```
-
 **策略二：惰性删除（每次命令执行前）**
 
 ```c
@@ -3184,7 +3195,6 @@ static int try_expire(int engine, char *key) {
     return 0;
 }
 ```
-
 **注意**：当前主动过期和惰性删除都只删除本机数据，**不会将 DEL 广播给 slave**。这是与 Redis 的重要差异——Redis 在 master 过期 key 后会生成 `DEL key` 命令复制到 slave，而本项目 slave 依赖自身的事件循环扫描过期。
 
 #### 完整流程示例
@@ -3206,7 +3216,6 @@ kvs_active_expire_cycle(budget=256)
   → heap_sift_down(新堆顶)
   → ... 继续处理最多 256 个 ...
 ```
-
 #### heap 操作示例
 
 ```
@@ -3220,7 +3229,6 @@ heap = [1000, 2000, 5000]   heap = [1000, 2000, 5000]
                                    ↑ sift_down
                           heap = [2000, 3000, 5000]  (已有序)
 ```
-
 #### 测试验证
 
 ```mermaid
@@ -3235,7 +3243,6 @@ graph LR
         E -->|否| D
     end
 ```
-
 ```bash
 # 终端 1: 启动 kvstore
 ./kvstore kvstore.conf --role master
@@ -3247,12 +3254,12 @@ graph LR
 redis-cli -p 5160 HTTL expire:k:000000
 redis-cli -p 5160 HGET expire:k:000000
 ```
-
 ### 内存管理 — 三种后端
 
 kvstore 支持三种内存后端，通过 `--mem` 参数切换。Custom 后端是自研的 **slab + mmap** 两级分配器，
 专为键值存储场景设计——大量频繁分配的小块内存（key/value 字符串）通过 slab 管理，
 超大块通过 mmap 直接映射。
+
 
 | 后端         | 实现                         | 适用场景         |
 | ------------ | ---------------------------- | ---------------- |
@@ -3305,7 +3312,6 @@ graph TB
     CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7 -->|mmap 失败| FALLBACK
     LARGE_ALLOC -->|mmap 失败| FALLBACK
 ```
-
 #### 三级分配器详解
 
 **① Slab 小内存分配（≤1024B）**
@@ -3323,7 +3329,6 @@ small_class_t
   ├── page_count: 页面数
   └── page_bytes: 页面总字节数
 ```
-
 **分配流程**：
 
 ```c
@@ -3357,7 +3362,6 @@ static void *custom_malloc(size_t size) {
     // ...
 }
 ```
-
 **页面扩展（`slab_grow_locked`）**：
 
 ```c
@@ -3392,7 +3396,6 @@ static int slab_grow_locked(int class_idx) {
     return 0;
 }
 ```
-
 **回收流程**：
 
 ```c
@@ -3411,7 +3414,6 @@ static void custom_free(void *ptr) {
     }
 }
 ```
-
 **② mmap 大内存分配（>1024B）**
 
 超过 slab 上限的大块直接通过 mmap 分配，释放时 `munmap` 归还给操作系统：
@@ -3439,7 +3441,6 @@ static void *custom_malloc(size_t size) {
     return (void *)(hdr + 1);                     // 返回数据区
 }
 ```
-
 **③ fallback 回退机制**
 
 当 slab 的 mmap 申请失败（内存不足）时，回退到标准的 `malloc`：
@@ -3452,7 +3453,6 @@ static void *fallback_malloc(size_t size) {
     return (void *)(hdr + 1);
 }
 ```
-
 #### 四、三后端统一 API
 
 所有后端通过同一组 API 对外暴露，上层代码无需关心后端实现：
@@ -3474,7 +3474,6 @@ static void *backend_malloc(size_t size) {
     }
 }
 ```
-
 #### 统计与观测
 
 `MEMSTAT` 命令暴露完整的分配统计，包括三级分配器的详细数据：
@@ -3499,17 +3498,17 @@ Custom 后端 MEMSTAT 示例:
   class[2]:  128B  total=32768   free=400   pages=1
   ...
 ```
-
 各个统计字段的含义：
 
-| 字段 | 含义 |
-|---|---|
-| `current_small_inuse` | slab 中正在使用的字节数（每个 chunk 算 class_size） |
-| `peak_small_inuse` | 历史峰值 |
-| `total_small_page_bytes` | slab 从 mmap 申请的总页面大小（包括空闲 chunk） |
-| `internal_fragment_bytes` | 内部碎片 = 已分配字节 - 请求字节（对齐浪费） |
-| `page_utilization` | 页面利用率 = current_small_inuse / total_small_page_bytes |
-| `class[X] free` | 该 class 的空闲 chunk 数（越大说明该 size 使用率低） |
+
+| 字段                      | 含义                                                      |
+| ------------------------- | --------------------------------------------------------- |
+| `current_small_inuse`     | slab 中正在使用的字节数（每个 chunk 算 class_size）       |
+| `peak_small_inuse`        | 历史峰值                                                  |
+| `total_small_page_bytes`  | slab 从 mmap 申请的总页面大小（包括空闲 chunk）           |
+| `internal_fragment_bytes` | 内部碎片 = 已分配字节 - 请求字节（对齐浪费）              |
+| `page_utilization`        | 页面利用率 = current_small_inuse / total_small_page_bytes |
+| `class[X] free`           | 该 class 的空闲 chunk 数（越大说明该 size 使用率低）      |
 
 #### jemalloc 的自动加载
 
@@ -3529,7 +3528,6 @@ int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv) 
     execvp(argv0, argv);
 }
 ```
-
 #### 测试验证
 
 ```bash
@@ -3545,7 +3543,6 @@ redis-cli -p 5160 MEMSTAT
 ./kvstore kvstore.conf --role master --mem custom
 redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 ```
-
 ### TTL 过期时间记录 in AOF
 
 写命令（SET/MSET/DEL/EXPIRE 等）会以原始 RESP 格式写入 AOF 文件：
@@ -3554,7 +3551,6 @@ redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 *3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n
 ```
-
 恢复时重放 AOF，重新执行 EXPIRE 命令重建 TTL 堆。
 
 ### 自动化快照 (AutoSnapshot)
@@ -3566,7 +3562,6 @@ redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 if (距离上次快照 ≥ sec && 自上次快照以来的写入次数 ≥ changes)
     persist_bgsave_start();  // fork 子进程执行 BGSAVE
 ```
-
 - 规则通过 `--autosnap "60:1000,300:10"` 或 `SNAPRULE 60 1000` 命令设置
 - `SNAPRULES` 查看当前规则，`SNAPRULECLEAR` 清除所有规则
 - 每个规则独立计时
@@ -3586,7 +3581,6 @@ redis-cli -p 5000 SAVE
 redis-cli -p 5000 BGSAVE
 redis-cli -p 5000 INFO | grep bgsave  # 查看 BGSAVE 状态
 ```
-
 ### 哨兵模式
 
 - 基础框架实现，支持 `SENTINEL` 系列命令
@@ -3598,7 +3592,6 @@ redis-cli -p 5000 INFO | grep bgsave  # 查看 BGSAVE 状态
 ```bash
 make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 ```
-
 ### C 测试程序 (`tests/`)
 
 `tests/` 目录下包含独立的 C 测试程序，通过 RESP 协议连接 kvstore 进行自动化验证。
@@ -3617,7 +3610,6 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 # 命令行参数可覆盖配置文件
 ./test_batch --config tests/test.conf --port 6380 --count 50000
 ```
-
 配置文件格式 (`tests/test.conf`):
 
 ```ini
@@ -3641,7 +3633,6 @@ batch=1000
 poll_ms=500
 ttl=10
 ```
-
 编译方式：
 
 ```bash
@@ -3660,7 +3651,6 @@ make test_batch                # → ./test_batch
 # 或手动编译
 gcc -I./include -o test_kvstore tests/test_kvstore.c
 ```
-
 ---
 
 #### `test_kvstore` — 全功能 C 客户端测试
@@ -3669,7 +3659,6 @@ gcc -I./include -o test_kvstore tests/test_kvstore.c
 编译: make test_kvstore           # → ./test_kvstore
 运行: ./test_kvstore [--config tests/test.conf] [host port]
 ```
-
 连接 kvstore 后依次测试 PING、各引擎 SET/GET/DEL、MSET/MGET、TTL/EXPIRE/PERSIST、
 LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、INFO 命令，
 最后输出 PASS/FAIL 汇总报告。
@@ -3689,7 +3678,6 @@ LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、
 # 或通过 Makefile 自动启动 + 测试
 make check-kvstore TEST_PORT=5160
 ```
-
 **验证**: 测试通过后，用 redis-cli 确认数据正确：
 
 ```bash
@@ -3702,7 +3690,6 @@ redis-cli -p 5160 HGET h:pre:100
 redis-cli -p 5160 INFO
 # 查看 role、mem、dirty 等信息
 ```
-
 ---
 
 #### `test_repl_5w5w` — 5w+5w 主从同步测试
@@ -3711,7 +3698,6 @@ redis-cli -p 5160 INFO
 编译: make test_repl_5w5w          # → tests/test_repl_5w5w
 运行: tests/test_repl_5w5w [选项]
 ```
-
 测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF+tcp) → 验证 eBPF+tcp 传输状态 → 验证 Slave 最终 10w 条数据一致性。
 
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
@@ -3748,7 +3734,6 @@ rm -f kvstore.dump kvstore.aof
     --master-host 127.0.0.1 --master-port 5160 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
-
 选项说明：
 
 
@@ -3765,14 +3750,16 @@ rm -f kvstore.dump kvstore.aof
 
 **eBPF+tcp 传输验证**: 测试 Phase 5.5 自动通过 `INFO` 命令检查以下字段确认 eBPF+tcp 路径是否生效：
 
-| INFO 字段                  | 预期               | 含义                                    |
-| -------------------------- | ------------------ | --------------------------------------- |
-| `repl_transport_active`    | `rdma+ebpf-tcp`    | 全量 RDMA + 增量 eBPF+tcp 双通道已激活  |
-| `kprobe_initialized`       | 1                  | client_capture BPF 已加载并 attach      |
-| `repl_broadcast_bytes`     | > 0                | TCP 增量数据已发送                      |
-| `repl_transport_fallback_reason` | `none`       | 无降级，传输层正常工作                  |
+
+| INFO 字段                        | 预期            | 含义                                   |
+| -------------------------------- | --------------- | -------------------------------------- |
+| `repl_transport_active`          | `rdma+ebpf-tcp` | 全量 RDMA + 增量 eBPF+tcp 双通道已激活 |
+| `kprobe_initialized`             | 1               | client_capture BPF 已加载并 attach     |
+| `repl_broadcast_bytes`           | > 0             | TCP 增量数据已发送                     |
+| `repl_transport_fallback_reason` | `none`          | 无降级，传输层正常工作                 |
 
 **kprobe+RDMA 验证** (使用 `repl_realtime_transport=kprobe-rdma` 时):
+
 
 | INFO 字段               | 预期 | 含义                                    |
 | ----------------------- | ---- | --------------------------------------- |
@@ -3796,7 +3783,6 @@ redis-cli -p 5161 HGET pre:k:000000
 redis-cli -p 5161 HGET post:k:000000
 "v50000"
 ```
-
 ---
 
 #### `test_persist_dump_demo` — 全量持久化演示
@@ -3805,7 +3791,6 @@ redis-cli -p 5161 HGET post:k:000000
 编译: make test_persist_dump_demo    # → ./test_persist_dump_demo
 运行: ./test_persist_dump_demo [--config tests/test.conf]
 ```
-
 交互式流程：连接 kvstore → 写入 count 条数据 → 提示用户执行 `SAVE` → 提示用户停止并重启 kvstore → 自动验证数据从 dump 文件恢复。
 
 ```bash
@@ -3821,7 +3806,6 @@ redis-cli -p 5161 HGET post:k:000000
 #   >>> Please stop kvstore (Ctrl+C) and restart it
 # 停止并重启 kvstore，程序自动检测重连并验证数据恢复
 ```
-
 **验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
 
 ```bash
@@ -3832,7 +3816,6 @@ redis-cli -p 5160 HGET bench:key:1
 redis-cli -p 5160 HGET bench:key:50000
 "value:50000"
 ```
-
 选项说明：
 
 
@@ -3851,7 +3834,6 @@ redis-cli -p 5160 HGET bench:key:50000
 编译: make test_persist_aof_demo     # → ./test_persist_aof_demo
 运行: ./test_persist_aof_demo [选项]
 ```
-
 交互式流程：连接 kvstore → 写入 count 条数据（**不执行 SAVE**）→ 提示用户停止并重启 kvstore → 自动验证数据从 AOF 文件恢复。
 
 > **重要**: kvstore 必须使用 `--appendfsync always`，确保每条写入即时落盘。
@@ -3868,7 +3850,6 @@ redis-cli -p 5160 HGET bench:key:50000
 #   >>> Please stop kvstore (Ctrl+C) and restart it
 # 停止并重启 kvstore，程序自动验证 AOF 恢复（注意: 不执行 SAVE，数据仅靠 AOF）
 ```
-
 **验证**: AOF 恢复后，确认重启前后的数据一致：
 
 ```bash
@@ -3886,7 +3867,6 @@ redis-cli -p 5170 HGET bench:key:50000
 redis-cli -p 5170 PING
 +PONG
 ```
-
 选项说明：
 
 
@@ -3905,7 +3885,6 @@ redis-cli -p 5170 PING
 编译: make test_uring_persist       # → ./test_uring_persist
 运行: ./test_uring_persist [选项]
 ```
-
 自动管理 kvstore 进程生命周期，测试 io_uring 写入路径的持久化正确性与性能。
 
 流程：自动启动 kvstore → HSET 写入 N 条数据 → SAVE → 停止 kvstore → 重启 → 验证数据恢复 → 输出性能指标。
@@ -3921,7 +3900,6 @@ redis-cli -p 5170 PING
 #   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
 # 停止并重启 kvstore，程序自动验证数据恢复
 ```
-
 **验证**: 测试完成后，用 redis-cli 手动确认：
 
 ```bash
@@ -3934,7 +3912,6 @@ redis-cli -p 5180 HGET uring:key:10000
 redis-cli -p 5180 INFO | grep mem
 # 查看内存后端和统计信息
 ```
-
 选项说明：
 
 
@@ -3953,7 +3930,6 @@ redis-cli -p 5180 INFO | grep mem
 编译: make test_mass_ttl             # → tests/test_mass_ttl
 运行: tests/test_mass_ttl [选项]
 ```
-
 设置 10000 个 key 并设置 10 秒过期时间，轮询抽样检查 TTL 状态，
 验证 kvstore 在海量 TTL key 下的过期扫描正确性。
 
@@ -3972,7 +3948,6 @@ redis-cli -p 5180 INFO | grep mem
 redis-cli -p 5200 HTTL expire:k:000000
 redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 ```
-
 选项说明：
 
 
@@ -3992,7 +3967,6 @@ redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 编译: make test_mmap_recover        # → ./test_mmap_recover
 运行: ./test_mmap_recover [选项]
 ```
-
 自动管理 kvstore 进程生命周期，验证启动时通过 mmap 恢复 dump 文件的正确性与性能。
 支持指定存储引擎（array/hash/rbtree/skiptable）。
 
@@ -4013,7 +3987,6 @@ redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 ./test_mmap_recover --config tests/test.conf --engine rbtree
 ./test_mmap_recover --config tests/test.conf --engine array
 ```
-
 **验证**: 测试完成后，确认各引擎数据恢复正确：
 
 ```bash
@@ -4035,7 +4008,6 @@ redis-cli -p 5190 XGET mmap:key:5000
 redis-cli -p 5190 GET mmap:key:1024
 "value:1024"
 ```
-
 选项说明：
 
 
@@ -4055,7 +4027,6 @@ redis-cli -p 5190 GET mmap:key:1024
 编译: make test_repl_basic          # → ./test_repl_basic
 运行: ./test_repl_basic [选项]
 ```
-
 用户手动管理 Master/Slave 进程，程序负责写入、监控、验证。
 
 流程：用户启动 Master → 程序跨引擎（Hash/Array/RBTREE/Skiptable）写入 N 条数据 → 提示用户启动 Slave → 等待全量同步完成 → 再写入增量数据 → 等待增量同步 → 验证各引擎数据一致性。
@@ -4100,7 +4071,6 @@ rm -f kvstore.dump kvstore.aof
     --master-host 192.168.233.128 --master-port 6380 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
-
 **验证**: 测试通过后，用 redis-cli 确认主从数据完全一致：
 
 ```bash
@@ -4138,7 +4108,6 @@ redis-cli -p 6381 XGET x:pre:999
 redis-cli -p 6381 SET should_fail x
 -ERR read only slave
 ```
-
 两种验证方法：
 
 - **全量同步验证**: 查询 `h:pre:*`（预存 5000 条）— 确认 Slave 有全部预存数据
@@ -4166,7 +4135,6 @@ redis-cli -p 6381 SET should_fail x
 编译: make test_repl_gap          # → ./test_repl_gap
 运行: ./test_repl_gap [选项]
 ```
-
 验证全量同步期间客户端写入 Master 的数据（gap）在全量同步完成后正确补发到 Slave。
 
 **测试原理**：
@@ -4202,7 +4170,6 @@ sequenceDiagram
     T->>S: HGET pre/gap/post 验证
     Note over T: 确认 Master == Slave
 ```
-
 ```bash
 # ── 双机四终端测试（推荐）──
 
@@ -4219,28 +4186,29 @@ sequenceDiagram
 redis-cli -p 5160 -h 192.168.233.128 HSET gap:mykey myvalue
 # 写入完成后，回到终端 2，按 Enter 继续
 ```
-
 三阶段验证确保数据不丢失：
 
-| 阶段 | 数据 | 写入者 | 写入时机 | 同步机制 | 验证点 |
-|---|---|---|---|---|---|
-| Phase 1 | `pre:k:001~030000` | 测试程序 | 全量同步前 | 全量快照 `+FULLRESYNC` | Slave 有全部 pre |
-| **Phase 2** | `gap:k:001~005000` | **用户手动** | **全量同步期间** | **backlog gap 补发** | **Slave 有全部 gap** |
-| Phase 3 | `post:k:001~005000` | 测试程序 | 全量同步后 | 实时 `repl_broadcast()` | Slave 有全部 post |
+
+| 阶段        | 数据                | 写入者       | 写入时机         | 同步机制               | 验证点               |
+| ----------- | ------------------- | ------------ | ---------------- | ---------------------- | -------------------- |
+| Phase 1     | `pre:k:001~030000`  | 测试程序     | 全量同步前       | 全量快照`+FULLRESYNC`  | Slave 有全部 pre     |
+| **Phase 2** | `gap:k:001~005000`  | **用户手动** | **全量同步期间** | **backlog gap 补发**   | **Slave 有全部 gap** |
+| Phase 3     | `post:k:001~005000` | 测试程序     | 全量同步后       | 实时`repl_broadcast()` | Slave 有全部 post    |
 
 **选项说明**：
 
-| 选项                 | 默认值    | 说明                |
-| -------------------- | --------- | ------------------- |
-| `--master-host HOST` | 127.0.0.1 | Master 地址         |
-| `--slave-host HOST`  | 127.0.0.1 | Slave 地址          |
-| `--master-port PORT` | 6379      | Master 端口         |
-| `--slave-port PORT`  | 6380      | Slave 端口          |
-| `--pre-count N`      | 30000     | 预存数据量（全量）  |
+
+| 选项                 | 默认值    | 说明                                     |
+| -------------------- | --------- | ---------------------------------------- |
+| `--master-host HOST` | 127.0.0.1 | Master 地址                              |
+| `--slave-host HOST`  | 127.0.0.1 | Slave 地址                               |
+| `--master-port PORT` | 6379      | Master 端口                              |
+| `--slave-port PORT`  | 6380      | Slave 端口                               |
+| `--pre-count N`      | 30000     | 预存数据量（全量）                       |
 | `--gap-count N`      | 0         | gap 数据量（全量同步期间手动写入后输入） |
-| `--post-count N`     | 5000      | 增量数据量          |
-| `--batch N`          | 1000      | 每批写入量          |
-| `--poll-ms N`        | 500       | 轮询间隔毫秒        |
+| `--post-count N`     | 5000      | 增量数据量                               |
+| `--batch N`          | 1000      | 每批写入量                               |
+| `--poll-ms N`        | 500       | 轮询间隔毫秒                             |
 
 ---
 
@@ -4274,7 +4242,7 @@ redis-cli -p 5160 -h 192.168.233.128 HSET gap:mykey myvalue
 | `make check-mmap-recover-c`          | 1w            | mmap 恢复验证（C 程序，支持指定引擎，自动管理进程）                                                             | `artifacts/persist/mmap-recover/`   |
 | `make check-repl`                    | 5k            | 主从复制基本验证（shell 脚本）                                                                                  | —                                  |
 | `make check-repl-basic`              | 5k            | 主从复制基本验证（C 程序，自动管理 Master/Slave 进程）                                                          | —                                  |
-| `make check-repl-gap`                | 3k+手动+1k     | 全量同步 gap 补发验证（C 程序，gap 数据由用户手动写入）                                                          | —                                  |
+| `make check-repl-gap`                | 3k+手动+1k    | 全量同步 gap 补发验证（C 程序，gap 数据由用户手动写入）                                                         | —                                  |
 | `make test_repl_5w5w`<br>（仅编译）  | **5w+5w**     | 5w+5w 主从同步 C 测试（`tests/test_repl_5w5w.c`）<br>编译后手动运行：`tests/test_repl_5w5w --master-host H ...` | —                                  |
 | `make check-repl-metrics`            | 5w+5k         | 复制指标基线                                                                                                    | `artifacts/repl/metrics/`           |
 | `make check-repl-profile`            | 5w+5k         | 复制 profiling                                                                                                  | `artifacts/repl/profile/`           |
@@ -4320,7 +4288,6 @@ bash tools/tests/test_master_slave_multi_engine_nc.sh 127.0.0.1 5160
 # SAVE/BGSAVE 性能测试
 bash tools/persist/run_save_bgsave_perf_test.sh
 ```
-
 ### 参数化运行
 
 ```bash
@@ -4375,7 +4342,6 @@ make check-all-quick
 # 只跑特定目标
 python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 ```
-
 ---
 
 ## 测试产物路径
@@ -4442,31 +4408,34 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 
 > **2026-06-26 重测**（redis-benchmark 7.0，报告值为 batches/sec，命令吞吐 = QPS × P）
 
-| P | Redis 5.0.7 always | kvstore always | kvstore everysec | kvstore no-AOF |
-|---|-------------------|----------------|------------------|----------------|
-| 1 | 2,283 | **22,447** | 20,960 | 22,237 |
-| 10 | 23,474 | **44,072** | 44,924 | 43,879 |
-| 20 | 46,729 | **49,950** | 49,975 | 49,407 |
-| 40 | 92,593 | **51,948** | 51,733 | 51,282 |
-| 80 | 156,250 | **54,318** | 53,821 | 54,230 |
-| 160 | 250,000 | **56,117** | 55,402 | 55,218 |
+
+| P   | Redis 5.0.7 always | kvstore always | kvstore everysec | kvstore no-AOF |
+| --- | ------------------ | -------------- | ---------------- | -------------- |
+| 1   | 2,283              | **22,447**     | 20,960           | 22,237         |
+| 10  | 23,474             | **44,072**     | 44,924           | 43,879         |
+| 20  | 46,729             | **49,950**     | 49,975           | 49,407         |
+| 40  | 92,593             | **51,948**     | 51,733           | 51,282         |
+| 80  | 156,250            | **54,318**     | 53,821           | 54,230         |
+| 160 | 250,000            | **56,117**     | 55,402           | 55,218         |
 
 ##### HSET 命令
 
 > **2026-06-26 重测**
 
-| P | Redis 5.0.7 always | kvstore always | kvstore everysec | kvstore no-AOF |
-|---|-------------------|----------------|------------------|----------------|
-| 1 | 2,290 | **22,548** | 21,340 | 21,706 |
-| 10 | 20,161 | **44,150** | 43,725 | 44,307 |
-| 20 | 42,735 | **49,480** | 49,237 | 48,662 |
-| 40 | 83,333 | **51,948** | 51,894 | 51,653 |
+
+| P  | Redis 5.0.7 always | kvstore always | kvstore everysec | kvstore no-AOF |
+| -- | ------------------ | -------------- | ---------------- | -------------- |
+| 1  | 2,290              | **22,548**     | 21,340           | 21,706         |
+| 10 | 20,161             | **44,150**     | 43,725           | 44,307         |
+| 20 | 42,735             | **49,480**     | 49,237           | 48,662         |
+| 40 | 83,333             | **51,948**     | 51,894           | 51,653         |
 
 ##### 关键发现
 
 **① kvstore AOF always 在 SET 下全面超越 Redis 5.0.7（4-9×）**
 
 核心原因：
+
 - **Group Commit**：10000 条 SET 仅需 2 次 `io_uring_enter(write+fsync)`（strace 实测），每次摊销 ~5000 条命令
 - **Redis 5.0.7 的缺陷**：`appendfsync always` 下每条 SET 会 `openat` + `close` AOF 文件（strace 捕获 ~9800 次/10000 请求），加上每命令一次 `fdatasync`（~70µs），累计开销巨大。Redis 6+ 已修复文件重复打开问题
 - **AOF always 对 kvstore 几乎零开销**：P=1 SET always (22,447) vs no-AOF (22,237)，AOF always 反而略高（测试波动范围内）
@@ -4474,6 +4443,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 **② HSET 在高 pipeline 下是弱项**
 
 P=40 时 kvstore HSET (53k) 落后 Redis (83k)。原因：
+
 - Hash 引擎的**渐进式 rehash** 在大批量写入时触发，扩容迁移增加延迟
 - Array 引擎（SET）无此开销，始终维持高吞吐
 
@@ -4501,17 +4471,18 @@ P=40 时 kvstore HSET (53k) 落后 Redis (83k)。原因：
 
 > **2026-06-26 重测**（`bash tools/bench/run_persist_bench.sh`）
 
-| 配置 | ECHO (QPS) | HSET (QPS) |
-|---|---|---|
-| **kvstore** (ECHO 基线) | **132,820** | — |
-| ├─ AOF 关闭（`--aof-disable`） | — | **136,295** |
-| ├─ AOF always（每条命令 fsync） | — | **74,610** |
-| └─ AOF everysec（每秒 fsync） | — | **136,537** |
-| **Redis 5.0.7** (ECHO 基线) | **124,285** | — |
-| ├─ 无 AOF | — | **124,409** |
-| ├─ AOF always | — | **123,533** |
-| └─ AOF everysec | — | **121,374** |
-| └─ AOF always | — | **121,581** |
+
+| 配置                              | ECHO (QPS)  | HSET (QPS)  |
+| --------------------------------- | ----------- | ----------- |
+| **kvstore** (ECHO 基线)           | **132,820** | —          |
+| ├─ AOF 关闭（`--aof-disable`）  | —          | **136,295** |
+| ├─ AOF always（每条命令 fsync） | —          | **74,610**  |
+| └─ AOF everysec（每秒 fsync）   | —          | **136,537** |
+| **Redis 5.0.7** (ECHO 基线)       | **124,285** | —          |
+| ├─ 无 AOF                       | —          | **124,409** |
+| ├─ AOF always                   | —          | **123,533** |
+| └─ AOF everysec                 | —          | **121,374** |
+| └─ AOF always                   | —          | **121,581** |
 
 ##### 分析
 
@@ -4532,11 +4503,12 @@ AOF always (74,610) vs AOF 关闭 (136,295) **−45.3%**，Group Commit + io_uri
 
 `kvstore.conf` 中 `kprobe_enabled=1`（默认）。普通用户运行时 BPF 加载失败（权限不够），静默跳过。**sudo 运行时 BPF kprobe 加载成功**，`kprobe/tcp_recvmsg` + `kretprobe/tcp_recvmsg` 拦截每个 TCP 包，引入 ~3× 开销：
 
-| 配置 | 非 sudo (QPS) | sudo (QPS) | 降幅 |
-|---|---|---|---|
-| kvstore AOF disable | 136,295 | 39,438 | 3.5× |
-| kvstore AOF always | 74,610 | 53,019 | 1.4× |
-| kvstore AOF everysec | 136,537 | 39,981 | 3.4× |
+
+| 配置                 | 非 sudo (QPS) | sudo (QPS) | 降幅  |
+| -------------------- | ------------- | ---------- | ----- |
+| kvstore AOF disable  | 136,295       | 39,438     | 3.5× |
+| kvstore AOF always   | 74,610        | 53,019     | 1.4× |
+| kvstore AOF everysec | 136,537       | 39,981     | 3.4× |
 
 > 如果需要在 sudo 下基准测试，可临时设置 `kprobe_enabled=0`（关闭 kprobe 捕获），或使用非 sudo 运行。
 >
@@ -4572,7 +4544,6 @@ AOF always (74,610) vs AOF 关闭 (136,295) **−45.3%**，Group Commit + io_uri
 redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value
 time redis-cli -p 5190 SAVE
 ```
-
 ##### 测试结果
 
 > **写入 QPS** 为 redis-benchmark 报告值。
@@ -4583,12 +4554,13 @@ time redis-cli -p 5190 SAVE
 >
 > **2026-06-26 重测**（`bash tools/bench/run_persist_bench.sh`），非 sudo，AOF 关闭。
 
-| 场景 | 数据量 | SAVE 次数 | 写入 QPS | 写入耗时 | 平均每次 SAVE | 有效 QPS |
-|---|---|---|---|---|---|---|
-| **100w → SAVE × 1** | 100万 | 1 | **136,258** | 7.396s | **3,839ms** | **89,005** |
-| 10w → SAVE × 10 | 10万 | 10 | **131,926** | 0.768s | **386ms** | **21,603** |
-| 1w → SAVE × 100 | 1万 | 100 | **123,457** | 0.086s | **41ms** | **2,395** |
-| 1k → SAVE × 1000 | 1千 | 1000 | **76,923** | 0.018s | **6.7ms** | **149** |
+
+| 场景                  | 数据量 | SAVE 次数 | 写入 QPS    | 写入耗时 | 平均每次 SAVE | 有效 QPS   |
+| --------------------- | ------ | --------- | ----------- | -------- | ------------- | ---------- |
+| **100w → SAVE × 1** | 100万  | 1         | **136,258** | 7.396s   | **3,839ms**   | **89,005** |
+| 10w → SAVE × 10     | 10万   | 10        | **131,926** | 0.768s   | **386ms**     | **21,603** |
+| 1w → SAVE × 100     | 1万    | 100       | **123,457** | 0.086s   | **41ms**      | **2,395**  |
+| 1k → SAVE × 1000    | 1千    | 1000      | **76,923**  | 0.018s   | **6.7ms**     | **149**    |
 
 > **写入 QPS 为何随数据量变化？** 渐进式 rehash 使桶数随数据量动态增长（4096 → 8192 → ... → 1M+），
 > 每桶始终维持 0~2 节点，HSET 查找 O(1)。1k/1w 场景因数据量小（<0.1 秒完成），
@@ -4598,12 +4570,13 @@ time redis-cli -p 5190 SAVE
 
 **① SAVE 耗时与数据量正相关，呈近似线性**
 
+
 | 数据量 | 平均 SAVE 耗时 | dump 文件大小 | 每条目 dump 字节 |
-|--------|---------------|-------------|-----------------|
-| 1000 | 6.7ms | 18.5 KB | 19.0 B |
-| 1万 | 41ms | 185 KB | 18.9 B |
-| 10万 | 386ms | 1.8 MB | 18.9 B |
-| 100万 | 3,839ms | 18.1 MB | 19.0 B |
+| ------ | -------------- | ------------- | ---------------- |
+| 1000   | 6.7ms          | 18.5 KB       | 19.0 B           |
+| 1万    | 41ms           | 185 KB        | 18.9 B           |
+| 10万   | 386ms          | 1.8 MB        | 18.9 B           |
+| 100万  | 3,839ms        | 18.1 MB       | 19.0 B           |
 
 SAVE 耗时与数据量近似正比（~3.85ms/千条，大样本下线性度 >0.99），因为 `persist_save_dump()` 遍历 Hash 引擎的全部链地址表，
 将 key-value 写入 KVSD 二进制格式。dump 文件约 **19 bytes/条目**（含 8 字节 AOF 偏移头 + 1 字节 engine_id + 4 字节 key/value 长度前缀 + key 字符串 + value 序列化数据）。
@@ -4622,7 +4595,6 @@ int persist_save_dump(void) {
     close(fd);
 }
 ```
-
 `kvs_dump_to_fd()` 遍历 Hash 引擎 1024 个桶的链地址表 → 约 100 万次节点的 key/value 拷贝 + write 系统调用。
 io_uring fsync 是异步的，不阻塞 SAVE 返回，但 write 本身的数据量决定了耗时。
 
@@ -4648,7 +4620,6 @@ autosnap 3600 0      # 每小时至少 BGSAVE 一次
 redis-cli -p 5000 SNAPRULE 60 10000
 redis-cli -p 5000 SNAPRULES
 ```
-
 #### Pipeline 批量性能测试
 
 ##### 测试目的
@@ -4672,54 +4643,57 @@ bash tools/bench/run_pipeline_bench.sh
 # 手动单点测试
 redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand_int__ value
 ```
-
 > **2026-06-26 重测**（`bash tools/bench/run_pipeline_bench.sh`，非 sudo）
 
 ##### 测试结果
 
 **ECHO（纯协议开销，无引擎/持久化）：**
 
+
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
-|--------|--------------|-------------|----------|
-| 1 | 132,820 | 124,285 | **107%** |
-| 10 | 490,918 | 1,225,490 | 40% |
-| 20 | 515,464 | 2,105,263 | 24% |
-| 40 | 686,342 | 2,680,965 | 26% |
-| 80 | 800,000 | 3,267,974 | 24% |
-| 160 | 900,901 | 3,496,503 | 26% |
+| ------ | ------------- | ----------- | -------- |
+| 1      | 132,820       | 124,285     | **107%** |
+| 10     | 490,918       | 1,225,490   | 40%      |
+| 20     | 515,464       | 2,105,263   | 24%      |
+| 40     | 686,342       | 2,680,965   | 26%      |
+| 80     | 800,000       | 3,267,974   | 24%      |
+| 160    | 900,901       | 3,496,503   | 26%      |
 
 **HSET AOF 关闭（引擎写入，无持久化）：**
 
+
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
-|--------|--------------|-------------|----------|
-| 1 | 136,295 | 124,409 | **110%** |
-| 10 | 315,457 | 1,288,660 | 24% |
-| 20 | 405,186 | 1,828,154 | 22% |
-| 40 | 472,367 | 2,293,578 | 21% |
-| 80 | 544,070 | 2,551,021 | 21% |
-| 160 | 561,482 | 2,762,431 | **20%** |
+| ------ | ------------- | ----------- | -------- |
+| 1      | 136,295       | 124,409     | **110%** |
+| 10     | 315,457       | 1,288,660   | 24%      |
+| 20     | 405,186       | 1,828,154   | 22%      |
+| 40     | 472,367       | 2,293,578   | 21%      |
+| 80     | 544,070       | 2,551,021   | 21%      |
+| 160    | 561,482       | 2,762,431   | **20%**  |
 
 **HSET AOF everysec（每秒 fsync）：**
 
+
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
-|--------|--------------|-------------|----------|
-| 1 | 136,537 | 121,374 | **112%** |
-| 10 | 303,674 | 1,273,885 | 24% |
-| 20 | 383,289 | 1,788,909 | 21% |
-| 40 | 454,339 | 2,320,186 | 20% |
-| 80 | 517,331 | 2,597,403 | 20% |
-| 160 | 549,149 | 2,840,909 | **19%** |
+| ------ | ------------- | ----------- | -------- |
+| 1      | 136,537       | 121,374     | **112%** |
+| 10     | 303,674       | 1,273,885   | 24%      |
+| 20     | 383,289       | 1,788,909   | 21%      |
+| 40     | 454,339       | 2,320,186   | 20%      |
+| 80     | 517,331       | 2,597,403   | 20%      |
+| 160    | 549,149       | 2,840,909   | **19%**  |
 
 **HSET AOF always（每条命令 fsync）：**
 
+
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
-|--------|--------------|-------------|----------|
-| 1 | 74,610 | 123,533 | **60%** |
-| 10 | 11,148 | 1,226,994 | 0.9% |
-| 20 | 22,261 | 1,814,882 | 1.2% |
-| 40 | 44,557 | 2,304,148 | 1.9% |
-| 80 | 88,739 | 2,583,979 | 3.4% |
-| 160 | 177,778 | 2,816,902 | **6.3%** |
+| ------ | ------------- | ----------- | -------- |
+| 1      | 74,610        | 123,533     | **60%**  |
+| 10     | 11,148        | 1,226,994   | 0.9%     |
+| 20     | 22,261        | 1,814,882   | 1.2%     |
+| 40     | 44,557        | 2,304,148   | 1.9%     |
+| 80     | 88,739        | 2,583,979   | 3.4%     |
+| 160    | 177,778       | 2,816,902   | **6.3%** |
 
 ##### 结果分析
 
@@ -4741,13 +4715,14 @@ kvstore AOF always 在 pipeline 下性能极差——P=160 时仅 178k QPS，是
 
 ##### 结论
 
-| 场景 | 推荐方案 | 说明 |
-|------|---------|------|
-| P=1 单请求 | **kvstore** | HSET 136k vs Redis 124k QPS，略快 |
-| Pipeline + 无 AOF | Redis | P=160 时 2.76M vs kvstore 561k QPS（4.9×） |
-| Pipeline + AOF everysec | Redis | P=160 时 2.84M vs kvstore 549k QPS（5.2×） |
-| Pipeline + AOF always | **Redis** | P=160 时 2.82M vs kvstore 178k QPS（**15.9×**） |
-| 单请求 + AOF always | **kvstore** | Group commit 使单请求 AOF always 无开销 |
+
+| 场景                    | 推荐方案    | 说明                                             |
+| ----------------------- | ----------- | ------------------------------------------------ |
+| P=1 单请求              | **kvstore** | HSET 136k vs Redis 124k QPS，略快                |
+| Pipeline + 无 AOF       | Redis       | P=160 时 2.76M vs kvstore 561k QPS（4.9×）      |
+| Pipeline + AOF everysec | Redis       | P=160 时 2.84M vs kvstore 549k QPS（5.2×）      |
+| Pipeline + AOF always   | **Redis**   | P=160 时 2.82M vs kvstore 178k QPS（**15.9×**） |
+| 单请求 + AOF always     | **kvstore** | Group commit 使单请求 AOF always 无开销          |
 
 > **注意**：AOF always 下非 pipeline 场景 kvstore 表现优异（129k vs Redis 122k），
 > 但 pipeline 场景因 group commit 的 fsync 串行化而大幅落后。
@@ -4765,7 +4740,6 @@ bash tools/bench/run_persist_bench.sh        # AOF 持久化（always/everysec/d
 bash tools/bench/run_save_hset.sh            # SAVE 性能（HSET 写入 + SAVE 耗时）
 bash tools/bench/run_benchmark.sh            # 通用入口
 ```
-
 #### Pipeline 批量性能（手动）
 
 ```bash
@@ -4788,7 +4762,6 @@ done
 
 pkill kvstore
 ```
-
 #### AOF 并发性能（手动）
 
 ```bash
@@ -4807,7 +4780,6 @@ redis-benchmark -p 6800 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 \
 
 pkill kvstore
 ```
-
 #### 内存后端性能
 
 ```bash
@@ -4818,7 +4790,6 @@ sudo python3 tools/bench/bench_mem_backend.py \
   --backends libc,jemalloc,custom \
   --csv my_bench.csv
 ```
-
 #### SAVE 性能
 
 ```bash
@@ -4829,19 +4800,6 @@ bash tools/bench/run_save_hset.sh
 # 2. redis-benchmark 写入 N 条 HSET
 # 3. redis-cli SAVE，记录耗时
 # 4. 检查 dump 文件大小
-```
-
-#### 跨机复制性能
-
-```bash
-# 主机
-sudo ./kvstore kvstore.conf --role master
-
-# 从机
-sudo ./kvstore kvstore.conf --role slave
-
-# 测试（主机 tests/ 目录）
-./test_repl_5w5w --config test.conf
 ```
 
 ### eBPF kprobe 主从转发 QPS 对比（跨虚拟机）
@@ -4918,14 +4876,14 @@ sudo ./kvstore kvstore.conf --role slave
 
    ③ 回显和 ⑤ 异步转发并行：kprobe 不阻塞 ②→③ 的主路径
 ```
-
 **三种模式实现差异**（都在同一个 main 函数中，`--mode` 切换）：
 
-| 模式 | Master echo 线程做什么 | 转发路径 |
-|------|----------------------|---------|
-| `none` | `read(client) → write_full(client)` | 无转发 |
-| `sync` | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步 `write()` 跨机 TCP |
-| `kprobe` | `read(client) → write_full(client)` | BPF 在内核 `tcp_recvmsg` 处截获数据→ringbuf→用户态异步线程 `write_full(slave)`，**不阻塞 echo** |
+
+| 模式     | Master echo 线程做什么                                    | 转发路径                                                                                         |
+| -------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `none`   | `read(client) → write_full(client)`                      | 无转发                                                                                           |
+| `sync`   | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步`write()` 跨机 TCP                                                             |
+| `kprobe` | `read(client) → write_full(client)`                      | BPF 在内核`tcp_recvmsg` 处截获数据→ringbuf→用户态异步线程 `write_full(slave)`，**不阻塞 echo** |
 
 **kprobe BPF 程序**（`kprobe_capture.bpf.c`）工作细节：
 
@@ -4949,7 +4907,6 @@ tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
         • bpf_probe_read_user(buf_addr, len) → BPF 临时 buf
         • 打包 [4B长度 | payload] → bpf_ringbuf_output → 用户态 ringbuf 消费者
 ```
-
 **为什么需要两次 hook（entry + return）？**
 
 kprobe 单个 hook 只能看到函数**入口**或**出口**的寄存器/内存状态，不能同时看到参数和返回值。`tcp_recvmsg` 的参数（`msg` 指针）只在入口可见，实际拷贝的字节数只在出口（`ax` 寄存器）可见。两者必须通过 entry 保存→return 取回的方式关联。
@@ -4963,7 +4920,6 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
         ↑                                    ↑
    正常 recv 路径                       kprobe 额外拷贝
 ```
-
 要避免第二次拷贝，需要 hook 更底层的函数（如 `skb_copy_datagram_iter`），从内核 `sk_buff` 直接读数据。但 `tcp_recvmsg` 是更稳定的 hook 点（内核 API 变动少），代价是接受这次额外拷贝。
 
 **客户端线程**负责精确计时：
@@ -4974,17 +4930,19 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 4. 输出：QPS = `count / 总耗时`，延迟取 avg/p50/p99/min/max
 
 **跨机 Slave**（`test_slave_receiver.c`）独立运行在从机：
+
 - `listen(15801)` → 循环 `accept` → 每连接 `read` 循环统计 → 打印 msgs/MB → `close`
 
 **参数说明**：
 
-| 参数 | 默认 | 含义 |
-|------|------|------|
-| `--payload, -p` | 64 | 单次请求/响应的字节数 |
-| `--count, -c` | 10000 | 正式测试的请求次数（≥1024B 用 5000） |
-| `--mode, -m` | all | `none` / `sync` / `kprobe` / `all` |
-| `--slave-host` | 127.0.0.1 | 跨机 Slave IP |
-| `--slave-port` | 15801 | 跨机 Slave 端口 |
+
+| 参数            | 默认      | 含义                                  |
+| --------------- | --------- | ------------------------------------- |
+| `--payload, -p` | 64        | 单次请求/响应的字节数                 |
+| `--count, -c`   | 10000     | 正式测试的请求次数（≥1024B 用 5000） |
+| `--mode, -m`    | all       | `none` / `sync` / `kprobe` / `all`    |
+| `--slave-host`  | 127.0.0.1 | 跨机 Slave IP                         |
+| `--slave-port`  | 15801     | 跨机 Slave 端口                       |
 
 **设计考量**：
 
@@ -4995,32 +4953,24 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 
 **测试结果**
 
+
 | Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
-|---------|---------:|---------:|-----------:|---------------:|-----------:|
-| 64B | 28,374 | 18,712 | 17,617 | −5.9% | 10,808 |
-| 128B | 29,796 | 22,124 | 13,336 | −39.7% | 10,500 |
-| 256B | 29,457 | 22,042 | 15,275 | −30.7% | 10,490 |
-| 512B | 29,076 | 22,566 | 17,254 | −23.5% | 10,507 |
-| 1024B | 29,425 | 23,189 | **29,521** | **+27.3%** | 4,821 |
-| 2048B | 28,336 | 22,253 | 18,338 | −17.6% | 5,516 |
-| 4096B | 28,337 | 21,019 | 17,029 | −19.0% | 5,508 |
+| ------- | -------: | -------: | ---------: | -------------: | ---------: |
+| 64B     |   27,651 |   21,007 |     14,294 |        −32.0% |     11,032 |
+| 128B    |   28,472 |   21,573 |     12,150 |        −43.7% |     10,496 |
+| 256B    |   28,530 |   20,597 |     16,266 |        −21.0% |     10,518 |
+| 512B    |   28,583 |   22,297 |     17,278 |        −22.5% |     10,523 |
+| 1024B   |   30,500 |   18,184 |     14,274 |        −21.5% |     10,495 |
+| 2048B   |   29,196 |   17,482 |     12,694 |        −27.4% |      5,628 |
+| 4096B   |   27,392 |   17,072 |     12,377 |        −27.5% |      5,499 |
 
 > ¹ Slave 收包数来自 test_kprobe_repl_qps 内部启动的**本地** Slave 线程（与跨机远程 Slave 无关，始终为 0）
 
 **关键发现**
 
-1. **kprobe vs sync：1024B 是唯一甜点，其余全部落后**：
-   - **1024B**：kprobe（29.5k）**反超 sync（23.2k）27%**，是唯一胜出的 payload
-   - 其余所有尺寸 kprobe 均落后 sync：64B(−6%) → 128B(−40%) → 256B(−31%) → 512B(−24%) → 2048B(−18%) → 4096B(−19%)
-   - 128B 最差，kprobe 仅达到 sync 的 60%，kprobe hook 开销远超同步 `write()`
-   - 1024B 甜点推测：payload 恰好在 TCP MSS(1460) 内单段交付，每请求仅触发一次 `tcp_recvmsg` hook，无分段也无合并，kprobe→ringbuf→异步发送的路径延迟低于同步 `write()` 阻塞主循环
-
-2. **kprobe 开销与 TCP 分段行为强耦合**：
-   - 小包（64-512B）：TCP 可能合并多个小段后一次交付，kprobe 在每次 `tcp_recvmsg` 返回时触发，但拷贝的数据量小于实际交付量
-   - 大包（≥2048B）：被 MSS 分裂为多段，每段触发一次 kprobe hook，开销叠加
-   - 只有 1024B 恰好"一段一请求"对齐，kprobe 开销最小化
-
-3. **none 基准稳定，sync 开销稳定**：本地 echo ~28-30K QPS（35μs），sync 转发额外增加 21-26% 延迟，两者均与 payload 大小弱相关
+1. **kprobe 在所有 payload 下均落后 sync**：kprobe QPS 仅为 sync 的 56%~79%。kprobe 挂载在 `tcp_recvmsg` 的 entry+return 上，每次 recv 触发两次 BPF hook + `bpf_probe_read_user` 拷贝，累计开销超过简单的同步 `write()` 转发
+2. **128B 最差（−43.7%）**，小包时 BPF hook 开销占单次请求比例最大
+3. **none 基准 ~27-30K QPS（34-36μs）**，sync 转发到从机增加 ~25-40% 延迟
 
 ---
 
@@ -5040,7 +4990,6 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 slave$ iperf3 -s -p 18526
 master$ iperf3 -c 192.168.233.129 -p 18526 -t 5 -f m
 ```
-
 iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps。作为跨机 TCP 的**天花板**——所有优化方案的上限不该超过裸 TCP 的物理带宽。
 
 ---
@@ -5052,6 +5001,7 @@ iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps
 **服务端**：`listen → accept → read 循环计数 → 计时 → 打印吞吐量`
 
 **客户端**：
+
 1. 创建临时文件 `/tmp/perf_test_file`：`write_full` 填充 `iters × size` 字节（'S'）
 2. 连接服务端 TCP
 3. `for i in 0..iters:` `sendfile(sock_fd, file_fd, &offset, size)` —— 内核直接搬运文件页到 socket 缓冲区，不走用户态
@@ -5062,14 +5012,14 @@ iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps
 off_t offset = 0;
 sendfile(sock, fd, &offset, buf_size);  // fd 是文件，sock 是 TCP socket
 ```
-
 **参数**：
 
-| 参数 | 默认 | 含义 |
-|------|------|------|
-| `--size` | 65536 | 单次 `sendfile()` 搬运字节数（模拟业务 payload） |
-| `--iters` | 5000 | 调用次数（≥1MB 用 1000） |
-| `--port, -p` | 18517 | TCP 端口 |
+
+| 参数         | 默认  | 含义                                            |
+| ------------ | ----- | ----------------------------------------------- |
+| `--size`     | 65536 | 单次`sendfile()` 搬运字节数（模拟业务 payload） |
+| `--iters`    | 5000  | 调用次数（≥1MB 用 1000）                       |
+| `--port, -p` | 18517 | TCP 端口                                        |
 
 **设计考量**：使用 `sendfile()` 而非 `write()`，数据从文件 page cache 直接进入 socket 发送缓冲区，省去 `read→用户态buf→write` 的两次拷贝。但 TCP 协议栈本身（拥塞控制、TSO/GRO、ACK 处理）完整保留。
 
@@ -5095,7 +5045,6 @@ rdma_create_qp()                      注册 MR
 rdma_connect() ← 附带 MR rkey/addr      ↓ 等待 ESTABLISHED
   ↓ 等待 ESTABLISHED                  ← 双方 QP 就绪 →
 ```
-
 MR（Memory Region）信息通过 rdma_cm 的 `private_data` 字段在 `rdma_connect`/`rdma_accept` 时互换——无需额外 TCP 通道。
 
 **数据传输**（客户端核心循环）：
@@ -5115,71 +5064,76 @@ for i in 0..iters:
     if inflight >= 256:
         ibv_poll_cq(cq, 32, wc)  // 回收完成事件，释放 QP 槽位
 ```
-
 **服务端**：预 post 256 个 recv WR → `ibv_poll_cq` 循环收完成通知 → 每收一条重新 post recv（保持接收队列满）
 
 **inflight 控制**：QP 的 `max_send_wr=1024`，inflight 超过 256 时主动 poll CQ 回收，超过 512 时自旋 drain。循环结束后全量 drain 剩余 inflight。
 
 **吞吐量计算**：
+
 ```c
 actual_iters = 实际 post_send 成功次数
 elapsed = now_us() - t0
 throughput = (actual_iters * size * 8) / elapsed_s   // bps
 ```
-
 **参数**：
 
-| 参数 | 默认 | 含义 |
-|------|------|------|
-| `--size` | 65536 | 单次 RDMA WR 的 payload 字节数 |
-| `--iters` | 5000 | 发送 WR 次数（≥1MB 用 1000） |
-| `--mode` | write | `write`（单边 RDMA WRITE）或 `send`（双边 SEND） |
-| `--port, -p` | 18516 | rdma_cm 端口 |
+
+| 参数         | 默认  | 含义                                             |
+| ------------ | ----- | ------------------------------------------------ |
+| `--size`     | 65536 | 单次 RDMA WR 的 payload 字节数                   |
+| `--iters`    | 5000  | 发送 WR 次数（≥1MB 用 1000）                    |
+| `--mode`     | write | `write`（单边 RDMA WRITE）或 `send`（双边 SEND） |
+| `--port, -p` | 18516 | rdma_cm 端口                                     |
 
 **RDMA WRITE vs SEND 本质区别**：
 
-| | RDMA WRITE | RDMA SEND |
-|---|---|---|
+
+|          | RDMA WRITE                   | RDMA SEND                     |
+| -------- | ---------------------------- | ----------------------------- |
 | 远端 CPU | **不参与**（DMA 直接写内存） | **参与**（需预 post recv WR） |
-| 远端感知 | 无通知（除非带 IMM） | CQ 产生 recv completion |
-| 适用场景 | 大块数据传输 | 消息传递 |
+| 远端感知 | 无通知（除非带 IMM）         | CQ 产生 recv completion       |
+| 适用场景 | 大块数据传输                 | 消息传递                      |
 
 ---
 
 #### 为什么这样对比？
 
-| 维度 | iperf3 TCP | sendfile | RDMA WRITE | RDMA SEND |
-|------|:--:|:--:|:--:|:--:|
-| 用户态拷贝 | 有 | 无（内核零拷贝） | 无（DMA） | 无（DMA） |
-| 内核协议栈 | TCP 全栈 | TCP 全栈 | 绕过，UDP 封装 | 绕过，UDP 封装 |
-| 远端 CPU 参与 | 参与 recv | 参与 recv | **不参与** | 参与 recv |
-| 连接管理 | TCP 握手 | TCP 握手 | rdma_cm | rdma_cm |
+
+| 维度          | iperf3 TCP |     sendfile     |   RDMA WRITE   |   RDMA SEND   |
+| ------------- | :--------: | :--------------: | :------------: | :------------: |
+| 用户态拷贝    |     有     | 无（内核零拷贝） |   无（DMA）   |   无（DMA）   |
+| 内核协议栈    |  TCP 全栈  |     TCP 全栈     | 绕过，UDP 封装 | 绕过，UDP 封装 |
+| 远端 CPU 参与 | 参与 recv |    参与 recv    |   **不参与**   |   参与 recv   |
+| 连接管理      |  TCP 握手  |     TCP 握手     |    rdma_cm    |    rdma_cm    |
 
 理论预期：RDMA WRITE > RDMA SEND ≈ sendfile > iperf3 TCP。但在 KVM + Soft-RoCE 虚拟网络中，UDP 封装和虚拟交换机处理成为瓶颈，**结果倒挂**。
 
 **测试结果**
 
-| 传输方式 | Payload | 吞吐量 | 对比 iperf3 |
-|----------|---------|-------:|-----------:|
-| iperf3 TCP | — | **5,208 Mbps** | 基准 |
-| sendfile | 4KB | 4,400 Mbps | −15.5% |
-| sendfile | 64KB | **5,520 Mbps** | +6.0% |
-| sendfile | 256KB | 5,000 Mbps | −4.0% |
-| sendfile | 1MB | 4,940 Mbps | −5.1% |
-| RDMA WRITE | 4KB | 562 Mbps | −89.2% |
-| RDMA SEND | 4KB | 582 Mbps | −88.8% |
-| RDMA WRITE | 64KB | 913 Mbps | −82.5% |
-| RDMA SEND | 64KB | 898 Mbps | −82.8% |
-| RDMA WRITE | 256KB | 967 Mbps | −81.4% |
-| RDMA SEND | 256KB | **1,070 Mbps** | −79.5% |
-| RDMA WRITE | 1MB | 943 Mbps | −81.9% |
-| RDMA SEND | 1MB | 943 Mbps | −81.9% |
+
+| 传输方式   | Payload |         吞吐量 | 对比 iperf3 |
+| ---------- | ------- | -------------: | ----------: |
+| iperf3 TCP | —      | **5,340 Mbps** |        基准 |
+| sendfile   | 4KB     | **6,540 Mbps** |     +22.5% |
+| sendfile   | 64KB    |     5,410 Mbps |      +1.3% |
+| sendfile   | 256KB   |     5,570 Mbps |      +4.3% |
+| sendfile   | 1MB     |     5,550 Mbps |      +3.9% |
+| RDMA WRITE | 4KB     |       588 Mbps |     −89.0% |
+| RDMA SEND  | 4KB     |       762 Mbps |     −85.7% |
+| RDMA WRITE | 64KB    |       968 Mbps |     −81.9% |
+| RDMA SEND  | 64KB    |       945 Mbps |     −82.3% |
+| RDMA WRITE | 256KB   |       949 Mbps |     −82.2% |
+| RDMA SEND  | 256KB   |       919 Mbps |     −82.8% |
+| RDMA WRITE | 1MB     | **1,010 Mbps** |     −81.1% |
+| RDMA SEND  | 1MB     |       995 Mbps |     −81.4% |
+
+> **2026-06-26 重测**
 
 **关键发现**
 
-1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：在同一物理宿主机的 KVM 虚拟网络中，Soft-RoCE 将 RDMA 操作封装为 UDP 包（RoCEv2），额外封装层 + 虚拟交换机处理导致吞吐量仅为 TCP 的 ~11-20%
-2. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 吞吐量基本持平（4.4-5.5 Gbps），说明跨机场景下内核 TCP 栈已充分优化，用户态零拷贝收益有限
-3. **RDMA WRITE ≈ RDMA SEND**：两种 RDMA 操作吞吐量接近，说明瓶颈在底层 RoCEv2 封装的 UDP 路径，而非 RDMA 操作类型
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：在同一物理宿主机的 KVM 虚拟网络中，Soft-RoCE 将 RDMA 操作封装为 UDP 包（RoCEv2），额外封装层 + 虚拟交换机处理导致吞吐量仅为 TCP 的 ~11-19%
+2. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 吞吐量基本持平（5.4-6.5 Gbps），跨机场景下内核 TCP 栈已充分优化
+3. **RDMA WRITE ≈ RDMA SEND**：两种 RDMA 操作吞吐量接近，瓶颈在底层 RoCEv2 封装的 UDP 路径，而非 RDMA 操作类型
 4. **本地 RDMA 可达 29 Gbps**（同机 rxe0 loopback，64KB × 500 iters），证明 Soft-RoCE 的内存带宽潜力巨大，瓶颈在网络路径
 
 > **注意**：硬件 RDMA（InfiniBand / 硬件 RoCE）跨机吞吐量预期远超 TCP。Soft-RoCE 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。
@@ -5214,7 +5168,6 @@ make ENABLE_EBPF=1
 # 编译零警告策略
 make CFLAGS="-Wall -Wextra -O2"
 ```
-
 ---
 
 ## 常见问题
@@ -5231,13 +5184,11 @@ make CFLAGS="-Wall -Wextra -O2"
 ./kvstore --port 6380
 # 或修改 kvstore.conf 中 port=6380
 ```
-
 ### 内存观测
 
 ```bash
 printf '*1\r\n$7\r\nMEMSTAT\r\n' | nc 127.0.0.1 5160
 ```
-
 关注指标：`current_small_inuse`、`peak_small_inuse`、`internal_fragment_ppm`。
 
 ### RDMA / eBPF 环境要求

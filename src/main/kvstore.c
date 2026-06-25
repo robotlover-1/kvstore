@@ -5,18 +5,6 @@
 #include <ctype.h>
 #include <strings.h>
 
-/* pre-encoded RESP literals — avoid snprintf on hot path */
-#define RESP_OK     "+OK\r\n"
-#define RESP_OK_LEN 5
-#define RESP_ONE    ":1\r\n"
-#define RESP_ONE_LEN 4
-#define RESP_ZERO   ":0\r\n"
-#define RESP_ZERO_LEN 4
-#define RESP_ERR_NF "-ERR not found or exists\r\n"
-#define RESP_ERR_NF_LEN 25
-#define RESP_ERR_FAIL "-ERR operation failed\r\n"
-#define RESP_ERR_FAIL_LEN 22
-
 /* kvs_repl.c 中的 static 变量，KPROBEMR 响应需要 */
 extern int g_slave_fd;
 
@@ -484,24 +472,6 @@ void repl_remove_slave(conn_t *c) {
     c->repl_draining = 0;
     c->repl_fullsync_pending = 0;
     pthread_mutex_unlock(&g_repl_lock);
-}
-
-static void repl_broadcast_argv(int argc, char **argv, size_t *argl) {
-    unsigned char buf[4096];
-    size_t pos = 0;
-    int n = snprintf((char *)buf, sizeof(buf), "*%d\r\n", argc);
-    if (n < 0 || (size_t)n >= sizeof(buf)) return;
-    pos = (size_t)n;
-    for (int i = 0; i < argc; i++) {
-        int m = snprintf((char *)buf + pos, sizeof(buf) - pos, "$%zu\r\n", argl[i]);
-        if (m < 0 || pos + (size_t)m + argl[i] + 2 > sizeof(buf)) return;
-        pos += (size_t)m;
-        memcpy(buf + pos, argv[i], argl[i]);
-        pos += argl[i];
-        buf[pos++] = '\r';
-        buf[pos++] = '\n';
-    }
-    repl_broadcast(buf, pos);
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
@@ -1027,24 +997,12 @@ static int split_inline_argv(char *line, char **argv, int maxargc) {
     return argc;
 }
 
-/* ensure resp has at least 'need' bytes; fall back to heap if stack buffer too small */
-static int resp_ensure(char **resp, char *resp_small, int *allocated, size_t need) {
-    (void)resp_small;
-    if (*allocated || need <= 1024) return 0;
-    char *big = (char *)kvs_malloc(BUFFER_CAP);
-    if (!big) return -1;
-    *resp = big;
-    *allocated = 1;
-    return 0;
-}
-
 int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const unsigned char *raw, size_t rawlen, int from_replication) {
 
     int rc_ret = 0;
     int n = 0;
-    char resp_small[1024];
-    char *resp = resp_small;
-    int resp_allocated = 0;
+    char *resp = (char *)kvs_malloc(BUFFER_CAP);
+    if (!resp) return -1;
 
     (void)argl;
     if (argc <= 0) {
@@ -1365,14 +1323,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             cc_repld, cc_l1, cc_l2,
             recover_n >= 0 ? recover : "");
 
-        resp_ensure(&resp, resp_small, &resp_allocated, strlen(info) + 32);
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;
     }
     if (!strcmp(cmd, "MEMSTAT")) {
-        resp_ensure(&resp, resp_small, &resp_allocated, 2048);
         char *info = (char *)kvs_malloc(BUFFER_CAP);
         n = build_memstat_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "memstat build failed");
@@ -1437,7 +1393,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "SNAPRULES")) {
-        resp_ensure(&resp, resp_small, &resp_allocated, 2048);
         char *info = (char *)kvs_malloc(BUFFER_CAP);
         n = persist_build_autosnap_text(info, BUFFER_CAP);
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "snaprules build failed");
@@ -1461,7 +1416,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1479,7 +1434,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1497,7 +1452,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1575,7 +1530,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else {
             n = resp_error(resp, BUFFER_CAP, "docset failed");
@@ -1596,7 +1551,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (drc == 1) {
             n = resp_error(resp, BUFFER_CAP, "doc or field not found");
@@ -1613,7 +1568,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!from_replication) {
                 persist_note_write();
                 persist_append_raw(raw, rawlen);
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
         } else if (drc == 1) {
             n = resp_error(resp, BUFFER_CAP, "doc not found");
@@ -1672,131 +1627,98 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     const char *op = strip_prefix(cmd);
     int rc = -1;
     int should_reply_missing = 0;
-    size_t oplen = argl[0];
-    /* strip engine prefix (H/R/X) — op already points past it */
-    if (op != argv[0]) oplen--;
 
-    /* fast dispatch by first char + length (zero-copy argv) */
-    switch (op[0]) {
-    case 'S': /* SET */
-        if (oplen == 3 && argc == 3) {
-            try_expire(engine, argv[1]);
-            rc = engine_set(engine, argv[1], argv[2]);
-            should_reply_missing = 1;
-        }
-        break;
-    case 'M':
-        if (op[1] == 'S') { /* MSET */
-            if (argc >= 3 && (argc & 1)) {
-                try_expire(engine, argv[1]);
-                rc = handle_multi_set(engine, argc, argv);
-            }
-        } else if (op[1] == 'O') { /* MOD */
-            if (argc == 3) {
-                try_expire(engine, argv[1]);
-                rc = engine_mod(engine, argv[1], argv[2]);
-                should_reply_missing = 1;
-            }
-        } else if (op[1] == 'G') { /* MGET */
-            n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
-#if KVS_ENABLE_RDMA
-            if (g_cfg.role == ROLE_SLAVE && !from_replication) {
-                for (int i = 1; i < argc; ++i) {
-                    if (repl_is_soak_key(argv[i])) {
-                        char *mv = engine_get(engine, argv[i]);
-                        repl_rdma_log("slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
-                            argv[i], mv ? 1 : 0, mv ? mv : "(null)", repl_slave_offset(), repl_master_link_state_name());
-                    }
-                }
-            }
-#endif
-            if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
-            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-            goto out;
-        }
-        break;
-    case 'D': /* DEL */
-        if (oplen == 3 && argc == 2) {
-            try_expire(engine, argv[1]);
-            rc = engine_del(engine, argv[1]);
-            kvs_expire_del(&global_expire, engine, argv[1]);
-            should_reply_missing = 1;
-        }
-        break;
-    case 'G': /* GET */
-        if (oplen == 3 && argc == 2) {
-            try_expire(engine, argv[1]);
-            char *v = engine_get(engine, argv[1]);
-#if KVS_ENABLE_RDMA
-            if (g_cfg.role == ROLE_SLAVE && !from_replication && repl_is_soak_key(argv[1])) {
-                repl_rdma_log("slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
-                    argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
-            }
-#endif
-            if (v) {
-                size_t vlen = strlen(v);
-                if (vlen > 1000) resp_ensure(&resp, resp_small, &resp_allocated, vlen + 32);
-                n = resp_bulk(resp, BUFFER_CAP, v, vlen);
-            } else {
-                n = resp_null_bulk(resp, BUFFER_CAP);
-            }
-            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-            goto out;
-        }
-        break;
-    case 'E':
-        if (op[1] == 'X') {
-            if (op[2] == 'I') { /* EXIST */
-                if (argc == 2) {
-                    try_expire(engine, argv[1]);
-                    n = resp_integer(resp, BUFFER_CAP, engine_exist(engine, argv[1]) == 0 ? 1 : 0);
-                    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-                    goto out;
-                }
-            } else if (op[2] == 'P') { /* EXPIRE */
-                if (argc == 3) {
-                    try_expire(engine, argv[1]);
-                    if (engine_exist(engine, argv[1]) != 0) rc = 1;
-                    else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
-                    should_reply_missing = 1;
-                }
-            }
-        }
-        break;
-    case 'T': /* TTL */
-        if (oplen == 3 && argc == 2) {
-            try_expire(engine, argv[1]);
-            if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, BUFFER_CAP, -2);
-            else {
-                long long ttl = kvs_expire_ttl(&global_expire, engine, argv[1]);
-                n = resp_integer(resp, BUFFER_CAP, ttl);
-            }
-            if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-            goto out;
-        }
-        break;
-    case 'P': /* PERSIST */
-        if (oplen == 7 && argc == 2) {
-            try_expire(engine, argv[1]);
-            if (engine_exist(engine, argv[1]) != 0) rc = 1;
-            else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
-            should_reply_missing = 1;
-        }
-        break;
-    default:
-        break;
+    if (!strcmp(op, "SET") && argc == 3) {
+        try_expire(engine, argv[1]);
+        rc = engine_set(engine, argv[1], argv[2]);
+        should_reply_missing = 1;
     }
-
-    if (rc < 0 && n <= 0) {
-        n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
+    else if (!strcmp(op, "MSET")) {
+        try_expire(engine, argv[1]);
+        rc = handle_multi_set(engine, argc, argv);
+    }
+    else if (!strcmp(op, "MOD") && argc == 3) {
+        try_expire(engine, argv[1]);
+        rc = engine_mod(engine, argv[1], argv[2]);
+        should_reply_missing = 1;
+    }
+    else if (!strcmp(op, "DEL") && argc == 2) {
+        try_expire(engine, argv[1]);
+        rc = engine_del(engine, argv[1]);
+        kvs_expire_del(&global_expire, engine, argv[1]);
+        should_reply_missing = 1;
+    }
+    else if (!strcmp(op, "GET") && argc == 2) {
+        try_expire(engine, argv[1]);
+        char *v = engine_get(engine, argv[1]);
+#if KVS_ENABLE_RDMA
+        if (g_cfg.role == ROLE_SLAVE && !from_replication && repl_is_soak_key(argv[1])) {
+            repl_rdma_log("slave_get_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
+                argv[1], v ? 1 : 0, v ? v : "(null)", repl_slave_offset(), repl_master_link_state_name());
+        }
+#endif
+        n = v ? resp_bulk(resp, BUFFER_CAP, v, strlen(v)) : resp_null_bulk(resp, BUFFER_CAP);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+        return 0;
+    } else if (!strcmp(op, "MGET")) {
+        n = handle_multi_get(engine, argc, argv, resp, BUFFER_CAP);
+#if KVS_ENABLE_RDMA
+        if (g_cfg.role == ROLE_SLAVE && !from_replication) {
+            for (int i = 1; i < argc; ++i) {
+                if (repl_is_soak_key(argv[i])) {
+                    char *mv = engine_get(engine, argv[i]);
+                    repl_rdma_log("slave_mget_inline - key=%s hit=%d value=%s slave_offset=%llu master_link=%s",
+                        argv[i], mv ? 1 : 0, mv ? mv : "(null)", repl_slave_offset(), repl_master_link_state_name());
+                }
+            }
+        }
+#endif
+        if (n < 0) n = resp_error(resp, BUFFER_CAP, "mget failed");
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+        return 0;
+    } else if (!strcmp(op, "EXIST") && argc == 2) {
+        try_expire(engine, argv[1]);
+        n = resp_integer(resp, BUFFER_CAP, engine_exist(engine, argv[1]) == 0 ? 1 : 0);
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+        return 0;
+    } else if (!strcmp(op, "EXPIRE") && argc == 3) {
+        try_expire(engine, argv[1]);
+        if (engine_exist(engine, argv[1]) != 0) rc = 1;
+        else rc = kvs_expire_set(&global_expire, engine, argv[1], atoll(argv[2]) * 1000);
+        should_reply_missing = 1;
+    } else if (!strcmp(op, "TTL") && argc == 2) {
+        try_expire(engine, argv[1]);
+        if (engine_exist(engine, argv[1]) != 0) n = resp_integer(resp, BUFFER_CAP, -2);
+        else {
+            long long ttl = kvs_expire_ttl(&global_expire, engine, argv[1]);
+            n = resp_integer(resp, BUFFER_CAP, ttl);
+        }
+        if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+        goto out;
+        return 0;
+    } else if (!strcmp(op, "PERSIST") && argc == 2) {
+        try_expire(engine, argv[1]);
+        if (engine_exist(engine, argv[1]) != 0) rc = 1;
+        else rc = kvs_expire_persist(&global_expire, engine, argv[1]);
+        should_reply_missing = 1;
+    } else {
+        int expected_argc = 0;
+        if (!strcmp(op, "SET") || !strcmp(op, "MOD") || !strcmp(op, "EXPIRE")) expected_argc = 3;
+        else if (!strcmp(op, "GET") || !strcmp(op, "DEL") || !strcmp(op, "EXIST") || !strcmp(op, "TTL") || !strcmp(op, "PERSIST")) expected_argc = 2;
+        if (expected_argc > 0 && argc != expected_argc)
+            n = resp_error(resp, BUFFER_CAP, "wrong number of arguments");
+        else
+            n = resp_error(resp, BUFFER_CAP, "unknown command or wrong args");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;
     }
 
     if (rc == 0) {
-        memcpy(resp, RESP_OK, RESP_OK_LEN);
-        n = RESP_OK_LEN;
+        n = resp_simple_string(resp, BUFFER_CAP, "OK");
         if (!strcmp(op, "SET") || !strcmp(op, "MOD")) {
             kvs_expire_persist(&global_expire, engine, argv[1]);
         }
@@ -1819,7 +1741,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
             persist_append_raw(raw, rawlen);
-            if (g_cfg.role == ROLE_MASTER) repl_broadcast_argv(argc, argv, argl);
+            if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             /* group commit: if data was buffered (not flushed), defer response */
             if (c && persist_aof_has_pending()) {
                 persist_defer_response(c, (unsigned char *)resp, (size_t)n);
@@ -1827,21 +1749,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             }
         }
     } else if (rc == 1 && should_reply_missing) {
-        if (!strcmp(op, "SET")) {
-            memcpy(resp, RESP_OK, RESP_OK_LEN);
-            n = RESP_OK_LEN;
-        } else {
-            memcpy(resp, RESP_ERR_NF, RESP_ERR_NF_LEN);
-            n = RESP_ERR_NF_LEN;
-        }
+        if (!strcmp(op, "SET")) n = resp_simple_string(resp, BUFFER_CAP, "OK");
+        else n = resp_error(resp, BUFFER_CAP, "not found or exists");
     } else {
-        memcpy(resp, RESP_ERR_FAIL, RESP_ERR_FAIL_LEN);
-        n = RESP_ERR_FAIL_LEN;
+        n = resp_error(resp, BUFFER_CAP, "operation failed");
     }
     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
     out:
-    if (resp != resp_small) kvs_free(resp);
+    kvs_free(resp);
     return rc_ret;
 }
 
@@ -1985,25 +1901,33 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                 incomplete = 1;
                 break;
             }
-            /* verify \r\n terminator before writing in-place null */
-            if (!(buf[p + (size_t)blen] == '\r' && buf[p + (size_t)blen + 1] == '\n')) {
+            argv[i] = (char *)kvs_malloc((size_t)blen + 1);
+            if (!argv[i]) {
                 malformed = 1;
                 break;
             }
-            /* zero-copy: point argv into inbuf, null-term in place */
-            argv[i] = (char *)(buf + p);
-            buf[p + (size_t)blen] = '\0';
+            memcpy(argv[i], buf + p, (size_t)blen);
+            argv[i][blen] = 0;
             argl[i] = (size_t)blen;
-            p += (size_t)blen + 2;
+            p += (size_t)blen;
+            if (!(buf[p] == '\r' && buf[p + 1] == '\n')) {
+                malformed = 1;
+                break;
+            }
+            p += 2;
         }
-        if (incomplete) { break; }
+        if (incomplete) {
+            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+            break;
+        }
         if (malformed) {
+            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
             if (p > start) pos = p;
             else break;
             continue;
         }
         handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
-        /* argv[i] points into inbuf (zero-copy) — no free needed */
+        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
         pos = p;
     }
     if (pos > 0 && pos < *len) {

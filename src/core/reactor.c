@@ -46,6 +46,7 @@ int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
     }
     c->out_ring_tail = (tail + len) & (OUT_RING_SIZE - 1);
     c->out_ring_len += len;
+    mod_events(c, EPOLLIN | EPOLLOUT);
     return 0;
 }
 

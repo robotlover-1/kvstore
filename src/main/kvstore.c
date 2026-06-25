@@ -506,24 +506,6 @@ static void repl_broadcast_argv(int argc, char **argv, size_t *argl) {
     repl_broadcast(buf, pos);
 }
 
-static void repl_broadcast_argv(int argc, char **argv, size_t *argl) {
-    unsigned char buf[4096];
-    size_t pos = 0;
-    int n = snprintf((char *)buf, sizeof(buf), "*%d\r\n", argc);
-    if (n < 0 || (size_t)n >= sizeof(buf)) return;
-    pos = (size_t)n;
-    for (int i = 0; i < argc; i++) {
-        int m = snprintf((char *)buf + pos, sizeof(buf) - pos, "$%zu\r\n", argl[i]);
-        if (m < 0 || pos + (size_t)m + argl[i] + 2 > sizeof(buf)) return;
-        pos += (size_t)m;
-        memcpy(buf + pos, argv[i], argl[i]);
-        pos += argl[i];
-        buf[pos++] = '\r';
-        buf[pos++] = '\n';
-    }
-    repl_broadcast(buf, pos);
-}
-
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
@@ -568,8 +550,6 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
-        /* 注册 EPOLLOUT — reactor 的 on_write() 会正确更新
-         * out_ring_head + out_ring_len，保证 ring buffer 一致性 */
         if (c->out_ring_len > 0 && g_epfd >= 0 && c->fd >= 0) {
             struct epoll_event _ev;
             _ev.events = EPOLLIN | EPOLLOUT;

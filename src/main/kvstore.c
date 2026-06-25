@@ -1,6 +1,7 @@
 
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
+#include <sys/epoll.h>
 #include <signal.h>
 #include <ctype.h>
 #include <strings.h>

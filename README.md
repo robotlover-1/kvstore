@@ -4768,6 +4768,346 @@ sudo python3 tools/bench/bench_mem_backend.py \
   --csv my_bench.csv
 ```
 
+### eBPF kprobe 主从转发 QPS 对比（跨虚拟机）
+
+> **测试环境**：2 × KVM 虚拟机（Master 192.168.233.128 / Slave 192.168.233.129）
+> Ubuntu 20.04 / Linux 5.15.0-139 / 同一物理宿主机
+
+**测试方法**
+
+测试程序 `test_kprobe_repl_qps.c` 是一个自包含的 C 程序，内部**同时创建**客户端线程、Master echo 线程、Slave 接收线程和 BPF ringbuf 消费者线程，无需外部依赖。
+
+**架构与数据流**（三种模式分列）：
+
+```
+                      none 模式（基准：纯 echo，无转发）
+                      ════════════════════════════════
+
+   Master (128) 进程内
+   ┌─────────────────────────────────────┐
+   │                                     │
+   │  client 线程          master 线程    │
+   │  ┌──────────┐        ┌──────────┐   │
+   │  │ ① 发送   │──TCP──→│ ② 接收   │   │
+   │  │   req    │        │   echo   │   │
+   │  │          │←──TCP─│ ③ 响应   │   │
+   │  │ ④ 计时   │        └──────────┘   │
+   │  └──────────┘                       │
+   └─────────────────────────────────────┘
+
+
+                      sync 模式（echo + 同步 TCP 转发到 Slave）
+                      ══════════════════════════════════════════
+
+   Master (128) 进程内                      Slave (129)
+   ┌──────────────────────────┐    TCP    ┌────────────────────┐
+   │ client 线程  master 线程  │══════════→│ test_slave_receiver│
+   │ ┌──────────┐ ┌──────────┐│  转发     │ ┌────────────────┐ │
+   │ │ ① 发送   │→│ ② 接收   ││══════════→│ │ ④ 接收 + 计数  │ │
+   │ │   req    │ │          ││           │ └────────────────┘ │
+   │ │          │←│ ③ 回显   ││           └────────────────────┘
+   │ │ ⑤ 计时   │ └──────────┘│
+   │ └──────────┘             │
+   └──────────────────────────┘
+
+   ③④ 顺序执行：回显完成后才转发，转发阻塞下一个请求的读取
+
+
+                      kprobe 模式（echo + 内核截获 → 异步转发）
+                      ══════════════════════════════════════════
+
+   Master (128) 进程内                      Slave (129)
+   ┌──────────────────────────────────┐    TCP    ┌────────────────────┐
+   │ client 线程     master 线程       │══════════→│ test_slave_receiver│
+   │ ┌──────────┐   ┌──────────────┐  │  转发     │ ┌────────────────┐ │
+   │ │ ① 发送   │──→│ ② read()     │  │           │ │ ⑥ 接收 + 计数  │ │
+   │ │   req    │   │              │  │           │ └────────────────┘ │
+   │ │          │←──│ ③ write()   │  │           └────────────────────┘
+   │ │ ④ 计时   │   └──────┬───────┘  │
+   │ └──────────┘          │          │
+   │             内核 kprobe 截获     │
+   │          ┌──────────────────┐    │
+   │          │ tcp_recvmsg      │    │
+   │          │  entry: 存 msg 指针  │
+   │          │  return: 读 iov ──→  │
+   │          │   ringbuf_output  │   │
+   │          └────────┬─────────┘   │
+   │                   │             │
+   │          ringbuf 消费者线程      │
+   │          ┌──────────────────┐   │
+   │          │ ⑤ 取 ringbuf     │   │
+   │          │   write_full ────┼───╝
+   │          └──────────────────┘
+   └──────────────────────────────────┘
+
+   ③ 回显和 ⑤ 异步转发并行：kprobe 不阻塞 ②→③ 的主路径
+```
+
+**三种模式实现差异**（都在同一个 main 函数中，`--mode` 切换）：
+
+| 模式 | Master echo 线程做什么 | 转发路径 |
+|------|----------------------|---------|
+| `none` | `read(client) → write_full(client)` | 无转发 |
+| `sync` | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步 `write()` 跨机 TCP |
+| `kprobe` | `read(client) → write_full(client)` | BPF 在内核 `tcp_recvmsg` 处截获数据→ringbuf→用户态异步线程 `write_full(slave)`，**不阻塞 echo** |
+
+**kprobe BPF 程序**（`kprobe_capture.bpf.c`）工作细节：
+
+```
+用户态调用 recv(fd, buf, len)
+        │
+        ▼
+tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
+  │
+  ├── [kprobe entry] kp_recv_entry:
+  │     • 过滤 PID（只截获 Master 进程的 recv 调用）
+  │     • msg 指针保存到 per-CPU map（entry_msg[0] = msg）
+  │     • 此时数据还在内核 socket 缓冲区，尚未拷贝
+  │
+  ├── 内核执行：skb → iov（用户 buf），把数据从内核拷贝到用户态
+  │
+  └── [kretprobe return] kp_recv_return:
+        • 返回值为实际拷贝字节数 retval
+        • 从 per-CPU map 取回之前保存的 msg 指针
+        • 读 msg→iov[0] 获取用户态 buf 的地址
+        • bpf_probe_read_user(buf_addr, len) → BPF 临时 buf
+        • 打包 [4B长度 | payload] → bpf_ringbuf_output → 用户态 ringbuf 消费者
+```
+
+**为什么需要两次 hook（entry + return）？**
+
+kprobe 单个 hook 只能看到函数**入口**或**出口**的寄存器/内存状态，不能同时看到参数和返回值。`tcp_recvmsg` 的参数（`msg` 指针）只在入口可见，实际拷贝的字节数只在出口（`ax` 寄存器）可见。两者必须通过 entry 保存→return 取回的方式关联。
+
+**为什么用 `bpf_probe_read_user` 而不是从内核缓冲区直接读？**
+
+kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket 缓冲区拷贝到**用户态 buf**（iovec 指向的地址）。此时 `bpf_probe_read_user` 把数据从用户态 buf 再拷贝一份到 BPF ringbuf。所以存在**两次拷贝**：
+
+```
+内核 socket buf ──(tcp_recvmsg)──→ 用户态 buf ──(bpf_probe_read_user)──→ BPF ringbuf
+        ↑                                    ↑
+   正常 recv 路径                       kprobe 额外拷贝
+```
+
+要避免第二次拷贝，需要 hook 更底层的函数（如 `skb_copy_datagram_iter`），从内核 `sk_buff` 直接读数据。但 `tcp_recvmsg` 是更稳定的 hook 点（内核 API 变动少），代价是接受这次额外拷贝。
+
+**客户端线程**负责精确计时：
+
+1. `connect()` 到 Master 的 15800 端口，TCP_NODELAY
+2. 预热：发送 `count/10` 次（100~500），消除冷启动波动
+3. 正式测试：循环 `count` 次，每次 `write_full(req) → read_full(rsp)`，记 `now_us()` 差值
+4. 输出：QPS = `count / 总耗时`，延迟取 avg/p50/p99/min/max
+
+**跨机 Slave**（`test_slave_receiver.c`）独立运行在从机：
+- `listen(15801)` → 循环 `accept` → 每连接 `read` 循环统计 → 打印 msgs/MB → `close`
+
+**参数说明**：
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `--payload, -p` | 64 | 单次请求/响应的字节数 |
+| `--count, -c` | 10000 | 正式测试的请求次数（≥1024B 用 5000） |
+| `--mode, -m` | all | `none` / `sync` / `kprobe` / `all` |
+| `--slave-host` | 127.0.0.1 | 跨机 Slave IP |
+| `--slave-port` | 15801 | 跨机 Slave 端口 |
+
+**设计考量**：
+
+- 每次 `read`/`write` 操作都走 `read_full`/`write_full`（循环到全部字节），排除短读写噪声
+- 预热从 `count/10` 中限幅 100~500，大 count 不会预热过久，小 count 保证最少预热
+- sync 模式对 slave 连接设 `SO_SNDBUF=64KB`，故意收紧发送缓冲区以便快速暴露慢消费导致的写阻塞
+- kprobe 模式 BPF 过滤 PID，只截获 Master echo 线程的 `tcp_recvmsg`，不会污染 ringbuf
+
+**测试结果**
+
+| Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
+|---------|---------:|---------:|-----------:|---------------:|-----------:|
+| 64B | 28,374 | 18,712 | 17,617 | −5.9% | 10,808 |
+| 128B | 29,796 | 22,124 | 13,336 | −39.7% | 10,500 |
+| 256B | 29,457 | 22,042 | 15,275 | −30.7% | 10,490 |
+| 512B | 29,076 | 22,566 | 17,254 | −23.5% | 10,507 |
+| 1024B | 29,425 | 23,189 | **29,521** | **+27.3%** | 4,821 |
+| 2048B | 28,336 | 22,253 | 18,338 | −17.6% | 5,516 |
+| 4096B | 28,337 | 21,019 | 17,029 | −19.0% | 5,508 |
+
+> ¹ Slave 收包数来自 test_kprobe_repl_qps 内部启动的**本地** Slave 线程（与跨机远程 Slave 无关，始终为 0）
+
+**关键发现**
+
+1. **kprobe vs sync：1024B 是唯一甜点，其余全部落后**：
+   - **1024B**：kprobe（29.5k）**反超 sync（23.2k）27%**，是唯一胜出的 payload
+   - 其余所有尺寸 kprobe 均落后 sync：64B(−6%) → 128B(−40%) → 256B(−31%) → 512B(−24%) → 2048B(−18%) → 4096B(−19%)
+   - 128B 最差，kprobe 仅达到 sync 的 60%，kprobe hook 开销远超同步 `write()`
+   - 1024B 甜点推测：payload 恰好在 TCP MSS(1460) 内单段交付，每请求仅触发一次 `tcp_recvmsg` hook，无分段也无合并，kprobe→ringbuf→异步发送的路径延迟低于同步 `write()` 阻塞主循环
+
+2. **kprobe 开销与 TCP 分段行为强耦合**：
+   - 小包（64-512B）：TCP 可能合并多个小段后一次交付，kprobe 在每次 `tcp_recvmsg` 返回时触发，但拷贝的数据量小于实际交付量
+   - 大包（≥2048B）：被 MSS 分裂为多段，每段触发一次 kprobe hook，开销叠加
+   - 只有 1024B 恰好"一段一请求"对齐，kprobe 开销最小化
+
+3. **none 基准稳定，sync 开销稳定**：本地 echo ~28-30K QPS（35μs），sync 转发额外增加 21-26% 延迟，两者均与 payload 大小弱相关
+
+---
+
+### RDMA vs sendfile vs iperf3 吞吐量对比（跨虚拟机）
+
+> **测试环境**：同上述 2 × KVM 虚拟机，两机均配置 Soft-RoCE（rxe0 on ens33）
+
+**测试方法**
+
+共 4 种传输方式，3 个自研 C 程序 + 1 个标准工具。全部测跨机单方向吞吐量（Master → Slave）。
+
+---
+
+#### iperf3 — TCP 基准线
+
+```bash
+slave$ iperf3 -s -p 18526
+master$ iperf3 -c 192.168.233.129 -p 18526 -t 5 -f m
+```
+
+iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps。作为跨机 TCP 的**天花板**——所有优化方案的上限不该超过裸 TCP 的物理带宽。
+
+---
+
+#### sendfile — 内核零拷贝 TCP
+
+`test_sendfile_throughput.c`：
+
+**服务端**：`listen → accept → read 循环计数 → 计时 → 打印吞吐量`
+
+**客户端**：
+1. 创建临时文件 `/tmp/perf_test_file`：`write_full` 填充 `iters × size` 字节（'S'）
+2. 连接服务端 TCP
+3. `for i in 0..iters:` `sendfile(sock_fd, file_fd, &offset, size)` —— 内核直接搬运文件页到 socket 缓冲区，不走用户态
+4. `shutdown(SHUT_WR)` 通知服务端结束 → 服务端统计耗时
+
+```c
+// 核心调用：一次 sendfile 搬运 size 字节
+off_t offset = 0;
+sendfile(sock, fd, &offset, buf_size);  // fd 是文件，sock 是 TCP socket
+```
+
+**参数**：
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `--size` | 65536 | 单次 `sendfile()` 搬运字节数（模拟业务 payload） |
+| `--iters` | 5000 | 调用次数（≥1MB 用 1000） |
+| `--port, -p` | 18517 | TCP 端口 |
+
+**设计考量**：使用 `sendfile()` 而非 `write()`，数据从文件 page cache 直接进入 socket 发送缓冲区，省去 `read→用户态buf→write` 的两次拷贝。但 TCP 协议栈本身（拥塞控制、TSO/GRO、ACK 处理）完整保留。
+
+---
+
+#### RDMA WRITE / SEND — 内核旁路
+
+`test_rdma_throughput.c`（**rdma_cm 版本**，与项目 `kvs_repl.c` 全量同步路径一致）：
+
+**连接建立**（rdma_cm，无手动 QP 状态转换）：
+
+```
+Client (Active)                       Server (Passive)
+─────────────────                     ─────────────────
+rdma_create_event_channel()           rdma_create_event_channel()
+rdma_create_id()                      rdma_create_id()
+rdma_resolve_addr(server_ip:port)     rdma_bind_addr(0.0.0.0:port)
+  ↓ 等待 ADDR_RESOLVED               rdma_listen()
+rdma_resolve_route()                    ↓ 等待 CONNECT_REQUEST
+  ↓ 等待 ROUTE_RESOLVED               rdma_create_qp()
+rdma_create_qp()                      注册 MR
+注册 MR                                rdma_accept() ← 附带 MR rkey/addr
+rdma_connect() ← 附带 MR rkey/addr      ↓ 等待 ESTABLISHED
+  ↓ 等待 ESTABLISHED                  ← 双方 QP 就绪 →
+```
+
+MR（Memory Region）信息通过 rdma_cm 的 `private_data` 字段在 `rdma_connect`/`rdma_accept` 时互换——无需额外 TCP 通道。
+
+**数据传输**（客户端核心循环）：
+
+```c
+// 循环 iters 次，每次 post 一个 send WR
+for i in 0..iters:
+    sge = { addr: buf, length: size, lkey: mr->lkey }
+    if mode == "write":
+        send_wr.opcode = IBV_WR_RDMA_WRITE       // 单边：写远端 MR
+        send_wr.wr.rdma.remote_addr = remote_mr.addr
+        send_wr.wr.rdma.rkey      = remote_mr.rkey
+    else:
+        send_wr.opcode = IBV_WR_SEND              // 双边：远端需预 post recv
+    ibv_post_send(qp, &send_wr, &bad_wr)
+
+    if inflight >= 256:
+        ibv_poll_cq(cq, 32, wc)  // 回收完成事件，释放 QP 槽位
+```
+
+**服务端**：预 post 256 个 recv WR → `ibv_poll_cq` 循环收完成通知 → 每收一条重新 post recv（保持接收队列满）
+
+**inflight 控制**：QP 的 `max_send_wr=1024`，inflight 超过 256 时主动 poll CQ 回收，超过 512 时自旋 drain。循环结束后全量 drain 剩余 inflight。
+
+**吞吐量计算**：
+```c
+actual_iters = 实际 post_send 成功次数
+elapsed = now_us() - t0
+throughput = (actual_iters * size * 8) / elapsed_s   // bps
+```
+
+**参数**：
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `--size` | 65536 | 单次 RDMA WR 的 payload 字节数 |
+| `--iters` | 5000 | 发送 WR 次数（≥1MB 用 1000） |
+| `--mode` | write | `write`（单边 RDMA WRITE）或 `send`（双边 SEND） |
+| `--port, -p` | 18516 | rdma_cm 端口 |
+
+**RDMA WRITE vs SEND 本质区别**：
+
+| | RDMA WRITE | RDMA SEND |
+|---|---|---|
+| 远端 CPU | **不参与**（DMA 直接写内存） | **参与**（需预 post recv WR） |
+| 远端感知 | 无通知（除非带 IMM） | CQ 产生 recv completion |
+| 适用场景 | 大块数据传输 | 消息传递 |
+
+---
+
+#### 为什么这样对比？
+
+| 维度 | iperf3 TCP | sendfile | RDMA WRITE | RDMA SEND |
+|------|:--:|:--:|:--:|:--:|
+| 用户态拷贝 | 有 | 无（内核零拷贝） | 无（DMA） | 无（DMA） |
+| 内核协议栈 | TCP 全栈 | TCP 全栈 | 绕过，UDP 封装 | 绕过，UDP 封装 |
+| 远端 CPU 参与 | 参与 recv | 参与 recv | **不参与** | 参与 recv |
+| 连接管理 | TCP 握手 | TCP 握手 | rdma_cm | rdma_cm |
+
+理论预期：RDMA WRITE > RDMA SEND ≈ sendfile > iperf3 TCP。但在 KVM + Soft-RoCE 虚拟网络中，UDP 封装和虚拟交换机处理成为瓶颈，**结果倒挂**。
+
+**测试结果**
+
+| 传输方式 | Payload | 吞吐量 | 对比 iperf3 |
+|----------|---------|-------:|-----------:|
+| iperf3 TCP | — | **5,208 Mbps** | 基准 |
+| sendfile | 4KB | 4,400 Mbps | −15.5% |
+| sendfile | 64KB | **5,520 Mbps** | +6.0% |
+| sendfile | 256KB | 5,000 Mbps | −4.0% |
+| sendfile | 1MB | 4,940 Mbps | −5.1% |
+| RDMA WRITE | 4KB | 562 Mbps | −89.2% |
+| RDMA SEND | 4KB | 582 Mbps | −88.8% |
+| RDMA WRITE | 64KB | 913 Mbps | −82.5% |
+| RDMA SEND | 64KB | 898 Mbps | −82.8% |
+| RDMA WRITE | 256KB | 967 Mbps | −81.4% |
+| RDMA SEND | 256KB | **1,070 Mbps** | −79.5% |
+| RDMA WRITE | 1MB | 943 Mbps | −81.9% |
+| RDMA SEND | 1MB | 943 Mbps | −81.9% |
+
+**关键发现**
+
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：在同一物理宿主机的 KVM 虚拟网络中，Soft-RoCE 将 RDMA 操作封装为 UDP 包（RoCEv2），额外封装层 + 虚拟交换机处理导致吞吐量仅为 TCP 的 ~11-20%
+2. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 吞吐量基本持平（4.4-5.5 Gbps），说明跨机场景下内核 TCP 栈已充分优化，用户态零拷贝收益有限
+3. **RDMA WRITE ≈ RDMA SEND**：两种 RDMA 操作吞吐量接近，说明瓶颈在底层 RoCEv2 封装的 UDP 路径，而非 RDMA 操作类型
+4. **本地 RDMA 可达 29 Gbps**（同机 rxe0 loopback，64KB × 500 iters），证明 Soft-RoCE 的内存带宽潜力巨大，瓶颈在网络路径
+
+> **注意**：硬件 RDMA（InfiniBand / 硬件 RoCE）跨机吞吐量预期远超 TCP。Soft-RoCE 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。
+
 ---
 
 ## 开发指南

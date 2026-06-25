@@ -1,16 +1,17 @@
 /*
- * test_rdma_throughput.c — RDMA write/send 吞吐量测试
+ * test_rdma_throughput.c — RDMA write/send 吞吐量测试 (rdma_cm 版本)
  *
- * 基于 libibverbs，支持：
- *   RDMA_WRITE（单边，跳过远程 CPU）
- *   RDMA_SEND（双边，远程 CPU 参与）
+ * 使用 rdma_cm (RDMA Connection Manager) 建立连接，
+ * 与项目 kvs_repl.c 全量同步的 RDMA 路径一致。
+ *
+ * MR 信息通过 rdma_cm private_data 交换，无需额外 TCP 控制通道。
  *
  * 用法:
- *   # 服务端（在接收方机器运行）
- *   ./test_rdma_throughput --server --ib-dev rxe0 --ib-port 1
+ *   # 服务端（接收方）
+ *   ./test_rdma_throughput --server --port 18516
  *
- *   # 客户端（在发送方机器运行）
- *   ./test_rdma_throughput --host <server_ip> --ib-dev rxe0 --ib-port 1 \
+ *   # 客户端（发送方）
+ *   ./test_rdma_throughput --host <server_ip> --port 18516 \
  *       --mode write --size 65536 --iters 10000
  *
  * 依赖: libibverbs, librdmacm
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -34,298 +36,200 @@
 
 /* ========== 配置 ========== */
 #define DEFAULT_PORT      18516
-#define DEFAULT_IB_DEV    "rxe0"
-#define DEFAULT_IB_PORT   1
-#define DEFAULT_GID_IDX   1
 #define DEFAULT_SIZE      65536
 #define DEFAULT_ITERS     5000
 #define DEFAULT_MODE      "write"
 
-/* 连接信息，通过 TCP 带外交换 */
+/* 通过 rdma_cm private_data 交换 MR 信息 */
 typedef struct {
-    uint64_t addr;   /* MR 虚拟地址 */
-    uint32_t rkey;   /* MR remote key */
-    uint32_t qp_num; /* QP number */
-    uint16_t lid;    /* LID */
-} conn_info_t;
+    uint64_t addr;
+    uint32_t rkey;
+} mr_info_t;
 
-/* ========== RDMA 资源 ========== */
+/* ========== RDMA 资源（rdma_cm 方式） ========== */
 typedef struct {
-    struct ibv_context *ctx;
+    struct rdma_event_channel *ec;
+    struct rdma_cm_id *id;
+    struct rdma_cm_id *listen_id;  /* server only */
     struct ibv_pd *pd;
     struct ibv_mr *mr;
     struct ibv_cq *cq;
-    struct ibv_qp *qp;
-    struct ibv_port_attr port_attr;
-    uint16_t lid;
-    int gid_idx;
-    union ibv_gid gid;
 
     void *buf;
     size_t buf_size;
 
-    conn_info_t local;
-    conn_info_t remote;
+    mr_info_t local_mr;
+    mr_info_t remote_mr;
+
+    int connected;
 } rdma_res_t;
 
-/* ========== 初始化 RDMA 资源 ========== */
-static int rdma_init(rdma_res_t *r, const char *ib_dev_name, int ib_port, int gid_idx,
-                     size_t buf_size) {
-    memset(r, 0, sizeof(*r));
-    r->gid_idx = gid_idx;
-    r->buf_size = buf_size;
+/* ========== 等待 rdma_cm 事件 ========== */
+static int wait_cm_event(struct rdma_event_channel *ec,
+                         enum rdma_cm_event_type expected,
+                         struct rdma_cm_event **out_event,
+                         int timeout_ms) {
+    struct rdma_cm_event *event = NULL;
+    struct pollfd pfd;
 
-    /* 获取设备列表 */
-    struct ibv_device **dev_list = ibv_get_device_list(NULL);
-    if (!dev_list) {
-        perror("ibv_get_device_list");
+    /* 使用 poll 等待 ec->fd 可读，实现超时（与项目 kvs_repl.c 一致） */
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = ec->fd;
+    pfd.events = POLLIN;
+
+    if (poll(&pfd, 1, timeout_ms) <= 0) {
+        fprintf(stderr, "[cm] poll timeout waiting for %s\n",
+                rdma_event_str(expected));
         return -1;
     }
 
-    /* 查找指定设备 */
-    struct ibv_device *dev = NULL;
-    for (int i = 0; dev_list[i]; i++) {
-        if (strcmp(ibv_get_device_name(dev_list[i]), ib_dev_name) == 0) {
-            dev = dev_list[i];
-            break;
-        }
-    }
-    if (!dev) {
-        fprintf(stderr, "RDMA 设备 %s 未找到\n", ib_dev_name);
-        ibv_free_device_list(dev_list);
+    if (rdma_get_cm_event(ec, &event) != 0) return -1;
+    if (event->event != expected) {
+        fprintf(stderr, "[cm] unexpected event: got=%s expect=%s\n",
+                rdma_event_str(event->event), rdma_event_str(expected));
+        rdma_ack_cm_event(event);
         return -1;
     }
-
-    /* 打开设备 */
-    r->ctx = ibv_open_device(dev);
-    if (!r->ctx) {
-        perror("ibv_open_device");
-        ibv_free_device_list(dev_list);
-        return -1;
-    }
-    ibv_free_device_list(dev_list);
-
-    /* 查询端口属性 */
-    if (ibv_query_port(r->ctx, ib_port, &r->port_attr) != 0) {
-        perror("ibv_query_port");
-        return -1;
-    }
-    r->lid = r->port_attr.lid;
-
-    /* 查询 GID */
-    if (ibv_query_gid(r->ctx, ib_port, gid_idx, &r->gid) != 0) {
-        perror("ibv_query_gid");
-        return -1;
-    }
-
-    /* 分配保护域 */
-    r->pd = ibv_alloc_pd(r->ctx);
-    if (!r->pd) {
-        perror("ibv_alloc_pd");
-        return -1;
-    }
-
-    /* 分配内存并注册 MR */
-    r->buf = aligned_alloc(4096, buf_size);
-    if (!r->buf) {
-        perror("aligned_alloc");
-        return -1;
-    }
-    memset(r->buf, 0, buf_size);
-
-    r->mr = ibv_reg_mr(r->pd, r->buf, buf_size,
-                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-    if (!r->mr) {
-        perror("ibv_reg_mr");
-        return -1;
-    }
-
-    /* 创建 CQ */
-    r->cq = ibv_create_cq(r->ctx, 256, NULL, NULL, 0);
-    if (!r->cq) {
-        perror("ibv_create_cq");
-        return -1;
-    }
-
-    /* 创建 QP */
-    struct ibv_qp_init_attr qp_attr = {
-        .send_cq = r->cq,
-        .recv_cq = r->cq,
-        .qp_type = IBV_QPT_RC,
-        .cap =
-            {
-                .max_send_wr = 256,
-                .max_recv_wr = 256,
-                .max_send_sge = 1,
-                .max_recv_sge = 1,
-            },
-    };
-    r->qp = ibv_create_qp(r->pd, &qp_attr);
-    if (!r->qp) {
-        perror("ibv_create_qp");
-        return -1;
-    }
-
-    /* 填充本地连接信息 */
-    r->local.addr = (uint64_t)(uintptr_t)r->buf;
-    r->local.rkey = r->mr->rkey;
-    r->local.qp_num = r->qp->qp_num;
-    r->local.lid = r->lid;
-
+    *out_event = event;
     return 0;
 }
 
-/* ========== QP 状态转换 ========== */
-static int modify_qp_to_init(struct ibv_qp *qp, int ib_port) {
-    struct ibv_qp_attr attr = {
-        .qp_state = IBV_QPS_INIT,
-        .pkey_index = 0,
-        .port_num = (uint8_t)ib_port,
-        .qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE,
-    };
-    return ibv_modify_qp(qp, &attr,
-                         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-}
-
-static int modify_qp_to_rtr(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t remote_lid,
-                            int gid_idx, union ibv_gid *remote_gid) {
-    struct ibv_qp_attr attr = {
-        .qp_state = IBV_QPS_RTR,
-        .path_mtu = IBV_MTU_4096,
-        .dest_qp_num = remote_qpn,
-        .rq_psn = 0,
-        .max_dest_rd_atomic = 1,
-        .min_rnr_timer = 12,
-        .ah_attr =
-            {
-                .dlid = remote_lid,
-                .sl = 0,
-                .src_path_bits = 0,
-                .is_global = 1,
-                .port_num = 1,
-                .grh =
-                    {
-                        .dgid = *remote_gid,
-                        .sgid_index = (uint8_t)gid_idx,
-                        .hop_limit = 1,
-                        .traffic_class = 0,
-                    },
-            },
-    };
-    memcpy(&attr.ah_attr.grh.dgid, remote_gid, sizeof(union ibv_gid));
-
-    return ibv_modify_qp(qp, &attr,
-                         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                             IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
-}
-
-static int modify_qp_to_rts(struct ibv_qp *qp) {
-    struct ibv_qp_attr attr = {
-        .qp_state = IBV_QPS_RTS,
-        .sq_psn = 0,
-        .timeout = 14,
-        .retry_cnt = 7,
-        .rnr_retry = 7,
-        .max_rd_atomic = 1,
-    };
-    return ibv_modify_qp(qp, &attr,
-                         IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                             IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
-}
-
 /* ========== 服务端 ========== */
-static int run_server(const char *ib_dev, int ib_port, int gid_idx, size_t buf_size,
-                      int port) {
+static int run_server(int port, size_t buf_size) {
     rdma_res_t r;
-    if (rdma_init(&r, ib_dev, ib_port, gid_idx, buf_size) != 0) return -1;
+    struct rdma_cm_event *event = NULL;
+    int ret = -1;
 
-    printf("[server] RDMA 设备: %s, port %d, LID %d\n", ib_dev, ib_port, r.lid);
+    memset(&r, 0, sizeof(r));
+    r.buf_size = buf_size;
 
-    /* TCP 监听，交换连接信息 */
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
+    /* 1. 创建 event channel */
+    r.ec = rdma_create_event_channel();
+    if (!r.ec) {
+        perror("rdma_create_event_channel");
         return -1;
     }
-    int one = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-    struct sockaddr_in addr = {.sin_family = AF_INET,
-                               .sin_addr.s_addr = htonl(INADDR_ANY),
-                               .sin_port = htons(port)};
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(sock);
-        return -1;
-    }
-    if (listen(sock, 1) < 0) {
-        perror("listen");
-        close(sock);
-        return -1;
-    }
-    printf("[server] TCP 监听端口 %d，等待客户端连接...\n", port);
-
-    int conn = accept(sock, NULL, NULL);
-    if (conn < 0) {
-        perror("accept");
-        close(sock);
-        return -1;
-    }
-    set_nodelay(conn);
-
-    /* 交换连接信息 */
-    if (write_full(conn, &r.local, sizeof(r.local)) != sizeof(r.local)) {
-        perror("send local info");
-        goto done;
-    }
-    if (read_full(conn, &r.remote, sizeof(r.remote)) != sizeof(r.remote)) {
-        perror("recv remote info");
-        goto done;
+    /* 2. 创建 listen id */
+    if (rdma_create_id(r.ec, &r.listen_id, NULL, RDMA_PS_TCP) != 0) {
+        perror("rdma_create_id (listen)");
+        goto cleanup;
     }
 
-    printf("[server] 远端 QP=%d, LID=%d, addr=0x%lx, rkey=%d\n",
-           r.remote.qp_num, r.remote.lid, r.remote.addr, r.remote.rkey);
+    /* 3. bind + listen */
+    struct sockaddr_in addr = { .sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_ANY),
+                                .sin_port = htons((uint16_t)port) };
+    if (rdma_bind_addr(r.listen_id, (struct sockaddr *)&addr) != 0) {
+        perror("rdma_bind_addr");
+        goto cleanup;
+    }
+    if (rdma_listen(r.listen_id, 1) != 0) {
+        perror("rdma_listen");
+        goto cleanup;
+    }
+    printf("[server] rdma_cm listening on port %d\n", port);
+    fflush(stdout);
 
-    /* 转换 QP 状态 */
-    if (modify_qp_to_init(r.qp, ib_port) != 0) {
-        perror("modify_qp_to_init");
-        goto done;
+    /* 4. 等待连接请求 */
+    if (wait_cm_event(r.ec, RDMA_CM_EVENT_CONNECT_REQUEST, &event, 30000) != 0) {
+        fprintf(stderr, "[server] timeout waiting for CONNECT_REQUEST\n");
+        goto cleanup;
+    }
+    r.id = event->id;  /* rdma_cm 分配的 accept id */
+    rdma_ack_cm_event(event);
+    event = NULL;
+    printf("[server] connect request received\n");
+    fflush(stdout);
+
+    /* 5. 分配资源（使用 accept id->verbs） */
+    r.pd = ibv_alloc_pd(r.id->verbs);
+    if (!r.pd) { perror("ibv_alloc_pd"); goto cleanup; }
+
+    r.cq = ibv_create_cq(r.id->verbs, 1024, NULL, NULL, 0);
+    if (!r.cq) { perror("ibv_create_cq"); goto cleanup; }
+
+    struct ibv_qp_init_attr qp_attr = {
+        .send_cq = r.cq,
+        .recv_cq = r.cq,
+        .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = 1024,
+                  .max_recv_wr = 1024,
+                  .max_send_sge = 1,
+                  .max_recv_sge = 1 },
+    };
+    if (rdma_create_qp(r.id, r.pd, &qp_attr) != 0) {
+        perror("rdma_create_qp");
+        goto cleanup;
     }
 
-    /* 发送端和服务端使用同一个 GID */
-    if (modify_qp_to_rtr(r.qp, r.remote.qp_num, r.remote.lid, gid_idx, &r.gid) != 0) {
-        perror("modify_qp_to_rtr");
-        goto done;
+    /* 6. 注册 MR */
+    r.buf = aligned_alloc(4096, buf_size);
+    if (!r.buf) { perror("aligned_alloc"); goto cleanup; }
+    memset(r.buf, 0, buf_size);
+
+    r.mr = ibv_reg_mr(r.pd, r.buf, buf_size,
+                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                          IBV_ACCESS_REMOTE_WRITE);
+    if (!r.mr) { perror("ibv_reg_mr"); goto cleanup; }
+
+    r.local_mr.addr = (uint64_t)(uintptr_t)r.buf;
+    r.local_mr.rkey = r.mr->rkey;
+
+    /* 7. rdma_accept（附带 MR 信息通过 private_data） */
+    struct rdma_conn_param param;
+    memset(&param, 0, sizeof(param));
+    param.initiator_depth = 1;
+    param.responder_resources = 1;
+    param.rnr_retry_count = 3;
+    param.private_data = &r.local_mr;
+    param.private_data_len = sizeof(r.local_mr);
+
+    if (rdma_accept(r.id, &param) != 0) {
+        perror("rdma_accept");
+        goto cleanup;
     }
-    if (modify_qp_to_rts(r.qp) != 0) {
-        perror("modify_qp_to_rts");
-        goto done;
+
+    /* 8. 等待 ESTABLISHED */
+    if (wait_cm_event(r.ec, RDMA_CM_EVENT_ESTABLISHED, &event, 5000) != 0) {
+        fprintf(stderr, "[server] timeout waiting for ESTABLISHED\n");
+        goto cleanup;
     }
 
-    printf("[server] QP 就绪，等待数据...\n");
+    /* 提取客户端 MR 信息 */
+    if (event->param.conn.private_data_len >= sizeof(mr_info_t)) {
+        memcpy(&r.remote_mr, event->param.conn.private_data, sizeof(mr_info_t));
+    }
+    rdma_ack_cm_event(event);
+    event = NULL;
+    r.connected = 1;
 
-    /* 接收数据并统计 */
-    double total_bytes = 0;
-    int completed = 0;
+    printf("[server] RDMA 连接已建立\n");
+    printf("[server] 远端 MR: addr=0x%lx rkey=%u\n",
+           r.remote_mr.addr, r.remote_mr.rkey);
+    fflush(stdout);
 
-    /* Pre-post recv WRs (one for each expected message) */
-    struct ibv_sge sge = {.addr = (uint64_t)(uintptr_t)r.buf, .length = (uint32_t)buf_size, .lkey = r.mr->lkey};
-    struct ibv_recv_wr recv_wr = {.wr_id = 0, .sg_list = &sge, .num_sge = 1};
-    struct ibv_recv_wr *bad_wr = NULL;
+    /* 9. 接收数据并统计 */
+    /* Pre-post recv WRs */
+    {
+        struct ibv_sge sge = { .addr = (uint64_t)(uintptr_t)r.buf,
+                                .length = (uint32_t)buf_size,
+                                .lkey = r.mr->lkey };
+        struct ibv_recv_wr recv_wr = { .wr_id = 0,
+                                        .sg_list = &sge,
+                                        .num_sge = 1 };
+        struct ibv_recv_wr *bad_wr = NULL;
 
-    for (int i = 0; i < 256; i++) {
-        if (ibv_post_recv(r.qp, &recv_wr, &bad_wr) != 0) {
-            /* 可能 post 队列满了，继续 */
-            break;
+        for (int i = 0; i < 256; i++) {
+            if (ibv_post_recv(r.id->qp, &recv_wr, &bad_wr) != 0) break;
         }
     }
 
-    /* 轮询 CQ，非阻塞等待 TCP done 信号 */
-    int done_signal = 0;
-    set_nonblock(conn);
+    double total_bytes = 0;
+    int completed = 0;
 
-    while (!done_signal) {
+    /* 等待连接断开或数据接收完成 */
+    while (r.connected) {
         struct ibv_wc wc[16];
         int n = ibv_poll_cq(r.cq, 16, wc);
         if (n < 0) {
@@ -334,197 +238,308 @@ static int run_server(const char *ib_dev, int ib_port, int gid_idx, size_t buf_s
         }
         for (int i = 0; i < n; i++) {
             if (wc[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "[server] WC 错误: status=%d\n", wc[i].status);
+                /* DISCONNECT 是正常结束信号 */
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                    r.connected = 0;
+                    break;
+                }
+                fprintf(stderr, "[server] WC 错误: status=%d\n",
+                        wc[i].status);
                 continue;
             }
-            if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+            if (wc[i].opcode == IBV_WC_RECV ||
+                wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
                 total_bytes += wc[i].byte_len;
                 completed++;
                 /* 重新 post recv */
-                recv_wr.wr_id = (uint64_t)completed;
-                ibv_post_recv(r.qp, &recv_wr, &bad_wr);
+                struct ibv_sge sge = {
+                    .addr = (uint64_t)(uintptr_t)r.buf,
+                    .length = (uint32_t)buf_size,
+                    .lkey = r.mr->lkey };
+                struct ibv_recv_wr recv_wr = { .wr_id = (uint64_t)completed,
+                                                .sg_list = &sge,
+                                                .num_sge = 1 };
+                struct ibv_recv_wr *bad_wr = NULL;
+                ibv_post_recv(r.id->qp, &recv_wr, &bad_wr);
             }
-        }
-        /* 非阻塞检查 TCP done */
-        char tmp;
-        if (read(conn, &tmp, 1) > 0) {
-            done_signal = 1;
         }
         if (n == 0) usleep(100);
     }
 
     printf("[server] 接收完成: %d msgs, %.2f MB\n",
            completed, total_bytes / (1024.0 * 1024.0));
+    ret = 0;
 
-done:
-    close(conn);
-    close(sock);
-
-    if (r.qp) ibv_destroy_qp(r.qp);
+cleanup:
+    if (event) rdma_ack_cm_event(event);
+    if (r.id && r.id->qp) rdma_destroy_qp(r.id);
     if (r.cq) ibv_destroy_cq(r.cq);
     if (r.mr) ibv_dereg_mr(r.mr);
     if (r.buf) free(r.buf);
     if (r.pd) ibv_dealloc_pd(r.pd);
-    if (r.ctx) ibv_close_device(r.ctx);
-
-    return 0;
+    if (r.id) rdma_destroy_id(r.id);
+    if (r.listen_id) rdma_destroy_id(r.listen_id);
+    if (r.ec) rdma_destroy_event_channel(r.ec);
+    return ret;
 }
 
 /* ========== 客户端 ========== */
-static int run_client(const char *host, const char *ib_dev, int ib_port, int gid_idx,
-                      size_t buf_size, int iters, const char *mode, int port) {
+static int run_client(const char *host, size_t buf_size, int iters,
+                      const char *mode, int port) {
     rdma_res_t r;
-    if (rdma_init(&r, ib_dev, ib_port, gid_idx, buf_size) != 0) return -1;
+    struct rdma_cm_event *event = NULL;
+    int ret = -1;
 
-    printf("[client] RDMA 设备: %s, port %d, LID %d\n", ib_dev, ib_port, r.lid);
+    memset(&r, 0, sizeof(r));
+    r.buf_size = buf_size;
 
-    /* TCP 连接服务端 */
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
+    /* 1. 创建 event channel */
+    r.ec = rdma_create_event_channel();
+    if (!r.ec) {
+        perror("rdma_create_event_channel");
         return -1;
     }
 
-    struct hostent *he = gethostbyname(host);
-    if (!he) {
-        fprintf(stderr, "解析主机 %s 失败\n", host);
-        close(sock);
-        return -1;
+    /* 2. 创建 id */
+    if (rdma_create_id(r.ec, &r.id, NULL, RDMA_PS_TCP) != 0) {
+        perror("rdma_create_id");
+        goto cleanup;
     }
 
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(port)};
-    memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("connect");
-        close(sock);
-        return -1;
-    }
-    set_nodelay(sock);
-
-    /* 交换连接信息 */
-    if (write_full(sock, &r.local, sizeof(r.local)) != sizeof(r.local)) {
-        perror("send local info");
-        goto done;
-    }
-    if (read_full(sock, &r.remote, sizeof(r.remote)) != sizeof(r.remote)) {
-        perror("recv remote info");
-        goto done;
+    /* 3. 解析地址 */
+    struct sockaddr_in addr = { .sin_family = AF_INET,
+                                .sin_port = htons((uint16_t)port) };
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        struct hostent *he = gethostbyname(host);
+        if (!he) {
+            fprintf(stderr, "解析主机 %s 失败\n", host);
+            goto cleanup;
+        }
+        memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
     }
 
-    printf("[client] 远端 QP=%d, LID=%d, addr=0x%lx, rkey=%d\n",
-           r.remote.qp_num, r.remote.lid, r.remote.addr, r.remote.rkey);
-
-    /* 转换 QP 状态 */
-    if (modify_qp_to_init(r.qp, ib_port) != 0) {
-        perror("modify_qp_to_init");
-        goto done;
-    }
-    if (modify_qp_to_rtr(r.qp, r.remote.qp_num, r.remote.lid, gid_idx, &r.gid) != 0) {
-        perror("modify_qp_to_rtr");
-        goto done;
-    }
-    if (modify_qp_to_rts(r.qp) != 0) {
-        perror("modify_qp_to_rts");
-        goto done;
+    if (rdma_resolve_addr(r.id, NULL, (struct sockaddr *)&addr, 2000) != 0) {
+        perror("rdma_resolve_addr");
+        goto cleanup;
     }
 
-    printf("[client] QP 就绪，开始传输...\n");
+    if (wait_cm_event(r.ec, RDMA_CM_EVENT_ADDR_RESOLVED, &event, 3000) != 0) {
+        fprintf(stderr, "ADDR_RESOLVED 超时或失败\n");
+        goto cleanup;
+    }
+    rdma_ack_cm_event(event);
+    event = NULL;
 
-    int is_write = (strcmp(mode, "write") == 0);
-    size_t total_bytes = (size_t)iters * buf_size;
+    /* 4. 解析路由 */
+    if (rdma_resolve_route(r.id, 2000) != 0) {
+        perror("rdma_resolve_route");
+        goto cleanup;
+    }
 
-    /* 填充发送 buffer */
+    if (wait_cm_event(r.ec, RDMA_CM_EVENT_ROUTE_RESOLVED, &event, 3000) != 0) {
+        fprintf(stderr, "ROUTE_RESOLVED 超时或失败\n");
+        goto cleanup;
+    }
+    rdma_ack_cm_event(event);
+    event = NULL;
+
+    /* 5. 分配资源 */
+    r.pd = ibv_alloc_pd(r.id->verbs);
+    if (!r.pd) { perror("ibv_alloc_pd"); goto cleanup; }
+
+    r.cq = ibv_create_cq(r.id->verbs, 1024, NULL, NULL, 0);
+    if (!r.cq) { perror("ibv_create_cq"); goto cleanup; }
+
+    struct ibv_qp_init_attr qp_attr = {
+        .send_cq = r.cq,
+        .recv_cq = r.cq,
+        .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = 1024,
+                  .max_recv_wr = 1024,
+                  .max_send_sge = 1,
+                  .max_recv_sge = 1 },
+    };
+    if (rdma_create_qp(r.id, r.pd, &qp_attr) != 0) {
+        perror("rdma_create_qp");
+        goto cleanup;
+    }
+
+    /* 6. 注册 MR */
+    r.buf = aligned_alloc(4096, buf_size);
+    if (!r.buf) { perror("aligned_alloc"); goto cleanup; }
     memset(r.buf, 'R', buf_size);
+
+    r.mr = ibv_reg_mr(r.pd, r.buf, buf_size,
+                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                          IBV_ACCESS_REMOTE_WRITE);
+    if (!r.mr) { perror("ibv_reg_mr"); goto cleanup; }
+
+    r.local_mr.addr = (uint64_t)(uintptr_t)r.buf;
+    r.local_mr.rkey = r.mr->rkey;
+
+    /* 7. rdma_connect（附带 MR 信息通过 private_data） */
+    struct rdma_conn_param param;
+    memset(&param, 0, sizeof(param));
+    param.initiator_depth = 1;
+    param.responder_resources = 1;
+    param.retry_count = 7;
+    param.rnr_retry_count = 7;
+    param.private_data = &r.local_mr;
+    param.private_data_len = sizeof(r.local_mr);
+
+    if (rdma_connect(r.id, &param) != 0) {
+        perror("rdma_connect");
+        goto cleanup;
+    }
+
+    /* 8. 等待 ESTABLISHED */
+    if (wait_cm_event(r.ec, RDMA_CM_EVENT_ESTABLISHED, &event, 5000) != 0) {
+        fprintf(stderr, "ESTABLISHED 超时或失败\n");
+        goto cleanup;
+    }
+
+    /* 提取服务端 MR 信息 */
+    if (event->param.conn.private_data_len >= sizeof(mr_info_t)) {
+        memcpy(&r.remote_mr, event->param.conn.private_data, sizeof(mr_info_t));
+    }
+    rdma_ack_cm_event(event);
+    event = NULL;
+    r.connected = 1;
+
+    printf("[client] RDMA 连接已建立\n");
+    printf("[client] 远端 MR: addr=0x%lx rkey=%u\n",
+           r.remote_mr.addr, r.remote_mr.rkey);
+    fflush(stdout);
+
+    /* 9. 数据传输 */
+    int is_write = (strcmp(mode, "write") == 0);
+    int actual_iters = 0;
+    int inflight = 0;
+    int next_poll = 0;
 
     double t0 = now_us();
 
     for (int i = 0; i < iters; i++) {
-        struct ibv_sge sge = {.addr = (uint64_t)(uintptr_t)r.buf,
-                              .length = (uint32_t)buf_size,
-                              .lkey = r.mr->lkey};
-        struct ibv_send_wr send_wr = {.wr_id = (uint64_t)i,
-                                      .sg_list = &sge,
-                                      .num_sge = 1,
-                                      .send_flags = IBV_SEND_SIGNALED};
+        struct ibv_sge sge = { .addr = (uint64_t)(uintptr_t)r.buf,
+                                .length = (uint32_t)buf_size,
+                                .lkey = r.mr->lkey };
+        struct ibv_send_wr send_wr = { .wr_id = (uint64_t)i,
+                                        .sg_list = &sge,
+                                        .num_sge = 1,
+                                        .send_flags = IBV_SEND_SIGNALED };
         struct ibv_send_wr *bad_wr = NULL;
 
         if (is_write) {
             send_wr.opcode = IBV_WR_RDMA_WRITE;
-            send_wr.wr.rdma.remote_addr = r.remote.addr;
-            send_wr.wr.rdma.rkey = r.remote.rkey;
+            send_wr.wr.rdma.remote_addr = r.remote_mr.addr;
+            send_wr.wr.rdma.rkey = r.remote_mr.rkey;
         } else {
             send_wr.opcode = IBV_WR_SEND;
         }
 
-        if (ibv_post_send(r.qp, &send_wr, &bad_wr) != 0) {
-            fprintf(stderr, "[client] ibv_post_send 失败于 iter %d\n", i);
-            break;
+        /* 如果发送队列满，先 poll 一些完成 */
+        if (ibv_post_send(r.id->qp, &send_wr, &bad_wr) != 0) {
+            struct ibv_wc wc[16];
+            int n = ibv_poll_cq(r.cq, 16, wc);
+            if (n > 0) {
+                inflight -= n;
+                /* 重试 post */
+                if (ibv_post_send(r.id->qp, &send_wr, &bad_wr) != 0) {
+                    fprintf(stderr, "[client] ibv_post_send 失败于 iter %d (retry failed)\n", i);
+                    break;
+                }
+                inflight++;
+                actual_iters++;
+            } else {
+                fprintf(stderr, "[client] ibv_post_send 失败于 iter %d (qp full, no completions)\n", i);
+                break;
+            }
+        } else {
+            inflight++;
+            actual_iters++;
         }
 
-        /* 每 64 个 WR poll 一次 CQ */
-        if ((i & 63) == 63 || i == iters - 1) {
-            struct ibv_wc wc[64];
-            int npoll = 0;
-            while (npoll == 0) {
-                int n = ibv_poll_cq(r.cq, 64, wc);
-                if (n < 0) {
-                    perror("ibv_poll_cq");
-                    goto done;
-                }
-                npoll += n;
+        /* 每 16 个 WR 或 inflight 超过 256 时 poll CQ */
+        if (inflight >= 256 || (i == next_poll) || i == iters - 1) {
+            struct ibv_wc wc[32];
+            int total_polled = 0;
+            int retries = 0;
+            while (inflight > 512 && retries < 100) {
+                int n = ibv_poll_cq(r.cq, 32, wc);
+                if (n <= 0) { usleep(10); retries++; continue; }
+                inflight -= n;
+                total_polled += n;
+                retries = 0;
                 for (int j = 0; j < n; j++) {
                     if (wc[j].status != IBV_WC_SUCCESS) {
-                        fprintf(stderr, "[client] WC 错误: status=%d at iter=%d\n",
-                                wc[j].status, i);
+                        fprintf(stderr,
+                                "[client] WC 错误: status=%d at iter=%ld\n",
+                                wc[j].status, wc[j].wr_id);
                     }
                 }
             }
+            if (inflight > 512) {
+                /* 强制 drain */
+                struct ibv_wc wc2[64];
+                int nd = ibv_poll_cq(r.cq, 64, wc2);
+                if (nd > 0) inflight -= nd;
+            }
+            next_poll = i + 16;
+        }
+    }
+
+    /* 等待所有 inflight 完成 */
+    {
+        int drain_retries = 0;
+        while (inflight > 0 && drain_retries < 1000) {
+            struct ibv_wc wc[64];
+            int n = ibv_poll_cq(r.cq, 64, wc);
+            if (n <= 0) { usleep(100); drain_retries++; continue; }
+            inflight -= n;
+            drain_retries = 0;
         }
     }
 
     double t1 = now_us();
     double elapsed_s = (t1 - t0) / 1000000.0;
-    double throughput_bps = (double)(total_bytes * 8) / elapsed_s;
+    size_t actual_bytes = (size_t)actual_iters * buf_size;
+    double throughput_bps = (double)(actual_bytes * 8) / elapsed_s;
 
     printf("\n=== RDMA 吞吐量结果 ===\n");
     printf("  模式:       %s\n", is_write ? "RDMA_WRITE" : "RDMA_SEND");
     printf("  payload:    %zu bytes\n", buf_size);
-    printf("  iters:      %d\n", iters);
-    printf("  总数据量:   %.2f MB\n", (double)total_bytes / (1024.0 * 1024.0));
+    printf("  iters:      %d (成功: %d)\n", iters, actual_iters);
+    printf("  总数据量:   %.2f MB\n", (double)actual_bytes / (1024.0 * 1024.0));
     printf("  耗时:       %.3f s\n", elapsed_s);
     printf("  吞吐量:     %s\n", throughput_str(throughput_bps));
 
-    /* 通知服务端完成 */
-    int done_signal = 1;
-    write_full(sock, &done_signal, sizeof(done_signal));
+    /* 断开连接，让服务端感知结束 */
+    rdma_disconnect(r.id);
 
-done:
-    close(sock);
+    ret = 0;
 
-    if (r.qp) ibv_destroy_qp(r.qp);
+cleanup:
+    if (event) rdma_ack_cm_event(event);
+    if (r.id && r.id->qp) rdma_destroy_qp(r.id);
     if (r.cq) ibv_destroy_cq(r.cq);
     if (r.mr) ibv_dereg_mr(r.mr);
     if (r.buf) free(r.buf);
     if (r.pd) ibv_dealloc_pd(r.pd);
-    if (r.ctx) ibv_close_device(r.ctx);
-
-    return 0;
+    if (r.id) rdma_destroy_id(r.id);
+    if (r.ec) rdma_destroy_event_channel(r.ec);
+    return ret;
 }
 
 /* ========== Main ========== */
 static void usage(const char *prog) {
     fprintf(stderr,
             "用法:\n"
-            "  服务端: %s --server [options]\n"
+            "  服务端: %s --server [--port PORT] [--size SIZE]\n"
             "  客户端: %s --host <server_ip> [options]\n"
             "选项:\n"
             "  --host, -H     服务端 IP（客户端模式必需）\n"
             "  --server, -s   以服务端模式运行\n"
-            "  --ib-dev         IB 设备名 (默认: rxe0)\n"
-            "  --ib-port        IB 端口 (默认: 1)\n"
-            "  --gid-idx        GID 索引 (默认: 1)\n"
-            "  --port, -p       TCP 控制端口 (默认: 18516)\n"
+            "  --port, -p     rdma_cm 端口 (默认: 18516)\n"
             "  --size           传输 payload 大小 (默认: 65536)\n"
             "  --iters          传输次数 (默认: 5000)\n"
             "  --mode           write 或 send (默认: write)\n"
@@ -534,39 +549,38 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     const char *host = NULL;
-    const char *ib_dev = DEFAULT_IB_DEV;
-    int ib_port = DEFAULT_IB_PORT;
-    int gid_idx = DEFAULT_GID_IDX;
+    int server_mode = 0;
     int port = DEFAULT_PORT;
     size_t buf_size = DEFAULT_SIZE;
     int iters = DEFAULT_ITERS;
     const char *mode = DEFAULT_MODE;
-    int server_mode = 0;
 
-    struct option long_opts[] = {{"host", required_argument, 0, 'H'},
-                                 {"server", no_argument, 0, 's'},
-                                 {"ib-dev", required_argument, 0, 1000},
-                                 {"ib-port", required_argument, 0, 1001},
-                                 {"gid-idx", required_argument, 0, 1002},
-                                 {"port", required_argument, 0, 'p'},
-                                 {"size", required_argument, 0, 1003},
-                                 {"iters", required_argument, 0, 1004},
-                                 {"mode", required_argument, 0, 1005},
-                                 {"help", no_argument, 0, 'h'},
-                                 {0, 0, 0, 0}};
+    struct option long_opts[] = {
+        {"host", required_argument, 0, 'H'},
+        {"server", no_argument, 0, 's'},
+        {"port", required_argument, 0, 'p'},
+        {"size", required_argument, 0, 1000},
+        {"iters", required_argument, 0, 1001},
+        {"mode", required_argument, 0, 1002},
+        /* 以下参数为兼容旧命令行保留，rdma_cm 自动处理，接受但忽略 */
+        {"ib-dev", required_argument, 0, 1003},
+        {"ib-port", required_argument, 0, 1004},
+        {"gid-idx", required_argument, 0, 1005},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "H:sp:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'H': host = optarg; break;
         case 's': server_mode = 1; break;
-        case 1000: ib_dev = optarg; break;
-        case 1001: ib_port = atoi(optarg); break;
-        case 1002: gid_idx = atoi(optarg); break;
         case 'p': port = atoi(optarg); break;
-        case 1003: buf_size = (size_t)atol(optarg); break;
-        case 1004: iters = atoi(optarg); break;
-        case 1005: mode = optarg; break;
+        case 1000: buf_size = (size_t)atol(optarg); break;
+        case 1001: iters = atoi(optarg); break;
+        case 1002: mode = optarg; break;
+        case 1003: /* --ib-dev: rdma_cm 自动选择，忽略 */ break;
+        case 1004: /* --ib-port: rdma_cm 自动选择，忽略 */ break;
+        case 1005: /* --gid-idx: rdma_cm 自动选择，忽略 */ break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -583,6 +597,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    return server_mode ? run_server(ib_dev, ib_port, gid_idx, buf_size, port)
-                       : run_client(host, ib_dev, ib_port, gid_idx, buf_size, iters, mode, port);
+    return server_mode ? run_server(port, buf_size)
+                       : run_client(host, buf_size, iters, mode, port);
 }

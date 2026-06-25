@@ -539,13 +539,25 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
-        while (c->out_ring_len > 0) {
-            size_t _head = (c->out_ring_tail - c->out_ring_len) & (OUT_RING_SIZE - 1);
-            size_t _chunk = OUT_RING_SIZE - _head;
-            if (_chunk > c->out_ring_len) _chunk = c->out_ring_len;
-            ssize_t _ns = send(c->fd, c->out_ring + _head, _chunk, MSG_NOSIGNAL);
-            if (_ns < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; break; }
-            c->out_ring_len -= (size_t)_ns;
+        /* Try synchronous send first, register EPOLLOUT for remainder */
+        {
+            int _tries = 0;
+            while (c->out_ring_len > 0 && _tries < 3) {
+                size_t _head = (c->out_ring_tail - c->out_ring_len) & (OUT_RING_SIZE - 1);
+                size_t _chunk = OUT_RING_SIZE - _head;
+                if (_chunk > c->out_ring_len) _chunk = c->out_ring_len;
+                ssize_t _ns = send(c->fd, c->out_ring + _head, _chunk,
+                                   MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (_ns < 0) { if (errno != EINTR) break; continue; }
+                c->out_ring_len -= (size_t)_ns;
+                _tries++;
+            }
+            if (c->out_ring_len > 0 && g_epfd >= 0 && c->fd >= 0) {
+                struct epoll_event _ev;
+                _ev.events = EPOLLIN | EPOLLOUT;
+                _ev.data.ptr = c;
+                epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &_ev);
+            }
         }
         pp = &c->next_replica;
     }

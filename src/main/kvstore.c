@@ -532,10 +532,21 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             continue;
         }
         /* eBPF 转发路径同时运行（best effort），repl_broadcast 作为可靠保底 */
-        if (repl_realtime_send(c, raw, rawlen) != 0) {
-            if (repl_handle_replica_send_failure(c, pp)) continue;
-            pp = &c->next_replica;
-            continue;
+        {
+            int _rc = repl_realtime_send(c, raw, rawlen);
+            /* ring buffer 满时先刷出再重试，避免数据静默丢失 */
+            if (_rc != 0 && c->out_ring_len > 0) {
+                size_t _head = (c->out_ring_tail - c->out_ring_len) & (OUT_RING_SIZE - 1);
+                size_t _chunk = OUT_RING_SIZE - _head;
+                if (_chunk > c->out_ring_len) _chunk = c->out_ring_len;
+                send(c->fd, c->out_ring + _head, _chunk, MSG_NOSIGNAL);
+                _rc = repl_realtime_send(c, raw, rawlen);
+            }
+            if (_rc != 0) {
+                if (repl_handle_replica_send_failure(c, pp)) continue;
+                pp = &c->next_replica;
+                continue;
+            }
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();

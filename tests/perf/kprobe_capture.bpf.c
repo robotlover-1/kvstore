@@ -47,7 +47,7 @@ struct {
 /* ringbuf */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20); /* 1MB */
+    __uint(max_entries, 1 << 22); /* 4MB */
 } ringbuf SEC(".maps");
 
 /* 临时缓冲区 */

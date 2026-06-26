@@ -142,7 +142,7 @@ static void *ringbuf_fwd_thread(void *arg) {
     fprintf(stderr, "[fwd] ready, polling ringbuf\n");
 
     while (rf->running) {
-        int n = ring_buffer__poll(rb, 100);
+        int n = ring_buffer__poll(rb, 5);
         if (n < 0) { fprintf(stderr, "[fwd] poll error\n"); break; }
     }
 
@@ -449,7 +449,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                 slave_fd = -1;
             } else {
                 /* 限制发送缓冲区，快速暴露慢消费导致的 write 阻塞 */
-                int sndbuf = 65536; /* 64KB */
+                int sndbuf = 262144; /* 256KB */
                 setsockopt(slave_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
             }
         }

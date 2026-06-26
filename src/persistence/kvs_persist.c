@@ -255,19 +255,32 @@ void persist_defer_response(conn_t *c, const unsigned char *data, size_t len) {
 /* flush AOF buffer (if pending) and deliver all deferred responses */
 void persist_flush_deferred(void) {
     deferred_resp_t *dr, *next;
+    int flushed[256] = {0};  /* track which connections we've flushed */
 
     /* only group-commit flush in ALWAYS mode; everysec has its own timer */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
         persist_aof_flush_buffer();
     }
 
-    /* deliver all deferred responses, attempt immediate write to avoid
-     * extra epoll_wait cycle waiting for EPOLLOUT */
+    /* phase 1: queue all responses into ring buffers without sending */
     dr = g_deferred_head;
     while (dr) {
         next = dr->next;
-        queue_bytes(dr->c, dr->data, dr->len);
-        flush_conn_output(dr->c);
+        if (dr->c) queue_bytes(dr->c, dr->data, dr->len);
+        dr = next;
+    }
+
+    /* phase 2: flush each connection's ring once (one send() per connection) */
+    dr = g_deferred_head;
+    while (dr) {
+        next = dr->next;
+        if (dr->c) {
+            int fd = dr->c->fd;
+            if (fd >= 0 && fd < (int)(sizeof(flushed)/sizeof(flushed[0])) && !flushed[fd]) {
+                flushed[fd] = 1;
+                flush_conn_output(dr->c);
+            }
+        }
         kvs_free(dr);
         dr = next;
     }

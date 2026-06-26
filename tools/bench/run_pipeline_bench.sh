@@ -201,25 +201,25 @@ for P in "${PIPELINE_DEPTHS[@]}"; do
     run_pipe_bench "kvstore_aof_always" $KVSTORE_PORT "$P" HSET key:__rand_int__ value
     cleanup_all
 
-    # --- redis no AOF ---
+    # --- redis no AOF (HSET 3-arg: key field value) ---
     CURRENT=$((CURRENT + 1))
     echo "--- $CURRENT/$TOTAL: redis_no_aof P=$P ---"
     start_redis "" || exit 1
-    run_pipe_bench "redis_no_aof" $REDIS_PORT "$P" HSET key:__rand_int__ value
+    run_pipe_bench "redis_no_aof" $REDIS_PORT "$P" HSET key:__rand_int__ __rand_int__ value
     cleanup_all
 
-    # --- redis AOF everysec ---
+    # --- redis AOF everysec (HSET 3-arg) ---
     CURRENT=$((CURRENT + 1))
     echo "--- $CURRENT/$TOTAL: redis_aof_everysec P=$P ---"
     start_redis "--appendonly yes --appendfsync everysec" || exit 1
-    run_pipe_bench "redis_aof_everysec" $REDIS_PORT "$P" HSET key:__rand_int__ value
+    run_pipe_bench "redis_aof_everysec" $REDIS_PORT "$P" HSET key:__rand_int__ __rand_int__ value
     cleanup_all
 
-    # --- redis AOF always ---
+    # --- redis AOF always (HSET 3-arg) ---
     CURRENT=$((CURRENT + 1))
     echo "--- $CURRENT/$TOTAL: redis_aof_always P=$P ---"
     start_redis "--appendonly yes --appendfsync always" || exit 1
-    run_pipe_bench "redis_aof_always" $REDIS_PORT "$P" HSET key:__rand_int__ value
+    run_pipe_bench "redis_aof_always" $REDIS_PORT "$P" HSET key:__rand_int__ __rand_int__ value
     cleanup_all
 done
 

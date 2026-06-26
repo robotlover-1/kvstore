@@ -26,7 +26,8 @@ echo "============================================"
 echo " 持久化性能基准测试 v2"
 echo " 日期: $(date)"
 echo " Host: $(hostname) CPU: $(nproc) cores"
-echo " redis-benchmark: -n $BENCH_N -c $BENCH_C -P $BENCH_P -d $BENCH_D -r $BENCH_R HSET key:__rand_int__ value"
+echo " redis-benchmark: -n $BENCH_N -c $BENCH_C -P $BENCH_P -d $BENCH_D -r $BENCH_R"
+echo " kvstore: HSET key:__rand_int__ value | redis: HSET key:__rand_int__ __rand_int__ value"
 echo "============================================"
 
 # ==================== Phase 1: 环境检查 ====================
@@ -205,25 +206,25 @@ start_kvstore "--appendfsync everysec" || exit 1
 run_bench "kvstore_aof_everysec" $KVSTORE_PORT HSET key:__rand_int__ value
 cleanup_all
 
-# 6. redis no_aof (RDB 关闭, 无 AOF)
+# 6. redis no_aof (RDB 关闭, 无 AOF) — HSET 3-arg (key field value)
 echo ""
 echo "--- 6/8: redis_no_aof ---"
 start_redis "" || exit 1
-run_bench "redis_no_aof" $REDIS_PORT HSET key:__rand_int__ value
+run_bench "redis_no_aof" $REDIS_PORT HSET key:__rand_int__ __rand_int__ value
 cleanup_all
 
-# 7. redis aof_always
+# 7. redis aof_always — HSET 3-arg
 echo ""
 echo "--- 7/8: redis_aof_always ---"
 start_redis "--appendonly yes --appendfsync always" || exit 1
-run_bench "redis_aof_always" $REDIS_PORT HSET key:__rand_int__ value
+run_bench "redis_aof_always" $REDIS_PORT HSET key:__rand_int__ __rand_int__ value
 cleanup_all
 
-# 8. redis aof_everysec
+# 8. redis aof_everysec — HSET 3-arg
 echo ""
 echo "--- 8/8: redis_aof_everysec ---"
 start_redis "--appendonly yes --appendfsync everysec" || exit 1
-run_bench "redis_aof_everysec" $REDIS_PORT HSET key:__rand_int__ value
+run_bench "redis_aof_everysec" $REDIS_PORT HSET key:__rand_int__ __rand_int__ value
 cleanup_all
 
 # ==================== Phase 3: SAVE 性能测试 ====================

@@ -65,6 +65,9 @@ void close_conn(conn_t *c) {
         fdmap[c->fd] = NULL;
     }
 
+    /* clear any deferred responses for this connection */
+    persist_cancel_deferred(c);
+
     kvs_free(c);
 }
 

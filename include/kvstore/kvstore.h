@@ -520,6 +520,7 @@ int persist_force_aof_flush(void);
 void persist_defer_response(conn_t *c, const unsigned char *data, size_t len);
 void persist_flush_deferred(void);
 int persist_aof_has_pending(void);
+void persist_cancel_deferred(conn_t *c);
 void persist_note_write(void);
 unsigned long long persist_dirty_count(void);
 long long persist_last_snapshot_ms(void);

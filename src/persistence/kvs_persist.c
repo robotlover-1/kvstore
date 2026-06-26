@@ -151,12 +151,13 @@ int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long
     return 0;
 }
 
-/* batch write + fsync: submit both SQEs, wait once (halves kernel round-trips) */
+/* batch write + fsync: submit both SQEs, wait once, dispatch CQEs by result value.
+ * CQE order is NOT guaranteed — write returns >0 (bytes), fsync returns 0 on success. */
 static int persist_write_and_fsync_uring(int fd, const unsigned char *buf, size_t len,
                                           off_t *offset) {
     struct io_uring_sqe *sqe_w, *sqe_f;
     struct io_uring_cqe *cqe;
-    int rc;
+    int rc, r1, r2;
 
     if (persist_uring_init_once() != 0) return -1;
 
@@ -165,7 +166,7 @@ static int persist_write_and_fsync_uring(int fd, const unsigned char *buf, size_
     if (!sqe_w) return -1;
     io_uring_prep_write(sqe_w, fd, buf, len, offset ? *offset : -1);
 
-    /* submit fsync SQE (ordered after write in the SQ) */
+    /* submit fsync SQE */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_f) return -1;
     io_uring_prep_fsync(sqe_f, fd, IORING_FSYNC_DATASYNC);
@@ -174,20 +175,32 @@ static int persist_write_and_fsync_uring(int fd, const unsigned char *buf, size_
     rc = io_uring_submit_and_wait(&g_persist_uring, 2);
     if (rc < 0) return -1;
 
-    /* collect write CQE */
+    /* collect first CQE */
     rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
     if (rc < 0 || !cqe) return -1;
-    rc = cqe->res;
+    r1 = cqe->res;
     io_uring_cqe_seen(&g_persist_uring, cqe);
-    if (rc <= 0) return -1;
-    if (offset) *offset += rc;
 
-    /* collect fsync CQE */
+    /* collect second CQE */
     rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
     if (rc < 0 || !cqe) return -1;
-    rc = cqe->res;
+    r2 = cqe->res;
     io_uring_cqe_seen(&g_persist_uring, cqe);
-    return rc < 0 ? -1 : 0;
+
+    /* dispatch by result: write returns >0 (bytes), fsync returns 0 on success */
+    if (r1 > 0) {
+        /* r1 is write bytes, r2 is fsync result */
+        if (r2 < 0) return -1;
+        if (offset) *offset += r1;
+        return 0;
+    } else if (r2 > 0) {
+        /* r2 is write bytes, r1 is fsync result */
+        if (r1 < 0) return -1;
+        if (offset) *offset += r2;
+        return 0;
+    }
+    /* neither returned positive bytes — both failed */
+    return -1;
 }
 
 static int persist_fsync_fd_best_effort(int fd) {
@@ -266,6 +279,28 @@ void persist_flush_deferred(void) {
  * (only meaningful in ALWAYS mode; everysec flushes on its own timer) */
 int persist_aof_has_pending(void) {
     return (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) ? 1 : 0;
+}
+
+/* remove all deferred responses belonging to a closed connection */
+void persist_cancel_deferred(conn_t *c) {
+    deferred_resp_t *dr, *next, *prev = NULL;
+
+    if (!c) return;
+
+    dr = g_deferred_head;
+    while (dr) {
+        next = dr->next;
+        if (dr->c == c) {
+            /* unlink from list */
+            if (prev) prev->next = next;
+            else g_deferred_head = next;
+            if (dr == g_deferred_tail) g_deferred_tail = prev;
+            kvs_free(dr);
+        } else {
+            prev = dr;
+        }
+        dr = next;
+    }
 }
 
 static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
@@ -574,6 +609,8 @@ int persist_init(void) {
 
 void persist_close(void) {
     if (g_aof_fd >= 0) {
+        /* flush any buffered AOF data before fsync+close */
+        if (g_aof_buf_len > 0) persist_aof_flush_buffer();
         persist_flush_aof_fd(g_aof_fd);
         close(g_aof_fd);
     }

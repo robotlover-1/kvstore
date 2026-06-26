@@ -38,19 +38,6 @@ static unsigned char g_aof_buf[AOF_BUF_SIZE];
 static size_t g_aof_buf_len = 0;
 static long long g_aof_buffered_since_ms = 0;
 
-/* deferred response queue for group commit (ALWAYS mode)
- * responses are small ("+OK\r\n", ":1\r\n", etc.) — inline to avoid malloc */
-#define DEFERRED_DATA_MAX 128
-typedef struct deferred_resp_s {
-    conn_t *c;
-    unsigned char data[DEFERRED_DATA_MAX];
-    size_t len;
-    struct deferred_resp_s *next;
-} deferred_resp_t;
-
-static deferred_resp_t *g_deferred_head = NULL;
-static deferred_resp_t *g_deferred_tail = NULL;
-
 int persist_aof_disable(void) {
     g_aof_disabled = 1;
     return 0;
@@ -236,85 +223,14 @@ int persist_fsync_fd(int fd) {
     return persist_fsync_fd_best_effort(fd);
 }
 
-/* queue a response for deferred delivery after next AOF group flush */
-void persist_defer_response(conn_t *c, const unsigned char *data, size_t len) {
-    deferred_resp_t *dr;
-    if (!c || !data || len == 0) return;
-    if (len > DEFERRED_DATA_MAX) return; /* oversized, shouldn't happen for write cmds */
-    dr = (deferred_resp_t *)kvs_malloc(sizeof(*dr));
-    if (!dr) return;
-    memcpy(dr->data, data, len);
-    dr->len = len;
-    dr->c = c;
-    dr->next = NULL;
-    if (g_deferred_tail) g_deferred_tail->next = dr;
-    else g_deferred_head = dr;
-    g_deferred_tail = dr;
-}
-
-/* flush AOF buffer (if pending) and deliver all deferred responses */
-void persist_flush_deferred(void) {
-    deferred_resp_t *dr, *next;
-    int flushed[256] = {0};  /* track which connections we've flushed */
-
-    /* only group-commit flush in ALWAYS mode; everysec has its own timer */
+/* flush pending AOF buffered data to disk after each reactor iteration.
+ * only active in ALWAYS mode; everysec has its own timer. */
+void persist_flush_pending(void) {
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
         persist_aof_flush_buffer();
     }
-
-    /* phase 1: queue all responses into ring buffers without sending */
-    dr = g_deferred_head;
-    while (dr) {
-        next = dr->next;
-        if (dr->c) queue_bytes(dr->c, dr->data, dr->len);
-        dr = next;
-    }
-
-    /* phase 2: flush each connection's ring once (one send() per connection) */
-    dr = g_deferred_head;
-    while (dr) {
-        next = dr->next;
-        if (dr->c) {
-            int fd = dr->c->fd;
-            if (fd >= 0 && fd < (int)(sizeof(flushed)/sizeof(flushed[0])) && !flushed[fd]) {
-                flushed[fd] = 1;
-                flush_conn_output(dr->c);
-            }
-        }
-        kvs_free(dr);
-        dr = next;
-    }
-    g_deferred_head = NULL;
-    g_deferred_tail = NULL;
 }
 
-/* returns 1 if there is buffered AOF data waiting for group flush
- * (only meaningful in ALWAYS mode; everysec flushes on its own timer) */
-int persist_aof_has_pending(void) {
-    return (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) ? 1 : 0;
-}
-
-/* remove all deferred responses belonging to a closed connection */
-void persist_cancel_deferred(conn_t *c) {
-    deferred_resp_t *dr, *next, *prev = NULL;
-
-    if (!c) return;
-
-    dr = g_deferred_head;
-    while (dr) {
-        next = dr->next;
-        if (dr->c == c) {
-            /* unlink from list */
-            if (prev) prev->next = next;
-            else g_deferred_head = next;
-            if (dr == g_deferred_tail) g_deferred_tail = prev;
-            kvs_free(dr);
-        } else {
-            prev = dr;
-        }
-        dr = next;
-    }
-}
 
 static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
     FILE *fp = fopen(path, "rb");
@@ -679,14 +595,13 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    /* ALWAYS mode: group commit — rely on reactor batch flush (persist_flush_deferred);
-     * only inline-flush on time threshold as latency ceiling */
+    /* ALWAYS mode: buffer accumulates; flushed at reactor iteration end
+     * (persist_flush_pending) or on 2ms timeout as latency ceiling */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
         if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
             persist_aof_flush_buffer();
             g_aof_buffered_since_ms = 0;
         }
-        /* else: response deferred by caller, flush in persist_flush_deferred() */
     }
     return 0;
 }
@@ -988,11 +903,10 @@ int persist_autosnap_cron(void) {
         }
     }
 
-    /* ALWAYS mode: flush pending buffered data if timeout exceeded,
-     * ensures deferred responses are delivered even without new commands */
+    /* ALWAYS mode: flush pending buffered data if timeout exceeded */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
         if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
-            persist_flush_deferred();
+            persist_aof_flush_buffer();
         }
     }
 

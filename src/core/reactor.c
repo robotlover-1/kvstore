@@ -73,9 +73,6 @@ void close_conn(conn_t *c) {
         fdmap[c->fd] = NULL;
     }
 
-    /* clear any deferred responses for this connection */
-    persist_cancel_deferred(c);
-
     kvs_free(c);
 }
 
@@ -287,8 +284,8 @@ int reactor_start(void) {
             }
         }
 
-        /* flush any deferred AOF responses from group commit */
-        persist_flush_deferred();
+        /* flush pending AOF buffered data */
+        persist_flush_pending();
     }
 
     return 0;

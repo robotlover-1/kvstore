@@ -231,7 +231,6 @@ void persist_flush_pending(void) {
     }
 }
 
-
 static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;

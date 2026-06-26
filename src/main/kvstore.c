@@ -1781,8 +1781,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         n = resp_error(resp, BUFFER_CAP, "operation failed");
     }
     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
-        goto out;
-    out:
+    goto out;
+out:
     kvs_free(resp);
     return rc_ret;
 }

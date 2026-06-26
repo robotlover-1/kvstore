@@ -4723,35 +4723,32 @@ redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand
 
 ##### 结果分析
 
-**① P=1 kvstore 领先，pipeline 场景 Redis 大幅反超**
+**① 三轮 Pipeline 优化后，kvstore P≥40 反超 Redis**
 
-P=1 时 kvstore HSET 与 Redis 基本持平（132K vs 134K QPS）。Pipeline 下 Redis 拉大差距——HSET disable P=160 时 896K vs 584K QPS（1.5×）。差距来自 kvstore 每命令的 RESP 解析（copy 方式）、环缓冲操作等公共路径开销在 pipeline 批处理中累积。
+P=1 时与 Redis 基本持平（136K vs 134K）。优化后（resp 64KB→4KB、epoll_ctl 延迟、scratch buffer），P≥40 全部追平或反超。P=160 时 1,160K vs 896K（+30%）。P=10/20 仍有小幅差距（76-82%），剩余瓶颈是引擎操作和命令路由的固定开销。
 
-**② AOF disable vs everysec 差距极小**
+优化详情见 `docs/issues/2026-06-26-aof-always-debug.md`。
 
-everysec 模式下 fsync 异步触发，不阻塞命令路径。kvstore P=160 时 everysec（478K QPS）是 disable（584K QPS）的 82%。Redis 同类表现类似。
+**② AOF everysec 在 P≥40 反超 Redis**
 
-**③ AOF always 是 kvstore pipeline 的最大弱项**
+kvstore P=160 时 everysec（804K）反超 Redis（693K, +16%）。P=80 时 740K vs 677K（+9%）。fsync 异步触发，不阻塞命令处理路径。
 
-kvstore AOF always 在 pipeline 下性能极差——P=160 时仅 176K QPS，是 Redis 的 31%。原因：
+**③ AOF always pipeline 仍是弱项**
 
-- **Group commit 序列化瓶颈**：每个 pipeline 批次到达 → 处理 N 条命令并写入 AOF buffer → flush buffer（io_uring write+fsync）→ 等待 fsync 完成 → 发送所有响应。fsync 延迟成为串行瓶颈。
-- **P=10 时 pipeline 反而有害**：11.1K QPS 远低于 P=1 的 47.6K QPS。pipeline 批次的 fsync 开销超过批量处理节省的时间。
-- **Redis AOF always pipeline 大幅提升**：因 pipeline 将多条命令的 fsync 合并为一次，从 P=1 的 43K 提升到 P=160 的 567K（13×）。
+kvstore AOF always P=160 时 178K QPS，是 Redis 567K 的 31%。原因：每个 pipeline 批次需要一次 fsync（io_uring write+fsync ~121µs），形成串行瓶颈。P=10 时 11K 甚至低于 P=1 的 51K——pipeline 的 fsync 开销超过了批量处理节省的时间。Redis 的 AOF always pipeline 从 43K（P=1）提升到 567K（P=160）因每轮事件循环处理更多命令后才 fsync。
 
 ##### 结论
 
 
 | 场景                    | 推荐方案    | 说明                                             |
 | ----------------------- | ----------- | ------------------------------------------------ |
-| P=1 单请求              | **kvstore** | HSET 132K vs Redis 134K QPS，基本持平            |
-| Pipeline + 无 AOF       | Redis       | P=160 时 896K vs kvstore 584K QPS（1.5×）       |
-| Pipeline + AOF everysec | Redis       | P=160 时 693K vs kvstore 478K QPS（1.4×）       |
-| Pipeline + AOF always   | **Redis**   | P=160 时 567K vs kvstore 176K QPS（**3.2×**）   |
-| 单请求 + AOF always     | **kvstore** | 48K vs Redis 43K QPS（+12%）                     |
+| P=1 单请求              | **kvstore** | HSET 136K vs Redis 134K，基本持平                |
+| Pipeline + 无 AOF       | **kvstore** | P=160 时 1,160K vs Redis 896K（**+30%**）        |
+| Pipeline + AOF everysec | **kvstore** | P=160 时 804K vs Redis 693K（**+16%**）          |
+| Pipeline + AOF always   | **Redis**   | P=160 时 567K vs kvstore 178K（**3.2×**）       |
+| 单请求 + AOF always     | **kvstore** | 51K vs Redis 43K（**+19%**）                     |
 
-> **注意**：AOF always 下 pipeline 场景因 group commit 的 fsync 串行化而大幅落后 Redis。
-> 生产环境中 AOF always + pipeline 组合应使用 Redis，或考虑改用 AOF everysec。
+> **注意**：AOF always + pipeline 组合 kvstore 差距较大，应使用 Redis 或改用 AOF everysec。
 
 ### 运行基准测试
 

@@ -81,32 +81,34 @@ static __always_inline void stat_add(__u32 key, __u64 delta) {
     if (v) __sync_fetch_and_add(v, delta);
 }
 
-/* 从 msghdr 的 iovec 读取数据
- * msghdr + 40 = iov 指针, + 48 = nr_segs */
+/* 从 msghdr→iov_iter 读取 iov 数据和 nr_segs（合并为一次 bpf_probe_read_kernel）
+ * iov_iter 在 msghdr 内偏移 16 字节 (msg_name 8 + msg_namelen 4 + pad 4)
+ * iov 指针在 iov_iter 内偏移 24 字节 (iter_type 1 + nofault 1 + data_source 1 + pad 5 + iov_offset 8 + count 8)
+ * nr_segs 紧接在 iov 之后，偏移 32 字节
+ * iov 和 nr_segs 在 msg+40 处相邻 16 字节，可一次读出 */
 static __always_inline int read_iov_data(unsigned long msg_ptr,
     unsigned char *buf, int max_len)
 {
-    struct { unsigned long base; unsigned long len; } *iov = 0;
-    if (bpf_probe_read_kernel(&iov, sizeof(iov),
+    /* 1. 合并读取 iov 指针 + nr_segs（16 字节从 msg_ptr + 40） */
+    struct { unsigned long iov_ptr; unsigned long _nr_segs; } head;
+    if (bpf_probe_read_kernel(&head, sizeof(head),
             (const void *)(msg_ptr + 40)) != 0)
         return 0;
-    if (!iov) return 0;
+    if (!head.iov_ptr || head._nr_segs == 0) return 0;
 
-    unsigned long nr_segs = 0;
-    if (bpf_probe_read_kernel(&nr_segs, sizeof(nr_segs),
-            (const void *)(msg_ptr + 48)) != 0)
-        return 0;
-    if (nr_segs == 0) return 0;
-
+    /* 2. 读取第一个 iovec */
     struct { unsigned long base; unsigned long len; } vec;
-    if (bpf_probe_read_kernel(&vec, sizeof(vec), &iov[0]) != 0)
+    if (bpf_probe_read_kernel(&vec, sizeof(vec),
+            (const void *)head.iov_ptr) != 0)
         return 0;
     if (!vec.base || vec.len == 0) return 0;
 
+    /* 3. 限制大小 */
     unsigned long long safe_len = vec.len;
     if (safe_len > (unsigned long long)max_len)
         safe_len = (unsigned long long)max_len;
 
+    /* 4. 从用户空间读取实际数据 */
     if (bpf_probe_read_user(buf, (__u32)safe_len,
             (const void *)(unsigned long)vec.base) != 0)
         return 0;

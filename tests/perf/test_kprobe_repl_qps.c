@@ -173,32 +173,78 @@ static void *load_kprobe_bpf(void) {
         bpf_map_update_elem(bpf_map__fd(ctl), &k1, &vpid, BPF_ANY);
     }
 
-    /* Attach kprobes */
+    /* Attach — 优先尝试 fentry/fexit trampoline，失败回退 kprobe/kretprobe.
+     * 注: libbpf 0.5.0 在缺少 BPF_PROG_TYPE_TRACING 的内核上可能对
+     * attach_trace 返回虚假成功。此时通过检查 kprobe attach 是否也成功来
+     * 判断：若两者都成功，优先使用 kprobe（更可靠）。 */
     struct bpf_program *prog;
     struct bpf_link *le = NULL, *lr = NULL;
+    struct bpf_link *le_kp = NULL, *lr_kp = NULL;
+    long attach_err = 0;
 
-    prog = bpf_object__find_program_by_name(obj, "kp_recv_entry");
+    /* 尝试 fentry/fexit trampoline */
+    prog = bpf_object__find_program_by_name(obj, "fentry_recv");
     if (prog) {
-        le = bpf_program__attach_kprobe(prog, false, "tcp_recvmsg");
-        if (libbpf_get_error(le)) {
-            fprintf(stderr, "kprobe: attach entry failed: %ld\n", libbpf_get_error(le));
+        le = bpf_program__attach_trace(prog);
+        attach_err = libbpf_get_error(le);
+        if (attach_err) {
+            fprintf(stderr, "kprobe: fentry trampoline failed: %ld\n", attach_err);
             le = NULL;
         }
     }
-
-    prog = bpf_object__find_program_by_name(obj, "kp_recv_return");
-    if (prog) {
-        lr = bpf_program__attach_kprobe(prog, true, "tcp_recvmsg");
-        if (libbpf_get_error(lr)) {
-            fprintf(stderr, "kprobe: attach return failed: %ld\n", libbpf_get_error(lr));
-            lr = NULL;
+    if (le) {
+        prog = bpf_object__find_program_by_name(obj, "fexit_recv");
+        if (prog) {
+            lr = bpf_program__attach_trace(prog);
+            attach_err = libbpf_get_error(lr);
+            if (attach_err) {
+                fprintf(stderr, "kprobe: fexit trampoline failed: %ld\n", attach_err);
+                bpf_link__destroy(le); le = NULL;
+                lr = NULL;
+            }
         }
     }
 
+    /* 同时尝试 kprobe 作为验证：若 kprobe 也能成功 attach，说明内核稳定支持
+     * kprobe，此时优先用 kprobe（避免 libbpf 虚假成功的 trampoline 问题）。 */
+    prog = bpf_object__find_program_by_name(obj, "kp_recv_entry");
+    if (prog) {
+        le_kp = bpf_program__attach_kprobe(prog, false, "tcp_recvmsg");
+        if (libbpf_get_error(le_kp)) {
+            le_kp = NULL;
+        }
+    }
+    prog = bpf_object__find_program_by_name(obj, "kp_recv_return");
+    if (prog) {
+        lr_kp = bpf_program__attach_kprobe(prog, true, "tcp_recvmsg");
+        if (libbpf_get_error(lr_kp)) {
+            lr_kp = NULL;
+        }
+    }
+
+    /* 决策：优先使用 kprobe（更稳定），fentry/fexit 仅在 kprobe 不可用时尝试 */
+    if (le_kp && lr_kp) {
+        /* kprobe 可用，释放 trampoline link */
+        if (le) { bpf_link__destroy(le); le = NULL; }
+        if (lr) { bpf_link__destroy(lr); lr = NULL; }
+        le = le_kp; le_kp = NULL;
+        lr = lr_kp; lr_kp = NULL;
+        fprintf(stderr, "kprobe: using kprobe/kretprobe\n");
+    } else if (le && lr) {
+        /* kprobe 不可用，使用 trampoline */
+        if (le_kp) { bpf_link__destroy(le_kp); le_kp = NULL; }
+        if (lr_kp) { bpf_link__destroy(lr_kp); lr_kp = NULL; }
+        fprintf(stderr, "kprobe: using fentry/fexit trampoline\n");
+    } else {
+        /* 部分成功，清理 */
+        if (le_kp && !le) { le = le_kp; le_kp = NULL; }
+        if (lr_kp && !lr) { lr = lr_kp; lr_kp = NULL; }
+        if (le_kp) bpf_link__destroy(le_kp);
+        if (lr_kp) bpf_link__destroy(lr_kp);
+    }
+
     if (!le && !lr) {
-        fprintf(stderr, "kprobe: no kprobes attached\n");
-        if (le) bpf_link__destroy(le);
-        if (lr) bpf_link__destroy(lr);
+        fprintf(stderr, "kprobe: no probes attached\n");
         bpf_object__close(obj);
         return NULL;
     }

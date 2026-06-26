@@ -13,6 +13,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 
 #ifndef BPF_MAP_TYPE_RINGBUF
 #define BPF_MAP_TYPE_RINGBUF 27
@@ -115,7 +116,78 @@ static __always_inline int read_iov_data(unsigned long msg_ptr,
     return (int)safe_len;
 }
 
-/* ──── Entry: 保存 msg 指针 ──── */
+/* ──── fentry: 在 tcp_recvmsg 入口保存 msg 指针 ──── */
+SEC("fentry/tcp_recvmsg")
+int BPF_PROG(fentry_recv, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    __u64 enabled = ctl_get(CTL_ENABLED);
+    if (!enabled) return 0;
+
+    __u64 target_pid = ctl_get(CTL_PID);
+    if (!target_pid) return 0;
+
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != (__u32)target_pid) {
+        stat_inc(STAT_SKIP_PID);
+        return 0;
+    }
+
+    /* 保存 msg 指针（供 fexit 使用） */
+    unsigned long msg_val = (unsigned long)msg;
+    __u32 key = 0;
+    bpf_map_update_elem(&entry_msg, &key, &msg_val, 0);
+
+    return 0;
+}
+
+/* ──── fexit: 在 tcp_recvmsg 返回时读取数据写 ringbuf ──── */
+SEC("fexit/tcp_recvmsg")
+int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    __u64 enabled = ctl_get(CTL_ENABLED);
+    if (!enabled) return 0;
+
+    /* fexit: ctx[0] = 返回值 (通过 ctx 原始参数读取, 避免 BTF 类型冲突) */
+    long retval = (long)ctx[0];
+    if (retval <= 0) return 0;
+
+    __u32 key = 0;
+    unsigned long *msg_ptr = bpf_map_lookup_elem(&entry_msg, &key);
+    if (!msg_ptr || *msg_ptr == 0) return 0;
+
+    __u32 size = (__u32)retval;
+    if (size > CAPTURE_MAX_DATA) size = CAPTURE_MAX_DATA;
+
+    unsigned char *buf = bpf_map_lookup_elem(&tmpbuf, &key);
+    if (!buf) return 0;
+
+    /* 头 4 字节 = payload 长度 */
+    __u32 plen = 0;
+    __builtin_memcpy(buf, &plen, 4);
+
+    int data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
+    if (data_len <= 0) return 0;
+
+    plen = (__u32)data_len;
+    __builtin_memcpy(buf, &plen, 4);
+
+    int total = 4 + data_len;
+    if (bpf_ringbuf_output(&ringbuf, buf, total, 0) != 0) {
+        stat_inc(STAT_RB_ERR);
+        return 0;
+    }
+
+    stat_inc(STAT_HIT);
+    stat_add(STAT_BYTES, (__u64)data_len);
+
+    /* 清除保存的 msg 指针 */
+    unsigned long zero = 0;
+    bpf_map_update_elem(&entry_msg, &key, &zero, 0);
+
+    return 0;
+}
+
+/* ──── 旧 kprobe 版本保留作为 fallback ──── */
 SEC("kprobe/tcp_recvmsg")
 int kp_recv_entry(struct pt_regs *ctx)
 {
@@ -139,7 +211,7 @@ int kp_recv_entry(struct pt_regs *ctx)
     return 0;
 }
 
-/* ──── Return: 读取数据并写 ringbuf ──── */
+/* ──── 旧 kretprobe 版本保留作为 fallback ──── */
 SEC("kretprobe/tcp_recvmsg")
 int kp_recv_return(struct pt_regs *ctx)
 {

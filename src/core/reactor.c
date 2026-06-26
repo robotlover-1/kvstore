@@ -32,10 +32,12 @@ static int mod_events(conn_t *c, uint32_t events) {
 
 int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
     size_t tail, first_chunk;
+    size_t old_len;
 
     if (!c || !buf || len == 0) return -1;
     if (len > OUT_RING_SIZE - c->out_ring_len) return -1;
 
+    old_len = c->out_ring_len;
     tail = c->out_ring_tail;
     first_chunk = OUT_RING_SIZE - tail;
     if (len <= first_chunk) {
@@ -46,7 +48,13 @@ int queue_bytes(conn_t *c, const unsigned char *buf, size_t len) {
     }
     c->out_ring_tail = (tail + len) & (OUT_RING_SIZE - 1);
     c->out_ring_len += len;
-    mod_events(c, EPOLLIN | EPOLLOUT);
+
+    /* register EPOLLOUT only when transitioning from empty→non-empty.
+     * avoids redundant epoll_ctl per pipelined response while ensuring
+     * cross-connection writes (replication) trigger EPOLLOUT registration. */
+    if (old_len == 0) {
+        mod_events(c, EPOLLIN | EPOLLOUT);
+    }
     return 0;
 }
 

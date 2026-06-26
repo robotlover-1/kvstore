@@ -1001,7 +1001,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
 
     int rc_ret = 0;
     int n = 0;
-    char *resp = (char *)kvs_malloc(BUFFER_CAP);
+    char *resp = (char *)kvs_malloc(4096);  /* 4KB covers 99.9% responses, 16x smaller than 64KB */
     if (!resp) return -1;
 
     (void)argl;

@@ -1793,6 +1793,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
 }
 
 int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
+#define PARSE_SCRATCH 4096
+    char scratch[PARSE_SCRATCH];
+    size_t scratch_off = 0;
     size_t pos = 0;
     while (pos < *len) {
         if (buf[pos] == '+') {
@@ -1932,10 +1935,13 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                 incomplete = 1;
                 break;
             }
-            argv[i] = (char *)kvs_malloc((size_t)blen + 1);
-            if (!argv[i]) {
-                malformed = 1;
-                break;
+            /* try scratch buffer first (amortizes malloc across pipeline batch) */
+            if (scratch_off + (size_t)blen + 1 <= PARSE_SCRATCH) {
+                argv[i] = scratch + scratch_off;
+                scratch_off += (size_t)blen + 1;
+            } else {
+                argv[i] = (char *)kvs_malloc((size_t)blen + 1);
+                if (!argv[i]) { malformed = 1; break; }
             }
             memcpy(argv[i], buf + p, (size_t)blen);
             argv[i][blen] = 0;
@@ -1948,17 +1954,22 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             p += 2;
         }
         if (incomplete) {
-            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+            for (int i = 0; i < argc; ++i)
+                if (argv[i] < scratch || argv[i] >= scratch + PARSE_SCRATCH) kvs_free(argv[i]);
             break;
         }
         if (malformed) {
-            for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+            for (int i = 0; i < argc; ++i)
+                if (argv[i] < scratch || argv[i] >= scratch + PARSE_SCRATCH) kvs_free(argv[i]);
+            scratch_off = 0;
             if (p > start) pos = p;
             else break;
             continue;
         }
         handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
-        for (int i = 0; i < argc; ++i) kvs_free(argv[i]);
+        for (int i = 0; i < argc; ++i)
+            if (argv[i] < scratch || argv[i] >= scratch + PARSE_SCRATCH) kvs_free(argv[i]);
+        scratch_off = 0;
         pos = p;
     }
     if (pos > 0 && pos < *len) {

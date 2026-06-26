@@ -155,9 +155,7 @@ int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
     unsigned long *msg_ptr = bpf_map_lookup_elem(&entry_msg, &key);
     if (!msg_ptr || *msg_ptr == 0) return 0;
 
-    __u32 size = (__u32)retval;
-    if (size > CAPTURE_MAX_DATA) size = CAPTURE_MAX_DATA;
-
+    /* 用 tmpbuf 做临时缓冲（BPF verifier 要求 map 指针作为 probe_read_user dst） */
     unsigned char *buf = bpf_map_lookup_elem(&tmpbuf, &key);
     if (!buf) return 0;
 
@@ -171,11 +169,15 @@ int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
     plen = (__u32)data_len;
     __builtin_memcpy(buf, &plen, 4);
 
-    int total = 4 + data_len;
-    if (bpf_ringbuf_output(&ringbuf, buf, total, 0) != 0) {
+    /* reserve → memcpy → submit（替代 bpf_ringbuf_output）
+     * BPF verifier 要求 __builtin_memcpy 的 size 为常量，统一 reserve+copy 固定大小 */
+    void *entry = bpf_ringbuf_reserve(&ringbuf, 4 + CAPTURE_MAX_DATA, 0);
+    if (!entry) {
         stat_inc(STAT_RB_ERR);
         return 0;
     }
+    bpf_probe_read_kernel(entry, 4 + CAPTURE_MAX_DATA, buf);
+    bpf_ringbuf_submit(entry, 0);
 
     stat_inc(STAT_HIT);
     stat_add(STAT_BYTES, (__u64)data_len);
@@ -225,9 +227,7 @@ int kp_recv_return(struct pt_regs *ctx)
     unsigned long *msg_ptr = bpf_map_lookup_elem(&entry_msg, &key);
     if (!msg_ptr || *msg_ptr == 0) return 0;
 
-    __u32 size = (__u32)retval;
-    if (size > CAPTURE_MAX_DATA) size = CAPTURE_MAX_DATA;
-
+    /* 用 tmpbuf 做临时缓冲（BPF verifier 要求 map 指针作为 probe_read_user dst） */
     unsigned char *buf = bpf_map_lookup_elem(&tmpbuf, &key);
     if (!buf) return 0;
 
@@ -241,11 +241,15 @@ int kp_recv_return(struct pt_regs *ctx)
     plen = (__u32)data_len;
     __builtin_memcpy(buf, &plen, 4);
 
-    int total = 4 + data_len;
-    if (bpf_ringbuf_output(&ringbuf, buf, total, 0) != 0) {
+    /* reserve → memcpy → submit（替代 bpf_ringbuf_output）
+     * BPF verifier 要求 __builtin_memcpy 的 size 为常量，统一 reserve+copy 固定大小 */
+    void *entry = bpf_ringbuf_reserve(&ringbuf, 4 + CAPTURE_MAX_DATA, 0);
+    if (!entry) {
         stat_inc(STAT_RB_ERR);
         return 0;
     }
+    bpf_probe_read_kernel(entry, 4 + CAPTURE_MAX_DATA, buf);
+    bpf_ringbuf_submit(entry, 0);
 
     stat_inc(STAT_HIT);
     stat_add(STAT_BYTES, (__u64)data_len);

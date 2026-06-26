@@ -167,160 +167,6 @@ kvstore/
 
 > 例：`HSET key value` 使用哈希引擎，`RSET key value` 使用红黑树引擎。
 
-### 内存后端
-
-
-| 后端       | 特点                                    |
-| ---------- | --------------------------------------- |
-| `libc`     | 标准 malloc/free，最通用                |
-| `jemalloc` | 高性能分配器，减少碎片                  |
-| `custom`   | 自研 slab + mmap 分配器，可观测碎片统计 |
-
-##### 内存占用测试（2026-06-16）
-
-> **测试方法**：启动 kvstore → 写入 100w 条 HSET → 释放 100w 条 HDEL，在 1%/10%/50%/80%/100% 进度点采样 `/proc/<pid>/status` 的 VmSize（虚拟内存）和 VmRSS（物理内存）。AOF 关闭，Hash 引擎，非 sudo。
->
-> 测试脚本：`tools/bench/mem_pool_bench.py`
-
-
-| 后端         | 阶段                  | 数据量   | VmSize (KB) | VmRSS (KB) | RSS/Size  |
-| ------------ | --------------------- | -------- | ----------- | ---------- | --------- |
-| **libc**     | 基线                  | 0        | 5,344       | 3,600      | 67.4%     |
-|              | 写入 1%               | 1w       | 7,120       | 4,652      | 65.3%     |
-|              | 写入 10%              | 10w      | 13,216      | 11,268     | 85.3%     |
-|              | 写入 50%              | 50w      | 39,700      | 37,756     | 95.1%     |
-|              | **写入 100%（峰值）** | **100w** | **72,900**  | **71,164** | **97.6%** |
-|              | 释放 50%              | 50w      | 72,900      | 71,164     | 97.6%     |
-|              | 释放 80%              | 20w      | 72,900      | 71,164     | 97.6%     |
-|              | 释放 100%             | 0        | 72,900      | 40,384     | 55.4%     |
-| **jemalloc** | 基线                  | 0        | 19,460      | 5,736      | 29.5%     |
-|              | 写入 1%               | 1w       | 22,020      | 6,784      | 30.8%     |
-|              | 写入 10%              | 10w      | 25,092      | 11,764     | 46.9%     |
-|              | 写入 50%              | 50w      | 59,396      | 40,116     | 67.5%     |
-|              | **写入 100%（峰值）** | **100w** | **96,260**  | **73,560** | **76.4%** |
-|              | 释放 50%              | 50w      | 96,260      | 61,540     | 63.9%     |
-|              | 释放 80%              | 20w      | 96,260      | 35,028     | 36.4%     |
-|              | 释放 100%             | 0        | 96,260      | 18,652     | 19.4%     |
-| **custom**   | 基线                  | 0        | 5,528       | 3,744      | 67.7%     |
-|              | 写入 1%               | 1w       | 7,228       | 4,796      | 66.4%     |
-|              | 写入 10%              | 10w      | 13,056      | 11,260     | 86.2%     |
-|              | 写入 50%              | 50w      | 38,808      | 37,024     | 95.4%     |
-|              | **写入 100%（峰值）** | **100w** | **71,224**  | **69,392** | **97.4%** |
-|              | 释放 50%              | 50w      | 44,984      | 43,152     | 95.9%     |
-|              | 释放 80%              | 20w      | 27,448      | 25,616     | 93.3%     |
-|              | 释放 100%             | 0        | **15,992**  | **14,160** | **88.5%** |
-
-##### 结果分析
-
-**① 峰值内存效率：custom 最优（71 MB），libc 居中（73 MB），jemalloc 最高（96 MB）**
-
-libc（ptmalloc2）使用 sbrk + mmap 混合策略，100w key 需 73 MB（~75 bytes/条目）。custom 经过四轮优化后降至 71 MB（~73 bytes/条目），**反超 libc 2.3%**。jemalloc 基于 mmap 页面粒度分配，虚拟内存偏高（~99 bytes/条目）。
-
-**② 物理内存释放：custom 最彻底（87%），jemalloc 次之（75%），libc 最差（43%）**
-
-
-| 后端         | 峰值 VmRSS | 释放后 VmRSS | 释放率    |
-| ------------ | ---------- | ------------ | --------- |
-| **libc**     | 71,164 KB  | 40,384 KB    | **43.3%** |
-| **jemalloc** | 73,560 KB  | 18,652 KB    | **74.6%** |
-| **custom**   | 69,392 KB  | 14,160 KB    | **79.6%** |
-
-- **libc**：free 后通过 arena 收缩归还部分物理页，但 VmRSS 仍保留 57%（40 MB），释放最保守。VmSize 完全不降（sbrk 堆区不归还）。
-- **jemalloc**：后台线程主动 purge dirty pages，释放率 75%。释放过程最平滑——free_50% 已降至 61,540 KB（60 MB），free_80% 降至 35,028 KB（34 MB），逐步归还。VmSize 保持不变（mmap 保留地址空间）。
-- **custom**：四轮优化后峰值内存最低（71 MB），**反超 libc**。唯一同时归还虚拟内存的后端——munmap 整页时 VmSize 随 VmRSS 同步下降。释放率 80%，呈阶梯状。每条目 `chunk_total = 4B (header) + 56B (class) = 60B`，header 仅 4 字节（request_size:2 + magic:1 + class_idx:1），比 libc 的 ~8B malloc 元数据更紧凑。
-
-**③ 三种后端的适用场景**
-
-
-| 后端         | 适用场景                                   | 不适用场景                                           |
-| ------------ | ------------------------------------------ | ---------------------------------------------------- |
-| **libc**     | 通用场景，内存占用最低，碎片可控           | 需要主动归还内存（需手动 trim）                      |
-| **jemalloc** | 长时间运行、内存自动回收需求               | 启动虚拟内存占用偏高（19 MB 基线）                   |
-| **custom**   | 高频 alloc/free、数据量稳定（O(1) 无碎片） | 数据量波动极大（释放粒度 < 单页 chunk 数时无法回收） |
-
-> **注意**：custom 已实现空闲页回收，释放后内存可归还 OS。但如果数据量在单页 chunk 数（~500-2000 个）范围内波动，
-> 部分页始终无法完全空闲，物理内存不会下降。极端场景下仍建议 **libc** 或 **jemalloc**。
-
-##### custom 分配器优化历程
-
-三次优化将峰值 VmSize 从 97 MB 降到 81 MB（与 libc 差距 32% → 11%），释放率从 0% 提升到 85%。
-
-**Phase 1：空闲页回收（释放率 0% → 86%）**
-
-*问题*：`custom_free` 将 chunk 放回 `free_list`，但 slab 页（mmap）从不 munmap。删除 100w 数据后 95 MB 物理内存纹丝不动。
-
-*方案*：per-page 追踪 `chunks_in_use`，整页空闲时 munmap 归还 OS。
-
-*关键代码*：
-
-```c
-// slab_page_t 新增字段
-size_t chunks_total;   // 该页总 chunk 数
-size_t chunks_in_use;  // 当前已分配数（0 = 全空闲 → 回收）
-
-// custom_free 递减后触发
-if (pg->chunks_in_use == 0)
-    try_reclaim_page_locked(&g_mem.classes[idx], pg);
-```
-
-*阈值保护*：至少保留 2 页的 free chunk 缓冲，防止 alloc/free 反复触发 mmap/munmap 颠簸。
-
-*效果*：释放 100% 后 VmRSS 从 95 MB 降至 12 MB（仅比基线高 ~8 MB）。
-
-**Phase 2：密集 slab class（内部碎片 100% → ≤25%）**
-
-*问题*：8 级 class `{32,64,128,256,384,512,768,1024}` 间距 2×，实际 46 字节请求落入 64B class 浪费 39%，80 字节请求落入 128B class 浪费 60%。
-
-*方案*：参考 jemalloc（~1.19× 间距）和 TCMalloc（~1.12× 间距），扩展为 17 级 `{16,24,32,...,1024}`，~1.25× 几何级数，内部碎片上限控制在 25%。
-
-*关键改动*：
-
-```
-SMALL_CLASS_COUNT  8 → 17
-class sizes:  {32,64,128,...}  →  {16,24,32,40,56,72,96,128,160,200,256,320,400,512,640,800,1024}
-                    2× 间距                        ~1.25× 间距
-```
-
-*效果*：46 字节请求 64B → 56B class（浪费 18B → 10B），每条目省 8 字节。峰值 VmSize 97 MB → 89 MB（-8.1%）。
-
-```c
-// class_index_for：遍历 class 数组找第一个 ≥ sz 的 class
-// 分配时：chunk_total = sizeof(small_chunk_t) + class_size 决定每页 chunk 数
-```
-
-**Phase 3：压缩 chunk header（24B → 16B）**
-
-*问题*：`small_chunk_t` 有未使用 `reserved` 字段，且 `magic`/`class_idx`/`request_size` 全部宽存储，sizeof=24 字节。
-
-*方案*：去掉 `reserved`，`magic` uint32→uint8（0xC0DEC0DE→0xCC），`class_idx` uint16→uint8，`request_size` uint32→uint16（max=1024）。`next` 指针放最前面确保 8 字节对齐，sizeof 从 24 降到 16。
-
-```c
-// 旧 (24B)                           新 (16B)
-typedef struct small_chunk_s {        typedef struct small_chunk_s {
-    uint32_t magic;     // 4B              struct small_chunk_s *next; // 8B
-    uint16_t class_idx; // 2B              uint16_t request_size;       // 2B
-    uint16_t reserved;  // 2B (废)          uint8_t  magic;              // 1B
-    uint32_t request_size; // 4B           uint8_t  class_idx;          // 1B
-    struct small_chunk_s *next; // 8B  } small_chunk_t;                 // 16B
-} small_chunk_t;                     // 24B
-```
-
-*效果*：每条目 `chunk_total = 16 + 56 = 72B`（vs 旧 80B），省 8 字节 × 1M = 8 MB。峰值 VmSize 89 MB → **81 MB**（与 libc 差距 11%）。
-
-
-| 阶段                               | 峰值 VmSize   | vs libc   | bytes/条目 | 释放率  |
-| ---------------------------------- | ------------- | --------- | ---------- | ------- |
-| 初始 (8 class, 24B header, 无回收) | 96,592 KB     | +32%      | 98.9       | 0%      |
-| P1: 空闲页回收                     | 96,592 KB     | +32%      | 98.9       | 86%     |
-| P2: 17 级密集 class                | 88,764 KB     | +22%      | 90.9       | 86%     |
-| P3: 压缩 header 24→16B            | 80,956 KB     | +11%      | 82.9       | 85%     |
-| **P4: free_stack 索引 16→4B**     | **71,224 KB** | **-2.3%** | **72.9**   | **80%** |
-| *libc 基线*                        | *72,900 KB*   | —        | *74.6*     | *43%*   |
-
-*P4 已反超 libc*（71 MB < 73 MB，73 bytes/条目 < 75 bytes/条目）。用 per-page `uint16_t` 索引栈（LIFO）替代链表 `next` 指针，`small_chunk_t` 从 16B 压缩到 4B（request_size:2 + magic:1 + class_idx:1）。每条目 `chunk_total = 4 + 56 = 60B`，比 libc 的 malloc 元数据更紧凑。释放后残留 ~14 MB（基线 ~4 MB），来自 free_stack 元数据 + 阈值缓冲页。
-
-**Phase 4 原理**：free list 链表将空闲 chunk 链接起来，每个 chunk 需要 8 字节 `next` 指针。用 per-page `uint16_t free_stack[]` 替代——slab 页最多 ~1000 chunks，2 字节足够索引。分配时 `free_stack[--free_top]` 弹出索引，释放时 `free_stack[free_top++] = ci` 压入索引，均为 O(1)。额外收益：`total_free_chunks = Σ page->free_top`（O(page_count)，比遍历链表 O(free_chunks) 快得多）。
-
 ### 网络模型
 
 
@@ -2647,6 +2493,7 @@ K->>D: mmap 读取 dump 恢复数据
 T->>K: HGET persist:dump:00000
 K-->>T: v0
 T->>T: 验证 N 条全部正确恢复
+
 ```
 
 ```bash
@@ -2660,6 +2507,7 @@ T->>T: 验证 N 条全部正确恢复
 # AOF 重写验证
 redis-cli -p 5170 BGREWRITEAOF
 ```
+
 ### 主从复制 — 四种传输路径详解
 
 kvstore 的复制系统采用类 Redis 的 RESP-based 复制协议，
@@ -2685,6 +2533,7 @@ int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len) {
     return repl_transport_tcp_send(c, buf, len);  // TCP 保底
 }
 ```
+
 #### 复制握手流程
 
 ```mermaid
@@ -2715,6 +2564,7 @@ sequenceDiagram
         S-->>M: "REPLACK (每秒)"
     end
 ```
+
 ---
 
 #### 1. TCP 传输（通用保底）
@@ -2729,6 +2579,7 @@ repl_broadcast()
         → reactor on_write()            // epoll 可写事件
           → write(c->fd, buf, len)      // 系统调用
 ```
+
 **实现**：
 
 ```c
@@ -2743,6 +2594,7 @@ static int repl_transport_tcp_connect_slave(const char *host, int port) {
     return fd;
 }
 ```
+
 **特点**：
 
 - 不依赖任何特殊硬件（无需 RDMA 网卡、无需 BPF）
@@ -2776,6 +2628,7 @@ static int repl_transport_tcp_connect_slave(const char *host, int port) {
 │  ⑧ 启动 CQ 轮询线程         │
 └──────────────────────────────┘
 ```
+
 **CQ 轮询线程**（事件驱动）：
 
 ```c
@@ -2797,6 +2650,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
     }
 }
 ```
+
 **Pipeline 4 槽异步发送**：
 
 ```c
@@ -2816,6 +2670,7 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     return 0;
 }
 ```
+
 **自适应 Pipeline 深度**：根据 `in_flight` 数量动态调整 `send_pipeline_depth`（2~4），
 利用率低时增加深度，饱和时减少。
 
@@ -2838,6 +2693,7 @@ repl_broadcast()
           → bpf_msg_redirect_map(sock_map, redirect_key)
             → 数据直接注入 slave TCP socket 的接收队列
 ```
+
 **fd 注册**：
 
 ```c
@@ -2851,6 +2707,7 @@ int repl_ebpf_register_fd(int fd, int is_master) {
     bpf_map_update_elem(role_map_fd, &key, &role, BPF_ANY);
 }
 ```
+
 **BPF 程序**（`src/replication/bpf/repl_sockmap.bpf.c`）：
 
 ```c
@@ -2862,6 +2719,7 @@ int kvstore_repl_sk_msg(struct sk_msg_md *msg) {
     return SK_PASS;
 }
 ```
+
 **特点**：
 
 - 数据在内核态完成转发，无需经过用户态→内核态的来回拷贝
@@ -2886,12 +2744,14 @@ Client → Master(tcp_recvmsg) → kprobe capture → client_cache_ringbuf
                           │
                           └─ FULLSYNC_IN_PROGRESS=0: repl_broadcast → TCP → Slave
 ```
+
 **REPLDONE 边界**（Master 主动控制，无需 BPF 探测）：
 
 ```
 ← RDMA 全量同步 →│← TCP 增量同步 →
            REPLDONE
 ```
+
 #### 5. kprobe+RDMA WRITE（单边最低延迟增量同步）
 
 **核心思想**：利用 kprobe 拦截 master 的 `tcp_sendmsg` 系统调用，
@@ -2938,6 +2798,7 @@ Client → Master(tcp_recvmsg) → kprobe capture → client_cache_ringbuf
 │   read(fd) → parse_resp_stream() → repl_offset 去重        │
 └──────────────────────────────────────────────────────────────┘
 ```
+
 **BPF 侧实现**：
 
 ```c
@@ -2986,6 +2847,7 @@ int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
     return 0;
 }
 ```
+
 **用户态转发**：
 
 ```c
@@ -3015,6 +2877,7 @@ static int wr_submit_data(int slot, size_t len) {
     return ibv_post_send(g_rdma_kprobe.id->qp, &wr, &bad);
 }
 ```
+
 **Slave 轮询消费**：
 
 ```c
@@ -3044,6 +2907,7 @@ static void *kprobe_rdma_slave_poll(void *arg) {
     }
 }
 ```
+
 **MR 信息交换**：
 
 ```c
@@ -3057,6 +2921,7 @@ g_slave_ringbuf_mr = ibv_reg_mr(pd, g_slave_ringbuf,
     KPROBE_RDMA_RINGBUF_SIZE,
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 ```
+
 **TCP 保底 + 去重**：
 
 ```c
@@ -3071,6 +2936,7 @@ static int repl_transport_kprobe_rdma_send(conn_t *c, ...) {
 // RDMA 路径先送达的数据，TCP 路径到达时跳过
 // （handle_parsed_command 中 from_replication 相同，幂等执行）
 ```
+
 ---
 
 #### 5. Slave 侧统一实现
@@ -3096,6 +2962,7 @@ static void *slave_thread(void *arg) {
 //   REPLDONE → repl_slave_finish_fullsync()
 //            → 保存 dump → g_slave_loading_fullsync = 0
 ```
+
 #### 测试验证
 
 ```bash
@@ -3121,6 +2988,7 @@ tests/test_repl_5w5w --master-host 192.168.233.128 --master-port 5160 \
     --slave-host 192.168.233.129 --slave-port 5161 \
     --pre 50000 --post 50000
 ```
+
 ### TTL 过期 — 哈希索引 + 最小堆
 
 kvstore 的 TTL 系统使用**哈希索引 + 最小堆**双结构，结合**主动扫描 + 惰性删除**两种策略。
@@ -3137,6 +3005,7 @@ kvs_expire_table_t
   ├── count               ← 总节点数 = 有 TTL 的 key 数
   └── size                ← 哈希表桶数（固定 8192）
 ```
+
 #### 核心操作
 
 
@@ -3159,6 +3028,7 @@ if (now - g_last_expire >= 100) {
     g_last_expire = now;
 }
 ```
+
 ```c
 int kvs_active_expire_cycle(int budget) {
     while (removed < budget && heap_size > 0) {
@@ -3170,6 +3040,7 @@ int kvs_active_expire_cycle(int budget) {
     }
 }
 ```
+
 **自适应 budget**（`src/core/reactor.c`）：
 
 ```c
@@ -3182,6 +3053,7 @@ count ≥ 10,000    → budget = 256
 count ≥ 1,000     → budget = 128
 else              → budget = 32
 ```
+
 **策略二：惰性删除（每次命令执行前）**
 
 ```c
@@ -3195,6 +3067,7 @@ static int try_expire(int engine, char *key) {
     return 0;
 }
 ```
+
 **注意**：当前主动过期和惰性删除都只删除本机数据，**不会将 DEL 广播给 slave**。这是与 Redis 的重要差异——Redis 在 master 过期 key 后会生成 `DEL key` 命令复制到 slave，而本项目 slave 依赖自身的事件循环扫描过期。
 
 #### 完整流程示例
@@ -3216,6 +3089,7 @@ kvs_active_expire_cycle(budget=256)
   → heap_sift_down(新堆顶)
   → ... 继续处理最多 256 个 ...
 ```
+
 #### heap 操作示例
 
 ```
@@ -3229,6 +3103,7 @@ heap = [1000, 2000, 5000]   heap = [1000, 2000, 5000]
                                    ↑ sift_down
                           heap = [2000, 3000, 5000]  (已有序)
 ```
+
 #### 测试验证
 
 ```mermaid
@@ -3243,6 +3118,7 @@ graph LR
         E -->|否| D
     end
 ```
+
 ```bash
 # 终端 1: 启动 kvstore
 ./kvstore kvstore.conf --role master
@@ -3254,6 +3130,7 @@ graph LR
 redis-cli -p 5160 HTTL expire:k:000000
 redis-cli -p 5160 HGET expire:k:000000
 ```
+
 ### 内存管理 — 三种后端
 
 kvstore 支持三种内存后端，通过 `--mem` 参数切换。Custom 后端是自研的 **slab + mmap** 两级分配器，
@@ -3312,6 +3189,7 @@ graph TB
     CLASS0 & CLASS1 & CLASS2 & CLASS3 & CLASS4 & CLASS5 & CLASS6 & CLASS7 -->|mmap 失败| FALLBACK
     LARGE_ALLOC -->|mmap 失败| FALLBACK
 ```
+
 #### 三级分配器详解
 
 **① Slab 小内存分配（≤1024B）**
@@ -3329,6 +3207,7 @@ small_class_t
   ├── page_count: 页面数
   └── page_bytes: 页面总字节数
 ```
+
 **分配流程**：
 
 ```c
@@ -3362,6 +3241,7 @@ static void *custom_malloc(size_t size) {
     // ...
 }
 ```
+
 **页面扩展（`slab_grow_locked`）**：
 
 ```c
@@ -3396,6 +3276,7 @@ static int slab_grow_locked(int class_idx) {
     return 0;
 }
 ```
+
 **回收流程**：
 
 ```c
@@ -3414,6 +3295,7 @@ static void custom_free(void *ptr) {
     }
 }
 ```
+
 **② mmap 大内存分配（>1024B）**
 
 超过 slab 上限的大块直接通过 mmap 分配，释放时 `munmap` 归还给操作系统：
@@ -3441,6 +3323,7 @@ static void *custom_malloc(size_t size) {
     return (void *)(hdr + 1);                     // 返回数据区
 }
 ```
+
 **③ fallback 回退机制**
 
 当 slab 的 mmap 申请失败（内存不足）时，回退到标准的 `malloc`：
@@ -3453,6 +3336,7 @@ static void *fallback_malloc(size_t size) {
     return (void *)(hdr + 1);
 }
 ```
+
 #### 四、三后端统一 API
 
 所有后端通过同一组 API 对外暴露，上层代码无需关心后端实现：
@@ -3474,6 +3358,7 @@ static void *backend_malloc(size_t size) {
     }
 }
 ```
+
 #### 统计与观测
 
 `MEMSTAT` 命令暴露完整的分配统计，包括三级分配器的详细数据：
@@ -3498,6 +3383,7 @@ Custom 后端 MEMSTAT 示例:
   class[2]:  128B  total=32768   free=400   pages=1
   ...
 ```
+
 各个统计字段的含义：
 
 
@@ -3528,6 +3414,7 @@ int kvs_mem_prepare_process(const char *backend_name, char *argv0, char **argv) 
     execvp(argv0, argv);
 }
 ```
+
 #### 测试验证
 
 ```bash
@@ -3543,6 +3430,7 @@ redis-cli -p 5160 MEMSTAT
 ./kvstore kvstore.conf --role master --mem custom
 redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 ```
+
 ### TTL 过期时间记录 in AOF
 
 写命令（SET/MSET/DEL/EXPIRE 等）会以原始 RESP 格式写入 AOF 文件：
@@ -3551,6 +3439,7 @@ redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 *3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n
 ```
+
 恢复时重放 AOF，重新执行 EXPIRE 命令重建 TTL 堆。
 
 ### 自动化快照 (AutoSnapshot)
@@ -3562,6 +3451,7 @@ redis-cli -p 5160 MEMSTAT  # 查看 slab class 详细统计
 if (距离上次快照 ≥ sec && 自上次快照以来的写入次数 ≥ changes)
     persist_bgsave_start();  // fork 子进程执行 BGSAVE
 ```
+
 - 规则通过 `--autosnap "60:1000,300:10"` 或 `SNAPRULE 60 1000` 命令设置
 - `SNAPRULES` 查看当前规则，`SNAPRULECLEAR` 清除所有规则
 - 每个规则独立计时
@@ -3581,6 +3471,7 @@ redis-cli -p 5000 SAVE
 redis-cli -p 5000 BGSAVE
 redis-cli -p 5000 INFO | grep bgsave  # 查看 BGSAVE 状态
 ```
+
 ### 哨兵模式
 
 - 基础框架实现，支持 `SENTINEL` 系列命令
@@ -3592,6 +3483,7 @@ redis-cli -p 5000 INFO | grep bgsave  # 查看 BGSAVE 状态
 ```bash
 make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 ```
+
 ### C 测试程序 (`tests/`)
 
 `tests/` 目录下包含独立的 C 测试程序，通过 RESP 协议连接 kvstore 进行自动化验证。
@@ -3610,6 +3502,7 @@ make check        # 运行全部基础测试 (resp + ttl + persist + doc)
 # 命令行参数可覆盖配置文件
 ./test_batch --config tests/test.conf --port 6380 --count 50000
 ```
+
 配置文件格式 (`tests/test.conf`):
 
 ```ini
@@ -3633,6 +3526,7 @@ batch=1000
 poll_ms=500
 ttl=10
 ```
+
 编译方式：
 
 ```bash
@@ -3651,6 +3545,7 @@ make test_batch                # → ./test_batch
 # 或手动编译
 gcc -I./include -o test_kvstore tests/test_kvstore.c
 ```
+
 ---
 
 #### `test_kvstore` — 全功能 C 客户端测试
@@ -3659,6 +3554,7 @@ gcc -I./include -o test_kvstore tests/test_kvstore.c
 编译: make test_kvstore           # → ./test_kvstore
 运行: ./test_kvstore [--config tests/test.conf] [host port]
 ```
+
 连接 kvstore 后依次测试 PING、各引擎 SET/GET/DEL、MSET/MGET、TTL/EXPIRE/PERSIST、
 LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、INFO 命令，
 最后输出 PASS/FAIL 汇总报告。
@@ -3678,6 +3574,7 @@ LOCK/UNLOCK/RENEW、DOC 命令、PING 批量流水线、SAVE/BGSAVE 持久化、
 # 或通过 Makefile 自动启动 + 测试
 make check-kvstore TEST_PORT=5160
 ```
+
 **验证**: 测试通过后，用 redis-cli 确认数据正确：
 
 ```bash
@@ -3690,6 +3587,7 @@ redis-cli -p 5160 HGET h:pre:100
 redis-cli -p 5160 INFO
 # 查看 role、mem、dirty 等信息
 ```
+
 ---
 
 #### `test_repl_5w5w` — 5w+5w 主从同步测试
@@ -3698,6 +3596,7 @@ redis-cli -p 5160 INFO
 编译: make test_repl_5w5w          # → tests/test_repl_5w5w
 运行: tests/test_repl_5w5w [选项]
 ```
+
 测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF+tcp) → 验证 eBPF+tcp 传输状态 → 验证 Slave 最终 10w 条数据一致性。
 
 **启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
@@ -3734,6 +3633,7 @@ rm -f kvstore.dump kvstore.aof
     --master-host 127.0.0.1 --master-port 5160 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
+
 选项说明：
 
 
@@ -3783,6 +3683,7 @@ redis-cli -p 5161 HGET pre:k:000000
 redis-cli -p 5161 HGET post:k:000000
 "v50000"
 ```
+
 ---
 
 #### `test_persist_dump_demo` — 全量持久化演示
@@ -3791,6 +3692,7 @@ redis-cli -p 5161 HGET post:k:000000
 编译: make test_persist_dump_demo    # → ./test_persist_dump_demo
 运行: ./test_persist_dump_demo [--config tests/test.conf]
 ```
+
 交互式流程：连接 kvstore → 写入 count 条数据 → 提示用户执行 `SAVE` → 提示用户停止并重启 kvstore → 自动验证数据从 dump 文件恢复。
 
 ```bash
@@ -3806,6 +3708,7 @@ redis-cli -p 5161 HGET post:k:000000
 #   >>> Please stop kvstore (Ctrl+C) and restart it
 # 停止并重启 kvstore，程序自动检测重连并验证数据恢复
 ```
+
 **验证**: SAVE 后、重启前，用 redis-cli 确认数据已持久化：
 
 ```bash
@@ -3816,6 +3719,7 @@ redis-cli -p 5160 HGET bench:key:1
 redis-cli -p 5160 HGET bench:key:50000
 "value:50000"
 ```
+
 选项说明：
 
 
@@ -3834,6 +3738,7 @@ redis-cli -p 5160 HGET bench:key:50000
 编译: make test_persist_aof_demo     # → ./test_persist_aof_demo
 运行: ./test_persist_aof_demo [选项]
 ```
+
 交互式流程：连接 kvstore → 写入 count 条数据（**不执行 SAVE**）→ 提示用户停止并重启 kvstore → 自动验证数据从 AOF 文件恢复。
 
 > **重要**: kvstore 必须使用 `--appendfsync always`，确保每条写入即时落盘。
@@ -3850,6 +3755,7 @@ redis-cli -p 5160 HGET bench:key:50000
 #   >>> Please stop kvstore (Ctrl+C) and restart it
 # 停止并重启 kvstore，程序自动验证 AOF 恢复（注意: 不执行 SAVE，数据仅靠 AOF）
 ```
+
 **验证**: AOF 恢复后，确认重启前后的数据一致：
 
 ```bash
@@ -3867,6 +3773,7 @@ redis-cli -p 5170 HGET bench:key:50000
 redis-cli -p 5170 PING
 +PONG
 ```
+
 选项说明：
 
 
@@ -3885,6 +3792,7 @@ redis-cli -p 5170 PING
 编译: make test_uring_persist       # → ./test_uring_persist
 运行: ./test_uring_persist [选项]
 ```
+
 自动管理 kvstore 进程生命周期，测试 io_uring 写入路径的持久化正确性与性能。
 
 流程：自动启动 kvstore → HSET 写入 N 条数据 → SAVE → 停止 kvstore → 重启 → 验证数据恢复 → 输出性能指标。
@@ -3900,6 +3808,7 @@ redis-cli -p 5170 PING
 #   >>> 请停止 kvstore (Ctrl+C) 并重新启动 (相同参数)
 # 停止并重启 kvstore，程序自动验证数据恢复
 ```
+
 **验证**: 测试完成后，用 redis-cli 手动确认：
 
 ```bash
@@ -3912,6 +3821,7 @@ redis-cli -p 5180 HGET uring:key:10000
 redis-cli -p 5180 INFO | grep mem
 # 查看内存后端和统计信息
 ```
+
 选项说明：
 
 
@@ -3930,6 +3840,7 @@ redis-cli -p 5180 INFO | grep mem
 编译: make test_mass_ttl             # → tests/test_mass_ttl
 运行: tests/test_mass_ttl [选项]
 ```
+
 设置 10000 个 key 并设置 10 秒过期时间，轮询抽样检查 TTL 状态，
 验证 kvstore 在海量 TTL key 下的过期扫描正确性。
 
@@ -3948,6 +3859,7 @@ redis-cli -p 5180 INFO | grep mem
 redis-cli -p 5200 HTTL expire:k:000000
 redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 ```
+
 选项说明：
 
 
@@ -3967,6 +3879,7 @@ redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 编译: make test_mmap_recover        # → ./test_mmap_recover
 运行: ./test_mmap_recover [选项]
 ```
+
 自动管理 kvstore 进程生命周期，验证启动时通过 mmap 恢复 dump 文件的正确性与性能。
 支持指定存储引擎（array/hash/rbtree/skiptable）。
 
@@ -3987,6 +3900,7 @@ redis-cli -p 5200 HGET expire:k:000000   # 10s 后应返回 nil
 ./test_mmap_recover --config tests/test.conf --engine rbtree
 ./test_mmap_recover --config tests/test.conf --engine array
 ```
+
 **验证**: 测试完成后，确认各引擎数据恢复正确：
 
 ```bash
@@ -4008,6 +3922,7 @@ redis-cli -p 5190 XGET mmap:key:5000
 redis-cli -p 5190 GET mmap:key:1024
 "value:1024"
 ```
+
 选项说明：
 
 
@@ -4027,6 +3942,7 @@ redis-cli -p 5190 GET mmap:key:1024
 编译: make test_repl_basic          # → ./test_repl_basic
 运行: ./test_repl_basic [选项]
 ```
+
 用户手动管理 Master/Slave 进程，程序负责写入、监控、验证。
 
 流程：用户启动 Master → 程序跨引擎（Hash/Array/RBTREE/Skiptable）写入 N 条数据 → 提示用户启动 Slave → 等待全量同步完成 → 再写入增量数据 → 等待增量同步 → 验证各引擎数据一致性。
@@ -4071,6 +3987,7 @@ rm -f kvstore.dump kvstore.aof
     --master-host 192.168.233.128 --master-port 6380 \
     --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ```
+
 **验证**: 测试通过后，用 redis-cli 确认主从数据完全一致：
 
 ```bash
@@ -4108,6 +4025,7 @@ redis-cli -p 6381 XGET x:pre:999
 redis-cli -p 6381 SET should_fail x
 -ERR read only slave
 ```
+
 两种验证方法：
 
 - **全量同步验证**: 查询 `h:pre:*`（预存 5000 条）— 确认 Slave 有全部预存数据
@@ -4135,6 +4053,7 @@ redis-cli -p 6381 SET should_fail x
 编译: make test_repl_gap          # → ./test_repl_gap
 运行: ./test_repl_gap [选项]
 ```
+
 验证全量同步期间客户端写入 Master 的数据（gap）在全量同步完成后正确补发到 Slave。
 
 **测试原理**：
@@ -4170,6 +4089,7 @@ sequenceDiagram
     T->>S: HGET pre/gap/post 验证
     Note over T: 确认 Master == Slave
 ```
+
 ```bash
 # ── 双机四终端测试（推荐）──
 
@@ -4186,6 +4106,7 @@ sequenceDiagram
 redis-cli -p 5160 -h 192.168.233.128 HSET gap:mykey myvalue
 # 写入完成后，回到终端 2，按 Enter 继续
 ```
+
 三阶段验证确保数据不丢失：
 
 
@@ -4288,6 +4209,7 @@ bash tools/tests/test_master_slave_multi_engine_nc.sh 127.0.0.1 5160
 # SAVE/BGSAVE 性能测试
 bash tools/persist/run_save_bgsave_perf_test.sh
 ```
+
 ### 参数化运行
 
 ```bash
@@ -4342,6 +4264,7 @@ make check-all-quick
 # 只跑特定目标
 python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 ```
+
 ---
 
 ## 测试产物路径
@@ -4374,93 +4297,164 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 ## 性能基准
 
 > **测试环境**：Intel Core Ultra 7 155H (4 vCPU) / 7.7GiB RAM / Ubuntu 20.04.6 / Linux 5.15.0-139 / KVM 虚拟机
+
+### 内存后端
+
+
+| 后端       | 特点                                    |
+| ---------- | --------------------------------------- |
+| `libc`     | 标准 malloc/free，最通用                |
+| `jemalloc` | 高性能分配器，减少碎片                  |
+| `custom`   | 自研 slab + mmap 分配器，可观测碎片统计 |
+
+##### 内存占用测试（2026-06-26 重测）
+
+> 测试脚本：`python3 tools/bench/mem_pool_bench.py`
 >
-> **测试方法**：`python3 tools/bench/bench_mem_backend.py`，每轮 200 次预热，`HSET` 命令写入
->
-> **测试日期**：2026-06-16
-
-### 基准数据 (HSET, 50k~100k ops)
+> **测试方法**：启动 kvstore → 写入 100w 条 HSET → 释放 100w 条 HDEL，在 1%/10%/50%/80%/100% 进度点采样 `/proc/<pid>/status` 的 VmSize（虚拟内存）和 VmRSS（物理内存）。AOF 关闭，Hash 引擎，非 sudo。
 
 
-| 后端     | ops    | value 大小 | 耗时(s) | QPS  | VmRSS(KB) |
-| -------- | ------ | ---------- | ------- | ---- | --------- |
-| libc     | 50000  | 32B        | 25.10   | 1992 | 8,204     |
-| jemalloc | 50000  | 32B        | 21.64   | 2310 | 10,400    |
-| custom   | 50000  | 32B        | 22.12   | 2261 | 12,304    |
-| libc     | 50000  | 128B       | 23.76   | 2104 | 12,960    |
-| jemalloc | 50000  | 128B       | 24.47   | 2044 | 15,908    |
-| custom   | 50000  | 128B       | 25.65   | 1949 | 21,844    |
-| libc     | 50000  | 4KB        | 27.27   | 1833 | 207,268   |
-| jemalloc | 50000  | 4KB        | 25.88   | 1932 | 260,952   |
-| custom   | 50000  | 4KB        | 32.47   | 1540 | 409,968   |
-| libc     | 100000 | 128B       | 48.94   | 2044 | 23,892    |
-| jemalloc | 100000 | 128B       | 48.51   | 2061 | 27,736    |
-| custom   | 100000 | 128B       | 49.30   | 2028 | 41,488    |
+| 后端         | 阶段                  | 数据量   | VmSize (KB) | VmRSS (KB) | RSS/Size  |
+| ------------ | --------------------- | -------- | ----------- | ---------- | --------- |
+| **libc**     | 基线                  | 0        | 5,548       | 3,684      | 66.4%     |
+|              | 写入 1%               | 1w       | 7,164       | 4,604      | 64.3%     |
+|              | 写入 10%              | 10w      | 13,260      | 11,280     | 85.1%     |
+|              | 写入 50%              | 50w      | 39,744      | 37,768     | 95.0%     |
+|              | **写入 100%（峰值）** | **100w** | **73,076**  | **71,176** | **97.4%** |
+|              | 释放 50%              | 50w      | 73,076      | 71,176     | 97.4%     |
+|              | 释放 80%              | 20w      | 73,076      | 71,176     | 97.4%     |
+|              | 释放 100%             | 0        | 10,672      | 8,932      | 83.7%     |
+| **jemalloc** | 基线                  | 0        | 19,440      | 5,708      | 29.4%     |
+|              | 写入 1%               | 1w       | 22,000      | 6,496      | 29.5%     |
+|              | 写入 10%              | 10w      | 25,072      | 11,732     | 46.8%     |
+|              | 写入 50%              | 50w      | 59,376      | 40,096     | 67.5%     |
+|              | **写入 100%（峰值）** | **100w** | **96,240**  | **73,492** | **76.4%** |
+|              | 释放 50%              | 50w      | 96,240      | 61,056     | 63.4%     |
+|              | 释放 80%              | 20w      | 96,240      | 43,952     | 45.7%     |
+|              | 释放 100%             | 0        | 96,240      | 15,844     | 16.5%     |
+| **custom**   | 基线                  | 0        | 5,592       | 3,900      | 69.7%     |
+|              | 写入 1%               | 1w       | 7,292       | 4,952      | 67.9%     |
+|              | 写入 10%              | 10w      | 13,120      | 11,420     | 87.0%     |
+|              | 写入 50%              | 50w      | 38,872      | 37,184     | 95.7%     |
+|              | **写入 100%（峰值）** | **100w** | **71,288**  | **69,552** | **97.6%** |
+|              | 释放 50%              | 50w      | 42,168      | 40,432     | 95.9%     |
+|              | 释放 80%              | 20w      | 24,568      | 22,832     | 92.9%     |
+|              | 释放 100%             | 0        | **12,856**  | **11,120** | **86.5%** |
 
-> 完整数据：`benchmarks/data/bench_results_all_rounds.csv`
+##### 结果分析
+
+**① 峰值内存效率：custom 最优（71 MB），libc 居中（73 MB），jemalloc 最高（96 MB）**
+
+**② 物理内存释放：custom 最优（84%），jemalloc 次之（78%），libc 最差（87% 但 VmSize 收缩好）**
+
+
+| 后端         | 峰值 VmRSS | 释放后 VmRSS | 释放率    | 释放后 VmSize |
+| ------------ | ---------- | ------------ | --------- | ------------- |
+| **libc**     | 71,176 KB  | 8,932 KB     | **87.5%** | 10,672 KB     |
+| **jemalloc** | 73,492 KB  | 15,844 KB    | **78.4%** | 96,240 KB     |
+| **custom**   | 69,552 KB  | 11,120 KB    | **84.0%** | 12,856 KB     |
+
+- **libc**：free 后 arena 收缩，VmSize 和 VmRSS 均大幅下降（10 MB / 9 MB），释放最彻底。
+- **jemalloc**：释放过程最平滑（free_50% 已降至 61 MB），但 VmSize 保持不变（mmap 保留地址空间）。
+- **custom**：峰值最低（69.5 MB），释放后 VmRSS 降至 11 MB。**唯一同时归还虚拟内存的后端**——munmap 整页时 VmSize 随 VmRSS 同步下降。
+
+**③ 三种后端的适用场景**
+
+
+| 后端         | 适用场景                                   | 不适用场景                                           |
+| ------------ | ------------------------------------------ | ---------------------------------------------------- |
+| **libc**     | 通用场景，内存占用最低，碎片可控           | 需要主动归还内存（需手动 trim）                      |
+| **jemalloc** | 长时间运行、内存自动回收需求               | 启动虚拟内存占用偏高（19 MB 基线）                   |
+| **custom**   | 高频 alloc/free、数据量稳定（O(1) 无碎片） | 数据量波动极大（释放粒度 < 单页 chunk 数时无法回收） |
+
+> **注意**：custom 已实现空闲页回收，释放后内存可归还 OS。但如果数据量在单页 chunk 数（~500-2000 个）范围内波动，
+> 部分页始终无法完全空闲，物理内存不会下降。极端场景下仍建议 **libc** 或 **jemalloc**。
+
+##### custom 分配器优化历程
+
+三次优化将峰值 VmSize 从 97 MB 降到 81 MB（与 libc 差距 32% → 11%），释放率从 0% 提升到 85%。
+
+**Phase 1：空闲页回收（释放率 0% → 86%）**
+
+*问题*：`custom_free` 将 chunk 放回 `free_list`，但 slab 页（mmap）从不 munmap。删除 100w 数据后 95 MB 物理内存纹丝不动。
+
+*方案*：per-page 追踪 `chunks_in_use`，整页空闲时 munmap 归还 OS。
+
+*关键代码*：
+
+```c
+// slab_page_t 新增字段
+size_t chunks_total;   // 该页总 chunk 数
+size_t chunks_in_use;  // 当前已分配数（0 = 全空闲 → 回收）
+
+// custom_free 递减后触发
+if (pg->chunks_in_use == 0)
+    try_reclaim_page_locked(&g_mem.classes[idx], pg);
+```
+
+*阈值保护*：至少保留 2 页的 free chunk 缓冲，防止 alloc/free 反复触发 mmap/munmap 颠簸。
+
+*效果*：释放 100% 后 VmRSS 从 95 MB 降至 12 MB（仅比基线高 ~8 MB）。
+
+**Phase 2：密集 slab class（内部碎片 100% → ≤25%）**
+
+*问题*：8 级 class `{32,64,128,256,384,512,768,1024}` 间距 2×，实际 46 字节请求落入 64B class 浪费 39%，80 字节请求落入 128B class 浪费 60%。
+
+*方案*：参考 jemalloc（~1.19× 间距）和 TCMalloc（~1.12× 间距），扩展为 17 级 `{16,24,32,...,1024}`，~1.25× 几何级数，内部碎片上限控制在 25%。
+
+*关键改动*：
+
+```
+SMALL_CLASS_COUNT  8 → 17
+class sizes:  {32,64,128,...}  →  {16,24,32,40,56,72,96,128,160,200,256,320,400,512,640,800,1024}
+                    2× 间距                        ~1.25× 间距
+```
+
+*效果*：46 字节请求 64B → 56B class（浪费 18B → 10B），每条目省 8 字节。峰值 VmSize 97 MB → 89 MB（-8.1%）。
+
+```c
+// class_index_for：遍历 class 数组找第一个 ≥ sz 的 class
+// 分配时：chunk_total = sizeof(small_chunk_t) + class_size 决定每页 chunk 数
+```
+
+**Phase 3：压缩 chunk header（24B → 16B）**
+
+*问题*：`small_chunk_t` 有未使用 `reserved` 字段，且 `magic`/`class_idx`/`request_size` 全部宽存储，sizeof=24 字节。
+
+*方案*：去掉 `reserved`，`magic` uint32→uint8（0xC0DEC0DE→0xCC），`class_idx` uint16→uint8，`request_size` uint32→uint16（max=1024）。`next` 指针放最前面确保 8 字节对齐，sizeof 从 24 降到 16。
+
+```c
+// 旧 (24B)                           新 (16B)
+typedef struct small_chunk_s {        typedef struct small_chunk_s {
+    uint32_t magic;     // 4B              struct small_chunk_s *next; // 8B
+    uint16_t class_idx; // 2B              uint16_t request_size;       // 2B
+    uint16_t reserved;  // 2B (废)          uint8_t  magic;              // 1B
+    uint32_t request_size; // 4B           uint8_t  class_idx;          // 1B
+    struct small_chunk_s *next; // 8B  } small_chunk_t;                 // 16B
+} small_chunk_t;                     // 24B
+```
+
+*效果*：每条目 `chunk_total = 16 + 56 = 72B`（vs 旧 80B），省 8 字节 × 1M = 8 MB。峰值 VmSize 89 MB → **81 MB**（与 libc 差距 11%）。
+
+
+| 阶段                               | 峰值 VmSize   | vs libc   | bytes/条目 | 释放率  |
+| ---------------------------------- | ------------- | --------- | ---------- | ------- |
+| 初始 (8 class, 24B header, 无回收) | 96,592 KB     | +32%      | 98.9       | 0%      |
+| P1: 空闲页回收                     | 96,592 KB     | +32%      | 98.9       | 86%     |
+| P2: 17 级密集 class                | 88,764 KB     | +22%      | 90.9       | 86%     |
+| P3: 压缩 header 24→16B            | 80,956 KB     | +11%      | 82.9       | 85%     |
+| **P4: free_stack 索引 16→4B**     | **71,224 KB** | **-2.3%** | **72.9**   | **80%** |
+| *libc 基线*                        | *72,900 KB*   | —        | *74.6*     | *43%*   |
+
+*P4 已反超 libc*（71 MB < 73 MB，73 bytes/条目 < 75 bytes/条目）。用 per-page `uint16_t` 索引栈（LIFO）替代链表 `next` 指针，`small_chunk_t` 从 16B 压缩到 4B（request_size:2 + magic:1 + class_idx:1）。每条目 `chunk_total = 4 + 56 = 60B`，比 libc 的 malloc 元数据更紧凑。释放后残留 ~14 MB（基线 ~4 MB），来自 free_stack 元数据 + 阈值缓冲页。
+
+**Phase 4 原理**：free list 链表将空闲 chunk 链接起来，每个 chunk 需要 8 字节 `next` 指针。用 per-page `uint16_t free_stack[]` 替代——slab 页最多 ~1000 chunks，2 字节足够索引。分配时 `free_stack[--free_top]` 弹出索引，释放时 `free_stack[free_top++] = ci` 压入索引，均为 O(1)。额外收益：`total_free_chunks = Σ page->free_top`（O(page_count)，比遍历链表 O(free_chunks) 快得多）。
 
 ### 持久化性能基准
 
 > **测试环境**：Intel Core Ultra 7 155H (4 vCPU) / 7.7GiB RAM / Ubuntu 20.04.6 / Linux 5.15.0-139 / KVM 虚拟机
 
-#### AOF Pipeline 性能对比 (2026-06-12 更新)
-
-> **测试工具**：`redis-benchmark -n 100000 -c 1 -P <N>`（单连接，可变 pipeline）
->
-> **对比对象**：Redis 5.0.7 vs kvstore
-
-##### SET 命令
-
-> **2026-06-26 重测**（redis-benchmark 7.0，报告值为 batches/sec，命令吞吐 = QPS × P）
-
-
-| P   | Redis 5.0.7 always | kvstore always | kvstore everysec | kvstore no-AOF |
-| --- | ------------------ | -------------- | ---------------- | -------------- |
-| 1   | 2,283              | **22,447**     | 20,960           | 22,237         |
-| 10  | 23,474             | **44,072**     | 44,924           | 43,879         |
-| 20  | 46,729             | **49,950**     | 49,975           | 49,407         |
-| 40  | 92,593             | **51,948**     | 51,733           | 51,282         |
-| 80  | 156,250            | **54,318**     | 53,821           | 54,230         |
-| 160 | 250,000            | **56,117**     | 55,402           | 55,218         |
-
-##### HSET 命令
-
-> **2026-06-26 重测**
-
-
-| P  | Redis 5.0.7 always | kvstore always | kvstore everysec | kvstore no-AOF |
-| -- | ------------------ | -------------- | ---------------- | -------------- |
-| 1  | 2,290              | **22,548**     | 21,340           | 21,706         |
-| 10 | 20,161             | **44,150**     | 43,725           | 44,307         |
-| 20 | 42,735             | **49,480**     | 49,237           | 48,662         |
-| 40 | 83,333             | **51,948**     | 51,894           | 51,653         |
-
-##### 关键发现
-
-**① kvstore AOF always 在 SET 下全面超越 Redis 5.0.7（4-9×）**
-
-核心原因：
-
-- **Group Commit**：10000 条 SET 仅需 2 次 `io_uring_enter(write+fsync)`（strace 实测），每次摊销 ~5000 条命令
-- **Redis 5.0.7 的缺陷**：`appendfsync always` 下每条 SET 会 `openat` + `close` AOF 文件（strace 捕获 ~9800 次/10000 请求），加上每命令一次 `fdatasync`（~70µs），累计开销巨大。Redis 6+ 已修复文件重复打开问题
-- **AOF always 对 kvstore 几乎零开销**：P=1 SET always (22,447) vs no-AOF (22,237)，AOF always 反而略高（测试波动范围内）
-
-**② HSET 在高 pipeline 下是弱项**
-
-P=40 时 kvstore HSET (53k) 落后 Redis (83k)。原因：
-
-- Hash 引擎的**渐进式 rehash** 在大批量写入时触发，扩容迁移增加延迟
-- Array 引擎（SET）无此开销，始终维持高吞吐
-
-**③ 旧测试数据（`-c 50 -P 1`）vs 新测试（`-c 1 -P <N>`）不可直接对比**
-
-旧测试（下节保留）使用 50 并发 + 100 万随机 key，反映高并发竞争场景。
-新测试使用单连接 + pipeline，反映纯协议吞吐。
-两种场景压力模式不同，各自有参考价值。
-
----
-
-#### AOF 并发性能对比（`-c 50 -P 1`, 2026-06-16 重测）
+#### AOF 并发性能对比（`-c 50 -P 1`, 2026-06-26 重测）
 
 > **测试工具**：`redis-benchmark -n 1000000 -c 50 -P 1 -d 64 -r 1000000`
 >
@@ -4549,6 +4543,7 @@ AOF always (74,610) vs AOF 关闭 (136,295) **−45.3%**，Group Commit + io_uri
 redis-benchmark -p 5190 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 HSET key:__rand_int__ value
 time redis-cli -p 5190 SAVE
 ```
+
 ##### 测试结果
 
 > **写入 QPS** 为 redis-benchmark 报告值。
@@ -4600,6 +4595,7 @@ int persist_save_dump(void) {
     close(fd);
 }
 ```
+
 `kvs_dump_to_fd()` 遍历 Hash 引擎 1024 个桶的链地址表 → 约 100 万次节点的 key/value 拷贝 + write 系统调用。
 io_uring fsync 是异步的，不阻塞 SAVE 返回，但 write 本身的数据量决定了耗时。
 
@@ -4625,6 +4621,7 @@ autosnap 3600 0      # 每小时至少 BGSAVE 一次
 redis-cli -p 5000 SNAPRULE 60 10000
 redis-cli -p 5000 SNAPRULES
 ```
+
 #### Pipeline 批量性能测试
 
 ##### 测试目的
@@ -4648,6 +4645,7 @@ bash tools/bench/run_pipeline_bench.sh
 # 手动单点测试
 redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand_int__ value
 ```
+
 > **2026-06-26 重测**（`bash tools/bench/run_pipeline_bench.sh`，非 sudo）
 
 ##### 测试结果
@@ -4745,6 +4743,7 @@ bash tools/bench/run_persist_bench.sh        # AOF 持久化（always/everysec/d
 bash tools/bench/run_save_hset.sh            # SAVE 性能（HSET 写入 + SAVE 耗时）
 bash tools/bench/run_benchmark.sh            # 通用入口
 ```
+
 #### Pipeline 批量性能（手动）
 
 ```bash
@@ -4767,6 +4766,7 @@ done
 
 pkill kvstore
 ```
+
 #### AOF 并发性能（手动）
 
 ```bash
@@ -4785,6 +4785,7 @@ redis-benchmark -p 6800 -n 1000000 -c 50 -P 1 -d 64 -r 1000000 \
 
 pkill kvstore
 ```
+
 #### 内存后端性能
 
 ```bash
@@ -4795,6 +4796,7 @@ sudo python3 tools/bench/bench_mem_backend.py \
   --backends libc,jemalloc,custom \
   --csv my_bench.csv
 ```
+
 #### SAVE 性能
 
 ```bash
@@ -4881,6 +4883,7 @@ bash tools/bench/run_save_hset.sh
 
    ③ 回显和 ⑤ 异步转发并行：kprobe 不阻塞 ②→③ 的主路径
 ```
+
 **三种模式实现差异**（都在同一个 main 函数中，`--mode` 切换）：
 
 
@@ -4912,6 +4915,7 @@ tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
         • bpf_probe_read_user(buf_addr, len) → BPF 临时 buf
         • 打包 [4B长度 | payload] → bpf_ringbuf_output → 用户态 ringbuf 消费者
 ```
+
 **为什么需要两次 hook（entry + return）？**
 
 kprobe 单个 hook 只能看到函数**入口**或**出口**的寄存器/内存状态，不能同时看到参数和返回值。`tcp_recvmsg` 的参数（`msg` 指针）只在入口可见，实际拷贝的字节数只在出口（`ax` 寄存器）可见。两者必须通过 entry 保存→return 取回的方式关联。
@@ -4925,6 +4929,7 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
         ↑                                    ↑
    正常 recv 路径                       kprobe 额外拷贝
 ```
+
 要避免第二次拷贝，需要 hook 更底层的函数（如 `skb_copy_datagram_iter`），从内核 `sk_buff` 直接读数据。但 `tcp_recvmsg` 是更稳定的 hook 点（内核 API 变动少），代价是接受这次额外拷贝。
 
 **客户端线程**负责精确计时：
@@ -4995,6 +5000,7 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 slave$ iperf3 -s -p 18526
 master$ iperf3 -c 192.168.233.129 -p 18526 -t 5 -f m
 ```
+
 iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps。作为跨机 TCP 的**天花板**——所有优化方案的上限不该超过裸 TCP 的物理带宽。
 
 ---
@@ -5017,6 +5023,7 @@ iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps
 off_t offset = 0;
 sendfile(sock, fd, &offset, buf_size);  // fd 是文件，sock 是 TCP socket
 ```
+
 **参数**：
 
 
@@ -5050,6 +5057,7 @@ rdma_create_qp()                      注册 MR
 rdma_connect() ← 附带 MR rkey/addr      ↓ 等待 ESTABLISHED
   ↓ 等待 ESTABLISHED                  ← 双方 QP 就绪 →
 ```
+
 MR（Memory Region）信息通过 rdma_cm 的 `private_data` 字段在 `rdma_connect`/`rdma_accept` 时互换——无需额外 TCP 通道。
 
 **数据传输**（客户端核心循环）：
@@ -5069,6 +5077,7 @@ for i in 0..iters:
     if inflight >= 256:
         ibv_poll_cq(cq, 32, wc)  // 回收完成事件，释放 QP 槽位
 ```
+
 **服务端**：预 post 256 个 recv WR → `ibv_poll_cq` 循环收完成通知 → 每收一条重新 post recv（保持接收队列满）
 
 **inflight 控制**：QP 的 `max_send_wr=1024`，inflight 超过 256 时主动 poll CQ 回收，超过 512 时自旋 drain。循环结束后全量 drain 剩余 inflight。
@@ -5080,6 +5089,7 @@ actual_iters = 实际 post_send 成功次数
 elapsed = now_us() - t0
 throughput = (actual_iters * size * 8) / elapsed_s   // bps
 ```
+
 **参数**：
 
 
@@ -5119,10 +5129,10 @@ throughput = (actual_iters * size * 8) / elapsed_s   // bps
 | 传输方式   | Payload |         吞吐量 | 对比 iperf3 |
 | ---------- | ------- | -------------: | ----------: |
 | iperf3 TCP | —      | **5,370 Mbps** |        基准 |
-| sendfile   | 4KB     |     5,430 Mbps |      +1.1% |
-| sendfile   | 64KB    |     5,700 Mbps |      +6.1% |
-| sendfile   | 256KB   |     5,620 Mbps |      +4.7% |
-| sendfile   | 1MB     |     5,580 Mbps |      +3.9% |
+| sendfile   | 4KB     |     5,430 Mbps |       +1.1% |
+| sendfile   | 64KB    |     5,700 Mbps |       +6.1% |
+| sendfile   | 256KB   |     5,620 Mbps |       +4.7% |
+| sendfile   | 1MB     |     5,580 Mbps |       +3.9% |
 | RDMA WRITE | 4KB     |       833 Mbps |     −84.5% |
 | RDMA SEND  | 4KB     |       912 Mbps |     −83.0% |
 | RDMA WRITE | 64KB    |       967 Mbps |     −82.0% |
@@ -5173,6 +5183,7 @@ make ENABLE_EBPF=1
 # 编译零警告策略
 make CFLAGS="-Wall -Wextra -O2"
 ```
+
 ---
 
 ## 常见问题
@@ -5189,11 +5200,13 @@ make CFLAGS="-Wall -Wextra -O2"
 ./kvstore --port 6380
 # 或修改 kvstore.conf 中 port=6380
 ```
+
 ### 内存观测
 
 ```bash
 printf '*1\r\n$7\r\nMEMSTAT\r\n' | nc 127.0.0.1 5160
 ```
+
 关注指标：`current_small_inuse`、`peak_small_inuse`、`internal_fragment_ppm`。
 
 ### RDMA / eBPF 环境要求

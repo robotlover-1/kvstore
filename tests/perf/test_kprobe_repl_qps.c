@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -37,6 +38,12 @@
 #define CLIENT_PORT  15800
 #define SLAVE_PORT   15801
 #define BPF_OBJ      "./kprobe_capture.bpf.o"
+
+/* 与 BPF 程序保持一致的 ctl key */
+#define CTL_ENABLED   0
+#define CTL_PID       1
+#define CTL_PORT      2
+#define CTL_MASTER_FD 3
 
 static const char *g_bpf_obj  = BPF_OBJ;
 static const char *g_slave_host = "127.0.0.1";
@@ -158,16 +165,49 @@ static void *load_kprobe_bpf(void) {
 
     struct bpf_object *obj = bpf_object__open(g_bpf_obj);
     if (!obj) { fprintf(stderr, "kprobe: open failed\n"); return NULL; }
-	    /* 禁用 fentry/fexit 程序的 autoload — kernel 5.15 verifier 对
-	     * fexit 的 BTF typed pointer 有限制 (ptr_sock <<= 32 被禁止) */
-	    { struct bpf_program *_p;
-	      _p = bpf_object__find_program_by_name(obj, "fentry_recv");
-	      if (_p) bpf_program__set_autoload(_p, false);
-	      _p = bpf_object__find_program_by_name(obj, "fexit_recv");
-	      if (_p) bpf_program__set_autoload(_p, false); }
 
+    /* 禁用 fentry/fexit/tp 程序，只保留 kprobe/kretprobe 的 autoload */
+    { struct bpf_program *_p;
+      _p = bpf_object__find_program_by_name(obj, "fentry_recv");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "fexit_recv");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "tp_sys_enter_read");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "tp_sys_exit_read");
+      if (_p) bpf_program__set_autoload(_p, false); }
+
+    /* libbpf 1.1 + kernel 6.1: 手动 attach kprobe/kretprobe */
     if (bpf_object__load(obj) != 0) {
         fprintf(stderr, "kprobe: load failed\n");
+        bpf_object__close(obj);
+        return NULL;
+    }
+
+    struct bpf_program *prog;
+    struct bpf_link *le = NULL, *lr = NULL;
+
+    prog = bpf_object__find_program_by_name(obj, "kp_recv_entry");
+    if (prog && bpf_program__fd(prog) >= 0) {
+        le = bpf_program__attach_kprobe(prog, false, "tcp_recvmsg");
+        if (libbpf_get_error(le)) {
+            fprintf(stderr, "kprobe: kprobe attach failed: %ld\n", libbpf_get_error(le));
+            le = NULL;
+        }
+    }
+    prog = bpf_object__find_program_by_name(obj, "kp_recv_return");
+    if (prog && bpf_program__fd(prog) >= 0) {
+        lr = bpf_program__attach_kprobe(prog, true, "tcp_recvmsg");
+        if (libbpf_get_error(lr)) {
+            fprintf(stderr, "kprobe: kretprobe attach failed: %ld\n", libbpf_get_error(lr));
+            lr = NULL;
+        }
+    }
+
+    if (!le || !lr) {
+        fprintf(stderr, "kprobe: attach failed\n");
+        if (le) bpf_link__destroy(le);
+        if (lr) bpf_link__destroy(lr);
         bpf_object__close(obj);
         return NULL;
     }
@@ -181,83 +221,142 @@ static void *load_kprobe_bpf(void) {
         bpf_map_update_elem(bpf_map__fd(ctl), &k1, &vpid, BPF_ANY);
     }
 
-    /* Attach — 优先尝试 fentry/fexit trampoline，失败回退 kprobe/kretprobe.
-     * 注: libbpf 0.5.0 在缺少 BPF_PROG_TYPE_TRACING 的内核上可能对
-     * attach_trace 返回虚假成功。此时通过检查 kprobe attach 是否也成功来
-     * 判断：若两者都成功，优先使用 kprobe（更可靠）。 */
-    struct bpf_program *prog;
-    struct bpf_link *le = NULL, *lr = NULL;
-    struct bpf_link *le_kp = NULL, *lr_kp = NULL;
-    long attach_err = 0;
+    fprintf(stderr, "[kprobe] loaded, manual attach kprobe/kretprobe (PID=%d)\n", getpid());
+    return obj;
+}
 
-    /* 尝试 fentry/fexit trampoline */
-    prog = bpf_object__find_program_by_name(obj, "fentry_recv");
-    if (prog) {
-        le = bpf_program__attach_trace(prog);
-        attach_err = libbpf_get_error(le);
-        if (attach_err) {
-            fprintf(stderr, "kprobe: fentry trampoline failed: %ld\n", attach_err);
-            le = NULL;
-        }
-    }
-    if (le) {
-        prog = bpf_object__find_program_by_name(obj, "fexit_recv");
-        if (prog) {
-            lr = bpf_program__attach_trace(prog);
-            attach_err = libbpf_get_error(lr);
-            if (attach_err) {
-                fprintf(stderr, "kprobe: fexit trampoline failed: %ld\n", attach_err);
-                bpf_link__destroy(le); le = NULL;
-                lr = NULL;
-            }
-        }
+/* ========== tracepoint 加载 ========== */
+static void *load_tp_bpf(void) {
+    struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+
+    struct bpf_object *obj = bpf_object__open(g_bpf_obj);
+    if (!obj) { fprintf(stderr, "tp: open failed\n"); return NULL; }
+
+    /* 禁用非 tp 程序；tp 程序保持 autoload 以获取 fd，然后手动 attach */
+    { struct bpf_program *_p;
+      _p = bpf_object__find_program_by_name(obj, "fentry_recv");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "fexit_recv");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "fentry_recv");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "fexit_recv");
+      if (_p) bpf_program__set_autoload(_p, false);
     }
 
-    /* 同时尝试 kprobe 作为验证：若 kprobe 也能成功 attach，说明内核稳定支持
-     * kprobe，此时优先用 kprobe（避免 libbpf 虚假成功的 trampoline 问题）。 */
-    prog = bpf_object__find_program_by_name(obj, "kp_recv_entry");
-    if (prog) {
-        le_kp = bpf_program__attach_kprobe(prog, false, "tcp_recvmsg");
-        if (libbpf_get_error(le_kp)) {
-            le_kp = NULL;
-        }
-    }
-    prog = bpf_object__find_program_by_name(obj, "kp_recv_return");
-    if (prog) {
-        lr_kp = bpf_program__attach_kprobe(prog, true, "tcp_recvmsg");
-        if (libbpf_get_error(lr_kp)) {
-            lr_kp = NULL;
-        }
-    }
-
-    /* 决策：优先使用 kprobe（更稳定），fentry/fexit 仅在 kprobe 不可用时尝试 */
-    if (le_kp && lr_kp) {
-        /* kprobe 可用，释放 trampoline link */
-        if (le) { bpf_link__destroy(le); le = NULL; }
-        if (lr) { bpf_link__destroy(lr); lr = NULL; }
-        le = le_kp; le_kp = NULL;
-        lr = lr_kp; lr_kp = NULL;
-        fprintf(stderr, "kprobe: using kprobe/kretprobe\n");
-    } else if (le && lr) {
-        /* kprobe 不可用，使用 trampoline */
-        if (le_kp) { bpf_link__destroy(le_kp); le_kp = NULL; }
-        if (lr_kp) { bpf_link__destroy(lr_kp); lr_kp = NULL; }
-        fprintf(stderr, "kprobe: using fentry/fexit trampoline\n");
-    } else {
-        /* 部分成功，清理 */
-        if (le_kp && !le) { le = le_kp; le_kp = NULL; }
-        if (lr_kp && !lr) { lr = lr_kp; lr_kp = NULL; }
-        if (le_kp) bpf_link__destroy(le_kp);
-        if (lr_kp) bpf_link__destroy(lr_kp);
-    }
-
-    if (!le && !lr) {
-        fprintf(stderr, "kprobe: no probes attached\n");
+    if (bpf_object__load(obj) != 0) {
+        fprintf(stderr, "tp: load failed\n");
         bpf_object__close(obj);
         return NULL;
     }
 
-    fprintf(stderr, "[kprobe] loaded, attached to tcp_recvmsg (PID=%d)\n", getpid());
+    /* libbpf 0.5.0 不支持 SEC("tp/...") 自动 attach，需手动 attach */
+    struct bpf_program *prog;
+    struct bpf_link *le = NULL, *lx = NULL;
+
+    prog = bpf_object__find_program_by_name(obj, "tp_sys_enter_read");
+    if (prog) {
+        le = bpf_program__attach_tracepoint(prog, "syscalls", "sys_enter_read");
+        if (libbpf_get_error(le)) {
+            fprintf(stderr, "tp: attach sys_enter_read failed: %ld\n", libbpf_get_error(le));
+            le = NULL;
+        }
+    }
+
+    prog = bpf_object__find_program_by_name(obj, "tp_sys_exit_read");
+    if (prog) {
+        lx = bpf_program__attach_tracepoint(prog, "syscalls", "sys_exit_read");
+        if (libbpf_get_error(lx)) {
+            fprintf(stderr, "tp: attach sys_exit_read failed: %ld\n", libbpf_get_error(lx));
+            lx = NULL;
+        }
+    }
+
+    if (!le || !lx) {
+        if (le) bpf_link__destroy(le);
+        if (lx) bpf_link__destroy(lx);
+        bpf_object__close(obj);
+        return NULL;
+    }
+
+    /* CTL_PID(1) = pid（低32位），master_fd 初始为0，由 master 线程 accept 后更新 */
+    struct bpf_map *ctl = bpf_object__find_map_by_name(obj, "ctl");
+    if (ctl) {
+        __u32 k1 = 1;
+        /* 低32位=pid, 高32位=~0U (sentinel, 过滤所有 fd, accept 后更新为真实 fd) */
+        __u64 vpid = ((__u64)~0U << 32) | (__u64)getpid();
+        bpf_map_update_elem(bpf_map__fd(ctl), &k1, &vpid, BPF_ANY);
+    }
+
+    fprintf(stderr, "[tp] loaded, attached to sys_enter_read+sys_exit_read (PID=%d)\n", getpid());
+    return obj;
+}
+
+/* ========== fentry/fexit 加载（内核 6.1+，trampoline）========== */
+static void *load_fentry_bpf(void) {
+    struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY};
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+
+    struct bpf_object *obj = bpf_object__open(g_bpf_obj);
+    if (!obj) { fprintf(stderr, "fentry: open failed\n"); return NULL; }
+
+    /* 禁用 kprobe/kretprobe/tp 程序，只保留 fentry/fexit 的 autoload */
+    { struct bpf_program *_p;
+      _p = bpf_object__find_program_by_name(obj, "kp_recv_entry");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "kp_recv_return");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "tp_sys_enter_read");
+      if (_p) bpf_program__set_autoload(_p, false);
+      _p = bpf_object__find_program_by_name(obj, "tp_sys_exit_read");
+      if (_p) bpf_program__set_autoload(_p, false); }
+
+    if (bpf_object__load(obj) != 0) {
+        fprintf(stderr, "fentry: load failed\n");
+        bpf_object__close(obj);
+        return NULL;
+    }
+
+    /* auto-attach fentry/fexit via trampoline */
+    struct bpf_program *prog;
+    struct bpf_link *le = NULL, *lx = NULL;
+
+    prog = bpf_object__find_program_by_name(obj, "fentry_recv");
+    if (prog && bpf_program__fd(prog) >= 0) {
+        le = bpf_program__attach(prog);
+        if (libbpf_get_error(le)) {
+            fprintf(stderr, "fentry: attach fentry_recv failed: %ld\n", libbpf_get_error(le));
+            le = NULL;
+        }
+    }
+    prog = bpf_object__find_program_by_name(obj, "fexit_recv");
+    if (prog && bpf_program__fd(prog) >= 0) {
+        lx = bpf_program__attach(prog);
+        if (libbpf_get_error(lx)) {
+            fprintf(stderr, "fentry: attach fexit_recv failed: %ld\n", libbpf_get_error(lx));
+            lx = NULL;
+        }
+    }
+
+    if (!le || !lx) {
+        fprintf(stderr, "fentry: attach failed\n");
+        if (le) bpf_link__destroy(le);
+        if (lx) bpf_link__destroy(lx);
+        bpf_object__close(obj);
+        return NULL;
+    }
+
+    /* 设置 PID 过滤 */
+    struct bpf_map *ctl = bpf_object__find_map_by_name(obj, "ctl");
+    if (ctl) {
+        __u32 k0 = 0, k1 = 1;
+        __u64 v1 = 1, vpid = (__u64)getpid();
+        bpf_map_update_elem(bpf_map__fd(ctl), &k0, &v1, BPF_ANY);
+        bpf_map_update_elem(bpf_map__fd(ctl), &k1, &vpid, BPF_ANY);
+    }
+
+    fprintf(stderr, "[fentry] loaded, attached fentry+fexit (PID=%d)\n", getpid());
     return obj;
 }
 
@@ -266,7 +365,8 @@ typedef struct {
     int listen_fd;
     int client_fd;
     int slave_fd;         /* sync 模式用 */
-    ringbuf_fwd_t *rf;    /* kprobe 模式用 */
+    ringbuf_fwd_t *rf;    /* kprobe/tp 模式用 */
+    int ctl_map_fd;       /* bp: tp 模式: ctl map fd，用于设置 CTL_MASTER_FD */
     volatile int running;
     volatile int ready;
     int echo_count;
@@ -300,8 +400,8 @@ static void *master_echo_sync(void *arg) {
     return NULL;
 }
 
-static void *master_echo_kprobe(void *arg) {
-    /* kprobe 模式: echo only，转发由 ringbuf 异步做 */
+static void *master_echo_bpf(void *arg) {
+    /* kprobe/tp 模式: echo only，转发由 BPF→ringbuf→异步线程做 */
     master_t *m = (master_t *)arg;
 
     m->ready = 1; /* ready before accept, so client can connect */
@@ -309,13 +409,20 @@ static void *master_echo_kprobe(void *arg) {
     if (m->client_fd < 0) { perror("master: accept"); return NULL; }
     set_nodelay(m->client_fd);
 
+    /* tp 模式: 把 client_fd 编码进 CTL_PID 高32位 (低32位=pid, 高32位=fd) */
+    if (m->ctl_map_fd >= 0) {
+        __u32 k = CTL_PID;
+        __u64 v = ((__u64)(unsigned long)m->client_fd << 32) | (__u64)getpid();
+        bpf_map_update_elem(m->ctl_map_fd, &k, &v, BPF_ANY);
+    }
+
     char buf[65536];
     while (1) {
         ssize_t n = read(m->client_fd, buf, sizeof(buf));
         if (n <= 0) break;
         m->echo_count++;
 
-        /* echo 响应客户端（转发由 kprobe→ringbuf→异步线程做） */
+        /* echo 响应客户端（转发由 BPF→ringbuf→异步线程做） */
         if (write_full(m->client_fd, buf, (size_t)n) < 0) break;
     }
 
@@ -460,7 +567,10 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     memset(&r, 0, sizeof(r));
 
     int use_kprobe = (strcmp(mode, "kprobe") == 0);
+    int use_tp     = (strcmp(mode, "tp") == 0);
+    int use_fentry = (strcmp(mode, "fentry") == 0);
     int use_sync   = (strcmp(mode, "sync") == 0);
+    int use_bpf    = use_kprobe || use_tp || use_fentry;
 
     /* BPF */
     struct bpf_object *bpf_obj = NULL;
@@ -471,6 +581,23 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     if (use_kprobe) {
         bpf_obj = load_kprobe_bpf();
         if (!bpf_obj) { fprintf(stderr, "[%s] kprobe load failed, skip\n", mode_name); return r; }
+    }
+    if (use_tp) {
+        bpf_obj = load_tp_bpf();
+        if (!bpf_obj) { fprintf(stderr, "[%s] tp load failed, skip\n", mode_name); return r; }
+    }
+    if (use_fentry) {
+        bpf_obj = load_fentry_bpf();
+        if (!bpf_obj) {
+            fprintf(stderr, "[%s] fentry load failed, falling back to kprobe\n", mode_name);
+            bpf_obj = load_kprobe_bpf();
+            use_kprobe = 1;
+            use_fentry = 0;
+            if (!bpf_obj) {
+                fprintf(stderr, "[%s] kprobe fallback also failed, skip\n", mode_name);
+                return r;
+            }
+        }
     }
 
     /* Master listen */
@@ -486,7 +613,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
 
     /* 连接 slave */
     int slave_fd = -1;
-    if (use_sync || use_kprobe) {
+    if (use_sync || use_bpf) {
         slave_fd = socket(AF_INET, SOCK_STREAM, 0);
         set_nodelay(slave_fd);
 
@@ -509,8 +636,8 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         }
     }
 
-    /* 启动 ringbuf 转发线程（kprobe 模式） */
-    if (use_kprobe && slave_fd >= 0) {
+    /* 启动 ringbuf 转发线程（kprobe/tp 模式） */
+    if (use_bpf && slave_fd >= 0) {
         rf.obj = bpf_obj;
         rf.slave_fd = slave_fd;
         rf.running = 1;
@@ -524,11 +651,16 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     master.listen_fd = listen_fd;
     master.slave_fd = slave_fd;
     master.rf = &rf;
+    master.ctl_map_fd = -1;
+    if (use_tp && bpf_obj) {
+        struct bpf_map *ctl = bpf_object__find_map_by_name(bpf_obj, "ctl");
+        master.ctl_map_fd = ctl ? bpf_map__fd(ctl) : -1;
+    }
     master.running = 1;
 
     pthread_t master_tid;
-    if (use_kprobe || !use_sync)
-        pthread_create(&master_tid, NULL, master_echo_kprobe, &master);
+    if (use_bpf || !use_sync)
+        pthread_create(&master_tid, NULL, master_echo_bpf, &master);
     else
         pthread_create(&master_tid, NULL, master_echo_sync, &master);
     while (!__atomic_load_n(&master.ready, __ATOMIC_ACQUIRE)) usleep(1000);
@@ -543,7 +675,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     shutdown(listen_fd, SHUT_RDWR);
     pthread_join(master_tid, NULL);
 
-    if (use_kprobe && rf.running) {
+    if (use_bpf && rf.running) {
         rf.running = 0;
         if (slave_fd >= 0) shutdown(slave_fd, SHUT_WR);
         pthread_join(fwd_tid, NULL);
@@ -551,10 +683,28 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     if (slave_fd >= 0) close(slave_fd);
 
     close(listen_fd);
-    if (bpf_obj) bpf_object__close(bpf_obj);
 
     *out_slave_msgs = slave->msg_count;
     *out_fwd_msgs   = rf.fwd_count;
+
+    /* BPF 模式: dump BPF stats 用于调试 */
+    if ((use_tp || use_kprobe) && bpf_obj) {
+        struct bpf_map *stats_map = bpf_object__find_map_by_name(bpf_obj, "stats");
+        if (stats_map) {
+            __u32 keys[] = {0, 1, 2, 3, 4, 5, 6};
+            __u64 vals[7];
+            for (int si = 0; si < 7; si++) {
+                vals[si] = 0;
+                bpf_map_lookup_elem(bpf_map__fd(stats_map), &keys[si], &vals[si]);
+            }
+            fprintf(stderr, "[bpf-stats] hit=%lu skip_pid=%lu skip_fd=%lu rb_err=%lu bytes=%lu msg_null=%lu\n",
+                    (unsigned long)vals[0], (unsigned long)vals[2],
+                    (unsigned long)vals[5], (unsigned long)vals[3],
+                    (unsigned long)vals[4], (unsigned long)vals[6]);
+        }
+    }
+
+    if (bpf_obj) bpf_object__close(bpf_obj);
 
     fprintf(stderr, "[run_one_mode] returning qps=%.0f completed=%d\n",
             r.qps, r.completed);
@@ -567,7 +717,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
 static void usage(const char *prog) {
     fprintf(stderr,
         "用法: sudo %s [options]\n"
-        "  --mode, -m    none | sync | kprobe | all (默认: all)\n"
+        "  --mode, -m    none | sync | kprobe | fentry | tp | all (默认: all)\n"
         "  --payload, -p 负载大小 (默认: 64)\n"
         "  --count, -c   请求数 (默认: 10000)\n"
         "  --bpf-obj, -b BPF 对象路径 (默认: ./kprobe_capture.bpf.o)\n"
@@ -575,6 +725,8 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+
     const char *mode_str = "all";
 
     struct option long_opts[] = {
@@ -604,14 +756,14 @@ int main(int argc, char **argv) {
     printf("=== kprobe 主从转发 QPS 对比 ===\n");
     printf("payload=%d bytes, count=%d\n", g_payload_size, g_req_count);
     printf("模式: %s\n", mode_str);
-    printf("none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发\n\n");
+    printf("none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发   fentry = echo+fentry异步转发   tp = echo+tracepoint异步转发\n\n");
 
     print_header();
 
-    const char *modes[] = {"none", "sync", "kprobe"};
+    const char *modes[] = {"none", "sync", "kprobe", "fentry", "tp"};
     int do_all = (strcmp(mode_str, "all") == 0);
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         if (!do_all && strcmp(mode_str, modes[i]) != 0) continue;
 
         /* 启动 slave */

@@ -688,19 +688,22 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     *out_fwd_msgs   = rf.fwd_count;
 
     /* BPF 模式: dump BPF stats 用于调试 */
-    if ((use_tp || use_kprobe) && bpf_obj) {
+    if (bpf_obj) {
         struct bpf_map *stats_map = bpf_object__find_map_by_name(bpf_obj, "stats");
         if (stats_map) {
-            __u32 keys[] = {0, 1, 2, 3, 4, 5, 6};
-            __u64 vals[7];
-            for (int si = 0; si < 7; si++) {
+            __u32 keys[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+            __u64 vals[12];
+            for (int si = 0; si < 12; si++) {
                 vals[si] = 0;
                 bpf_map_lookup_elem(bpf_map__fd(stats_map), &keys[si], &vals[si]);
             }
-            fprintf(stderr, "[bpf-stats] hit=%lu skip_pid=%lu skip_fd=%lu rb_err=%lu bytes=%lu msg_null=%lu\n",
+            fprintf(stderr, "[bpf-stats] hit=%lu skip_pid=%lu skip_fd=%lu rb_err=%lu bytes=%lu msg_null=%lu step1=%lu step2=%lu step3=%lu step4=%lu step5=%lu\n",
                     (unsigned long)vals[0], (unsigned long)vals[2],
                     (unsigned long)vals[5], (unsigned long)vals[3],
-                    (unsigned long)vals[4], (unsigned long)vals[6]);
+                    (unsigned long)vals[4], (unsigned long)vals[6],
+                    (unsigned long)vals[7], (unsigned long)vals[8],
+                    (unsigned long)vals[9], (unsigned long)vals[10],
+                    (unsigned long)vals[11]);
         }
     }
 

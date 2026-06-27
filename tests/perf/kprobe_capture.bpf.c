@@ -186,6 +186,11 @@ int BPF_PROG(fentry_recv, struct sock *sk, struct msghdr *msg, size_t len)
     __u32 key = 0;
     bpf_map_update_elem(&entry_msg, &key, &msg_val, 0);
 
+    /* 保存 sk 指针 (key=1)，供 fexit 尝试 sk_buff 直读 */
+    unsigned long sk_val = (unsigned long)sk;
+    __u32 key1 = 1;
+    bpf_map_update_elem(&entry_msg, &key1, &sk_val, 0);
+
     return 0;
 }
 
@@ -212,7 +217,20 @@ int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
     __u32 plen = 0;
     __builtin_memcpy(buf, &plen, 4);
 
-    int data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
+    int data_len = 0;
+
+    /* 尝试从 sk_buff 直接读（避免 bpf_probe_read_user 拷贝） */
+    __u32 key1 = 1;
+    unsigned long *sk_ptr = bpf_map_lookup_elem(&entry_msg, &key1);
+    if (sk_ptr && *sk_ptr != 0) {
+        data_len = read_skb_data((struct sock *)*sk_ptr, buf + 4,
+                                 CAPTURE_MAX_DATA, (int)retval);
+    }
+
+    /* 回退：从用户态 iov 读 */
+    if (data_len <= 0) {
+        data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
+    }
     if (data_len <= 0) return 0;
 
     plen = (__u32)data_len;
@@ -231,9 +249,10 @@ int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
     stat_inc(STAT_HIT);
     stat_add(STAT_BYTES, (__u64)data_len);
 
-    /* 清除保存的 msg 指针 */
+    /* 清除保存的 msg 和 sk 指针 */
     unsigned long zero = 0;
     bpf_map_update_elem(&entry_msg, &key, &zero, 0);
+    bpf_map_update_elem(&entry_msg, &key1, &zero, 0);
 
     return 0;
 }

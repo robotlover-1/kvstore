@@ -4963,6 +4963,91 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 3. **kprobe vs sync 比例受 sync 波动干扰**：sync QPS 在原生环境下波动显著（26K~41K），导致比例不稳定（−8%~−39%）。512B 时 kprobe 甚至反超 sync。应关注 kprobe 绝对 QPS 提升
 4. **none 基准 ~27-32K QPS**，优化前后无变化（纯 echo，不涉及转发优化）
 5. **fentry/fexit 已编写但因内核 5.15 verifier 限制暂时禁用**（BPF_PROG 类型化指针不被接受），代码保留待未来内核升级启用。当前使用 kprobe/kretprobe fallback
+
+##### 内核 6.1 适配
+
+Master VM 升级到 6.1 后，kprobe 遇到 3 个兼容性问题（详见 `docs/ebpf-forwarding-optimization-journey.md`）：
+
+| 问题 | 修复 |
+|------|------|
+| 6.1 的 `tcp_recvmsg` 使用 `ITER_UBUF` 而非 `ITER_IOVEC`（`nr_segs=0`） | `read_iov_data` 增加 UBUF 路径 |
+| `bpf_probe_read` 对内核内存失效 | 全替换为 `bpf_probe_read_kernel` |
+| fexit 的 `ctx[0]` 在 6.1 上不是 retval | 移除 fexit 的 retval 检查 |
+
+修复后 kprobe 在 6.1 上正常工作，fentry/fexit 也成功加载（trampoline 机制在 6.1 verifier 中可用）。
+
+**fentry 模式 QPS**（客户端 Master 本机，跨机 Slave）：
+
+| Payload | sync QPS | fentry QPS | fentry vs sync |
+| ------- | -------: | ---------: | -------------: |
+| 64B     |   22,221 |     17,320 |        −22.1% |
+| 256B    |   19,674 |     17,333 |        −11.9% |
+| 512B    |   21,402 |     16,676 |        −22.1% |
+| 1024B   |   16,528 |     12,206 |        −26.1% |
+
+> fentry 在大部分 payload 下仍未超过 sync——trampoline 开销虽比 kprobe 低 ~90%，但仍在每次 `tcp_recvmsg` 上执行 BPF 程序，拖慢主 echo 路径。
+
+---
+
+### TC BPF `bpf_clone_redirect` + VXLAN 跨机转发 QPS 对比
+
+> **测试环境**：同上 2 × KVM 虚拟机（Master 192.168.233.128 / Slave 192.168.233.129）
+> Master 内核 6.1.176，Slave 内核 5.15.0
+
+#### 技术原理
+
+TC（Traffic Control）BPF 是唯一能在**不触碰主 I/O 路径**的前提下实现跨机数据克隆的 eBPF 方案：
+
+```
+Slave (129)                     Master (128)
+──────                          ──────
+tc_client ──TCP──→ ens33 ──→ TC ingress BPF (bpf_clone_redirect)
+                                ├── 原始包 → TCP 栈 → echo → 返回 Slave
+                                └── 克隆包 → VXLAN 封装 → Slave vxlan100
+```
+
+- `bpf_clone_redirect` 只做 sk_buff 引用计数 +1，无数据拷贝，无系统调用
+- VXLAN 隧道由内核自动封装/解封，BPF 只需指定目标 interface index
+- 主 echo 路径零 BPF hook 开销，每个包的开销仅一次原子操作
+
+#### 测试架构
+
+与 kprobe 测试不同，本测试**客户端运行在 Slave VM**（非本机 127.0.0.1）。因为 TC BPF 挂在 Master 的物理网卡 `ens33` 上，本地回环流量不会经过物理网卡。三种模式对比：
+
+| 模式 | 数据流 | 网络往返 |
+|------|--------|---------|
+| none | Slave→Master(req) + Master→Slave(echo) | 2 次 |
+| sync | Slave→Master(req) + Master→Slave(echo+fwd) | 2 次（echo 和 fwd 同方向） |
+| TC | Slave→Master(req) + Master→Slave(echo) + 内核 clone→Slave | 2 次（clone 并行） |
+
+#### 测试结果
+
+> 客户端在 Slave (129)，5000 请求，无 pipeline。
+
+| Payload | none QPS | sync QPS | TC QPS | TC vs sync |
+| ------- | -------: | -------: | -------: | ---------: |
+| 64B     |    2,251 |    1,986 |    1,812 |       −8% |
+| 128B    |    2,155 |    2,199 |    1,892 |      −13% |
+| 256B    |    2,109 |    1,783 |    1,838 |       +3% |
+| 512B    |    1,853 |    1,932 |    1,808 |       −6% |
+| 1024B   |    1,749 |    1,801 |    1,966 |       +9% |
+| 2048B   |    4,089 |    4,060 |    3,951 |       −2% |
+| 4096B   |    3,975 |    3,990 |    4,054 |       +1% |
+
+> **QPS 受限于跨 VM 网络 RTT（~0.5ms）**，三种模式差距在噪声范围内（±13%）。TC 的零主路径开销优势在当前负载下被网络延迟完全掩盖——sync 的 `write(slave_fd)` 在客户端等 echo 的窗口期内完成，不阻塞主循环。TC 的真正优势在高并发多连接、Slave 网络较慢或 CPU 吃紧时才会显现。
+
+#### 相关文件
+
+| 文件 | 说明 |
+|------|------|
+| `tests/perf/tc_clone.bpf.c` | TC ingress BPF 程序（`bpf_clone_redirect`） |
+| `tests/perf/tc_clone_receiver.c` | Slave 侧 AF_PACKET 接收器 |
+| `tests/perf/tc_client.c` | 跨机 QPS 客户端 |
+| `tests/perf/tiny_echo.c` | 最小 echo 服务端 |
+| `tests/perf/tiny_sync_echo.c` | echo + 同步转发服务端 |
+
+> 完整探索过程见 `docs/ebpf-forwarding-optimization-journey.md`
+
 ---
 
 ### RDMA vs sendfile vs iperf3 吞吐量对比（跨虚拟机）

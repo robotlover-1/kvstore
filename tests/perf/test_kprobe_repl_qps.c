@@ -158,6 +158,14 @@ static void *load_kprobe_bpf(void) {
 
     struct bpf_object *obj = bpf_object__open(g_bpf_obj);
     if (!obj) { fprintf(stderr, "kprobe: open failed\n"); return NULL; }
+	    /* 禁用 fentry/fexit 程序的 autoload — kernel 5.15 verifier 对
+	     * fexit 的 BTF typed pointer 有限制 (ptr_sock <<= 32 被禁止) */
+	    { struct bpf_program *_p;
+	      _p = bpf_object__find_program_by_name(obj, "fentry_recv");
+	      if (_p) bpf_program__set_autoload(_p, false);
+	      _p = bpf_object__find_program_by_name(obj, "fexit_recv");
+	      if (_p) bpf_program__set_autoload(_p, false); }
+
     if (bpf_object__load(obj) != 0) {
         fprintf(stderr, "kprobe: load failed\n");
         bpf_object__close(obj);

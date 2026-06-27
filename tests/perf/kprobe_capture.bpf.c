@@ -196,13 +196,13 @@ int BPF_PROG(fentry_recv, struct sock *sk, struct msghdr *msg, size_t len)
 
 /* ──── fexit: 在 tcp_recvmsg 返回时读取数据写 ringbuf ──── */
 SEC("fexit/tcp_recvmsg")
-int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
+int BPF_PROG(fexit_recv, int retval, struct sock *sk, struct msghdr *msg, size_t len)
 {
     __u64 enabled = ctl_get(CTL_ENABLED);
     if (!enabled) return 0;
 
-    /* fexit: ctx[0] = 返回值 (通过 ctx 原始参数读取, 避免 BTF 类型冲突) */
-    long retval = (long)ctx[0];
+    /* fexit: retval=ctx[0], sk=ctx[1], msg=ctx[2], len=ctx[3] */
+    (void)len; /* unused BPF_PROG param */
     if (retval <= 0) return 0;
 
     __u32 key = 0;
@@ -249,10 +249,9 @@ int BPF_PROG(fexit_recv, struct sock *sk, struct msghdr *msg, size_t len)
     stat_inc(STAT_HIT);
     stat_add(STAT_BYTES, (__u64)data_len);
 
-    /* 清除保存的 msg 和 sk 指针 */
+    /* 清除保存的 msg 指针 */
     unsigned long zero = 0;
     bpf_map_update_elem(&entry_msg, &key, &zero, 0);
-    bpf_map_update_elem(&entry_msg, &key1, &zero, 0);
 
     return 0;
 }
@@ -308,20 +307,8 @@ int kp_recv_return(struct pt_regs *ctx)
     __u32 plen = 0;
     __builtin_memcpy(buf, &plen, 4);
 
-    int data_len = 0;
+    int data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
 
-    /* 尝试从 sk_buff 直接读（避免 bpf_probe_read_user 拷贝） */
-    __u32 key1 = 1;
-    unsigned long *sk_ptr = bpf_map_lookup_elem(&entry_msg, &key1);
-    if (sk_ptr && *sk_ptr != 0) {
-        data_len = read_skb_data((struct sock *)*sk_ptr, buf + 4,
-                                 CAPTURE_MAX_DATA, (int)retval);
-    }
-
-    /* 回退：从用户态 iov 读 */
-    if (data_len <= 0) {
-        data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
-    }
     if (data_len <= 0) return 0;
 
     plen = (__u32)data_len;
@@ -340,10 +327,9 @@ int kp_recv_return(struct pt_regs *ctx)
     stat_inc(STAT_HIT);
     stat_add(STAT_BYTES, (__u64)data_len);
 
-    /* 清除保存的 msg 和 sk 指针 */
+    /* 清除保存的 msg 指针 */
     unsigned long zero = 0;
     bpf_map_update_elem(&entry_msg, &key0, &zero, 0);
-    bpf_map_update_elem(&entry_msg, &key1, &zero, 0);
 
     return 0;
 }

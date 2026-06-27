@@ -552,8 +552,12 @@ static qps_result_t run_client(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     set_nodelay(fd);
 
+    /* TC 模式需要走物理网卡（ens33），否则 BPF 截获不到包 */
+    const char *master_ip = getenv("MASTER_IP");
+    __u32 dst_ip = master_ip ? inet_addr(master_ip) : htonl(INADDR_LOOPBACK);
+
     struct sockaddr_in addr = {.sin_family = AF_INET,
-                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+                               .sin_addr.s_addr = dst_ip,
                                .sin_port = htons(CLIENT_PORT)};
 
     for (int retry = 0; retry < 50; retry++) {
@@ -659,6 +663,12 @@ static void print_header(void) {
     printf("----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------\n");
 }
 
+/* ========== TC clone helpers ========== */
+static int tc_clone_setup(void);
+static void tc_clone_teardown(void);
+static void tc_read_counters(long long *total, long long *cloned,
+                              long long *skip, long long *err);
+
 /* ========== run_one ========== */
 static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                                   slave_t *slave, int *out_slave_msgs, int *out_fwd_msgs) {
@@ -671,6 +681,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     int use_tp     = (strcmp(mode, "tp") == 0);
     int use_fentry = (strcmp(mode, "fentry") == 0);
     int use_async  = (strcmp(mode, "async") == 0);
+    int use_tc     = (strcmp(mode, "tc") == 0);
     int use_sync   = (strcmp(mode, "sync") == 0);
     int use_bpf    = use_kprobe || use_tp || use_fentry;
 
@@ -712,6 +723,11 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                                .sin_port = htons(CLIENT_PORT)};
     bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
     listen(listen_fd, 1);
+
+    /* TC 模式：setup BPF clone + VXLAN */
+    if (use_tc) {
+        tc_clone_setup();
+    }
 
     /* 连接 slave */
     int slave_fd = -1;
@@ -771,6 +787,8 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     pthread_t master_tid;
     if (use_async)
         pthread_create(&master_tid, NULL, master_echo_async, &master);
+    else if (use_tc)
+        pthread_create(&master_tid, NULL, master_echo_bpf, &master); /* echo only, TC does forwarding */
     else if (use_bpf || !use_sync)
         pthread_create(&master_tid, NULL, master_echo_bpf, &master);
     else
@@ -780,8 +798,27 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     printf("[%-7s] master ready, running client...\n", mode_name);
     fflush(stdout);
 
-    /* 跑客户端 */
-    r = run_client();
+    if (use_tc) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+            "sshpass -p '2983372202' ssh -o StrictHostKeyChecking=no pp@192.168.233.129 "
+            "\"cd /home/pp/Desktop/ls_study/proj/9.1-kvstore/tests/perf && "
+            "./tc_client 192.168.233.128 %d %d %d\" 2>&1",
+            CLIENT_PORT, g_payload_size, g_req_count);
+        FILE *cfp = popen(cmd, "r");
+        if (cfp) {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), cfp)) fprintf(stderr, "[client] %s", buf);
+            pclose(cfp);
+        }
+        FILE *rf = fopen("/tmp/perf_client_result.txt", "r");
+        if (rf) {
+            fscanf(rf, "qps=%lf count=%d", &r.qps, &r.completed);
+            fclose(rf);
+        }
+    } else {
+        r = run_client();
+    }
 
     /* 收尾 */
     shutdown(listen_fd, SHUT_RDWR);
@@ -803,7 +840,18 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     close(listen_fd);
 
     *out_slave_msgs = slave->msg_count;
-    *out_fwd_msgs   = use_async ? async_ring.fwd_count : rf.fwd_count;
+    if (use_tc) {
+        long long tc_total, tc_cloned, tc_skip, tc_err;
+        tc_read_counters(&tc_total, &tc_cloned, &tc_skip, &tc_err);
+        fprintf(stderr, "[tc-stats] total=%lld cloned=%lld skip=%lld err=%lld\n",
+                tc_total, tc_cloned, tc_skip, tc_err);
+        *out_fwd_msgs = (int)tc_cloned;
+        tc_clone_teardown();
+    } else if (use_async) {
+        *out_fwd_msgs = async_ring.fwd_count;
+    } else {
+        *out_fwd_msgs = rf.fwd_count;
+    }
 
     /* BPF 模式: dump BPF stats 用于调试 */
     if (bpf_obj) {
@@ -832,6 +880,97 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     fflush(stderr);
 
     return r;
+}
+
+/* ========== TC BPF clone（tc 命令 + bpftool）========== */
+#define TC_BPF_OBJ    "./tc_clone.bpf.o"
+#define TC_PORT       15800
+#define TC_VXLAN_IFINDEX 4  /* vxlan100 */
+
+static struct bpf_object *tc_obj = NULL;
+
+static void tc_bpftool_map_update(const char *name, int key, unsigned val) {
+    char cmd[256];
+    /* bpftool 需要字节值（小端序），分解 u32 为 4 个字节 */
+    snprintf(cmd, sizeof(cmd),
+        "bpftool map update name %s key %d 0 0 0 value %d %d %d %d 2>/dev/null",
+        name, key, val & 0xff, (val >> 8) & 0xff, (val >> 16) & 0xff, (val >> 24) & 0xff);
+    system(cmd);
+}
+
+static long long tc_bpftool_map_lookup(const char *name, int key) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "bpftool map lookup name %s key %d 0 0 0 2>/dev/null | "
+        "grep -o '0x[0-9a-f]*' | head -1", name, key);
+    FILE *fp = popen(cmd, "r");
+    long long val = 0;
+    if (fp) {
+        char line[64];
+        if (fgets(line, sizeof(line), fp))
+            val = strtoll(line, NULL, 0);
+        pclose(fp);
+    }
+    return val;
+}
+
+static int tc_clone_setup(void) {
+    char cmd[512];
+
+    /* Step 1: bpftool loads BPF program (proper BTF/map resolution), pins to bpffs */
+    snprintf(cmd, sizeof(cmd),
+        "rm -f /sys/fs/bpf/tc_clone; "
+        "bpftool prog load " TC_BPF_OBJ " /sys/fs/bpf/tc_clone type classifier 2>&1");
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) fprintf(stderr, "[tc-load] %s", buf);
+        int rc = pclose(fp);
+        if (rc != 0) {
+            fprintf(stderr, "[tc] bpftool load failed (rc=%d)\n", rc);
+            return -1;
+        }
+    }
+
+    /* Step 2: tc attaches the pinned program */
+    snprintf(cmd, sizeof(cmd),
+        "tc qdisc add dev ens33 clsact 2>/dev/null; "
+        "tc filter del dev ens33 ingress 2>/dev/null; "
+        "tc filter add dev ens33 ingress bpf object-pinned /sys/fs/bpf/tc_clone direct-action 2>&1");
+    fp = popen(cmd, "r");
+    if (fp) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) fprintf(stderr, "[tc-attach] %s", buf);
+        int rc = pclose(fp);
+        if (rc != 0) {
+            fprintf(stderr, "[tc] tc attach failed (rc=%d)\n", rc);
+            return -1;
+        }
+    }
+
+    /* 用 bpftool 配置 maps */
+    tc_bpftool_map_update("cfg", 0, 1);               /* enabled */
+    tc_bpftool_map_update("cfg", 1, TC_PORT);         /* port */
+    tc_bpftool_map_update("cfg", 2, TC_VXLAN_IFINDEX);/* vxlan ifindex */
+
+    fprintf(stderr, "[tc] attached to ens33 ingress, port=%d vxlan_ifindex=%d\n",
+            TC_PORT, TC_VXLAN_IFINDEX);
+    return 0;
+}
+
+static void tc_clone_teardown(void) {
+    tc_bpftool_map_update("cfg", 0, 0);  /* disable */
+    system("tc filter del dev ens33 ingress 2>/dev/null");
+    system("rm -f /sys/fs/bpf/tc_clone");
+    fprintf(stderr, "[tc] detached from ens33 ingress\n");
+}
+
+static void tc_read_counters(long long *out_total, long long *out_cloned,
+                              long long *out_skip, long long *out_err) {
+    *out_total  = tc_bpftool_map_lookup("cnt", 0);
+    *out_cloned = tc_bpftool_map_lookup("cnt", 1);
+    *out_skip   = tc_bpftool_map_lookup("cnt", 2);
+    *out_err    = tc_bpftool_map_lookup("cnt", 3);
 }
 
 /* ========== Main ========== */
@@ -877,14 +1016,14 @@ int main(int argc, char **argv) {
     printf("=== kprobe 主从转发 QPS 对比 ===\n");
     printf("payload=%d bytes, count=%d\n", g_payload_size, g_req_count);
     printf("模式: %s\n", mode_str);
-    printf("none  = 纯echo不转发   sync = echo+同步转发   async = echo+用户态异步转发   kprobe = echo+kprobe异步转发   fentry = echo+fentry异步转发   tp = echo+tracepoint异步转发\n\n");
+    printf("none  = 纯echo   sync = echo+同步转发   async = echo+用户态异步转发   tc = echo+TC克隆转发   kprobe/fentry/tp = BPF异步转发\n\n");
 
     print_header();
 
-    const char *modes[] = {"none", "sync", "async", "kprobe", "fentry", "tp"};
+    const char *modes[] = {"none", "sync", "async", "tc", "kprobe", "fentry", "tp"};
     int do_all = (strcmp(mode_str, "all") == 0);
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         if (!do_all && strcmp(mode_str, modes[i]) != 0) continue;
 
         /* 启动 slave */

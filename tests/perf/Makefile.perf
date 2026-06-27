@@ -7,10 +7,13 @@
 
 CC       := gcc
 CLANG    := clang
-BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu
 
-CFLAGS   := -Wall -Wextra -O2 -I/usr/include
-LDFLAGS  := -lpthread
+# 使用 kernel 6.1 源码编译的 libbpf 1.1（修复 BTF 兼容性）
+LIBBPF_DIR := /tmp/linux-src-6.1/tools/lib/bpf
+
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu -I$(LIBBPF_DIR)/include -I$(LIBBPF_DIR)/include/uapi
+CFLAGS   := -Wall -Wextra -O2 -I/usr/include -I$(LIBBPF_DIR)/include/uapi
+LDFLAGS  := -lpthread -L$(LIBBPF_DIR) -Wl,-rpath,$(LIBBPF_DIR)
 
 # eBPF 相关
 EBPF_LIBS := -lbpf -lelf -lz
@@ -21,8 +24,10 @@ RDMA_LIBS := -libverbs -lrdmacm
 # --- 目标 ---
 ALL := test_ebpf_forward_qps test_rdma_throughput test_sendfile_throughput
 ALL += test_kprobe_echo_qps test_kprobe_repl_qps test_slave_receiver
+ALL += tc_clone_receiver
 BPF_OBJ := ebpf_forward.bpf.o
 KPROBE_BPF_OBJ := kprobe_capture.bpf.o
+TC_BPF_OBJ := tc_clone.bpf.o
 
 .PHONY: all clean test-qps test-kprobe test-thru
 
@@ -54,6 +59,19 @@ test_kprobe_repl_qps: test_kprobe_repl_qps.c $(KPROBE_BPF_OBJ) common.h
 # --- 独立 slave receiver ---
 test_slave_receiver: test_slave_receiver.c
 	$(CC) $(CFLAGS) -o $@ test_slave_receiver.c $(LDFLAGS)
+
+# --- TC clone ---
+$(TC_BPF_OBJ): tc_clone.bpf.c
+	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu -c $< -o $@
+
+tc_clone_receiver: tc_clone_receiver.c
+	$(CC) $(CFLAGS) -o $@ tc_clone_receiver.c $(LDFLAGS)
+
+tc_client: tc_client.c
+	$(CC) $(CFLAGS) -o $@ tc_client.c $(LDFLAGS)
+
+tiny_echo: tiny_echo.c
+	$(CC) $(CFLAGS) -o $@ tiny_echo.c $(LDFLAGS)
 
 # --- RDMA 吞吐量测试 ---
 test_rdma_throughput: test_rdma_throughput.c common.h

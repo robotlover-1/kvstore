@@ -59,10 +59,10 @@ struct {
     __type(value, unsigned char[4 + CAPTURE_MAX_DATA]);
 } tmpbuf SEC(".maps");
 
-/* 用于 kprobe→kretprobe 传递 msg 指针 */
+/* 用于 kprobe→kretprobe 传递 msg 指针 (key=0) 和 sk 指针 (key=1) */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
     __type(key, __u32);
     __type(value, unsigned long);
 } entry_msg SEC(".maps");
@@ -114,6 +114,55 @@ static __always_inline int read_iov_data(unsigned long msg_ptr,
             (const void *)(unsigned long)vec.base) != 0)
         return 0;
     return (int)safe_len;
+}
+
+/* 尝试从 sk->sk_receive_queue 的 sk_buff 直接读内核态数据
+ * 避免 bpf_probe_read_user 的额外用户态拷贝
+ *
+ * 适用条件：tcp_recvmsg 返回时，skb 数据可能仍在接收到队列中
+ * 返回：成功读取的字节数，失败返回 0（调用方应回退 read_iov_data） */
+static __always_inline int read_skb_data(struct sock *sk,
+    unsigned char *buf, int max_len, int expected_len)
+{
+    if (!sk || max_len <= 0 || expected_len <= 0)
+        return 0;
+
+    /* 读取 sk_receive_queue.next（第一个 skb） */
+    struct sk_buff *skb = NULL;
+    if (bpf_core_read(&skb, sizeof(skb), &sk->sk_receive_queue.next) != 0)
+        return 0;
+
+    int found = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (!skb || found)
+            break;
+
+        unsigned int data_len = 0;
+        if (bpf_core_read(&data_len, sizeof(data_len), &skb->len) != 0)
+            break;
+
+        /* 长度匹配即认为是目标 skb */
+        if (data_len >= (unsigned int)expected_len &&
+            data_len <= (unsigned int)max_len) {
+            unsigned char *data = NULL;
+            if (bpf_core_read(&data, sizeof(data), &skb->data) == 0 && data) {
+                unsigned long long safe_len = (unsigned long long)expected_len;
+                if (safe_len > (unsigned long long)max_len)
+                    safe_len = (unsigned long long)max_len;
+                if (bpf_probe_read_kernel(buf, (__u32)safe_len, data) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+
+        /* 下一个 skb */
+        if (bpf_core_read(&skb, sizeof(skb), &skb->next) != 0)
+            break;
+    }
+
+    return found ? expected_len : 0;
 }
 
 /* ──── fentry: 在 tcp_recvmsg 入口保存 msg 指针 ──── */
@@ -205,10 +254,15 @@ int kp_recv_entry(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 保存 msg 指针 */
+    /* 保存 msg 指针 (key=0) */
     unsigned long msg_ptr = (unsigned long)ctx->si;
-    __u32 key = 0;
-    bpf_map_update_elem(&entry_msg, &key, &msg_ptr, 0);
+    __u32 key0 = 0;
+    bpf_map_update_elem(&entry_msg, &key0, &msg_ptr, 0);
+
+    /* 保存 sk 指针 (key=1)，供 kretprobe 尝试 sk_buff 直读 */
+    unsigned long sk_ptr = (unsigned long)ctx->di;
+    __u32 key1 = 1;
+    bpf_map_update_elem(&entry_msg, &key1, &sk_ptr, 0);
 
     return 0;
 }
@@ -223,19 +277,32 @@ int kp_recv_return(struct pt_regs *ctx)
     long retval = (long)ctx->ax;
     if (retval <= 0) return 0;
 
-    __u32 key = 0;
-    unsigned long *msg_ptr = bpf_map_lookup_elem(&entry_msg, &key);
+    __u32 key0 = 0;
+    unsigned long *msg_ptr = bpf_map_lookup_elem(&entry_msg, &key0);
     if (!msg_ptr || *msg_ptr == 0) return 0;
 
     /* 用 tmpbuf 做临时缓冲（BPF verifier 要求 map 指针作为 probe_read_user dst） */
-    unsigned char *buf = bpf_map_lookup_elem(&tmpbuf, &key);
+    unsigned char *buf = bpf_map_lookup_elem(&tmpbuf, &key0);
     if (!buf) return 0;
 
     /* 头 4 字节 = payload 长度 */
     __u32 plen = 0;
     __builtin_memcpy(buf, &plen, 4);
 
-    int data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
+    int data_len = 0;
+
+    /* 尝试从 sk_buff 直接读（避免 bpf_probe_read_user 拷贝） */
+    __u32 key1 = 1;
+    unsigned long *sk_ptr = bpf_map_lookup_elem(&entry_msg, &key1);
+    if (sk_ptr && *sk_ptr != 0) {
+        data_len = read_skb_data((struct sock *)*sk_ptr, buf + 4,
+                                 CAPTURE_MAX_DATA, (int)retval);
+    }
+
+    /* 回退：从用户态 iov 读 */
+    if (data_len <= 0) {
+        data_len = read_iov_data(*msg_ptr, buf + 4, CAPTURE_MAX_DATA);
+    }
     if (data_len <= 0) return 0;
 
     plen = (__u32)data_len;
@@ -254,9 +321,10 @@ int kp_recv_return(struct pt_regs *ctx)
     stat_inc(STAT_HIT);
     stat_add(STAT_BYTES, (__u64)data_len);
 
-    /* 清除保存的 msg 指针 */
+    /* 清除保存的 msg 和 sk 指针 */
     unsigned long zero = 0;
-    bpf_map_update_elem(&entry_msg, &key, &zero, 0);
+    bpf_map_update_elem(&entry_msg, &key0, &zero, 0);
+    bpf_map_update_elem(&entry_msg, &key1, &zero, 0);
 
     return 0;
 }

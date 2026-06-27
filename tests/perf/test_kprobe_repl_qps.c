@@ -113,6 +113,80 @@ static void slave_stop(slave_t *s) {
     pthread_join(s->thread, NULL);
 }
 
+/* ========== 异步转发 ring buffer（用户态，无 BPF）========== */
+#define ASYNC_RING_SIZE 4096
+#define ASYNC_MAX_ENTRY 65536
+
+typedef struct {
+    unsigned char *data;  /* malloc(max_entry) per slot */
+    int len;
+} async_slot_t;
+
+typedef struct {
+    async_slot_t slots[ASYNC_RING_SIZE];
+    volatile int head;      /* producer index */
+    volatile int tail;      /* consumer index */
+    volatile int running;
+    int slave_fd;
+    int fwd_count;
+    pthread_t thread;
+} async_ring_t;
+
+static void async_ring_init(async_ring_t *r, int slave_fd) {
+    memset(r, 0, sizeof(*r));
+    r->slave_fd = slave_fd;
+    r->running = 1;
+    for (int i = 0; i < ASYNC_RING_SIZE; i++)
+        r->slots[i].data = malloc(ASYNC_MAX_ENTRY);
+}
+
+static void async_ring_free(async_ring_t *r) {
+    for (int i = 0; i < ASYNC_RING_SIZE; i++)
+        free(r->slots[i].data);
+}
+
+static int async_ring_push(async_ring_t *r, const void *data, int len) {
+    int head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+    int next = (head + 1) % ASYNC_RING_SIZE;
+
+    /* 队列满则自旋等待（同步模式下写 slave 也会阻塞，等价） */
+    while (next == __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE))
+        usleep(1);
+
+    if (len > ASYNC_MAX_ENTRY) len = ASYNC_MAX_ENTRY;
+    memcpy(r->slots[head].data, data, (size_t)len);
+    r->slots[head].len = len;
+    __atomic_store_n(&r->head, next, __ATOMIC_RELEASE);
+    return len;
+}
+
+static void *async_forward_thread(void *arg) {
+    async_ring_t *r = (async_ring_t *)arg;
+
+    while (r->running) {
+        int tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+        if (tail == __atomic_load_n(&r->head, __ATOMIC_ACQUIRE)) {
+            usleep(5);
+            continue;
+        }
+
+        write_full(r->slave_fd, r->slots[tail].data, r->slots[tail].len);
+        r->fwd_count++;
+        __atomic_store_n(&r->tail, (tail + 1) % ASYNC_RING_SIZE, __ATOMIC_RELEASE);
+    }
+
+    /* drain remaining */
+    int tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+    int head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+    while (tail != head) {
+        write_full(r->slave_fd, r->slots[tail].data, r->slots[tail].len);
+        r->fwd_count++;
+        tail = (tail + 1) % ASYNC_RING_SIZE;
+    }
+    fprintf(stderr, "[async-fwd] exiting, forwarded=%d\n", r->fwd_count);
+    return NULL;
+}
+
 /* ========== ringbuf 消费者（转发到 slave） ========== */
 typedef struct {
     struct bpf_object *obj;
@@ -366,6 +440,7 @@ typedef struct {
     int client_fd;
     int slave_fd;         /* sync 模式用 */
     ringbuf_fwd_t *rf;    /* kprobe/tp 模式用 */
+    async_ring_t *ar;     /* async 模式用 */
     int ctl_map_fd;       /* bp: tp 模式: ctl map fd，用于设置 CTL_MASTER_FD */
     volatile int running;
     volatile int ready;
@@ -424,6 +499,32 @@ static void *master_echo_bpf(void *arg) {
 
         /* echo 响应客户端（转发由 BPF→ringbuf→异步线程做） */
         if (write_full(m->client_fd, buf, (size_t)n) < 0) break;
+    }
+
+    close(m->client_fd);
+    return NULL;
+}
+
+static void *master_echo_async(void *arg) {
+    /* async 模式: echo + 异步转发（用户态 ringbuf，无 BPF） */
+    master_t *m = (master_t *)arg;
+
+    m->ready = 1;
+    m->client_fd = accept(m->listen_fd, NULL, NULL);
+    if (m->client_fd < 0) { perror("master: accept"); return NULL; }
+    set_nodelay(m->client_fd);
+
+    char buf[65536];
+    while (1) {
+        ssize_t n = read(m->client_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        m->echo_count++;
+
+        /* echo 响应客户端 */
+        if (write_full(m->client_fd, buf, (size_t)n) < 0) break;
+
+        /* 推到异步 ring buffer，后台线程转发到 slave */
+        if (m->ar) async_ring_push(m->ar, buf, (int)n);
     }
 
     close(m->client_fd);
@@ -569,6 +670,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     int use_kprobe = (strcmp(mode, "kprobe") == 0);
     int use_tp     = (strcmp(mode, "tp") == 0);
     int use_fentry = (strcmp(mode, "fentry") == 0);
+    int use_async  = (strcmp(mode, "async") == 0);
     int use_sync   = (strcmp(mode, "sync") == 0);
     int use_bpf    = use_kprobe || use_tp || use_fentry;
 
@@ -613,7 +715,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
 
     /* 连接 slave */
     int slave_fd = -1;
-    if (use_sync || use_bpf) {
+    if (use_sync || use_bpf || use_async) {
         slave_fd = socket(AF_INET, SOCK_STREAM, 0);
         set_nodelay(slave_fd);
 
@@ -636,7 +738,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         }
     }
 
-    /* 启动 ringbuf 转发线程（kprobe/tp 模式） */
+    /* 启动 ringbuf 转发线程（kprobe/tp/fentry 模式） */
     if (use_bpf && slave_fd >= 0) {
         rf.obj = bpf_obj;
         rf.slave_fd = slave_fd;
@@ -645,12 +747,20 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         while (!__atomic_load_n(&rf.ready, __ATOMIC_ACQUIRE)) usleep(1000);
     }
 
+    /* 启动 async ring 转发线程（async 模式） */
+    async_ring_t async_ring;
+    if (use_async && slave_fd >= 0) {
+        async_ring_init(&async_ring, slave_fd);
+        pthread_create(&fwd_tid, NULL, async_forward_thread, &async_ring);
+    }
+
     /* 启动 master 线程 */
     master_t master;
     memset(&master, 0, sizeof(master));
     master.listen_fd = listen_fd;
     master.slave_fd = slave_fd;
     master.rf = &rf;
+    master.ar = use_async ? &async_ring : NULL;
     master.ctl_map_fd = -1;
     if (use_tp && bpf_obj) {
         struct bpf_map *ctl = bpf_object__find_map_by_name(bpf_obj, "ctl");
@@ -659,7 +769,9 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     master.running = 1;
 
     pthread_t master_tid;
-    if (use_bpf || !use_sync)
+    if (use_async)
+        pthread_create(&master_tid, NULL, master_echo_async, &master);
+    else if (use_bpf || !use_sync)
         pthread_create(&master_tid, NULL, master_echo_bpf, &master);
     else
         pthread_create(&master_tid, NULL, master_echo_sync, &master);
@@ -680,12 +792,18 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         if (slave_fd >= 0) shutdown(slave_fd, SHUT_WR);
         pthread_join(fwd_tid, NULL);
     }
+    if (use_async && async_ring.running) {
+        async_ring.running = 0;
+        if (slave_fd >= 0) shutdown(slave_fd, SHUT_WR);
+        pthread_join(fwd_tid, NULL);
+        async_ring_free(&async_ring);
+    }
     if (slave_fd >= 0) close(slave_fd);
 
     close(listen_fd);
 
     *out_slave_msgs = slave->msg_count;
-    *out_fwd_msgs   = rf.fwd_count;
+    *out_fwd_msgs   = use_async ? async_ring.fwd_count : rf.fwd_count;
 
     /* BPF 模式: dump BPF stats 用于调试 */
     if (bpf_obj) {
@@ -720,7 +838,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
 static void usage(const char *prog) {
     fprintf(stderr,
         "用法: sudo %s [options]\n"
-        "  --mode, -m    none | sync | kprobe | fentry | tp | all (默认: all)\n"
+        "  --mode, -m    none | sync | async | kprobe | fentry | tp | all (默认: all)\n"
         "  --payload, -p 负载大小 (默认: 64)\n"
         "  --count, -c   请求数 (默认: 10000)\n"
         "  --bpf-obj, -b BPF 对象路径 (默认: ./kprobe_capture.bpf.o)\n"
@@ -759,14 +877,14 @@ int main(int argc, char **argv) {
     printf("=== kprobe 主从转发 QPS 对比 ===\n");
     printf("payload=%d bytes, count=%d\n", g_payload_size, g_req_count);
     printf("模式: %s\n", mode_str);
-    printf("none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发   fentry = echo+fentry异步转发   tp = echo+tracepoint异步转发\n\n");
+    printf("none  = 纯echo不转发   sync = echo+同步转发   async = echo+用户态异步转发   kprobe = echo+kprobe异步转发   fentry = echo+fentry异步转发   tp = echo+tracepoint异步转发\n\n");
 
     print_header();
 
-    const char *modes[] = {"none", "sync", "kprobe", "fentry", "tp"};
+    const char *modes[] = {"none", "sync", "async", "kprobe", "fentry", "tp"};
     int do_all = (strcmp(mode_str, "all") == 0);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         if (!do_all && strcmp(mode_str, modes[i]) != 0) continue;
 
         /* 启动 slave */

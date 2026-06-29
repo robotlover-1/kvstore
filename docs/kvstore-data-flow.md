@@ -407,6 +407,41 @@ EVERYSEC 模式:
   (最长延迟: ~1s)
 ```
 
+### 4.5 Per-Command ALWAYS 尝试与分析（2026-06-29）
+
+**目标：** 实现严格 per-command 的 `appendfsync always`——每条写命令执行后立即 write+fsync 落盘，完成后才回复客户端。使用 io_uring `submit_and_wait` 在一次 syscall 中提交 write+fsync。
+
+**实现：** 新增 `persist_aof_per_command_flush()`，直接调用 `persist_write_and_fsync_uring()`（复用 EVERYSEC 已有的 io_uring batch write+fsync 函数）。ALWAYS 模式下 `persist_append_raw()` 不再缓冲，每条命令直接触发 io_uring write+fsync。
+
+**strace 分析 Redis 5.0.7 的真相：**
+
+| 测试场景 | fdatasync 次数 | 命令数 | 比例 |
+|----------|---------------|--------|------|
+| `-c 1` 单连接，10 条 HSET 逐个发送 | **1** | 10 | 10:1 |
+| `-c 50` 50 并发，100 条 HSET | **2** | 100 | 50:1 |
+
+Redis 源码中 `flushAppendOnlyFile()` 确实每条命令后都会调用，但因为 Redis 单线程事件循环的特性：一次 `epoll_wait` 返回多个就绪连接 → 全部读完、执行完 → `server.aof_buf` 已累积多条命令的 RESP 数据 → 一次 `write()+fdatasync()` 全部落盘。**实际效果是事件循环级别的 group commit，并非严格 per-command fsync。** 50 并发时 ~50 条命令共享 1 次 fdatasync（96µs），等效每命令 fsync 成本 ~2µs。
+
+**为什么没采用 per-command：**
+
+| | kvstore per-command | kvstore 2ms group commit | Redis 5.0.7 "always" |
+|---|---|---|---|
+| 机制 | 每条命令独立 io_uring write+fsync | 缓冲 2ms 内命令，批量 io_uring | 事件循环级隐式批量 write+fdatasync |
+| HSET -c 1 QPS | ~2,857 | ~20,000* | ~2,174 |
+| HSET -c 50 QPS | ~3,411 | ~56,838* | ~38,168 |
+| fsync 数/100 命令 | 100 | ~2 (50:1 摊销) | ~2 (50:1 摊销) |
+| 严格 per-command | ✅ | ❌ (最多丢 2ms 数据) | ❌ (最多丢一个事件循环的数据) |
+
+> *group commit 数据来自 `benchmarks/data/persist_bench/aof_summary.csv`
+
+kvstore per-command 在 `-c 50` 下几乎不随并发扩展（3.4k vs 单连接 2.9k），因为 reactor 单线程串行阻塞在每条命令的 io_uring write+fsync（~300µs/条）。50 条命令串行 = 15ms/轮 → ~3,300 QPS。
+
+而 2ms group commit 将 ~50 条命令的 AOF 数据累积到 64KB buffer，一次 `io_uring_submit_and_wait` 批量 write+fsync，fsync 成本摊销到 50 条命令上，并发下可到 56k QPS。
+
+**结论：** 保留 2ms group commit 方案。per-command 实现在单连接延迟上无优势（2.9k vs 2.2k Redis），并发下因串行 fsync 无法扩展。Redis 的 "always" 语义本身也非严格 per-command——它依赖事件循环隐式批量化。group commit 在该语义下是更好的性能/持久性平衡点。
+
+**相关 commits：** `9ba215f` → `6dfebb9`（per-command 实现 + SQPOLL 尝试 + 修复 + 最终回退到 3cf6cd6 的 2ms group commit）
+
 ---
 
 ## 5. 全量同步（FULLRESYNC）

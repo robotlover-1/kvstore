@@ -195,31 +195,6 @@ static int persist_fsync_fd_best_effort(int fd) {
     return fsync(fd);
 }
 
-/* Per-command write+fsync for ALWAYS mode using io_uring.
- * Uses single submit_and_wait with write+fsync SQEs.
- * Falls back to pwrite+fdatasync when io_uring is unavailable. */
-static int persist_aof_per_command_flush(const unsigned char *buf, size_t len) {
-    off_t off;
-
-    if (len == 0) return 0;
-
-    off = (off_t)g_aof_write_offset;
-
-    /* try io_uring batch write+fsync */
-    if (persist_uring_init_once() == 0 &&
-        persist_write_and_fsync_uring(g_aof_fd, buf, len, &off) == 0) {
-        g_aof_write_offset = (long long)off;
-        return 0;
-    }
-
-    /* degrade: direct pwrite+fdatasync */
-    off = (off_t)g_aof_write_offset;
-    if (persist_write_fd_sync(g_aof_fd, buf, len, &off) != 0) return -1;
-    if (fdatasync(g_aof_fd) != 0) return -1;
-    g_aof_write_offset = (long long)off;
-    return 0;
-}
-
 /* flush AOF buffer to disk */
 static int persist_aof_flush_buffer(void) {
     off_t off;
@@ -230,8 +205,7 @@ static int persist_aof_flush_buffer(void) {
     off = (off_t)g_aof_write_offset;
 
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        /* ALWAYS: flush residual buffer (mode-switch edge case); normal per-command path
-         * uses persist_aof_per_command_flush, never goes through buffer */
+        /* ALWAYS: per-command, direct syscall 比 io_uring submit_and_wait 快 */
         rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
         if (rc != 0) return -1;
         if (fdatasync(g_aof_fd) != 0) return -1;
@@ -583,13 +557,6 @@ void persist_close(void) {
 
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy) {
     if (policy != KVS_AOF_FSYNC_ALWAYS && policy != KVS_AOF_FSYNC_EVERYSEC) return -1;
-
-    /* EVERYSEC → ALWAYS: flush residual buffer, per-command path used after */
-    if (policy == KVS_AOF_FSYNC_ALWAYS && g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) {
-        persist_aof_flush_buffer();
-        g_aof_buf_len = 0;
-    }
-
     g_cfg.aof_fsync = policy;
     return 0;
 }
@@ -611,42 +578,34 @@ int persist_force_aof_flush(void) {
 int persist_append_raw(const unsigned char *buf, size_t len) {
     if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;
 
-    /* oversized command: flush buffer first, then write directly */
+    /* if single command exceeds buffer, flush first then write directly */
     if (len >= AOF_BUF_SIZE) {
         if (persist_aof_flush_buffer() != 0) return -1;
-        if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-            if (persist_aof_per_command_flush(buf, len) != 0) return -1;
-        } else {
-            off_t off = (off_t)g_aof_write_offset;
-            if (persist_write_and_fsync_uring(g_aof_fd, buf, len, &off) != 0) {
-                if (persist_write_fd_sync(g_aof_fd, buf, len, &off) != 0) return -1;
-            }
-            g_aof_write_offset = (long long)off;
+        off_t off = (off_t)g_aof_write_offset;
+        if (persist_write_and_fsync_uring(g_aof_fd, buf, len, &off) != 0) {
+            if (persist_write_fd_sync(g_aof_fd, buf, len, &off) != 0) return -1;
         }
-        if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
-        return 0;
-    }
-
-    /* small command routing */
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        /* ALWAYS: per-command write+fsync — no buffering */
-        if (g_aof_buf_len > 0) persist_aof_flush_buffer();
-        if (persist_aof_per_command_flush(buf, len) != 0) return -1;
+        g_aof_write_offset = (long long)off;
     } else {
-        /* EVERYSEC: buffer the write, flush deferred to cron timer */
+        /* buffer the write */
         if (g_aof_buf_len + len > AOF_BUF_SIZE) {
             if (persist_aof_flush_buffer() != 0) return -1;
         }
         memcpy(g_aof_buf + g_aof_buf_len, buf, len);
         g_aof_buf_len += len;
-        if (g_aof_buffered_since_ms == 0) g_aof_buffered_since_ms = kvs_now_ms();
-        g_aof_dirty = 1;
+        /* offset updated in persist_aof_flush_buffer after actual write */
     }
+
+    /* track when first byte was buffered for group-commit time threshold */
+    if (g_aof_buffered_since_ms == 0) g_aof_buffered_since_ms = kvs_now_ms();
+
+    g_aof_dirty = 1;
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    /* EVERYSEC group-commit: flush on 2ms timeout ceiling */
-    if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) {
+    /* ALWAYS mode: buffer accumulates; flushed at reactor iteration end
+     * (persist_flush_pending) or on 2ms timeout as latency ceiling */
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
         if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
             persist_aof_flush_buffer();
             g_aof_buffered_since_ms = 0;

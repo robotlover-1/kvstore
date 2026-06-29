@@ -263,7 +263,8 @@ static int persist_aof_flush_buffer(void) {
     off = (off_t)g_aof_write_offset;
 
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        /* ALWAYS: per-command, direct syscall 比 io_uring submit_and_wait 快 */
+        /* ALWAYS: flush residual buffer (mode-switch edge case); normal per-command path
+         * uses persist_aof_per_command_flush with SQPOLL, never goes through buffer */
         rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
         if (rc != 0) return -1;
         if (fdatasync(g_aof_fd) != 0) return -1;

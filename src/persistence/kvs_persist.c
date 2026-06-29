@@ -195,7 +195,7 @@ static int persist_fsync_fd_best_effort(int fd) {
     return fsync(fd);
 }
 
-/* flush AOF buffer to disk: write + fsync as one io_uring batch */
+/* flush AOF buffer to disk */
 static int persist_aof_flush_buffer(void) {
     off_t off;
     int rc;
@@ -203,14 +203,23 @@ static int persist_aof_flush_buffer(void) {
     if (g_aof_buf_len == 0 || g_aof_fd < 0) return 0;
 
     off = (off_t)g_aof_write_offset;
-    rc = persist_write_and_fsync_uring(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
-    if (rc != 0) {
-        /* fallback: pwrite + fsync */
+
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
+        /* ALWAYS: per-command, direct syscall 比 io_uring submit_and_wait 快 */
         rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
         if (rc != 0) return -1;
-        rc = persist_fsync_fd_best_effort(g_aof_fd);
-        if (rc != 0) return -1;
+        if (fdatasync(g_aof_fd) != 0) return -1;
+    } else {
+        /* EVERYSEC: batch write + fsync via io_uring */
+        rc = persist_write_and_fsync_uring(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
+        if (rc != 0) {
+            rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
+            if (rc != 0) return -1;
+            rc = persist_fsync_fd_best_effort(g_aof_fd);
+            if (rc != 0) return -1;
+        }
     }
+
     g_aof_write_offset = (long long)off;
     g_aof_buf_len = 0;
     g_aof_dirty = 0;

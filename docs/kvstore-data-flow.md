@@ -565,198 +565,192 @@ Backlog 是 1MB 环形缓冲，正常运行时**一直都**在记录。不是全
 
 ---
 
-## 6. 增量同步（eBPF / kprobe+RDMA / eBPF+TCP）
+## 6. 增量同步（4 种模式）
 
-增量同步有**两种数据路径**和**三种传输模式**。全量同步和增量同步的传输层**独立配置**。
+增量同步有**4 种传输模式**，全量同步和增量同步的传输层**独立配置**。
 
 ### 6.1 传输模式总览
 
 ```
-全量同步 (repl_fullsync_transport):         增量同步 (repl_realtime_transport):
-  ┌─────────────┬──────────────────┐         ┌──────────────┬─────────────────────────┐
-  │ 配置值      │ 传输方式          │         │ 配置值       │ 传输方式                 │
-  ├─────────────┼──────────────────┤         ├──────────────┼─────────────────────────┤
-  │ rdma (默认) │ RDMA SEND         │         │ tcp (默认)   │ TCP send                │
-  │             │ fallback: TCP     │         │ ebpf/sockmap │ BPF sk_msg redirect     │
-  │ tcp         │ TCP send          │         │              │ → sockmap egress        │
-  │             │                   │         │              │ → 或 sockmap ingress    │
-  └─────────────┴──────────────────┘         │ kprobe-rdma  │ kprobe 拦截 tcp_sendmsg │
-                                              │              │ → ringbuf → RDMA WRITE │
-                                              │ ebpf+tcp     │ BPF sk_msg redirect    │
-                                              │              │ → 跨机 TCP 转发        │
-                                              └──────────────┴─────────────────────────┘
+全量同步 (repl_fullsync_transport):   增量同步 (repl_realtime_transport):
+  ┌──────────┬───────────────┐         ┌──────────────┬──────────────────────────────────┐
+  │ 配置值   │ 传输方式       │         │ 配置值       │ 传输方式                          │
+  ├──────────┼───────────────┤         ├──────────────┼──────────────────────────────────┤
+  │ rdma     │ RDMA SEND      │         │ tcp (默认)   │ 纯 TCP send/recv                 │
+  │ (默认)   │ fallback: TCP  │         │              │                                  │
+  │ tcp      │ TCP send       │         │ ebpf/sockmap │ BPF sk_msg (hook sendmsg)        │
+  └──────────┴───────────────┘         │              │ → sockmap redirect (本机/跨机)   │
+                                        │ kprobe-rdma  │ BPF kprobe (hook tcp_sendmsg)      │
+                                        │              │ → ringbuf → RDMA WRITE           │
+                                        │ ebpf+tcp     │ BPF kprobe (hook tcp_recvmsg)      │
+                                        │              │ client_capture → ringbuf          │
+                                        │              │ → forward_to_slave (TCP port+13)  │
+                                        └──────────────┴──────────────────────────────────┘
 
-两个配置独立，可以组合使用，例如:
+两个配置独立:
   repl_fullsync_transport = rdma    (全量用 RDMA)
-  repl_realtime_transport = ebpf    (增量用 eBPF sockmap)
+  repl_realtime_transport = ebpf+tcp (增量用 client_capture kprobe)
 ```
 
-### 6.2 模式 A: eBPF sockmap（本地 redirect）
+**三种 BPF 程序对应不同模式：**
 
-**原理：** 利用 BPF sk_msg 程序在内核态拦截 `sendmsg`，将数据从 master socket 重定向到 slave socket 的发送/接收队列，**绕过用户态拷贝**。
+| BPF 程序 | hook 点 | 对应配置 | 数据去向 |
+|----------|---------|----------|---------|
+| `repl_sockmap.bpf.o` | sk_msg (sendmsg) | `repl_realtime_transport=ebpf/sockmap` | sockmap redirect |
+| `repl_kprobe.bpf.o` | kprobe (tcp_sendmsg) | `repl_realtime_transport=kprobe-rdma` | ringbuf → RDMA WRITE |
+| `repl_client_capture.bpf.o` | kprobe (tcp_recvmsg) | `kprobe_enabled=1` 且 role=MASTER | ringbuf → TCP forward |
 
-```
-MASTER (sock_map[0] = master_fd)          SLAVE (sock_map[1] = slave_fd)
-                                                   
-  repl_broadcast(raw, rawlen)                    
-      │                                          
-      ▼                                          
-  queue_bytes → reactor on_write → send(master_fd)
-      │                                           
-      ▼                   [内核态]                
-  BPF sk_msg 程序:         TCP 互联                
-    ├─ 判断 role = MASTER                         
-    ├─ redirect=1 且 ingress=1:                   
-    │    bpf_msg_redirect_map(msg, sock_map,       
-    │       redirect_key, BPF_F_INGRESS)          
-    │    → 数据进入目标 socket 的接收队列 (本地)  
-    │                                             
-    └─ redirect=1 且 ingress=0:                   
-         bpf_msg_redirect_map(msg, sock_map,       
-            redirect_key, 0)                      
-         → 数据进入目标 socket 的发送队列          
-         → 走 TCP 传到远端 slave                    
-                                                   
-  sock_map 结构:                                  
-    key 0 → master 端的 socket fd                
-    key 1 → slave TCP 连接的 fd (redirect target) 
-```
-
-**跨机的工作原理：**
-
-sockmap 本身不能跨机——它只能在同一内核内 redirect socket buffer。跨机的关键是：sock_map[redirect_key] 里存的是**已经连接到远端 slave 的 TCP socket fd**。`bpf_msg_redirect_map` 不带 `BPF_F_INGRESS` 时，数据进入目标 socket 的**发送队列**，然后内核 TCP 栈正常发包到远端。所以本质是：BPF 在 master 侧本地 redirect → 目标 socket 的 TCP 栈 → 跨机传输。
-
-### 6.3 模式 B: eBPF+TCP（跨机转发）
-
-这是 "ebpf+tcp" 配置对应的路径。与 6.2 一样用 `bpf_msg_redirect_map`，但 `ebpf_forward=1` 时设置 `KVS_EBPF_CTL_REDIRECT_INGRESS=0`（egress 模式），数据经过 TCP 到达远端 slave 后正常 recv+parse。
+### 6.2 模式 A: 纯 TCP
 
 ```
-Master 侧:                                 Slave 侧:
-  send(master_fd)                            recv(slave_fd)
-    │                                          │
-  BPF sk_msg:                                  ▼
-    bpf_msg_redirect_map(msg, sock_map,   parse_resp_stream(NULL,
-      redirect_key, 0)  ← flag=0           buf, len, from_replication=1)
-    → sock_map[redirect_key] = slave TCP fd
-    → 数据进入 slave socket 的发送队列
-    → 内核 TCP 发包 ───────── TCP ──────────→ 远端 slave 进程 recv
+Master:                                   Slave:
+  repl_broadcast(raw, rawlen)
+    → repl_realtime_send()
+    → repl_transport_tcp_send()
+    → queue_bytes → reactor on_write
+    → send(c->fd) ──── TCP ────────────→ recv(slave_fd)
+                                          → parse_resp_stream(from_replication=1)
 ```
 
-### 6.4 模式 C: kprobe + RDMA WRITE
-    │    bpf_msg_redirect_map(                └─ repl_slave_note_durable()
-    │      msg, sock_map, redirect_key, 0)
-    │    → 数据重定向到 sock_map[redirect_key]
-    │      对应 socket 的发送队列
+### 6.3 模式 B: eBPF sockmap（`repl_realtime_transport=ebpf/sockmap`）
+
+**原理：** BPF sk_msg 程序在内核态拦截 `sendmsg`，通过 sockmap 将数据重定向到目标 socket，绕过用户态拷贝。
+
+```
+MASTER (sock_map[0] = master_fd)        SLAVE (sock_map[1] = slave_fd)
+
+  repl_broadcast → send(master_fd)
+      │
+      ▼                              [内核态 — 本机场景]
+  BPF sk_msg:                        同一台机器时 pinned BPF maps 共享:
+    bpf_msg_redirect_map(msg,         sock_map[0] = master accept fd (master 进程注册)
+      sock_map, redirect_key,         sock_map[1] = slave connect fd (slave 进程注册)
+      BPF_F_INGRESS)                  BPF: sock_map[0] → sock_map[1]
+    → 数据直入 slave socket 接收队列  → slave recv() 读到
+    → 全程在内核态完成，无用户态转发
+```
+
+**跨机变体（`ebpf_forward=1`）：**
+不带 `BPF_F_INGRESS`，数据进入 sock_map[redirect_key] 的发送队列，经 TCP 传到远端。redirect_key 对应的 fd 需由 `repl_ebpf_register_forward_fd()` 注册（当前未实现自动注册）。
+
+### 6.4 模式 C: kprobe + RDMA WRITE（`repl_realtime_transport=kprobe-rdma`）
+
+**原理：** BPF kprobe 挂载在 `tcp_sendmsg`，在内核态拦截 master→slave 方向的 TCP 数据，通过 BPF ringbuf 传到用户态后，用 RDMA WRITE 单边写入 slave 的 MR 环形缓冲区。
+
+```
+MASTER                                        SLAVE
+
+[内核 BPF kprobe]
+tcp_sendmsg() 被调用时:
+  ├─ 过滤: PID/fd 匹配
+  ├─ 从 msghdr->msg_iter->iov 读取数据
+  ├─ 写入 BPF ringbuf: [4B len][payload]
+  └─ bpf_ringbuf_submit()
+
+[用户态 ringbuf 回调]
+kprobe_ringbuf_cb():
+  ├─ 解析 [4B len][payload]
+  ├─ 获取 RDMA WRITE slot
+  ├─ ibv_post_send RDMA_WRITE(data → slave MR slot)
+  └─ ibv_post_send RDMA_WRITE(producer_head → slave MR header)
+
+[TCP 路径同时运行作为保底]
+send() → TCP → slave                  recv() → parse_resp_stream
+                                         │
+                                      repl_offset 去重
+```
+
+Slave 侧 MR 环形缓冲区结构见第 8.3 节。poll 线程循环读取 `producer_head`，消费 slot 数据 → `parse_resp_stream(from_replication=1)`。
+
+### 6.5 模式 D: eBPF+TCP（`repl_realtime_transport=ebpf+tcp`）—— client_capture kprobe
+
+**这是默认推荐配置**（配合 `repl_fullsync_transport=rdma`），全量用 RDMA，增量用这条 kprobe 转发路径。
+
+**原理：** 在**内核态**拦截 `tcp_recvmsg`（客户端→master 方向），通过 BPF ringbuf 将原始 TCP 字节流直接转发给 slave，**绕过了 `parse_resp_stream → handle_parsed_command → repl_broadcast` 的用户态重建路径**。
+
+**涉及的 BPF 程序：** `repl_client_capture.bpf.o`，hook `tcp_recvmsg`（与模式 C 的 `tcp_sendmsg` hook 不同）
+
+**Master 初始化：**
+```
+kprobe_enabled=1 且 role=MASTER:
+  → repl_client_capture_init()
+    → 加载 repl_client_capture.bpf.o
+    → attach kprobe 到 tcp_recvmsg
+    → 启动 ringbuf poll 线程
+    → g_repl_client_capture_active = 1
+```
+
+**Slave 初始化：**
+```
+kprobe_enabled=1 且 role=SLAVE:
+  → repl_kprobe_fwd_slave_init(port)
+    → 在 port+13 上启动 TCP 监听
+    → accept 连接 → read → parse_resp_stream(from_replication=1)
+```
+
+**完整数据流：**
+
+```
+Client 发送 SET key val
     │
-    ├─ 如果 forward=1 (跨机):
-    │    bpf_msg_redirect_map(
-    │      msg, sock_map, redirect_key, 
-    │      BPF_F_INGRESS=0) → egress redirect
-    │    → 数据走 TCP 到远端 slave
+    ▼
+Master 内核 tcp_recvmsg()
     │
-    └─ 否则: SK_PASS → 正常 TCP 路径
-
-sock_map 结构:
-  key 0 → master 监听 fd
-  key 1 → slave TCP fd (redirect target)
+    ├─ 正常路径 (初始阶段双路径并行):
+    │   数据 → 用户态 → parse_resp_stream → handle_parsed_command
+    │     → repl_broadcast(raw, rawlen)
+    │     → send() → TCP → slave 主端口
+    │   (健康检查通过后被抑制: g_repl_broadcast_suppressed = 1)
+    │
+    └─ kprobe 路径 (内核态拦截):
+         BPF kprobe 在 tcp_recvmsg 拦截客户端原始 TCP 数据
+           → BPF ringbuf: [4B len][payload]
+           → 用户态 ring_buffer__poll
+           → client_ringbuf_cb()
+               │
+               ├─ g_repl_fullsync_in_progress=1:
+               │    缓存到 L1 (内存链表) / L2 (临时文件)
+               │
+               └─ g_fwd_healthy=1:
+                    forward_to_slave(payload, len)
+                      → send(g_kprobe_fwd_fd, ...)  ← 独立 TCP 连接
+                      → TCP ──────────────────────→ slave:port+13
+                      → parse_resp_stream(NULL, buf, len, from_replication=1)
 ```
 
-### 6.3 模式 B: kprobe + RDMA WRITE 增量同步
+**双路径 → 单路径切换：**
 
 ```
-MASTER                                          SLAVE
-
-[用户态]                                  [用户态]
-kprobe_rdma_forward_thread()              kprobe_rdma_slave_poll()
-    │                                         │
-    ├─ ring_buffer__poll(                    ├─ 轮询 MR 环形缓冲区
-    │    ringbuf, timeout=5ms)               │   while (consumer_tail < producer_head)
-    │    │                                    │     │
-    │    ▼                                    │     ▼
-    │  [内核 BPF kprobe]                     │   从 slot[consumer_tail] 读取数据
-    │  tcp_sendmsg() 被调用时:               │    ︙
-    │    ├─ 过滤: PID 匹配? fd 匹配?          │   parse_resp_stream(NULL,
-    │    ├─ 从 msghdr->msg_iter->iov         │     slot_data, slot_len,
-    │    │  读取发送数据                      │     from_replication=1)
-    │    ├─ 写入 BPF ringbuf:                │    ︙
-    │    │  [4B len][payload]                │   consumer_tail++
-    │    └─ bpf_ringbuf_submit()             │   (volatile 写入, RDMA 可见)
-    │                                        │
-    │  [回到用户态回调]                       │
-    │  kprobe_ringbuf_cb(ctx, data, size)    │
-    │    │                                    │
-    │    ├─ 解析 [4B len][payload]           │
-    │    ├─ wr_slot_acquire() 取空闲 slot    │
-    │    │   (8 slots × 512B, pipeline)      │
-    │    ├─ memcpy → slot buf                │
-    │    ├─ wr_submit_data(slot, len)        │
-    │    │   RDMA WRITE data → slave MR      │
-    │    │   (写入 slot[producer_seq])        │
-    │    ├─ wr_submit_head(slot)             │
-    │    │   RDMA WRITE producer_head        │
-    │    │   → slave MR header               │
-    │    └─ producer_seq++                   │
-    │                                        │
-    │  [TCP 路径同时运行]                    [TCP 路径同时接收]
-    │  send() → TCP → slave                  recv() → parse_resp_stream
-    │                                        │
-    │                                        └─ repl_offset 去重
-    │                                           (TCP 和 RDMA 可能收到相同数据)
-    │                                           parse_resp_stream 中
-    │                                           repl_slave_note_applied 检查
-    │                                           offset 是否已应用
+全量同步完成时 (queue_snapshot 尾部):
+  ├─ g_fwd_healthy = 1                    ← 启用 kprobe forward
+  ├─ repl_kprobe_fwd_connect_from_replica() ← 建立 port+13 独立连接
+  ├─ repl_client_capture_flush_to_slave()  ← 先刷全量同步期间缓存的数据
+  ├─ g_repl_broadcast_suppressed = 0      ← 初始双路径并行
+  └─ 5 秒健康检查 (KVS_KPROBE_FWD_HEALTH_TIMEOUT):
+       ├─ kprobe forward 正常 → g_repl_broadcast_suppressed = 1 (压制 repl_broadcast)
+       └─ kprobe forward 异常 → g_fwd_healthy = 0 (回退到 repl_broadcast)
 ```
 
-**kprobe+RDMA 数据流详解：**
+**为什么这条路径更高效：**
 
-```
-Master 侧:
-  tcp_sendmsg (内核)
-    → BPF kprobe 拦截 (repl_kprobe.bpf.c)
-    → 读取 msghdr 中的数据
-    → 写入 BPF ringbuf: [4B len][cmd_bytes]
-    → 用户态 ring_buffer__poll 回调
-    → 获取 RDMA WRITE slot (8 slots pipeline)
-    → ibv_post_send RDMA_WRITE:
-        data → slave MR 的 slot 区域
-        head → slave MR 的 producer_head
-    → 注意: TCP 数据仍然正常发送到 slave (作为保底路径)
+| | repl_broadcast 路径 | kprobe forward 路径 |
+|---|---|---|
+| 数据来源 | 用户态 RESP 解析后 `resp_build_cmdN` 重建 | 内核态从 TCP 流中原始截获 |
+| 关键省略 | — | **省去 RESP parse + rebuild**，直接转发原始字节 |
 
-Slave 侧:
-  ┌─────────────────────────────────────────────┐
-  │  kprobe_rdma_ringbuf_t (MR 环形缓冲区)      │
-  │                                              │
-  │  [producer_head (volatile, 8B)]              │
-  │  [consumer_tail (volatile, 8B)]              │
-  │  [slot 0: 512B]                              │
-  │  [slot 1: 512B]                              │
-  │  ...                                         │
-  │  [slot 1023: 512B]                           │
-  └─────────────────────────────────────────────┘
-
-  poll 线程:
-    while running:
-      读取 producer_head (RDMA 写入的 volatile 值)
-      while consumer_tail < producer_head:
-        从 slot[consumer_tail % 1024] 读数据
-        parse_resp_stream(NULL, data, len, from_replication=1)
-        consumer_tail++ (本地更新)
-      usleep(100)
-```
-
-### 6.4 传输层抽象
+### 6.6 传输层抽象
 
 ```
 repl_transport_ops_t:
-  ├─ TCP:
+  ├─ TCP / eBPF+TCP:
   │    .send = repl_transport_tcp_send → queue_bytes → send()
   │    .connect_slave = socket + connect
   │    .disconnect_slave = close
+  │    (ebpf+tcp 同样使用 tcp_ops，额外的 kprobe 转发不在 transport ops 层面)
   │
-  ├─ eBPF:
+  ├─ eBPF sockmap:
   │    .send = repl_transport_ebpf_send → queue_bytes → send()
-  │           (同样调用 send(), 但 fd 已注册到 sockmap,
-  │            BPF sk_msg 在内核态拦截并重定向)
+  │           (fd 已注册到 sockmap, BPF sk_msg 在内核态拦截并重定向)
   │    .connect_slave = TCP connect + repl_ebpf_register_fd()
   │    .disconnect_slave = repl_ebpf_unregister_fd() + close
   │
@@ -767,19 +761,22 @@ repl_transport_ops_t:
   │    .disconnect_slave = RDMA 资源清理
   │
   └─ kprobe-rdma:
-       .send = 返回 -1 (不做实际发送, kprobe 在内核拦截)
+       .send = 返回 -1 (不做实际发送, kprobe 在内核拦截 tcp_sendmsg)
        .connect_slave = kprobe RDMA 建链
        .disconnect_slave = kprobe RDMA 清理
 
 传输选择逻辑:
   repl_transport_ops_for_context(KVS_REPL_SEND_FULLSYNC):
-    → 根据 repl_fullsync_transport 配置选择
+    → 根据 repl_fullsync_transport 配置选择 (rdma/tcp)
   repl_transport_ops_for_context(KVS_REPL_SEND_REALTIME):
-    → 根据 repl_realtime_transport 配置选择
+    → 根据 repl_realtime_transport 配置选择 (tcp/ebpf/kprobe-rdma/ebpf+tcp)
+
+注意: eBPF+TCP 的 kprobe 转发路径不在 transport ops 框架内 —
+      它通过 client_capture BPF (hook tcp_recvmsg) + 独立 TCP 连接 (port+13) 实现。
 
 Fallback 机制:
   如果 RDMA/eBPF 发送失败 → 自动 fallback 到 TCP
-  (cooldown 期内不再重试)
+  kprobe forward 异常 → g_fwd_healthy=0 → 回退到 repl_broadcast
 ```
 
 ---

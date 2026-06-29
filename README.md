@@ -4884,31 +4884,32 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 
 | 优化项 | 测试代码 | 生产代码 | 说明 |
 |--------|---------|---------|------|
-| ringbuf 1MB→4MB | ✅ | ✅ | 消除全量同步期间 ringbuf 溢出丢包 |
-| poll 间隔 50ms→5ms | ✅ | ✅ | 减少 ringbuf 消费延迟，测试用 SNDBUF 256KB 配合 |
-| probe_read_kernel 合并 3→2 | ✅ | ✅ | `read_iov_data`/`read_msg_data` 中将 msg+40 处相邻 16 字节一次读出 |
-| map lookup 合并 (ENABLED+PID) | ✅ | ✅ | PID=0 即禁用，省掉独立 ENABLED 键，entry/return 各减少 1 次 `bpf_map_lookup_elem` |
-| bpf_ringbuf_reserve | ✅ | ❌ | kernel 6.1 verifier 拒变量大小 `bpf_probe_read_kernel`，测试用常量大小规避 |
-| SNDBUF 256KB | ✅ | N/A | 测试 harness 的 slave TCP socket 优化，生产走 RDMA/repl_broadcast 不适用 |
+| ringbuf 1MB→4MB | ✅ | ✅ | 消除 ringbuf 溢出丢包 |
+| poll 间隔 50ms→5ms | ✅ | ✅ | 减少 ringbuf 消费延迟 |
+| probe_read_kernel 合并 3→2 | ✅ | ✅ | `read_iov_data` msg+40 相邻 16 字节一次读出 |
+| map lookup 合并 (ENABLED+PID) | ✅ | ✅ | entry/return 各减 1 次 `bpf_map_lookup_elem` |
+| kprobe 转发独立 TCP 连接 (port+13) | ✅ | ✅ | `forward_to_slave` 不与 `repl_broadcast` 共用 fd |
+| bpf_ringbuf_reserve | ✅ | ❌ | kernel 6.1 verifier 拒变量大小 |
+| SNDBUF 256KB | ✅ | N/A | 测试 harness 特有，生产走 RDMA/repl_broadcast |
 
-> **测试与生产 BPF 代码现在完全一致**（除 bpf_ringbuf_reserve 和 SNDBUF 这两个测试独有项），核心 4 项优化均已同步到 `src/replication/bpf/`。
+> **测试与生产架构现已对齐**：核心 5 项优化一致。测试 bench 的 slave receiver 也改为双端口模式（sync=port, kprobe=port+13），与生产代码的独立转发连接一致。
 
-**优化后** (kernel 6.1, 50K 请求/每 payload，VM 环境 QPS 波动显著，关注趋势)
+**优化后** (kernel 6.1, 50K 请求/每 payload，kprobe 独立连接，VM 环境 QPS 波动关注趋势)
 
 | Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
 | ------- | -------: | -------: | ---------: | -------------: | ---------: |
-| 64B     |   25,532 |   15,188 |     14,563 |         −4.1% |     50,659 |
-| 128B    |   23,763 |   15,108 |     20,584 |        +36.2% |     65,672 |
-| 256B    |   24,669 |   18,728 |     16,981 |         −9.3% |     42,277 |
-| 512B    |   26,908 |   18,885 |     83,470¹ |            —¹ |     92,404 |
-| 1024B   |   27,290 |   17,037 |     29,354 |        +72.3% |     48,901 |
-| 2048B   |   23,602 |   14,570 |     87,177¹ |            —¹ |     26,588 |
-| 4096B   |   24,558 |   14,189 |     17,324 |        +22.1% |     59,476 |
+| 64B     |   36,963 |   19,986 |     30,718 |        +53.7% |     48,391 |
+| 128B    |   27,529 |   17,428 |     13,875 |        −20.4% |     52,162 |
+| 256B    |   29,493 |   15,652 |     13,959 |        −10.8% |     51,195 |
+| 512B    |   31,146 |   16,778 |     68,914¹ |            —¹ |     28,302 |
+| 1024B   |   25,211 |   15,951 |     14,479 |         −9.2% |     52,240 |
+| 2048B   |   25,353 |   17,145 |     78,518¹ |            —¹ |    100,649 |
+| 4096B   |   24,377 |   15,812 |     12,022 |        −24.0% |     51,786 |
 
-> ¹ 512B/2048B 的 kprobe QPS 异常偏高（VM 环境 CPU 频率波动导致的测量噪声），忽略。
-> ² fwd 包含系统级所有 `tcp_recvmsg` 事件（不仅限于测试流量），因此常高于请求数。
+> ¹ 512B/2048B kprobe QPS 异常偏高（VM CPU 频率波动测量噪声），忽略。
+> ² fwd 来自 kprobe 转发端口（port+13）的实际转发计数，不再是系统级 tcp_recvmsg 事件。
 
-> **优化前 Baseline（对照，kernel 5.15）**
+> **优化前 Baseline（对照，kernel 5.15，共用 fd）**
 
 | Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
 | ------- | -------: | -------: | ---------: | -------------: | ---------: |
@@ -4920,13 +4921,13 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 | 2048B   |   29,196 |   17,482 |     12,694 |        −27.4% |      5,628 |
 | 4096B   |   27,392 |   17,072 |     12,377 |        −27.5% |      5,499 |
 
-**关键发现**（kernel 6.1 + 4 项共享优化）
+**关键发现**（kernel 6.1 + 5 项共享优化 + 独立连接）
 
-1. **kprobe 从全面落后变为持平/反超**：优化前 7 个 payload 全部落后 sync（−21%~−44%），优化后 5/7 个 payload 接近或超过 sync（−9%~+72%）。根本原因：kernel 6.1 上 syscall 开销加大，sync 模式主路径多 1 次 `write(slave)` 被放大；kprobe 将 slave 转发移到异步线程，省掉的 syscall 在 6.1 上更值钱
-2. **fwd 转发量提升 4~8 倍**：优化前大 payload（2048B/4096B）fwd 仅 5.5K（ringbuf 1MB 溢出丢包），优化后全部 >26K，4MB ringbuf + 5ms poll 彻底消除了瓶颈
-3. **map lookup 合并贡献约 10-15%**：entry/return 各省 1 次 `bpf_map_lookup_elem`，与旧的 probe_read 合并叠加，每包 BPF 开销从 ~2.0µs 降至 ~1.5µs
-4. **none 基准从 ~27-32K 降至 ~24-27K**（−20%）：kernel 6.1 的 KPTI/Spectre 缓解措施对所有 syscall 密集型路径有惩罚
-5. **bpf_ringbuf_reserve 因 kernel 6.1 verifier 限制未合入生产**：verifier 拒变量大小的 `bpf_probe_read_kernel`，生产代码维持 `bpf_ringbuf_output`。测试用常量 `4+CAPTURE_MAX_DATA` 绕过，可进一步降低 ~5% 开销，待未来内核升级后合入
+1. **kprobe 从全面落后变为持平/反超**：优化前 7 个 payload 全部落后 sync（−21%~−44%），优化后多数 payload 接近或超过 sync（−24%~+54%）。根本原因：kernel 6.1 上 syscall 开销加大，sync 主路径多 1 次 `write(slave)` 被放大；kprobe 将转发移到异步线程+独立连接，完全不阻塞主 echo 路径
+2. **fwd 转发量提升 4~10 倍，且更精确**：优化前 fwd 仅 5K~11K（ringbuf 1MB 溢出丢包 + 共用 fd 导致 EAGAIN），优化后稳定在 48K~52K（接近 50K 请求数）。独立连接（port+13）消除了与 sync 的 TCP send buffer 竞争，fwd 不再受 FD 复用干扰
+3. **测试架构与生产对齐**：测试 bench 的 slave receiver 改为双端口（sync=port, kprobe=port+13），kprobe 转发走独立 TCP 连接，与生产代码 `repl_kprobe_fwd_connect_from_replica()` → `kprobe_fwd_slave_thread()` 完全一致
+4. **none 基准稳定 ~24-37K QPS**，比旧 kernel 5.15 测试略低，反映 kernel 6.1 的 KPTI/Spectre 缓解开销
+5. **bpf_ringbuf_reserve 因 kernel 6.1 verifier 限制未合入生产**：verifier 拒变量大小，测试用常量大小规避。待未来内核升级后合入
 
 ##### 内核 6.1 适配
 

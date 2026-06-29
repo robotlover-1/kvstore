@@ -187,10 +187,12 @@ static void *async_forward_thread(void *arg) {
     return NULL;
 }
 
-/* ========== ringbuf 消费者（转发到 slave） ========== */
+/* ========== ringbuf 消费者（转发到 slave port+13） ========== */
+#define KPROBE_PORT_OFFSET 13
+
 typedef struct {
     struct bpf_object *obj;
-    int slave_fd;
+    int fwd_fd;          /* kprobe 转发专用连接 (port+13) */
     volatile int running;
     volatile int ready;
     int fwd_count;
@@ -204,7 +206,7 @@ static int ringbuf_cb(void *ctx, void *data, size_t len) {
     __builtin_memcpy(&plen, data, 4);
     if (plen == 0 || plen > len - 4) return 0;
 
-    if (write_full(rf->slave_fd, (const char *)data + 4, plen) < 0)
+    if (write_full(rf->fwd_fd, (const char *)data + 4, plen) < 0)
         return 1; /* stop */
     rf->fwd_count++;
     return 0;
@@ -727,16 +729,17 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         tc_clone_setup();
     }
 
-    /* 连接 slave */
+    /* 连接 slave (sync 转发，port) */
     int slave_fd = -1;
+    int kprobe_fwd_fd = -1;  /* kprobe 转发独立连接 (port+13) */
     if (use_sync || use_bpf || use_async) {
-        slave_fd = socket(AF_INET, SOCK_STREAM, 0);
-        set_nodelay(slave_fd);
-
         struct hostent *he = gethostbyname(g_slave_host);
         if (!he) {
             fprintf(stderr, "slave: gethostbyname(%s) failed\n", g_slave_host);
         } else {
+            /* sync / async 转发连接 (port) */
+            slave_fd = socket(AF_INET, SOCK_STREAM, 0);
+            set_nodelay(slave_fd);
             struct sockaddr_in sa = {.sin_family = AF_INET,
                                      .sin_port = htons(g_slave_port)};
             memcpy(&sa.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
@@ -745,17 +748,29 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                 close(slave_fd);
                 slave_fd = -1;
             } else {
-                /* 限制发送缓冲区，快速暴露慢消费导致的 write 阻塞 */
                 int sndbuf = 262144; /* 256KB */
                 setsockopt(slave_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+            }
+
+            /* kprobe 转发独立连接 (port+13，不与 sync 共用 fd) */
+            if (use_bpf) {
+                kprobe_fwd_fd = socket(AF_INET, SOCK_STREAM, 0);
+                set_nodelay(kprobe_fwd_fd);
+                sa.sin_port = htons(g_slave_port + KPROBE_PORT_OFFSET);
+                if (connect(kprobe_fwd_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+                    fprintf(stderr, "kprobe fwd: connect to %s:%d failed: %s\n",
+                            g_slave_host, g_slave_port + KPROBE_PORT_OFFSET, strerror(errno));
+                    close(kprobe_fwd_fd);
+                    kprobe_fwd_fd = -1;
+                }
             }
         }
     }
 
     /* 启动 ringbuf 转发线程（kprobe/tp/fentry 模式） */
-    if (use_bpf && slave_fd >= 0) {
+    if (use_bpf && kprobe_fwd_fd >= 0) {
         rf.obj = bpf_obj;
-        rf.slave_fd = slave_fd;
+        rf.fwd_fd = kprobe_fwd_fd;
         rf.running = 1;
         pthread_create(&fwd_tid, NULL, ringbuf_fwd_thread, &rf);
         while (!__atomic_load_n(&rf.ready, __ATOMIC_ACQUIRE)) usleep(1000);
@@ -834,6 +849,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         async_ring_free(&async_ring);
     }
     if (slave_fd >= 0) close(slave_fd);
+    if (kprobe_fwd_fd >= 0) close(kprobe_fwd_fd);
 
     close(listen_fd);
 

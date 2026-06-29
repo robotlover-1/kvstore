@@ -594,13 +594,9 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    /* ALWAYS mode: buffer accumulates; flushed at reactor iteration end
-     * (persist_flush_pending) or on 2ms timeout as latency ceiling */
+    /* ALWAYS mode: per-command write + fsync（不做 group commit） */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
-            persist_aof_flush_buffer();
-            g_aof_buffered_since_ms = 0;
-        }
+        persist_aof_flush_buffer();
     }
     return 0;
 }

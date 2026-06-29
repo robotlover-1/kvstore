@@ -1184,7 +1184,6 @@ static int cache_spill_to_l2(const unsigned char *data, size_t len);
 /* ── eBPF+tcp 新路径: INCR 模式直接转发到 slave ──
  * 当前禁用: bpf_probe_read_user 在内核 5.15 上可靠性不足，
  * 增量数据改由 repl_broadcast (TCP) 可靠发送。保留此函数供未来修复后启用。 */
-__attribute__((unused))
 static int forward_to_slave(const unsigned char *data, size_t len) {
     extern int g_repl_capture_slave_fd;
     if (g_repl_capture_slave_fd < 0) return -1;
@@ -1293,8 +1292,11 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
     }
-    /* STATE_INCR: 增量同步 — 数据由 repl_broadcast 可靠发送（TCP），
-     * eBPF 转发因 bpf_probe_read_user 不可靠而禁用 */
+    /* STATE_INCR: 增量同步 — kprobe 异步转发为主路径，repl_broadcast 为保底 */
+    if (g_fwd_healthy) {
+        if (forward_to_slave(payload, payload_len) == 0)
+            g_fwd_last_active = time(NULL);  /* 更新心跳 */
+    }
     return 0;
 }
 

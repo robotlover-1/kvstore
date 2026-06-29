@@ -615,6 +615,21 @@ void persist_close(void) {
 
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy) {
     if (policy != KVS_AOF_FSYNC_ALWAYS && policy != KVS_AOF_FSYNC_EVERYSEC) return -1;
+
+    /* EVERYSEC → ALWAYS: flush any remaining buffer, SQPOLL ring init lazy */
+    if (policy == KVS_AOF_FSYNC_ALWAYS && g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) {
+        persist_aof_flush_buffer();
+        g_aof_buf_len = 0;
+    }
+
+    /* ALWAYS → EVERYSEC: tear down SQPOLL ring, free kernel thread */
+    if (policy != KVS_AOF_FSYNC_ALWAYS && g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
+        if (g_persist_uring_sqpoll_ready) {
+            io_uring_queue_exit(&g_persist_uring_sqpoll);
+            g_persist_uring_sqpoll_ready = 0;
+        }
+    }
+
     g_cfg.aof_fsync = policy;
     return 0;
 }

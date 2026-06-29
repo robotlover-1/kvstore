@@ -71,6 +71,10 @@ volatile int g_repl_client_capture_active = 0;
 
 /* Master 侧 slave 的 TCP 连接 fd（供 client_capture 转发引擎使用） */
 int g_repl_capture_slave_fd = -1;
+
+/* kprobe 转发接管增量同步时，压制 repl_broadcast */
+volatile int g_repl_broadcast_suppressed = 0;
+
 static pthread_mutex_t g_repl_last_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_repl_last_send_stage[64] = "none";
 static unsigned long long g_repl_last_send_len = 0;
@@ -475,6 +479,9 @@ void repl_remove_slave(conn_t *c) {
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
+    /* kprobe 转发接管时跳过 repl_broadcast（保底路径静默） */
+    if (g_repl_broadcast_suppressed) return;
+
     repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
@@ -622,6 +629,16 @@ static int queue_snapshot(conn_t *c) {
     /* NEW: 全量同步数据发送完成 — 关闭 RDMA，清除标志 */
     g_repl_fullsync_in_progress = 0;
     repl_client_capture_set_fullsync(0);
+
+    /* 启用 kprobe 异步转发接管增量同步 */
+    extern volatile int g_repl_broadcast_suppressed;
+    extern volatile time_t g_fwd_last_active;
+    extern volatile int g_fwd_healthy;
+    g_repl_broadcast_suppressed = 1;
+    g_fwd_last_active = time(NULL);
+    g_fwd_healthy = 1;
+    fprintf(stderr, "kprobe fwd: enabled for incremental sync\n");
+
     if (rdma_ok) {
         repl_rdma_stop_fullsync();
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");

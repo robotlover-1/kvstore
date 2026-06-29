@@ -43,7 +43,7 @@
 
 volatile time_t g_fwd_last_active = 0;  /* 最后成功转发时间戳 */
 volatile int g_fwd_healthy = 0;          /* 1=健康 0=异常 */
-volatile int g_repl_broadcast_suppressed = 0;  /* 1=抑制 repl_broadcast 走 kprobe 路径 */
+extern volatile int g_repl_broadcast_suppressed;   /* 1=抑制 repl_broadcast 走 kprobe 路径（定义在 kvstore.c） */
 
 /* ---- BPF Map FDs ---- */
 static struct bpf_object *g_kprobe_obj = NULL;
@@ -1125,7 +1125,6 @@ void repl_kprobe_fwd_health_check(void) {
     if (time(NULL) - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
         g_fwd_healthy = 0;
         /* 切回 repl_broadcast */
-        extern volatile int g_repl_broadcast_suppressed;
         g_repl_broadcast_suppressed = 0;
         fprintf(stderr, "kprobe fwd: health check FAILED, "
                 "fallback to repl_broadcast (last_active=%lds ago)\n",

@@ -209,6 +209,50 @@ static int persist_fsync_fd_best_effort(int fd) {
     return fsync(fd);
 }
 
+/* Per-command write+fsync for ALWAYS mode using io_uring SQPOLL.
+ * Falls back to pwrite+fdatasync when SQPOLL is unavailable (old kernel). */
+static int persist_aof_per_command_flush(const unsigned char *buf, size_t len) {
+    struct io_uring_sqe *sqe_w, *sqe_f;
+    struct io_uring_cqe *cqe;
+    int written;
+
+    if (len == 0) return 0;
+
+    /* Degrade: SQPOLL unavailable → direct pwrite+fdatasync */
+    if (persist_uring_sqpoll_init_once() != 0) {
+        off_t off = (off_t)g_aof_write_offset;
+        if (persist_write_fd_sync(g_aof_fd, buf, len, &off) != 0) return -1;
+        if (fdatasync(g_aof_fd) != 0) return -1;
+        g_aof_write_offset = (long long)off;
+        return 0;
+    }
+
+    sqe_w = io_uring_get_sqe(&g_persist_uring_sqpoll);
+    sqe_f = io_uring_get_sqe(&g_persist_uring_sqpoll);
+    if (!sqe_w || !sqe_f) return -1;
+
+    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, (off_t)g_aof_write_offset);
+    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+    sqe_f->flags |= IOSQE_IO_LINK;  /* chain: write completes → fsync begins */
+
+    /* SQPOLL kernel thread polls SQ; io_uring_submit wakes it from idle */
+    io_uring_submit(&g_persist_uring_sqpoll);
+
+    /* wait for write completion */
+    if (io_uring_wait_cqe(&g_persist_uring_sqpoll, &cqe) < 0 || !cqe) return -1;
+    written = cqe->res;
+    io_uring_cqe_seen(&g_persist_uring_sqpoll, cqe);
+    if (written <= 0) return -1;
+
+    /* wait for fsync completion */
+    if (io_uring_wait_cqe(&g_persist_uring_sqpoll, &cqe) < 0 || !cqe) return -1;
+    if (cqe->res < 0) { io_uring_cqe_seen(&g_persist_uring_sqpoll, cqe); return -1; }
+    io_uring_cqe_seen(&g_persist_uring_sqpoll, cqe);
+
+    g_aof_write_offset += (long long)written;
+    return 0;
+}
+
 /* flush AOF buffer to disk */
 static int persist_aof_flush_buffer(void) {
     off_t off;

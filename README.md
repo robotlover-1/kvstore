@@ -4773,23 +4773,23 @@ sudo python3 tools/bench/bench_mem_backend.py \
    ③④ 顺序执行：回显完成后才转发，转发阻塞下一个请求的读取
 
 
-                      kprobe 模式（echo + 内核截获 → 异步转发）
-                      ══════════════════════════════════════════
+                      kprobe 模式（echo + 内核截获 → 异步转发，独立连接）
+                      ═══════════════════════════════════════════════
 
    Master (128) 进程内                      Slave (129)
-   ┌──────────────────────────────────┐    TCP    ┌────────────────────┐
-   │ client 线程     master 线程       │══════════→│ test_slave_receiver│
-   │ ┌──────────┐   ┌──────────────┐  │  转发     │ ┌────────────────┐ │
-   │ │ ① 发送   │──→│ ② read()     │  │           │ │ ⑥ 接收 + 计数  │ │
-   │ │   req    │   │              │  │           │ └────────────────┘ │
-   │ │          │←──│ ③ write()   │  │           └────────────────────┘
-   │ │ ④ 计时   │   └──────┬───────┘  │
-   │ └──────────┘          │          │
-   │             内核 kprobe 截获     │
-   │          ┌──────────────────┐    │
+   ┌──────────────────────────────────┐    TCP     ┌─────────────────────────┐
+   │ client 线程     master 线程       │═══════════→│ test_slave_receiver      │
+   │ ┌──────────┐   ┌──────────────┐  │  sync端口  │ ┌─────────────────────┐ │
+   │ │ ① 发送   │──→│ ② read()     │  │   15801    │ │ [sync] 接收 + 计数   │ │
+   │ │   req    │   │              │  │            │ └─────────────────────┘ │
+   │ │          │←──│ ③ write()   │  │            │                         │
+   │ │ ④ 计时   │   └──────┬───────┘  │    TCP     │ ┌─────────────────────┐ │
+   │ └──────────┘          │          │═══════════→│ │ [kprobe] 接收+计数   │ │
+   │             内核 kprobe 截获     │  kp端口    │ └─────────────────────┘ │
+   │          ┌──────────────────┐    │  15801+13  └─────────────────────────┘
    │          │ tcp_recvmsg      │    │
-   │          │  entry: 存 msg 指针  │
-   │          │  return: 读 iov ──→  │
+   │          │  entry: 存 msg 指针  │    sync 转发走 15801，kprobe 转发走 15814
+   │          │  return: 读 iov ──→  │    两条独立 TCP 连接，不共用 fd
    │          │   ringbuf_output  │   │
    │          └────────┬─────────┘   │
    │                   │             │
@@ -4801,15 +4801,18 @@ sudo python3 tools/bench/bench_mem_backend.py \
    └──────────────────────────────────┘
 
    ③ 回显和 ⑤ 异步转发并行：kprobe 不阻塞 ②→③ 的主路径
+   kprobe 转发走独立连接 (port+13)，与 sync 的 TCP 连接完全隔离
 ```
 
 **三种模式实现差异**（都在同一个 main 函数中，`--mode` 切换）：
 
-| 模式       | Master echo 线程做什么                                      | 转发路径                                                                                                    |
-| ---------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `none`   | `read(client) → write_full(client)`                      | 无转发                                                                                                      |
-| `sync`   | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步 `write()` 跨机 TCP                                                                     |
-| `kprobe` | `read(client) → write_full(client)`                      | BPF 在内核 `tcp_recvmsg` 处截获数据→ringbuf→用户态异步线程 `write_full(slave)`，**不阻塞 echo** |
+| 模式     | Master echo 线程做什么                                    | 转发路径                                                                                         |
+| -------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `none`   | `read(client) → write_full(client)`                      | 无转发                                                                                           |
+| `sync`   | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步 `write()` 跨机 TCP → slave port 15801                                         |
+| `kprobe` | `read(client) → write_full(client)`                      | BPF 内核截获 → ringbuf → 异步线程 `write_full(kprobe_fwd_fd)` → slave **port 15801+13（独立连接）** |
+
+> kprobe 转发走独立 TCP 连接（port+13），不与 sync 共用 fd。Slave 侧 `test_slave_receiver` 双端口监听（sync=port, kprobe=port+13），与生产代码 `repl_kprobe_fwd_connect_from_replica()` + `kprobe_fwd_slave_thread()` 架构一致。
 
 **kprobe BPF 程序**（`kprobe_capture.bpf.c`）工作细节：
 

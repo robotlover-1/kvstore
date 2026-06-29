@@ -1121,14 +1121,32 @@ void repl_client_capture_note_repldone(void) {
  * 如果超过 KVS_KPROBE_FWD_HEALTH_TIMEOUT 秒没有成功转发数据，
  * 则判定异常并回退到 repl_broadcast 路径 */
 void repl_kprobe_fwd_health_check(void) {
+    static time_t g_fwd_first_healthy = 0;
+    time_t now = time(NULL);
+
     if (!g_fwd_healthy) return;
-    if (time(NULL) - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
+
+    /* 检查是否失活：超时无数据 → 切回 repl_broadcast */
+    if (now - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
         g_fwd_healthy = 0;
-        /* 切回 repl_broadcast */
         g_repl_broadcast_suppressed = 0;
+        g_fwd_first_healthy = 0;
         fprintf(stderr, "kprobe fwd: health check FAILED, "
                 "fallback to repl_broadcast (last_active=%lds ago)\n",
-                (long)(time(NULL) - g_fwd_last_active));
+                (long)(now - g_fwd_last_active));
+        return;
+    }
+
+    /* kprobe 正在转发。稳定运行 HEALTH_TIMEOUT 秒后压制 repl_broadcast */
+    if (!g_repl_broadcast_suppressed) {
+        if (g_fwd_first_healthy == 0) {
+            g_fwd_first_healthy = now;
+        } else if (now - g_fwd_first_healthy >= KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
+            g_repl_broadcast_suppressed = 1;
+            fprintf(stderr, "kprobe fwd: proven healthy for %ds, "
+                    "suppressing repl_broadcast\n",
+                    KVS_KPROBE_FWD_HEALTH_TIMEOUT);
+        }
     }
 }
 

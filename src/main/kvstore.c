@@ -630,14 +630,15 @@ static int queue_snapshot(conn_t *c) {
     g_repl_fullsync_in_progress = 0;
     repl_client_capture_set_fullsync(0);
 
-    /* 启用 kprobe 异步转发接管增量同步 */
+    /* 启用 kprobe 异步转发探索模式（双路径并行，验证通过后压制 repl_broadcast） */
     extern volatile int g_repl_broadcast_suppressed;
     extern volatile time_t g_fwd_last_active;
     extern volatile int g_fwd_healthy;
-    g_repl_broadcast_suppressed = 1;
+    /* 不立即压制 repl_broadcast — 等健康检查确认 kprobe 转发正常后再压制 */
+    g_repl_broadcast_suppressed = 0;
     g_fwd_last_active = time(NULL);
     g_fwd_healthy = 1;
-    fprintf(stderr, "kprobe fwd: enabled for incremental sync\n");
+    fprintf(stderr, "kprobe fwd: probe mode (dual-path until proven healthy)\n");
 
     if (rdma_ok) {
         repl_rdma_stop_fullsync();

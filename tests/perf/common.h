@@ -62,13 +62,14 @@ static inline int set_nodelay(int fd) {
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
-/* 安全的 full write */
+/* 安全的 full write — EPIPE 时返回已写字节数，不触发 SIGPIPE */
 static inline ssize_t write_full(int fd, const void *buf, size_t len) {
     size_t written = 0;
     while (written < len) {
         ssize_t n = write(fd, (const char *)buf + written, len - written);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (errno == EPIPE) break; /* 对端已关闭，不触发 SIGPIPE */
             return -1;
         }
         written += (size_t)n;

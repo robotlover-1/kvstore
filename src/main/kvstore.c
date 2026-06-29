@@ -634,6 +634,8 @@ static int queue_snapshot(conn_t *c) {
     extern volatile int g_repl_broadcast_suppressed;
     extern volatile time_t g_fwd_last_active;
     extern volatile int g_fwd_healthy;
+    /* 建立 kprobe 转发独立连接（不与 repl_broadcast 共用 fd） */
+    repl_kprobe_fwd_connect_from_replica(c, g_cfg.port);
     /* 不立即压制 repl_broadcast — 等健康检查确认 kprobe 转发正常后再压制 */
     g_repl_broadcast_suppressed = 0;
     g_fwd_last_active = time(NULL);
@@ -2317,6 +2319,11 @@ int main(int argc, char **argv) {
         if (repl_client_capture_init() != 0) {
             fprintf(stderr, "client capture init failed, continuing without cache\n");
         }
+    }
+
+    /* kprobe 转发独立 TCP 监听（slave 侧，port+13） */
+    if (g_cfg.kprobe_enabled && g_cfg.role == ROLE_SLAVE) {
+        repl_kprobe_fwd_slave_init(g_cfg.port);
     }
 
     if (!strcmp(g_cfg.net_backend, "reactor")) {

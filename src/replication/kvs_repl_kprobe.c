@@ -27,6 +27,7 @@
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <netinet/tcp.h>
 #if KVS_ENABLE_RDMA
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
@@ -44,6 +45,10 @@
 volatile time_t g_fwd_last_active = 0;  /* 最后成功转发时间戳 */
 volatile int g_fwd_healthy = 0;          /* 1=健康 0=异常 */
 extern volatile int g_repl_broadcast_suppressed;   /* 1=抑制 repl_broadcast 走 kprobe 路径（定义在 kvstore.c） */
+
+/* kprobe 转发独立 TCP 连接（不与 repl_broadcast 共用 fd） */
+#define KVS_KPROBE_FWD_PORT_OFFSET  13   /* slave port + 13 为 kprobe 转发端口 */
+static int g_kprobe_fwd_fd = -1;
 
 /* ---- BPF Map FDs ---- */
 static struct bpf_object *g_kprobe_obj = NULL;
@@ -116,6 +121,10 @@ static void *kprobe_rdma_slave_poll(void *arg);
 
 /* 供 reactor 定时器调用 */
 void repl_kprobe_fwd_health_check(void);
+
+/* kprobe 转发独立连接 */
+int repl_kprobe_fwd_connect_from_replica(conn_t *c, int slave_port);
+int repl_kprobe_fwd_slave_init(int base_port);
 
 /* ============================================================
  * BPF 加载与管理
@@ -1151,6 +1160,107 @@ void repl_kprobe_fwd_health_check(void) {
 }
 
 /* ============================================================
+ * kprobe 转发独立 TCP 连接
+ *
+ * Master: REPLDONE 后连接 slave port+13，forward_to_slave 使用此独立 fd
+ * Slave:  监听 port+13，accept 后 read → parse_resp_stream(from_replication=1)
+ * ============================================================ */
+
+/* Master: 建立 kprobe 转发独立连接（从复制连接提取 slave 地址） */
+int repl_kprobe_fwd_connect_from_replica(conn_t *c, int slave_port) {
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    if (getpeername(c->fd, (struct sockaddr *)&addr, &addrlen) < 0) {
+        fprintf(stderr, "kprobe fwd: getpeername failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("kprobe fwd: socket"); return -1; }
+
+    addr.sin_port = htons((uint16_t)(slave_port + KVS_KPROBE_FWD_PORT_OFFSET));
+
+    char ip[64];
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "kprobe fwd: connect to %s:%d failed: %s\n",
+                ip, slave_port + KVS_KPROBE_FWD_PORT_OFFSET, strerror(errno));
+        close(fd); return -1;
+    }
+
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    g_kprobe_fwd_fd = fd;
+    fprintf(stderr, "kprobe fwd: dedicated connection to %s:%d (fd=%d)\n",
+            ip, slave_port + KVS_KPROBE_FWD_PORT_OFFSET, fd);
+    return fd;
+}
+
+/* Slave: kprobe 转发数据接收线程 */
+static void *kprobe_fwd_slave_thread(void *arg) {
+    int port = (int)(intptr_t)arg;
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) { perror("kprobe fwd slave: socket"); return NULL; }
+
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("kprobe fwd slave: bind");
+        close(listen_fd); return NULL;
+    }
+    if (listen(listen_fd, 1) < 0) {
+        perror("kprobe fwd slave: listen");
+        close(listen_fd); return NULL;
+    }
+    fprintf(stderr, "kprobe fwd slave: listening on port %d\n", port);
+
+    while (g_kprobe_running) {
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(100000); continue; }
+            break;
+        }
+        fprintf(stderr, "kprobe fwd slave: accepted connection fd=%d\n", cfd);
+
+        unsigned char buf[BUFFER_CAP];
+        size_t len = 0;
+        while (g_kprobe_running) {
+            ssize_t n = recv(cfd, buf + len, sizeof(buf) - len, 0);
+            if (n <= 0) break;
+            len += (size_t)n;
+            /* from_replication=1: 不回写 AOF、不广播、静默 apply */
+            parse_resp_stream(NULL, buf, &len, 1);
+        }
+        close(cfd);
+        fprintf(stderr, "kprobe fwd slave: connection closed\n");
+    }
+    close(listen_fd);
+    return NULL;
+}
+
+/* Slave: 启动 kprobe 转发监听线程 */
+int repl_kprobe_fwd_slave_init(int base_port) {
+    int port = base_port + KVS_KPROBE_FWD_PORT_OFFSET;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, kprobe_fwd_slave_thread,
+                       (void *)(intptr_t)port) != 0) {
+        fprintf(stderr, "kprobe fwd slave: failed to create thread\n");
+        return -1;
+    }
+    pthread_detach(tid);
+    return 0;
+}
+
+/* ============================================================
  * Client Capture — 用户态管理
  * ============================================================
  *
@@ -1202,8 +1312,7 @@ static int cache_spill_to_l2(const unsigned char *data, size_t len);
  * 当前禁用: bpf_probe_read_user 在内核 5.15 上可靠性不足，
  * 增量数据改由 repl_broadcast (TCP) 可靠发送。保留此函数供未来修复后启用。 */
 static int forward_to_slave(const unsigned char *data, size_t len) {
-    extern int g_repl_capture_slave_fd;
-    if (g_repl_capture_slave_fd < 0) return -1;
+    if (g_kprobe_fwd_fd < 0) return -1;
 
     /* 过滤复制控制命令 — BPF 捕获了 slave→master 的控制消息（REPLSYNC/REPLACK），
      * 若转发回 slave 会导致解析错误和 buffer 堆积 */
@@ -1223,7 +1332,7 @@ static int forward_to_slave(const unsigned char *data, size_t len) {
     int err_count = 0;
 
     while (total_sent < len) {
-        ssize_t sent = send(g_repl_capture_slave_fd, data + total_sent,
+        ssize_t sent = send(g_kprobe_fwd_fd, data + total_sent,
                             len - total_sent, MSG_NOSIGNAL);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1233,7 +1342,7 @@ static int forward_to_slave(const unsigned char *data, size_t len) {
                     if (now - last_stuck_warn > 5000) {
                         last_stuck_warn = now;
                         fprintf(stderr, "client_capture: forward stuck (EAGAIN x%d) fd=%d\n",
-                                err_count, g_repl_capture_slave_fd);
+                                err_count, g_kprobe_fwd_fd);
                     }
                     return -1;
                 }
@@ -1245,7 +1354,7 @@ static int forward_to_slave(const unsigned char *data, size_t len) {
             if (now - last_err_ms > 5000) {
                 last_err_ms = now;
                 fprintf(stderr, "client_capture: forward send error fd=%d errno=%d\n",
-                        g_repl_capture_slave_fd, errno);
+                        g_kprobe_fwd_fd, errno);
             }
             return -1;
         }
@@ -1539,9 +1648,8 @@ int repl_client_capture_init(void) {
 
     /* 激活 eBPF+tcp 新增量路径 — repl_broadcast 将跳过实时发送 */
     extern volatile int g_repl_client_capture_active;
-    extern int g_repl_capture_slave_fd;
     g_repl_client_capture_active = 1;
-    g_repl_capture_slave_fd = -1;
+    g_kprobe_fwd_fd = -1;
 
     fprintf(stderr, "client_capture: initialized (pid=%d), capture active\n", getpid());
     return 0;

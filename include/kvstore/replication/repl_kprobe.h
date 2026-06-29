@@ -56,6 +56,11 @@ int repl_kprobe_rdma_set_pid(pid_t pid);
 /* 设置 kprobe fd 过滤 */
 int repl_kprobe_rdma_set_fd(int fd);
 
+/* ---- kprobe 转发独立 TCP 连接 ---- */
+int repl_kprobe_fwd_connect_from_replica(conn_t *c, int slave_port);
+int repl_kprobe_fwd_slave_init(int base_port);
+void repl_kprobe_fwd_health_check(void);
+
 /* ---- Client capture 接口 ---- */
 int repl_client_capture_init(void);
 void repl_client_capture_set_fullsync(int in_progress);

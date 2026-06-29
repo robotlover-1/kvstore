@@ -60,10 +60,24 @@ static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_persist_uring_ready = 0;
 static struct io_uring g_persist_uring;
 
+static int g_persist_uring_sqpoll_ready = 0;
+static struct io_uring g_persist_uring_sqpoll;
+
 static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
     if (io_uring_queue_init(64, &g_persist_uring, 0) != 0) return -1;
     g_persist_uring_ready = 1;
+    return 0;
+}
+
+static int persist_uring_sqpoll_init_once(void) {
+    if (g_persist_uring_sqpoll_ready) return 0;
+    struct io_uring_params p = {0};
+    p.flags = IORING_SETUP_SQPOLL;
+    p.sq_thread_idle = 2000;  /* kernel thread sleeps after 2s idle (kernel 5.11+) */
+    if (io_uring_queue_init_params(64, &g_persist_uring_sqpoll, &p) != 0)
+        return -1;
+    g_persist_uring_sqpoll_ready = 1;
     return 0;
 }
 

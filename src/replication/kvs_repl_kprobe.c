@@ -38,6 +38,13 @@
 #define KVS_RDMA_WRITE_SLOT_SIZE       512 /* 每 slot 容量（与 BPF 匹配） */
 #define KVS_KPROBE_RDMA_POLL_US        100 /* Slave 轮询间隔(us) */
 
+/* ---- kprobe 转发健康检查 ---- */
+#define KVS_KPROBE_FWD_HEALTH_TIMEOUT 5  /* 5秒无数据判定异常 */
+
+volatile time_t g_fwd_last_active = 0;  /* 最后成功转发时间戳 */
+volatile int g_fwd_healthy = 0;          /* 1=健康 0=异常 */
+volatile int g_repl_broadcast_suppressed = 0;  /* 1=抑制 repl_broadcast 走 kprobe 路径 */
+
 /* ---- BPF Map FDs ---- */
 static struct bpf_object *g_kprobe_obj = NULL;
 static int g_kprobe_ctl_fd = -1;
@@ -106,6 +113,9 @@ static int kprobe_load_bpf(void);
 static void kprobe_unload_bpf(void);
 static void *kprobe_rdma_forward_thread(void *arg);
 static void *kprobe_rdma_slave_poll(void *arg);
+
+/* 供 reactor 定时器调用 */
+void repl_kprobe_fwd_health_check(void);
 
 /* ============================================================
  * BPF 加载与管理
@@ -747,13 +757,9 @@ int repl_kprobe_rdma_master_init(void) {
         return -1;
     }
 
-    /* 设置 PID 过滤 (key 0 = enabled, key 1 = pid) */
+    /* 设置 CTL_PID (key=1): PID=0 表示禁用，PID!=0 自动启用 */
     pid_t pid = getpid();
-    __u32 key = 0;
-    __u64 en = 1;
-    if (g_kprobe_ctl_fd >= 0)
-        bpf_map_update_elem(g_kprobe_ctl_fd, &key, &en, BPF_ANY);
-    key = 1;
+    __u32 key = 1;
     __u64 pid_val = (__u64)pid;
     if (g_kprobe_ctl_fd >= 0)
         bpf_map_update_elem(g_kprobe_ctl_fd, &key, &pid_val, BPF_ANY);
@@ -961,8 +967,8 @@ int repl_kprobe_rdma_set_fd(int fd) {
 void repl_kprobe_rdma_cleanup(void) {
     g_kprobe_running = 0;
 
-    /* 停止 kprobe (key 0 = KVS_KPROBE_CTL_ENABLED) */
-    __u32 ctl_key = 0;
+    /* 停止 kprobe (CTL_PID=0 即禁用) */
+    __u32 ctl_key = 1;
     __u64 ctl_val = 0;
     if (g_kprobe_ctl_fd >= 0)
         bpf_map_update_elem(g_kprobe_ctl_fd, &ctl_key, &ctl_val, BPF_ANY);
@@ -1109,6 +1115,22 @@ void repl_kprobe_fullsync_done(void) {
 /* 用户态通知 REPLDONE（eBPF+tcp 路径不走 kprobe，由 queue_snapshot 调用） */
 void repl_client_capture_note_repldone(void) {
     g_cc_repldone_detect++;
+}
+
+/* kprobe 转发健康检查 — 由 reactor 定时器周期性调用
+ * 如果超过 KVS_KPROBE_FWD_HEALTH_TIMEOUT 秒没有成功转发数据，
+ * 则判定异常并回退到 repl_broadcast 路径 */
+void repl_kprobe_fwd_health_check(void) {
+    if (!g_fwd_healthy) return;
+    if (time(NULL) - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
+        g_fwd_healthy = 0;
+        /* 切回 repl_broadcast */
+        extern volatile int g_repl_broadcast_suppressed;
+        g_repl_broadcast_suppressed = 0;
+        fprintf(stderr, "kprobe fwd: health check FAILED, "
+                "fallback to repl_broadcast (last_active=%lds ago)\n",
+                (long)(time(NULL) - g_fwd_last_active));
+    }
 }
 
 /* ============================================================
@@ -1360,7 +1382,7 @@ static void *client_poll_thread(void *arg) {
     fprintf(stderr, "client_capture: poll thread started\n");
 
     while (g_client_running && g_client_ringbuf) {
-        int err = ring_buffer__poll(g_client_ringbuf, 50);  /* 50ms 超时 */
+        int err = ring_buffer__poll(g_client_ringbuf, 5);  /* 5ms 超时 */
         if (err < 0 && err != -EAGAIN) {
             fprintf(stderr, "client_capture: ringbuf poll err=%d\n", err);
             usleep(10000);
@@ -1471,15 +1493,10 @@ int repl_client_capture_init(void) {
         return -1;
     }
 
-    /* 设置 PID 过滤 = 当前进程 */
-    __u32 pid_key = 1;  /* PID */
+    /* 设置 CTL_PID: PID!=0 自动启用（PID 编码合并 ENABLED 键） */
+    __u32 pid_key = 1;  /* CTL_PID */
     __u64 pid_val = (__u64)getpid();
     bpf_map_update_elem(g_client_ctl_fd, &pid_key, &pid_val, 0);
-
-    /* 启用 BPF 程序 */
-    __u32 enable_key = 0;  /* ENABLED */
-    __u64 enable_val = 1;
-    bpf_map_update_elem(g_client_ctl_fd, &enable_key, &enable_val, 0);
 
     /* 创建 ringbuf */
     g_client_ringbuf = ring_buffer__new(g_client_ringbuf_fd,

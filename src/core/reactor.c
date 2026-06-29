@@ -241,6 +241,10 @@ int reactor_start(void) {
             int budget = expire_cycle_budget();
             kvs_active_expire_cycle(budget);
             persist_autosnap_cron();
+#if KVS_ENABLE_KPROBE_RDMA
+            extern void repl_kprobe_fwd_health_check(void);
+            repl_kprobe_fwd_health_check();
+#endif
             g_last_expire = now;
         }
 

@@ -611,6 +611,10 @@ void persist_close(void) {
     }
     g_aof_fd = -1;
     persist_uring_close();
+    if (g_persist_uring_sqpoll_ready) {
+        io_uring_queue_exit(&g_persist_uring_sqpoll);
+        g_persist_uring_sqpoll_ready = 0;
+    }
 }
 
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy) {

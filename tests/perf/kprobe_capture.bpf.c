@@ -223,9 +223,7 @@ SEC("fentry/tcp_recvmsg")
 int fentry_recv(u64 *ctx)
 {
     /* ctx[0]=sk, ctx[1]=msg, ctx[2]=len (fentry: ctx = 函数参数) */
-    __u64 enabled = ctl_get(CTL_ENABLED);
-    if (!enabled) return 0;
-
+    /* CTL_PID=0 表示禁用（PID+enabled 合并） */
     __u64 target_pid = ctl_get(CTL_PID);
     if (!target_pid) return 0;
 
@@ -256,12 +254,11 @@ int fentry_recv(u64 *ctx)
 SEC("fexit/tcp_recvmsg")
 int fexit_recv(u64 *ctx)
 {
-    __u64 enabled = ctl_get(CTL_ENABLED);
-    if (!enabled) return 0;
-
-    /* PID 过滤: 只处理目标进程的调用 */
+    /* CTL_PID=0 表示禁用（PID+enabled 合并） */
     __u64 target_pid = ctl_get(CTL_PID);
     if (!target_pid) return 0;
+
+    /* PID 过滤: 只处理目标进程的调用 */
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != (__u32)target_pid) return 0;
 
@@ -313,9 +310,7 @@ int fexit_recv(u64 *ctx)
 SEC("kprobe/tcp_recvmsg")
 int kp_recv_entry(struct pt_regs *ctx)
 {
-    __u64 enabled = ctl_get(CTL_ENABLED);
-    if (!enabled) return 0;
-
+    /* CTL_PID=0 表示禁用（PID+enabled 合并，与生产代码一致） */
     __u64 target_pid = ctl_get(CTL_PID);
     if (!target_pid) return 0;
 
@@ -342,8 +337,9 @@ int kp_recv_entry(struct pt_regs *ctx)
 SEC("kretprobe/tcp_recvmsg")
 int kp_recv_return(struct pt_regs *ctx)
 {
-    __u64 enabled = ctl_get(CTL_ENABLED);
-    if (!enabled) return 0;
+    /* CTL_PID=0 表示禁用（与 entry 一致，无需独立 ENABLED 键） */
+    __u64 target_pid = ctl_get(CTL_PID);
+    if (!target_pid) return 0;
 
     long retval = (long)ctx->ax;
     if (retval <= 0) return 0;

@@ -64,7 +64,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20);
+    __uint(max_entries, 1 << 22); /* 4MB */
 } repl_ringbuf SEC(".maps");
 
 /* 临时缓冲区（per-CPU，避免 BPF 栈 512B 限制） */
@@ -76,7 +76,7 @@ struct {
 } kprobe_tmpbuf SEC(".maps");
 
 /* ---- Control Keys ---- */
-#define KVS_KPROBE_CTL_ENABLED         0
+/* 合并优化: PID=0 表示禁用，无需独立 ENABLED 键 */
 #define KVS_KPROBE_CTL_PID             1
 #define KVS_KPROBE_CTL_FULLSYNC_DONE   2  /* 写1表示全量同步完成（BPF检测到REPLDONE）*/
 
@@ -95,38 +95,33 @@ struct {
  *   msghdr: msg_name(8)+msg_namelen(4)+pad(4)+msg_iter(16)
  *   iov_iter: iter_type(1)+nofault(1)+data_source(1)+pad(5)=8B
  *             iov_offset(8)+count(8)+iov(8)+nr_segs(8)=40B
- *   iov 在 msg+16+24=msg+40, nr_segs 在 msg+16+32=msg+48 */
+ *   iov 在 msg+16+24=msg+40, nr_segs 在 msg+16+32=msg+48
+ *   iov 和 nr_segs 相邻 16 字节，合并为一次 bpf_probe_read_kernel */
 static __always_inline int read_msg_data(unsigned long msg_ptr,
     unsigned char *buf, int max_len)
 {
-    /* 1. 读取 iov 指针 */
-    const struct { unsigned long b; unsigned long l; } *iov = 0;
-    if (bpf_probe_read_kernel(&iov, sizeof(iov),
+    /* 1. 合并读取 iov 指针 + nr_segs（msg+40 处连续 16 字节） */
+    struct { unsigned long iov_ptr; unsigned long _nr_segs; } head;
+    if (bpf_probe_read_kernel(&head, sizeof(head),
             (const void *)(msg_ptr + 40)) != 0)
         return 0;
-    if (!iov) return 0;
+    if (!head.iov_ptr || head._nr_segs == 0) return 0;
 
-    /* 2. 读取 nr_segs */
-    unsigned long nr_segs = 0;
-    if (bpf_probe_read_kernel(&nr_segs, sizeof(nr_segs),
-            (const void *)(msg_ptr + 48)) != 0)
-        return 0;
-    if (nr_segs == 0) return 0;
-
-    /* 3. 读取第一个 iovec */
+    /* 2. 读取第一个 iovec */
     struct { unsigned long b; unsigned long l; } vec;
-    if (bpf_probe_read_kernel(&vec, sizeof(vec), &iov[0]) != 0)
+    if (bpf_probe_read_kernel(&vec, sizeof(vec),
+            (const void *)head.iov_ptr) != 0)
         return 0;
     if (!vec.b || vec.l == 0)
         return 0;
 
-    /* 4. 限制大小不超过 max_len */
+    /* 3. 限制大小不超过 max_len */
     unsigned long long safe_len = vec.l;
     if (safe_len > (unsigned long long)max_len)
         safe_len = (unsigned long long)max_len;
     if (safe_len == 0) return 0;
 
-    /* 5. 从用户空间读取实际数据 */
+    /* 4. 从用户空间读取实际数据 */
     if (bpf_probe_read_user(buf, (__u32)safe_len,
             (const void *)(unsigned long)vec.b) != 0) {
         __u64 *st = bpf_map_lookup_elem(&kprobe_stats,
@@ -140,26 +135,23 @@ static __always_inline int read_msg_data(unsigned long msg_ptr,
 SEC("kprobe/tcp_sendmsg")
 int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
 {
-    __u64 *enabled, *target_pid, *stat;
+    /* CTL_PID=0 表示禁用（PID+enabled 合并） */
+    __u64 *ctl_pid, *stat;
 
-    /* 1. 检查开关 */
-    enabled = bpf_map_lookup_elem(&kprobe_ctl, &(__u32){KVS_KPROBE_CTL_ENABLED});
-    if (!enabled || !*enabled)
+    /* 1. 检查开关 + PID 过滤（合并为一次 lookup） */
+    ctl_pid = bpf_map_lookup_elem(&kprobe_ctl, &(__u32){KVS_KPROBE_CTL_PID});
+    if (!ctl_pid || !*ctl_pid)
         return 0;
 
-    /* 2. PID 过滤 */
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    target_pid = bpf_map_lookup_elem(&kprobe_ctl, &(__u32){KVS_KPROBE_CTL_PID});
-    if (!target_pid)
-        return 0;
-    if (pid != (__u32)(*target_pid)) {
+    if (pid != (__u32)(*ctl_pid)) {
         stat = bpf_map_lookup_elem(&kprobe_stats,
             &(__u32){KVS_KPROBE_STAT_SKIP_PID});
         if (stat) __sync_fetch_and_add(stat, 1);
         return 0;
     }
 
-    /* 3. 获取数据长度：dx = tcp_sendmsg 的 size 参数 (x86_64) */
+    /* 2. 获取数据长度：dx = tcp_sendmsg 的 size 参数 (x86_64) */
     __u32 size = (__u32)ctx->dx;
     if (size == 0) return 0;
     if (size > KVS_KPROBE_ENTRY_MAX_LEN) {
@@ -169,7 +161,7 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         size = KVS_KPROBE_ENTRY_MAX_LEN;
     }
 
-    /* 4. 从 msg 参数中读取数据 */
+    /* 3. 从 msg 参数中读取数据 */
     __u32 map_key = 0;
     unsigned char(*entry)[KVS_KPROBE_ENTRY_HDR_SZ + KVS_KPROBE_ENTRY_MAX_LEN];
     entry = bpf_map_lookup_elem(&kprobe_tmpbuf, &map_key);
@@ -195,7 +187,7 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 5. 更新 payload_len 并写入 ringbuf */
+    /* 4. 更新 payload_len 并写入 ringbuf */
     payload_len = (__u32)data_len;
     __builtin_memcpy(*entry, &payload_len, 4);
 
@@ -207,7 +199,7 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 6. 检测 REPLDONE 命令 — 匹配 payload 开头 "REPLDONE\r\n" (10字节)
+    /* 5. 检测 REPLDONE 命令 — 匹配 payload 开头 "REPLDONE\r\n" (10字节)
      * REPLDONE 以 RESP 格式 *1\r\n$8\r\nREPLDONE\r\n (15字节) 发送，
      * 在 TCP 路径中整个命令在一个 tcp_sendmsg 调用中发送，
      * 因此检测 payload 开头偏移 0 即可（避免变长偏移导致 verifier 拒绝）。 */
@@ -242,7 +234,7 @@ int kprobe_kvs_repl_tcp_sendmsg(struct pt_regs *ctx)
         }
     }
 
-    /* 7. 更新统计 */
+    /* 6. 更新统计 */
     stat = bpf_map_lookup_elem(&kprobe_stats, &(__u32){KVS_KPROBE_STAT_HIT});
     if (stat) __sync_fetch_and_add(stat, 1);
 

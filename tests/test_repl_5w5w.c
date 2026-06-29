@@ -847,6 +847,38 @@ static int run_test(void) {
             break;
         }
 
+        /* RDMA 全量同步: offset 始终为 0，用快照字节数判断 */
+        unsigned long long snap_bytes = 0;
+        {
+            char *snap = info_field(info_s, "repl_snapshot_bytes");
+            snap_bytes = parse_ull(snap);
+            free(snap);
+        }
+        if (master_off == 0 && slave_off == 0 && !slave_loading && snap_bytes > 0 && i > 5) {
+            int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
+            if (vfd >= 0 && g_opt.post_count > 0) {
+                char key[64], expected[64];
+                int last = g_opt.post_count - 1;
+                snprintf(key, sizeof(key), "post:k:%06d", last);
+                snprintf(expected, sizeof(expected), "v%d", last);
+                char *r = cmd(vfd, "HGET", key, NULL);
+                if (r) {
+                    char check[256];
+                    snprintf(check, sizeof(check), "$%zu\r\n%s\r\n", strlen(expected), expected);
+                    if (strcmp(r, check) == 0) {
+                        free(r); close(vfd);
+                        caught_up = 1;
+                        progress_clear();
+                        printf("  %s✓ 增量同步完成! slave 数据已就绪 (RDMA fullsync, 已验证 key=%s)%s\n\n",
+                               ANSI_GREEN, key, ANSI_RESET);
+                        break;
+                    }
+                    free(r);
+                }
+                close(vfd);
+            }
+        }
+
         /* 后备检测：slave 卡住不动时，直接读增量 key 验证数据是否已同步 */
         if (i > 30 && !caught_up && g_opt.post_count > 0) { /* 等了至少 15 秒后 */
             int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);

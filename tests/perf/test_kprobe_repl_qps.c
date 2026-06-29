@@ -286,12 +286,11 @@ static void *load_kprobe_bpf(void) {
         return NULL;
     }
 
-    /* 设置 PID 过滤 */
+    /* 设置 CTL_PID（PID!=0 自动启用，合并 ENABLED 键） */
     struct bpf_map *ctl = bpf_object__find_map_by_name(obj, "ctl");
     if (ctl) {
-        __u32 k0 = 0, k1 = 1;
-        __u64 v1 = 1, vpid = (__u64)getpid();
-        bpf_map_update_elem(bpf_map__fd(ctl), &k0, &v1, BPF_ANY);
+        __u32 k1 = 1;
+        __u64 vpid = (__u64)getpid();
         bpf_map_update_elem(bpf_map__fd(ctl), &k1, &vpid, BPF_ANY);
     }
 
@@ -421,12 +420,11 @@ static void *load_fentry_bpf(void) {
         return NULL;
     }
 
-    /* 设置 PID 过滤 */
+    /* 设置 CTL_PID（PID!=0 自动启用，合并 ENABLED 键） */
     struct bpf_map *ctl = bpf_object__find_map_by_name(obj, "ctl");
     if (ctl) {
-        __u32 k0 = 0, k1 = 1;
-        __u64 v1 = 1, vpid = (__u64)getpid();
-        bpf_map_update_elem(bpf_map__fd(ctl), &k0, &v1, BPF_ANY);
+        __u32 k1 = 1;
+        __u64 vpid = (__u64)getpid();
         bpf_map_update_elem(bpf_map__fd(ctl), &k1, &vpid, BPF_ANY);
     }
 

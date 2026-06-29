@@ -49,8 +49,7 @@ struct pt_regs {
 /* ---- BPF Maps ---- */
 
 /* Control Map:
- * [0]: ENABLED              — 0=禁用 1=启用
- * [1]: PID                  — Master 进程 PID
+ * [1]: CTL_PID              — 0=禁用, !=0=(enabled, PID=low32)
  * [2]: LISTEN_PORT          — Master 监听端口（用于过滤客户端连接）
  * [3]: FULLSYNC_IN_PROGRESS — 1=全量同步进行中 0=正常
  */
@@ -81,7 +80,7 @@ struct {
 /* Ringbuf — 缓存客户端写入数据 */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20);  /* 1MB */
+    __uint(max_entries, 1 << 22);  /* 4MB */
 } client_cache_ringbuf SEC(".maps");
 
 /* 临时缓冲区（per-CPU，避免 BPF 栈 512B 限制） */
@@ -104,29 +103,24 @@ struct {
 /* 从 msghdr 的 iovec 中读取已接收的数据
  * 在 kretprobe 中调用（此时数据已写入 iovec）
  *
- * msghdr 布局 (x86_64 kernel):
- *   msg_name(8)+msg_namelen(4)+pad(4)+msg_iter(16) = 32? 不对
- *   看实际偏移需要从调试信息确认
- *
- * 简单方法: iov 指针在 msg_ptr + 40, nr_segs 在 msg_ptr + 48
- */
+ * iov_iter 在 msghdr 内偏移 16 字节 (msg_name 8 + msg_namelen 4 + pad 4)
+ * iov 指针在 iov_iter 内偏移 24 字节 (iter_type 1 + nofault 1 + data_source 1 + pad 5 + iov_offset 8 + count 8)
+ * nr_segs 紧接在 iov 之后，偏移 32 字节
+ * iov 和 nr_segs 在 msg+40 处相邻 16 字节，合并为一次 bpf_probe_read_kernel */
 static __always_inline int read_recv_data(unsigned long msg_ptr,
     unsigned char *buf, int max_len)
 {
-    const struct { unsigned long b; unsigned long l; } *iov = 0;
-    if (bpf_probe_read_kernel(&iov, sizeof(iov),
+    /* 1. 合并读取 iov 指针 + nr_segs（16 字节从 msg_ptr + 40） */
+    struct { unsigned long iov_ptr; unsigned long _nr_segs; } head;
+    if (bpf_probe_read_kernel(&head, sizeof(head),
             (const void *)(msg_ptr + 40)) != 0)
         return 0;
-    if (!iov) return 0;
+    if (!head.iov_ptr || head._nr_segs == 0) return 0;
 
-    unsigned long nr_segs = 0;
-    if (bpf_probe_read_kernel(&nr_segs, sizeof(nr_segs),
-            (const void *)(msg_ptr + 48)) != 0)
-        return 0;
-    if (nr_segs == 0) return 0;
-
+    /* 2. 读取第一个 iovec */
     struct { unsigned long b; unsigned long l; } vec;
-    if (bpf_probe_read_kernel(&vec, sizeof(vec), &iov[0]) != 0)
+    if (bpf_probe_read_kernel(&vec, sizeof(vec),
+            (const void *)head.iov_ptr) != 0)
         return 0;
     if (!vec.b || vec.l == 0)
         return 0;
@@ -136,7 +130,7 @@ static __always_inline int read_recv_data(unsigned long msg_ptr,
         safe_len = (unsigned long long)max_len;
     if (safe_len == 0) return 0;
 
-    /* 从用户空间读取数据（kretprobe 时数据已写入 iovec） */
+    /* 3. 从用户空间读取数据（kretprobe 时数据已写入 iovec） */
     if (bpf_probe_read_user(buf, (__u32)safe_len,
             (const void *)(unsigned long)vec.b) != 0) {
         __u64 *st = bpf_map_lookup_elem(&client_stats,
@@ -151,25 +145,20 @@ static __always_inline int read_recv_data(unsigned long msg_ptr,
 SEC("kprobe/tcp_recvmsg")
 int kprobe_client_recv_entry(struct pt_regs *ctx)
 {
-    __u64 *enabled, *target_pid;
-
-    /* 1. 检查开关 */
-    enabled = bpf_map_lookup_elem(&client_ctl, &(__u32){0});
-    if (!enabled || !*enabled)
+    /* CTL_PID=0 表示禁用，无需额外 ENABLED 键 */
+    __u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
+    if (!ctl_pid || !*ctl_pid)
         return 0;
 
-    /* 2. PID 过滤 — 只捕获 Master 进程的数据接收 */
+    /* PID 过滤 — 只捕获 Master 进程的数据接收 */
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    target_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
-    if (!target_pid)
-        return 0;
-    if (pid != (__u32)(*target_pid)) {
+    if (pid != (__u32)(*ctl_pid)) {
         __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){1}); /* SKIP_PID */
         if (st) __sync_fetch_and_add(st, 1);
         return 0;
     }
 
-    /* 3. 保存 msg 指针 (si = PT_REGS_PARM2) 到 per-CPU map */
+    /* 保存 msg 指针 (si = PT_REGS_PARM2) 到 per-CPU map */
     unsigned long msg_ptr = (unsigned long)ctx->si;
     __u32 map_key = 0;
     bpf_map_update_elem(&client_entry_msg, &map_key, &msg_ptr, 0);
@@ -181,19 +170,17 @@ int kprobe_client_recv_entry(struct pt_regs *ctx)
 SEC("kretprobe/tcp_recvmsg")
 int kprobe_client_recv_return(struct pt_regs *ctx)
 {
-    __u64 *enabled, *stat;
-
-    /* 1. 检查开关 */
-    enabled = bpf_map_lookup_elem(&client_ctl, &(__u32){0});
-    if (!enabled || !*enabled)
+    /* CTL_PID=0 表示禁用 */
+    __u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
+    if (!ctl_pid || !*ctl_pid)
         return 0;
 
-    /* 2. 获取返回值 = 实际接收字节数 */
+    /* 获取返回值 = 实际接收字节数 */
     long retval = (long)ctx->ax;
     if (retval <= 0)
         return 0;
 
-    /* 3. 获取 entry 保存的 msg 指针 */
+    /* 获取 entry 保存的 msg 指针 */
     __u32 map_key = 0;
     unsigned long *msg_ptr = bpf_map_lookup_elem(&client_entry_msg, &map_key);
     if (!msg_ptr || *msg_ptr == 0) {
@@ -202,45 +189,44 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
         return 0;
     }
 
-    /* 4. 限制数据大小 */
+    /* 限制数据大小 */
     __u32 size = (__u32)retval;
     if (size > CLIENT_ENTRY_MAX_LEN) {
-        stat = bpf_map_lookup_elem(&client_stats, &(__u32){3}); /* DATA_OVR */
-        if (stat) __sync_fetch_and_add(stat, 1);
+        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){3}); /* DATA_OVR */
+        if (st) __sync_fetch_and_add(st, 1);
         size = CLIENT_ENTRY_MAX_LEN;
     }
 
-    /* 5. 读取数据 */
+    /* 读取数据到 tmpbuf */
     unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
     entry = bpf_map_lookup_elem(&client_tmpbuf, &map_key);
     if (!entry) return 0;
 
-    /* 先写 0 长度头 */
     __u32 payload_len = 0;
     __builtin_memcpy(*entry, &payload_len, 4);
 
     int data_len = read_recv_data(*msg_ptr, (*entry) + 4, CLIENT_ENTRY_MAX_LEN);
     if (data_len <= 0) return 0;
 
-    /* 6. 更新 payload_len 并写入 ringbuf */
     payload_len = (__u32)data_len;
     __builtin_memcpy(*entry, &payload_len, 4);
 
+    /* 写入 ringbuf */
     int entry_size = CLIENT_ENTRY_HDR_SZ + data_len;
     if (bpf_ringbuf_output(&client_cache_ringbuf, *entry, entry_size, 0) != 0) {
-        stat = bpf_map_lookup_elem(&client_stats, &(__u32){2}); /* RB_ERR */
-        if (stat) __sync_fetch_and_add(stat, 1);
+        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){2}); /* RB_ERR */
+        if (st) __sync_fetch_and_add(st, 1);
         return 0;
     }
 
-    /* 7. 更新统计 */
-    stat = bpf_map_lookup_elem(&client_stats, &(__u32){0}); /* HIT */
-    if (stat) __sync_fetch_and_add(stat, 1);
+    /* 更新统计 */
+    __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){0}); /* HIT */
+    if (st) __sync_fetch_and_add(st, 1);
 
     __u64 *in_progress = bpf_map_lookup_elem(&client_ctl, &(__u32){3});
     if (in_progress && *in_progress) {
-        stat = bpf_map_lookup_elem(&client_stats, &(__u32){5}); /* CACHED */
-        if (stat) __sync_fetch_and_add(stat, 1);
+        st = bpf_map_lookup_elem(&client_stats, &(__u32){5}); /* CACHED */
+        if (st) __sync_fetch_and_add(st, 1);
     }
 
     return 0;
@@ -262,20 +248,17 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
 SEC("kprobe/tcp_sendmsg")
 int kprobe_client_sendmsg(struct pt_regs *ctx)
 {
-	__u64 *enabled, *target_pid;
-
-	/* 1. 检查开关 */
-	enabled = bpf_map_lookup_elem(&client_ctl, &(__u32){0});
-	if (!enabled || !*enabled)
+	/* CTL_PID=0 表示禁用 */
+	__u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
+	if (!ctl_pid || !*ctl_pid)
 		return 0;
 
-	/* 2. PID 过滤 — 只关注 Master 进程发出的数据 */
+	/* PID 过滤 — 只关注 Master 进程发出的数据 */
 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
-	target_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
-	if (!target_pid || pid != (__u32)(*target_pid))
+	if (pid != (__u32)(*ctl_pid))
 		return 0;
 
-	/* 3. 只在全量同步进行中才探测 REPLDONE */
+	/* 只在全量同步进行中才探测 REPLDONE */
 	__u64 *in_progress = bpf_map_lookup_elem(&client_ctl, &(__u32){3});
 	if (!in_progress || !*in_progress)
 		return 0;

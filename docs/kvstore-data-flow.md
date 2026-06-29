@@ -415,12 +415,41 @@ EVERYSEC 模式:
 
 **strace 分析 Redis 5.0.7 的真相：**
 
-| 测试场景 | fdatasync 次数 | 命令数 | 比例 |
-|----------|---------------|--------|------|
-| `-c 1` 单连接，10 条 HSET 逐个发送 | **1** | 10 | 10:1 |
-| `-c 50` 50 并发，100 条 HSET | **2** | 100 | 50:1 |
+测试方法：`strace -f -p <redis_pid> -e trace=fdatasync,write,openat,close -c` 统计 syscall 次数。
 
-Redis 源码中 `flushAppendOnlyFile()` 确实每条命令后都会调用，但因为 Redis 单线程事件循环的特性：一次 `epoll_wait` 返回多个就绪连接 → 全部读完、执行完 → `server.aof_buf` 已累积多条命令的 RESP 数据 → 一次 `write()+fdatasync()` 全部落盘。**实际效果是事件循环级别的 group commit，并非严格 per-command fsync。** 50 并发时 ~50 条命令共享 1 次 fdatasync（96µs），等效每命令 fsync 成本 ~2µs。
+```bash
+# 1. 启动 Redis always
+redis-server --port 6391 --dir /tmp --save "" \
+  --appendonly yes --appendfsync always --daemonize yes \
+  --pidfile /tmp/r.pid --logfile /tmp/r.log --appendfilename aof_test.aof
+
+# 2. strace attach 到 Redis 进程，统计 fdatasync/write/openat/close
+sudo strace -f -p $(cat /tmp/r.pid) \
+  -e trace=fdatasync,write,openat,close -c -o /tmp/r.txt &
+STRACE_PID=$!
+
+# 3. 跑 benchmark
+redis-benchmark -p 6391 -n 100 -c 50 -P 1 -d 64 -r 10000 \
+  HSET key:__rand_int__ __rand_int__ value
+
+# 4. 停 strace，统计
+sudo kill $STRACE_PID
+grep -c fdatasync /tmp/r.txt
+grep -c write     /tmp/r.txt
+grep -c openat    /tmp/r.txt
+grep -c close     /tmp/r.txt
+```
+
+测试结果：
+
+| 测试场景 | fdatasync | write | openat | close | 命令数 | fsync:命令 |
+|----------|-----------|-------|--------|-------|--------|------------|
+| `-c 1` 逐个发送 10 条 HSET | **1** | 12 | 12 | 61 | 10 | 1:10 |
+| `-c 50` 50 并发 100 条 HSET | **2** | 102 | 10 | 60 | 100 | 1:50 |
+
+同时测量了本机 fdatasync 延迟（38 字节 write + fdatasync，1000 次平均 = **96µs**），用于计算 fsync 理论瓶颈。
+
+Redis 源码中 `flushAppendOnlyFile()` 确实每条命令后都会调用，但因为 Redis 单线程事件循环的特性：一次 `epoll_wait` 返回多个就绪连接 → 全部读完、执行完 → `server.aof_buf` 已累积多条命令的 RESP 数据 → 一次 `write()+fdatasync()` 全部落盘。**实际效果是事件循环级别的 group commit，并非严格 per-command fsync。** 50 并发时 ~50 条命令共享 1 次 fdatasync（96µs），等效每命令 fsync 成本 ~2µs。单连接下由于 localhost 延迟极低，多条命令也能在同一事件循环内到达，10 条命令仅触发 1 次 fsync。
 
 **为什么没采用 per-command：**
 

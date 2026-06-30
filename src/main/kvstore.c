@@ -617,13 +617,7 @@ static int queue_snapshot(conn_t *c) {
     {
         size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
         repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
-        if (repl_send_chunked(c, buf, done) != 0) {
-            repl_rdma_log("queue_snapshot - REPLDONE send failed");
-            goto out;
-        }
-        /* 通知 client_capture: REPLDONE 已发送（用户态路径，eBPF+tcp 不经过 kprobe） */
-        repl_client_capture_note_repldone();
-
+        /* 通过全量传输层（RDMA 或 TCP）发送 REPLDONE */
         if (repl_send_chunked(c, buf, done) != 0) {
             repl_rdma_log("queue_snapshot - REPLDONE send failed");
             goto out;
@@ -638,17 +632,18 @@ static int queue_snapshot(conn_t *c) {
     if (rdma_ok) {
         repl_rdma_stop_fullsync();
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
+        /* 全量同步使用 RDMA 时，也通过 TCP 发送 REPLDONE。
+         * TCP 顺序保证后续同一 c->fd 上的 kprobe fwd 增量数据
+         * 一定在 REPLDONE 之后到达 slave，彻底消除 RDMA/TCP 竞态。 */
+        send(c->fd, buf, done, MSG_NOSIGNAL);
     }
 
-    /* Flush eBPF 缓存。fwd_healthy 暂不激活——由健康检查在确认
-     * 写空闲后激活，确保 slave 侧 RDMA fullsync 彻底完成、
-     * g_slave_loading_fullsync=0 之后再开始转发增量数据。 */
+    /* Flush eBPF 缓存。TCP REPLDONE 已确保顺序，立即激活 kprobe fwd。 */
     int cache_flushed = repl_client_capture_flush_to_slave(c);
     if (cache_flushed >= 0) {
-        c->fwd_healthy = 0;
-        c->fwd_last_active = time(NULL);  /* 记录全量完成时间，健康检查用 */
-        fprintf(stderr, "kprobe fwd: pending for slave fd=%d "
-                "(waiting idle window)\n", c->fd);
+        c->fwd_healthy = 1;
+        c->fwd_last_active = time(NULL);
+        fprintf(stderr, "kprobe fwd: healthy for slave fd=%d (post-flush)\n", c->fd);
     } else {
         c->fwd_healthy = 0;
         fprintf(stderr, "kprobe fwd: cache flush failed, slave fd=%d uses repl_broadcast\n", c->fd);

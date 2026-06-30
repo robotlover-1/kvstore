@@ -1942,19 +1942,33 @@ void repl_slave_finish_fullsync(void) {
         }
     }
 #endif
-    /* 全量同步完成后，将当前内存数据保存到 dump 文件
-     * 格式与 kvs_dump_to_fd() 一致（二进制长度前缀格式）
-     * 后续增量数据通过 AOF 持续写入 */
-    int dump_fd = open(g_cfg.dump_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dump_fd >= 0) {
-        if (kvs_dump_to_fd(dump_fd, 0) == 0) {
-            fprintf(stderr, "repl: slave fullsync dump saved to %s\n", g_cfg.dump_path);
+    /* 全量同步完成后，从临时 KVSD 文件加载数据到内存并持久化
+     * 临时文件在 parse_resp_stream 拦截中已写入完整 KVSD 数据 */
+    if (g_slave_fullsync_tmp_fd >= 0) {
+        char tmp_path[512];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
+                 g_cfg.dump_path, (long)getpid());
+
+        /* fsync the temp file before loading */
+        fsync(g_slave_fullsync_tmp_fd);
+        close(g_slave_fullsync_tmp_fd);
+        g_slave_fullsync_tmp_fd = -1;
+
+        /* Load KVSD data into memory + TTL */
+        unsigned long long aof_off = replay_dump_file(tmp_path);
+        fprintf(stderr, "repl: slave fullsync loaded from %s, aof_offset=%llu\n",
+                tmp_path, aof_off);
+
+        /* Move temp file to official dump path as the persistence base */
+        if (rename(tmp_path, g_cfg.dump_path) != 0) {
+            fprintf(stderr, "repl: slave fullsync rename to %s failed: %s\n",
+                    g_cfg.dump_path, strerror(errno));
         } else {
-            fprintf(stderr, "repl: slave fullsync dump write failed\n");
+            fprintf(stderr, "repl: slave fullsync dump saved to %s\n", g_cfg.dump_path);
         }
-        close(dump_fd);
     } else {
-        fprintf(stderr, "repl: slave fullsync dump open failed: %s\n", strerror(errno));
+        fprintf(stderr, "repl: slave fullsync finished but no temp file (fd=%d)\n",
+                g_slave_fullsync_tmp_fd);
     }
     repl_slave_state_save();
     repl_slave_send_ack();

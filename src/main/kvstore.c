@@ -624,31 +624,22 @@ static int queue_snapshot(conn_t *c) {
     g_repl_fullsync_in_progress = 0;
     repl_client_capture_set_fullsync(0);
 
-    /* 启用 kprobe 异步转发探索模式（双路径并行，验证通过后压制 repl_broadcast） */
-    extern volatile int g_repl_broadcast_suppressed;
-    extern volatile time_t g_fwd_last_active;
-    extern volatile int g_fwd_healthy;
-    /* 建立 kprobe 转发独立连接（不与 repl_broadcast 共用 fd） */
-    int kprobe_fwd_fd = repl_kprobe_fwd_connect_from_replica(c, g_cfg.port);
-    if (kprobe_fwd_fd < 0) {
-        g_fwd_healthy = 0;
-        fprintf(stderr, "kprobe fwd: connect failed, skipping probe mode\n");
-    } else {
-        /* 不立即压制 repl_broadcast — 等健康检查确认 kprobe 转发正常后再压制 */
-        g_repl_broadcast_suppressed = 0;
-        g_fwd_last_active = time(NULL);
-        g_fwd_healthy = 1;
-        fprintf(stderr, "kprobe fwd: probe mode (dual-path until proven healthy)\n");
-    }
-
+    /* kprobe fwd 作为增量同步主路径（共享 c->fd），待 flush 成功后标记 healthy */
     if (rdma_ok) {
         repl_rdma_stop_fullsync();
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
     }
 
-    /* NEW: Flush eBPF 缓存的客户端数据（通过 TCP 发送到 slave，RDMA 已关闭）
-     * 返回 > 0 表示有缓存数据被刷新，此时跳过 backlog gap replay 避免重复 */
+    /* Flush eBPF 缓存的客户端数据，成功后标记 kprobe fwd 健康 */
     int cache_flushed = repl_client_capture_flush_to_slave(c);
+    if (cache_flushed >= 0) {
+        c->fwd_healthy = 1;
+        c->fwd_last_active = time(NULL);
+        fprintf(stderr, "kprobe fwd: healthy for slave fd=%d (post-flush)\n", c->fd);
+    } else {
+        c->fwd_healthy = 0;
+        fprintf(stderr, "kprobe fwd: cache flush failed, slave fd=%d uses repl_broadcast\n", c->fd);
+    }
 
     /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset）
      * 仅当 eBPF 缓存未启用/无数据时才回放 backlog，避免数据重复 */

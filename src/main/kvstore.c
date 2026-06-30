@@ -2392,11 +2392,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* kprobe 转发独立 TCP 监听（slave 侧，port+13） */
-    if (g_cfg.kprobe_enabled && g_cfg.role == ROLE_SLAVE) {
-        repl_kprobe_fwd_slave_init(g_cfg.port);
-    }
-
     if (!strcmp(g_cfg.net_backend, "reactor")) {
         return reactor_start();
     } else if (!strcmp(g_cfg.net_backend, "proactor")) {

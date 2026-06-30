@@ -2458,6 +2458,11 @@ static void *slave_thread(void *arg) {
                         }
                         blen += (size_t)r;
                         had_new_data = 1;
+                        if (incr_count == 1) {
+                            fprintf(stderr, "slave incr: first recv %zd bytes, "
+                                    "preview: %.*s\n", r,
+                                    (int)(r < 64 ? r : 64), buf + blen - r);
+                        }
                         parse_resp_stream(NULL, buf, &blen, 1);
                         repl_slave_ack_heartbeat();
                         repl_set_link_state(1);

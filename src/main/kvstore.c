@@ -545,7 +545,7 @@ int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int s
 static int queue_snapshot(conn_t *c) {
     char hdr[128];
     char tmp_path[512];
-    FILE *fp;
+    int fd;
     size_t buf_size = BUFFER_CAP;
     {
         size_t eff = (size_t)repl_rdma_effective_chunk_size();
@@ -577,39 +577,35 @@ static int queue_snapshot(conn_t *c) {
         }
     }
 
-    /* Use a temporary path so we don't overwrite the binary dump file */
+    /* Generate KVSD snapshot to temp file */
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
-    fp = fopen(tmp_path, "wb");
-    if (!fp) goto out;
-    if (kvs_snapshot_to_fp(fp) != 0) { fclose(fp); unlink(tmp_path); goto out; }
-    fclose(fp);
-    fp = fopen(tmp_path, "rb");
-    if (!fp) { unlink(tmp_path); goto out; }
-    while ((r = fread(buf, 1, buf_size, fp)) > 0) total_bytes += r;
-    fclose(fp);
-    fp = NULL;
+    fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) goto out;
+    if (kvs_dump_to_fd(fd, snap_base_offset) != 0) { close(fd); unlink(tmp_path); goto out; }
+    total_bytes = (size_t)lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
 
-    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu\r\n", repl_master_id(), snap_base_offset, total_bytes);
+    int n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu\r\n",
+                     repl_master_id(), snap_base_offset, total_bytes);
 
     repl_note_send_context("fullsync-header", (size_t)n, snap_base_offset, (unsigned char *)hdr);
     if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)n) != 0) {
         repl_rdma_log("queue_snapshot - header send failed");
+        close(fd);
+        unlink(tmp_path);
         goto out;
     }
-    fp = fopen(tmp_path, "rb");
-    if (!fp) { unlink(tmp_path); goto out; }
-    while ((r = fread(buf, 1, buf_size, fp)) > 0) {
+    while ((r = (size_t)read(fd, buf, buf_size)) > 0) {
         total += r;
         repl_note_send_context("fullsync-snapshot", r, repl_master_offset(), buf);
         if (repl_send_chunked(c, buf, r) != 0) {
             repl_rdma_log("queue_snapshot - snapshot chunk send failed total=%zu chunk=%zu", total, r);
-            fclose(fp);
+            close(fd);
             unlink(tmp_path);
             goto out;
         }
     }
-    fclose(fp);
-    fp = NULL;
+    close(fd);
     unlink(tmp_path);
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
@@ -669,7 +665,6 @@ static int queue_snapshot(conn_t *c) {
     ret = 0;
     repl_rdma_log("queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu", total, repl_master_offset());
 out:
-    if (fp) fclose(fp);
     kvs_free(buf);
     return ret;
 }

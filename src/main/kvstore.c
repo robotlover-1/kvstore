@@ -514,7 +514,6 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        repl_note_broadcast(rawlen);
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
         pp = &c->next_replica;
@@ -1791,7 +1790,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (g_cfg.role == ROLE_MASTER) {
                 g_last_write_ts = time(NULL);
                 repl_backlog_feed(raw, rawlen);
-                repl_broadcast(raw, rawlen);   /* 内部判断 per-slave fwd_healthy，仅实际发送时计数 */
+                repl_note_broadcast(rawlen);   /* 无条件计数 — offset 必须对所有写命令递增 */
+                repl_broadcast(raw, rawlen);   /* 内部判断 per-slave fwd_healthy，仅 unhealthy slave 走 TCP 发送 */
             }
         }
     } else if (rc == 1 && should_reply_missing) {

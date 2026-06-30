@@ -1287,15 +1287,29 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         pthread_mutex_unlock(&g_cache_lock);
     }
     /* STATE_INCR: 增量同步 — kprobe fwd 通过 out_ring 转发到健康 slave */
+    static long long fwd_count = 0;
+    static long long fwd_drop = 0;
     if (!is_repl_control(payload, payload_len)) {
         pthread_mutex_lock(&g_repl_lock);
         for (conn_t *c = g_replicas; c; c = c->next_replica) {
             if (c->repl_draining || c->repl_fullsync_pending) continue;
             if (!c->fwd_healthy) continue;
-            queue_bytes(c, payload, payload_len);
-            c->fwd_last_active = time(NULL);
+            if (queue_bytes(c, payload, payload_len) == 0) {
+                c->fwd_last_active = time(NULL);
+            } else {
+                fwd_drop++;
+                if (fwd_drop == 1 || fwd_drop % 1000 == 0) {
+                    fprintf(stderr, "kprobe fwd: queue_bytes failed (drop=%lld out_ring_len=%zu)\n",
+                            fwd_drop, c->out_ring_len);
+                }
+            }
         }
         pthread_mutex_unlock(&g_repl_lock);
+        fwd_count++;
+        if (fwd_count == 1 || fwd_count % 5000 == 0) {
+            fprintf(stderr, "kprobe fwd: forwarded %lld commands, dropped %lld\n",
+                    fwd_count, fwd_drop);
+        }
     }
 
     return 0;

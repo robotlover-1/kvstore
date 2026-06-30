@@ -1808,6 +1808,46 @@ out:
 }
 
 int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_replication) {
+    /* KVSD fullsync interception: during full sync, write raw KVSD bytes
+     * to temp file instead of RESP parsing. This is the single choke point
+     * for ALL receive paths (TCP, RDMA, kprobe). */
+    extern int g_slave_fullsync_tmp_fd;
+    extern int g_slave_loading_fullsync;
+    extern unsigned long long g_slave_fullsync_target_bytes;
+    extern unsigned long long g_slave_fullsync_loaded_bytes;
+
+    if (from_replication && g_slave_loading_fullsync) {
+        size_t remaining = g_slave_fullsync_target_bytes - g_slave_fullsync_loaded_bytes;
+        size_t to_write = (*len < remaining) ? *len : remaining;
+
+        if (g_slave_fullsync_tmp_fd >= 0 && to_write > 0) {
+            ssize_t wr = write(g_slave_fullsync_tmp_fd, buf, to_write);
+            if (wr < 0) {
+                *len = 0;
+                return -1;
+            }
+        }
+        g_slave_fullsync_loaded_bytes += to_write;
+
+        if (to_write < *len) {
+            /* trailing bytes (e.g. REPLDONE) — keep in buf for normal parsing */
+            memmove(buf, buf + to_write, *len - to_write);
+            *len -= to_write;
+            if (g_slave_fullsync_target_bytes > 0 &&
+                g_slave_fullsync_loaded_bytes >= g_slave_fullsync_target_bytes) {
+                repl_slave_finish_fullsync();
+            }
+            return 0;
+        }
+
+        *len = 0;
+        if (g_slave_fullsync_target_bytes > 0 &&
+            g_slave_fullsync_loaded_bytes >= g_slave_fullsync_target_bytes) {
+            repl_slave_finish_fullsync();
+        }
+        return 0;
+    }
+
 #define PARSE_SCRATCH 4096
     char scratch[PARSE_SCRATCH];
     size_t scratch_off = 0;

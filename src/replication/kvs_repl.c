@@ -82,9 +82,10 @@ static char g_slave_master_replid[41] = "?";
 static unsigned long long g_slave_repl_offset = 0;
 static unsigned long long g_slave_repl_applied_offset = 0;
 static unsigned long long g_slave_repl_durable_offset = 0;
-static int g_slave_loading_fullsync = 0;
-static unsigned long long g_slave_fullsync_target_bytes = 0;
-static unsigned long long g_slave_fullsync_loaded_bytes = 0;
+int g_slave_loading_fullsync = 0;
+unsigned long long g_slave_fullsync_target_bytes = 0;
+unsigned long long g_slave_fullsync_loaded_bytes = 0;
+int g_slave_fullsync_tmp_fd = -1;   /* temp file fd for receiving KVSD full sync data */
 static char g_slave_state_path[512] = {0};
 static conn_t g_rdma_master_replica_conn = {0};
 
@@ -1896,6 +1897,20 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
         fprintf(stderr, "repl rdma: slave_sync_state - replid=%s applied_offset=%llu durable_offset=%llu fullsync_loading=%d target_bytes=%llu\n",
             g_slave_master_replid, g_slave_repl_applied_offset, g_slave_repl_durable_offset, g_slave_loading_fullsync, g_slave_fullsync_target_bytes);
 #endif
+    /* Manage fullsync temp file: open when starting fullsync, close when not */
+    if (fullsync_loading && g_slave_fullsync_tmp_fd < 0) {
+        char tmp_path[512];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
+                 g_cfg.dump_path, (long)getpid());
+        g_slave_fullsync_tmp_fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (g_slave_fullsync_tmp_fd < 0) {
+            fprintf(stderr, "repl: slave fullsync tmp file open failed: %s\n", strerror(errno));
+        }
+    } else if (!fullsync_loading && g_slave_fullsync_tmp_fd >= 0) {
+        /* sync not loading but tmp fd still open — close and cleanup */
+        close(g_slave_fullsync_tmp_fd);
+        g_slave_fullsync_tmp_fd = -1;
+    }
     repl_slave_state_save();
 }
 

@@ -1286,7 +1286,9 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
     }
-    /* STATE_INCR: 增量同步 — kprobe fwd 通过 out_ring 转发到健康 slave */
+    /* STATE_INCR: 增量同步 — kprobe fwd 直接 send() 到 c->fd。
+     * send() 是内核级线程安全的。互斥模式下（fwd_healthy=1），
+     * repl_broadcast 跳过此 slave，不存在并发写同一 fd。 */
     static long long fwd_count = 0;
     static long long fwd_drop = 0;
     if (!is_repl_control(payload, payload_len)) {
@@ -1294,13 +1296,30 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         for (conn_t *c = g_replicas; c; c = c->next_replica) {
             if (c->repl_draining || c->repl_fullsync_pending) continue;
             if (!c->fwd_healthy) continue;
-            if (queue_bytes(c, payload, payload_len) == 0) {
+            size_t total_sent = 0;
+            int err_count = 0;
+            while (total_sent < payload_len) {
+                ssize_t n = send(c->fd, payload + total_sent,
+                                 payload_len - total_sent,
+                                 MSG_NOSIGNAL);
+                if (n <= 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        if (++err_count > 100) break;
+                        usleep(1000);
+                        continue;
+                    }
+                    break;
+                }
+                total_sent += (size_t)n;
+                err_count = 0;
+            }
+            if (total_sent == payload_len) {
                 c->fwd_last_active = time(NULL);
             } else {
                 fwd_drop++;
                 if (fwd_drop == 1 || fwd_drop % 1000 == 0) {
-                    fprintf(stderr, "kprobe fwd: queue_bytes failed (drop=%lld out_ring_len=%zu)\n",
-                            fwd_drop, c->out_ring_len);
+                    fprintf(stderr, "kprobe fwd: send failed fd=%d sent=%zu/%u errno=%d (drop=%lld)\n",
+                            c->fd, total_sent, payload_len, errno, fwd_drop);
                 }
             }
         }

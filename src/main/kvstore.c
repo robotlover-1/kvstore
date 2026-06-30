@@ -636,12 +636,16 @@ static int queue_snapshot(conn_t *c) {
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
     }
 
-    /* Flush eBPF 缓存的客户端数据，成功后标记 kprobe fwd 健康 */
+    /* Flush eBPF 缓存的客户端数据，成功后标记 kprobe fwd 健康。
+     * fwd_healthy 延迟 1 秒激活，确保 RDMA REPLDONE 在增量数据之前到达 slave。
+     * RDMA 和 TCP 是不同传输层，无顺序保证；若 kprobe fwd 的 TCP 数据先于
+     * RDMA REPLDONE 到达 slave，会被 g_slave_loading_fullsync=1 拦截为
+     * KVSD 二进制而丢弃。 */
     int cache_flushed = repl_client_capture_flush_to_slave(c);
     if (cache_flushed >= 0) {
-        c->fwd_healthy = 1;
-        c->fwd_last_active = time(NULL);
-        fprintf(stderr, "kprobe fwd: healthy for slave fd=%d (post-flush)\n", c->fd);
+        c->fwd_healthy = 0;  /* 先不激活，等 REPLDONE 送达 */
+        c->fwd_last_active = time(NULL);  /* 记录全量完成时间 */
+        fprintf(stderr, "kprobe fwd: pending for slave fd=%d (waiting REPLDONE delivery)\n", c->fd);
     } else {
         c->fwd_healthy = 0;
         fprintf(stderr, "kprobe fwd: cache flush failed, slave fd=%d uses repl_broadcast\n", c->fd);

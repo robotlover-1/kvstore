@@ -614,16 +614,15 @@ static int queue_snapshot(conn_t *c) {
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
     c->repl_last_send_ms = kvs_now_ms();
-    {
-        size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
-        repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
-        /* 通过全量传输层（RDMA 或 TCP）发送 REPLDONE */
-        if (repl_send_chunked(c, buf, done) != 0) {
-            repl_rdma_log("queue_snapshot - REPLDONE send failed");
-            goto out;
-        }
-        repl_client_capture_note_repldone();
+    size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
+    repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
+    /* 通过全量传输层（RDMA 或 TCP）发送 REPLDONE */
+    if (repl_send_chunked(c, buf, done) != 0) {
+        repl_rdma_log("queue_snapshot - REPLDONE send failed");
+        goto out;
     }
+    repl_client_capture_note_repldone();
+
     c->repl_fullsync_pending = 0;
 
     g_repl_fullsync_in_progress = 0;

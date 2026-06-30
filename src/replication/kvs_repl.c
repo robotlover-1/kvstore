@@ -2442,6 +2442,23 @@ static void *slave_thread(void *arg) {
 
                     int had_new_data = 0;
 
+                    /* ── TCP 控制消息 + 增量数据 ──
+                     * FULLRESYNC arrives via TCP first; must process BEFORE
+                     * RDMA poll so g_slave_loading_fullsync is set before
+                     * the first KVSD chunk arrives. */
+                    ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
+                    if (r > 0) {
+                        blen += (size_t)r;
+                        had_new_data = 1;
+                        parse_resp_stream(NULL, buf, &blen, 1);
+                        repl_slave_ack_heartbeat();
+                        repl_set_link_state(1);
+                    } else if (r == 0) {
+                        break;
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        break;
+                    }
+
                     /* ── RDMA 全量数据（全量同步期间）── */
         #if KVS_ENABLE_RDMA
                     if (g_repl_rdma_ctx.connected) {
@@ -2474,25 +2491,6 @@ static void *slave_thread(void *arg) {
                         parse_resp_stream(NULL, buf, &blen, 1);
                         repl_slave_ack_heartbeat();
                         repl_set_link_state(1);
-                    }
-
-                    /* ── TCP 控制消息 + 增量数据 ── */
-                    ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
-                    if (r > 0) {
-                        blen += (size_t)r;
-                        had_new_data = 1;
-                        fprintf(stderr, "repl ebpf-tcp: recv %zd bytes, blen=%zu\n", r, blen);
-                        parse_resp_stream(NULL, buf, &blen, 1);
-                        fprintf(stderr, "repl ebpf-tcp: parse done, blen=%zu\n", blen);
-                        repl_slave_ack_heartbeat();
-                        repl_set_link_state(1);
-                    } else if (r == 0) {
-                        /* TCP 连接断开 — 退出循环，外层重连 */
-                        fprintf(stderr, "repl ebpf-tcp: tcp connection closed\n");
-                        break;
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        fprintf(stderr, "repl ebpf-tcp: tcp recv error errno=%d\n", errno);
-                        break;
                     }
 
                     if (blen > 0) {

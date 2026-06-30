@@ -1286,39 +1286,18 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
     }
-    /* STATE_INCR: 增量同步 — kprobe fwd 遍历所有健康 slave 直接写 c->fd */
-    if (is_repl_control(payload, payload_len))
-        goto done;
-
-    pthread_mutex_lock(&g_repl_lock);
-    for (conn_t *c = g_replicas; c; c = c->next_replica) {
-        if (c->repl_draining || c->repl_fullsync_pending) continue;
-        if (!c->fwd_healthy) continue;
-
-        size_t total_sent = 0;
-        int err_count = 0;
-        while (total_sent < payload_len) {
-            ssize_t n = send(c->fd, payload + total_sent,
-                             payload_len - total_sent,
-                             MSG_NOSIGNAL);
-            if (n <= 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    if (++err_count > 100) break;
-                    usleep(1000);
-                    continue;
-                }
-                break;
-            }
-            total_sent += (size_t)n;
-            err_count = 0;
-        }
-        if (total_sent == payload_len) {
+    /* STATE_INCR: 增量同步 — kprobe fwd 通过 out_ring 转发到健康 slave */
+    if (!is_repl_control(payload, payload_len)) {
+        pthread_mutex_lock(&g_repl_lock);
+        for (conn_t *c = g_replicas; c; c = c->next_replica) {
+            if (c->repl_draining || c->repl_fullsync_pending) continue;
+            if (!c->fwd_healthy) continue;
+            queue_bytes(c, payload, payload_len);
             c->fwd_last_active = time(NULL);
         }
+        pthread_mutex_unlock(&g_repl_lock);
     }
-    pthread_mutex_unlock(&g_repl_lock);
 
-done:
     return 0;
 }
 

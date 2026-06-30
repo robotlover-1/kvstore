@@ -451,6 +451,8 @@ void repl_add_slave(conn_t *c) {
             c->is_replica = 1;
             c->repl_draining = 0;
             c->repl_fullsync_pending = 0;
+            c->fwd_healthy = 0;
+            c->fwd_last_active = 0;
             pthread_mutex_unlock(&g_repl_lock);
             return;
         }
@@ -458,6 +460,8 @@ void repl_add_slave(conn_t *c) {
     c->is_replica = 1;
     c->repl_draining = 0;
     c->repl_fullsync_pending = 0;
+    c->fwd_healthy = 0;
+    c->fwd_last_active = 0;
     c->next_replica = g_replicas;
     g_replicas = c;
     pthread_mutex_unlock(&g_repl_lock);
@@ -474,6 +478,8 @@ void repl_remove_slave(conn_t *c) {
     c->is_replica = 0;
     c->repl_draining = 0;
     c->repl_fullsync_pending = 0;
+    c->fwd_healthy = 0;
+    c->fwd_last_active = 0;
     pthread_mutex_unlock(&g_repl_lock);
 }
 
@@ -508,6 +514,7 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
+        repl_note_broadcast(rawlen);
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
         pp = &c->next_replica;
@@ -1784,8 +1791,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (g_cfg.role == ROLE_MASTER) {
                 g_last_write_ts = time(NULL);
                 repl_backlog_feed(raw, rawlen);
-                repl_note_broadcast(rawlen);
-                repl_broadcast(raw, rawlen);   /* 内部判断 per-slave fwd_healthy */
+                repl_broadcast(raw, rawlen);   /* 内部判断 per-slave fwd_healthy，仅实际发送时计数 */
             }
         }
     } else if (rc == 1 && should_reply_missing) {

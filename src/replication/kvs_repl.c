@@ -1908,7 +1908,11 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
         }
     } else if (!fullsync_loading && g_slave_fullsync_tmp_fd >= 0) {
         /* sync not loading but tmp fd still open — close and cleanup */
+        char tmp_path[512];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
+                 g_cfg.dump_path, (long)getpid());
         close(g_slave_fullsync_tmp_fd);
+        unlink(tmp_path);
         g_slave_fullsync_tmp_fd = -1;
     }
     repl_slave_state_save();

@@ -1829,6 +1829,10 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             if (g_slave_fullsync_tmp_fd >= 0 && to_write > 0) {
                 ssize_t wr = write(g_slave_fullsync_tmp_fd, buf + pos, to_write);
                 if (wr < 0) { *len = 0; return -1; }
+                if ((size_t)wr != to_write) {
+                    /* partial write — advance by what was actually written */
+                    to_write = (size_t)wr;
+                }
             }
             g_slave_fullsync_loaded_bytes += to_write;
             pos += to_write;

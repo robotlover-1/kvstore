@@ -1379,6 +1379,18 @@ static int forward_to_slave(const unsigned char *data, size_t len) {
     return 0;
 }
 
+/* 过滤复制控制命令（REPLSYNC/REPLACK），防止 slave→master 的数据被转发回 slave */
+static inline int is_repl_control(const unsigned char *data, size_t len) {
+    if (len < 7) return 0;
+    size_t scan = len < 128 ? len : 128;
+    for (size_t i = 0; i + 8 <= scan; i++) {
+        if ((memcmp(data + i, "REPLSYNC", 8) == 0) ||
+            (memcmp(data + i, "REPLACK", 7) == 0))
+            return 1;
+    }
+    return 0;
+}
+
 /* Ringbuf 回调 — BPF 有客户端数据到达时触发 */
 static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
     (void)ctx;
@@ -1433,11 +1445,39 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
     }
-    /* STATE_INCR: 增量同步 — kprobe 异步转发为主路径，repl_broadcast 为保底 */
-    if (g_fwd_healthy) {
-        if (forward_to_slave(payload, payload_len) == 0)
-            g_fwd_last_active = time(NULL);  /* 更新心跳 */
+    /* STATE_INCR: 增量同步 — kprobe fwd 遍历所有健康 slave 直接写 c->fd */
+    if (is_repl_control(payload, payload_len))
+        goto done;
+
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_draining || c->repl_fullsync_pending) continue;
+        if (!c->fwd_healthy) continue;
+
+        size_t total_sent = 0;
+        int err_count = 0;
+        while (total_sent < payload_len) {
+            ssize_t n = send(c->fd, payload + total_sent,
+                             payload_len - total_sent,
+                             MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (++err_count > 100) break;
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            total_sent += (size_t)n;
+            err_count = 0;
+        }
+        if (total_sent == payload_len) {
+            c->fwd_last_active = time(NULL);
+        }
     }
+    pthread_mutex_unlock(&g_repl_lock);
+
+done:
     return 0;
 }
 

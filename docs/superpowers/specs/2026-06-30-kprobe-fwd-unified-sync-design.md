@@ -249,3 +249,33 @@ pthread_mutex_unlock(&g_repl_lock);
 4. **多 slave 独立健康** — 一个 slave unhealthy 不影响其他 slave
 5. **全量同步** — 全量同步→flush→增量 流程不受影响
 6. **repl_offset 正确性** — offset 解耦后 partial resync (CONTINUE) 仍然正常
+
+## 实现过程中发现的关键问题
+
+### BPF iovec 读取返回缓冲区大小而非实际数据大小
+
+**症状：** slave 能收到增量数据但 RESP 解析器在第一个命令后卡住，recv buffer 开头全是 `\0` 字节。
+
+**根因：** `repl_client_capture.bpf.c` 中 `read_recv_data()` 返回 `vec.l`（iovec 缓冲区长度，如 8192），而非 `tcp_recvmsg` 的实际返回值（如 40 字节）。ringbuf entry 的 `payload_len` 设为 8192，导致大量零填充字节被发送到 slave。
+
+**修复：** 在 `client_ringbuf_cb` 发送前 trim 尾部 `\0` 字节：
+```c
+while (payload_len > 0 && payload[payload_len - 1] == 0)
+    payload_len--;
+```
+
+### RDMA/TCP 全量同步后时序竞争
+
+**症状：** 全量同步完成后无增量数据到达 slave。
+
+**根因：** 全量同步完成时 master 立即激活 kprobe fwd（`c->fwd_healthy=1`），ringbuf callback 开始通过 TCP `send(c->fd)` 转发增量数据。但 RDMA REPLDONE 与 TCP 增量数据在不同传输层，无顺序保证，TCP 增量数据可能在 RDMA REPLDONE 之前到达 slave，此时 `g_slave_loading_fullsync=1`，数据被当作 KVSD 二进制拦截并丢弃。
+
+**修复：** RDMA 全量完成后，额外通过 TCP 发送一份 REPLDONE（`send(c->fd, ...)`）。TCP 顺序保证后续同一连接上的所有增量数据一定在 TCP REPLDONE 之后到达。
+
+### ringbuf callback 持锁 send() 导致写 QPS 暴跌
+
+**症状：** 增量写入 QPS 从 2000+ 降至 160。
+
+**根因：** ringbuf callback 在持有 `g_repl_lock` 期间调用阻塞 `send()`，当 TCP 缓冲区满时持锁长达 100ms，阻塞了 `repl_broadcast`（也需要 `g_repl_lock`）和所有写命令处理。
+
+**修复：** 在锁内只收集目标 fd 列表，释放锁后再执行 `send()`。

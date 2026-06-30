@@ -2064,6 +2064,7 @@ static int snapshot_emit_fd(void *ctx, const unsigned char *buf, size_t len) {
     return 0;
 }
 
+/* deprecated: unused after KVSD unification */
 static int maybe_emit_expire_sink(snapshot_sink_t *sink, int engine, const char *key) {
     long long ttl = kvs_expire_ttl(&global_expire, engine, key);
     if (ttl < 0) return 0;
@@ -2075,6 +2076,7 @@ static int maybe_emit_expire_sink(snapshot_sink_t *sink, int engine, const char 
     return emit_cmd3_sink(sink, cmd, key, sec);
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_array_sink(snapshot_sink_t *sink) {
     for (int i = 0; i < KVS_ARRAY_SIZE; ++i) {
         if (global_array.table && global_array.table[i].key) {
@@ -2085,6 +2087,7 @@ static int snapshot_array_sink(snapshot_sink_t *sink) {
     return 0;
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_hash_sink(snapshot_sink_t *sink) {
     for (int t = 0; t < 2; t++) {
         if (!global_hash.ht[t].nodes) continue;
@@ -2098,6 +2101,7 @@ static int snapshot_hash_sink(snapshot_sink_t *sink) {
     return 0;
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_rbtree_node_sink(snapshot_sink_t *sink, rbtree_node *node, rbtree_node *nil) {
     if (node == nil) return 0;
     if (snapshot_rbtree_node_sink(sink, node->left, nil) != 0) return -1;
@@ -2107,6 +2111,7 @@ static int snapshot_rbtree_node_sink(snapshot_sink_t *sink, rbtree_node *node, r
     return 0;
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_skiptable_cb_sink(const char *key, const char *value, void *arg) {
     snapshot_sink_t *sink = (snapshot_sink_t *)arg;
     if (emit_cmd3_sink(sink, "XSET", key, value) != 0) return -1;
@@ -2114,10 +2119,12 @@ static int snapshot_skiptable_cb_sink(const char *key, const char *value, void *
     return 0;
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_skiptable_sink(snapshot_sink_t *sink) {
     return kvs_skiptable_foreach(&global_skiptable, snapshot_skiptable_cb_sink, sink);
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_doc_field_cb_sink(const char *name, const char *value, void *arg) {
     void **ctx = (void **)arg;
     snapshot_sink_t *sink = (snapshot_sink_t *)ctx[0];
@@ -2125,6 +2132,7 @@ static int snapshot_doc_field_cb_sink(const char *name, const char *value, void 
     return emit_cmd4_sink(sink, "DOCSET", key, name, value);
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_doc_cb_sink(const char *key, kvs_doc_t *doc, void *arg) {
     snapshot_sink_t *sink = (snapshot_sink_t *)arg;
     (void)doc;
@@ -2132,10 +2140,12 @@ static int snapshot_doc_cb_sink(const char *key, kvs_doc_t *doc, void *arg) {
     return kvs_doc_foreach_field(&global_doc, key, snapshot_doc_field_cb_sink, ctx);
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_doc_sink(snapshot_sink_t *sink) {
     return kvs_doc_foreach(&global_doc, snapshot_doc_cb_sink, sink);
 }
 
+/* deprecated: unused after KVSD unification */
 static int snapshot_all_sink(snapshot_sink_t *sink) {
     if (!sink || !sink->emit) return -1;
     if (snapshot_array_sink(sink) != 0) return -1;
@@ -2146,6 +2156,7 @@ static int snapshot_all_sink(snapshot_sink_t *sink) {
     return 0;
 }
 
+/* deprecated: unused after KVSD unification */
 int kvs_snapshot_to_fp(FILE *fp) {
     snapshot_sink_t sink;
     if (!fp) return -1;
@@ -2154,6 +2165,7 @@ int kvs_snapshot_to_fp(FILE *fp) {
     return snapshot_all_sink(&sink);
 }
 
+/* deprecated: unused after KVSD unification */
 int kvs_snapshot_to_fd(int fd) {
     snapshot_sink_t sink;
     long long fd_state[2];

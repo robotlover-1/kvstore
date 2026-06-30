@@ -266,6 +266,8 @@ typedef struct conn_s {
     size_t out_ring_head;                   /* read position */
     size_t out_ring_tail;                   /* write position */
     size_t out_ring_len;                    /* pending bytes */
+    int fwd_healthy;                   /* kprobe fwd health: 1=healthy, 0=fallback */
+    time_t fwd_last_active;            /* last successful kprobe fwd send timestamp */
     struct conn_s *next_replica;
 } conn_t;
 
@@ -447,6 +449,7 @@ int repl_slaveof(const char *host, int port);
 int repl_slaveof_noone(void);
 const char *repl_master_link_state_name(void);
 const char *repl_master_id(void);
+extern volatile time_t g_last_write_ts;
 unsigned long long repl_master_offset(void);
 unsigned long long repl_connected_slaves(void);
 unsigned long long repl_fullsync_count(void);

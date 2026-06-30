@@ -1120,12 +1120,10 @@ void repl_client_capture_note_repldone(void) {
 
 /* kprobe 转发健康检查 — 由 reactor 定时器周期性调用
  *
- * 只在 repl_broadcast 有活动但 kprobe fwd 没转发时判定异常：
- *  - 两者都空闲 → 无客户端写入，正常，不判定失败
- *  - repl_broadcast 活跃但 kprobe fwd 静默 → kprobe fwd 真的有问题
- *
- * NOTE: 不再自动压制 repl_broadcast。双路径并行（kprobe fwd + repl_broadcast）
- * 是从机去重的设计。 */
+ * 健康检查策略：
+ *  - 无写流量 → 尝试恢复 unhealthy slave（空闲边界）
+ *  - 有写流量 → 检查 per-slave fwd_last_active，超时则标记 unhealthy
+ *  - 降级后 slave 走 repl_broadcast，kprobe fwd 恢复后自动切回 */
 void repl_kprobe_fwd_health_check(void) {
     time_t now = time(NULL);
 

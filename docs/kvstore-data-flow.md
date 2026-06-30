@@ -748,6 +748,7 @@ kprobe_enabled=1 且 role=MASTER:
 ```
 kprobe_enabled=1 且 role=SLAVE:
   → repl_kprobe_fwd_slave_init(port)
+    → 设置 g_kprobe_running = 1（确保监听线程不会在非 kprobe-rdma 模式下立即退出）
     → 在 port+13 上启动 TCP 监听
     → accept 连接 → read → parse_resp_stream(from_replication=1)
 ```
@@ -760,11 +761,11 @@ Client 发送 SET key val
     ▼
 Master 内核 tcp_recvmsg()
     │
-    ├─ 正常路径 (初始阶段双路径并行):
+    ├─ repl_broadcast 路径 (永久保底):
     │   数据 → 用户态 → parse_resp_stream → handle_parsed_command
     │     → repl_broadcast(raw, rawlen)
     │     → send() → TCP → slave 主端口
-    │   (健康检查通过后被抑制: g_repl_broadcast_suppressed = 1)
+    │   (从不会被自动压制，与 kprobe 路径永久并行)
     │
     └─ kprobe 路径 (内核态拦截):
          BPF kprobe 在 tcp_recvmsg 拦截客户端原始 TCP 数据
@@ -782,17 +783,25 @@ Master 内核 tcp_recvmsg()
                       → parse_resp_stream(NULL, buf, len, from_replication=1)
 ```
 
-**双路径 → 单路径切换：**
+**probe mode（双路径永久并行）：**
 
 ```
 全量同步完成时 (queue_snapshot 尾部):
-  ├─ g_fwd_healthy = 1                    ← 启用 kprobe forward
   ├─ repl_kprobe_fwd_connect_from_replica() ← 建立 port+13 独立连接
+  │    ├─ 成功 → g_fwd_healthy = 1, g_repl_broadcast_suppressed = 0
+  │    └─ 失败 → g_fwd_healthy = 0, 跳过 probe mode
   ├─ repl_client_capture_flush_to_slave()  ← 先刷全量同步期间缓存的数据
-  ├─ g_repl_broadcast_suppressed = 0      ← 初始双路径并行
-  └─ 5 秒健康检查 (KVS_KPROBE_FWD_HEALTH_TIMEOUT):
-       ├─ kprobe forward 正常 → g_repl_broadcast_suppressed = 1 (压制 repl_broadcast)
-       └─ kprobe forward 异常 → g_fwd_healthy = 0 (回退到 repl_broadcast)
+  └─ 进入双路径并行:
+       ├─ kprobe fwd: BPF 捕获 → forward_to_slave → send(fwd_fd)
+       └─ repl_broadcast: 始终激活，永不自动压制
+       
+健康检查 (repl_kprobe_fwd_health_check, 每 100ms):
+  ├─ g_fwd_healthy == 0 → 直接返回
+  └─ g_fwd_healthy == 1:
+       └─ repl_broadcast 近期活跃 AND kprobe fwd 近期无转发 → 标记异常
+          (两者都空闲 → 不判定失败，无流量不是 kprobe fwd 的问题)
+
+注意: 不再自动压制 repl_broadcast。从机靠 repl_offset 去重，双路径并行不丢数据。
 ```
 
 **为什么这条路径更高效：**
@@ -840,7 +849,9 @@ repl_transport_ops_t:
 
 Fallback 机制:
   如果 RDMA/eBPF 发送失败 → 自动 fallback 到 TCP
-  kprobe forward 异常 → g_fwd_healthy=0 → 回退到 repl_broadcast
+  kprobe forward 连接失败 → g_fwd_healthy=0 → 跳过 probe mode
+  kprobe forward 健康检查失败 → g_fwd_healthy=0 → kprobe 路径停止转发, repl_broadcast 保底
+  (不再自动压制 repl_broadcast; 双路径永久并行去重)
 ```
 
 ---

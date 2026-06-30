@@ -42,13 +42,6 @@
 /* ---- kprobe 转发健康检查 ---- */
 #define KVS_KPROBE_FWD_HEALTH_TIMEOUT 5  /* 5秒无数据判定异常 */
 
-volatile time_t g_fwd_last_active = 0;  /* 最后成功转发时间戳 */
-volatile int g_fwd_healthy = 0;          /* 1=健康 0=异常 */
-extern volatile int g_repl_broadcast_suppressed;   /* 1=抑制 repl_broadcast 走 kprobe 路径（定义在 kvstore.c） */
-
-/* kprobe 转发独立 TCP 连接（不与 repl_broadcast 共用 fd） */
-#define KVS_KPROBE_FWD_PORT_OFFSET  13   /* slave port + 13 为 kprobe 转发端口 */
-static int g_kprobe_fwd_fd = -1;
 
 /* ---- BPF Map FDs ---- */
 static struct bpf_object *g_kprobe_obj = NULL;

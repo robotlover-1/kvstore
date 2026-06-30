@@ -72,9 +72,7 @@ volatile int g_repl_client_capture_active = 0;
 /* Master 侧 slave 的 TCP 连接 fd（供 client_capture 转发引擎使用） */
 int g_repl_capture_slave_fd = -1;
 
-/* kprobe 转发接管增量同步时，压制 repl_broadcast */
-volatile int g_repl_broadcast_suppressed = 0;
-volatile time_t g_last_broadcast_time = 0;  /* repl_broadcast 最后发送时间戳，健康检查用 */
+volatile time_t g_last_write_ts = 0;   /* 最后一次写命令时间戳，健康检查用 */
 
 static pthread_mutex_t g_repl_last_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_repl_last_send_stage[64] = "none";

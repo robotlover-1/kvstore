@@ -1347,7 +1347,6 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
             }
         }
     }
-
     return 0;
 }
 

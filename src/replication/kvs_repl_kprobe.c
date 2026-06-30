@@ -1287,19 +1287,30 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         pthread_mutex_unlock(&g_cache_lock);
     }
     /* STATE_INCR: 增量同步 — kprobe fwd 直接 send() 到 c->fd。
-     * send() 是内核级线程安全的。互斥模式下（fwd_healthy=1），
-     * repl_broadcast 跳过此 slave，不存在并发写同一 fd。 */
+     * 先在锁内收集 fd 列表，再在锁外 send()，避免持锁阻塞 repl_broadcast。 */
     static long long fwd_count = 0;
     static long long fwd_drop = 0;
     if (!is_repl_control(payload, payload_len)) {
+        #define MAX_FWD_FDS 16
+        int fds[MAX_FWD_FDS];
+        conn_t *targets[MAX_FWD_FDS];
+        int n_targets = 0;
+
         pthread_mutex_lock(&g_repl_lock);
-        for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        for (conn_t *c = g_replicas; c && n_targets < MAX_FWD_FDS; c = c->next_replica) {
             if (c->repl_draining || c->repl_fullsync_pending) continue;
             if (!c->fwd_healthy) continue;
+            fds[n_targets] = c->fd;
+            targets[n_targets] = c;
+            n_targets++;
+        }
+        pthread_mutex_unlock(&g_repl_lock);
+
+        for (int i = 0; i < n_targets; i++) {
             size_t total_sent = 0;
             int err_count = 0;
             while (total_sent < payload_len) {
-                ssize_t n = send(c->fd, payload + total_sent,
+                ssize_t n = send(fds[i], payload + total_sent,
                                  payload_len - total_sent,
                                  MSG_NOSIGNAL);
                 if (n <= 0) {
@@ -1314,16 +1325,15 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
                 err_count = 0;
             }
             if (total_sent == payload_len) {
-                c->fwd_last_active = time(NULL);
+                targets[i]->fwd_last_active = time(NULL);
             } else {
                 fwd_drop++;
                 if (fwd_drop == 1 || fwd_drop % 1000 == 0) {
                     fprintf(stderr, "kprobe fwd: send failed fd=%d sent=%zu/%u errno=%d (drop=%lld)\n",
-                            c->fd, total_sent, payload_len, errno, fwd_drop);
+                            fds[i], total_sent, payload_len, errno, fwd_drop);
                 }
             }
         }
-        pthread_mutex_unlock(&g_repl_lock);
         fwd_count++;
         if (fwd_count == 1 || fwd_count % 5000 == 0) {
             fprintf(stderr, "kprobe fwd: forwarded %lld commands, dropped %lld\n",

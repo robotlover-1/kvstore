@@ -74,6 +74,7 @@ int g_repl_capture_slave_fd = -1;
 
 /* kprobe 转发接管增量同步时，压制 repl_broadcast */
 volatile int g_repl_broadcast_suppressed = 0;
+volatile time_t g_last_broadcast_time = 0;  /* repl_broadcast 最后发送时间戳，健康检查用 */
 
 static pthread_mutex_t g_repl_last_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_repl_last_send_stage[64] = "none";
@@ -482,6 +483,8 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     /* kprobe 转发接管时跳过 repl_broadcast（保底路径静默） */
     if (g_repl_broadcast_suppressed) return;
 
+    g_last_broadcast_time = time(NULL);
+
     repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
     repl_backlog_feed(raw, rawlen);
     repl_note_broadcast(rawlen);
@@ -631,12 +634,17 @@ static int queue_snapshot(conn_t *c) {
     extern volatile time_t g_fwd_last_active;
     extern volatile int g_fwd_healthy;
     /* 建立 kprobe 转发独立连接（不与 repl_broadcast 共用 fd） */
-    repl_kprobe_fwd_connect_from_replica(c, g_cfg.port);
-    /* 不立即压制 repl_broadcast — 等健康检查确认 kprobe 转发正常后再压制 */
-    g_repl_broadcast_suppressed = 0;
-    g_fwd_last_active = time(NULL);
-    g_fwd_healthy = 1;
-    fprintf(stderr, "kprobe fwd: probe mode (dual-path until proven healthy)\n");
+    int kprobe_fwd_fd = repl_kprobe_fwd_connect_from_replica(c, g_cfg.port);
+    if (kprobe_fwd_fd < 0) {
+        g_fwd_healthy = 0;
+        fprintf(stderr, "kprobe fwd: connect failed, skipping probe mode\n");
+    } else {
+        /* 不立即压制 repl_broadcast — 等健康检查确认 kprobe 转发正常后再压制 */
+        g_repl_broadcast_suppressed = 0;
+        g_fwd_last_active = time(NULL);
+        g_fwd_healthy = 1;
+        fprintf(stderr, "kprobe fwd: probe mode (dual-path until proven healthy)\n");
+    }
 
     if (rdma_ok) {
         repl_rdma_stop_fullsync();

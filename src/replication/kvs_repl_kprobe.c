@@ -1127,35 +1127,30 @@ void repl_client_capture_note_repldone(void) {
 }
 
 /* kprobe 转发健康检查 — 由 reactor 定时器周期性调用
- * 如果超过 KVS_KPROBE_FWD_HEALTH_TIMEOUT 秒没有成功转发数据，
- * 则判定异常并回退到 repl_broadcast 路径 */
+ *
+ * 只在 repl_broadcast 有活动但 kprobe fwd 没转发时判定异常：
+ *  - 两者都空闲 → 无客户端写入，正常，不判定失败
+ *  - repl_broadcast 活跃但 kprobe fwd 静默 → kprobe fwd 真的有问题
+ *
+ * NOTE: 不再自动压制 repl_broadcast。双路径并行（kprobe fwd + repl_broadcast）
+ * 是从机去重的设计。 */
 void repl_kprobe_fwd_health_check(void) {
-    static time_t g_fwd_first_healthy = 0;
+    extern volatile time_t g_last_broadcast_time;
     time_t now = time(NULL);
 
     if (!g_fwd_healthy) return;
 
-    /* 检查是否失活：超时无数据 → 切回 repl_broadcast */
-    if (now - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
+    /* 有客户端流量（repl_broadcast 近期活跃）但 kprobe fwd 没有转发 →
+     * kprobe fwd 路径异常 */
+    if (now - g_last_broadcast_time < KVS_KPROBE_FWD_HEALTH_TIMEOUT &&
+        now - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
         g_fwd_healthy = 0;
         g_repl_broadcast_suppressed = 0;
-        g_fwd_first_healthy = 0;
         fprintf(stderr, "kprobe fwd: health check FAILED, "
-                "fallback to repl_broadcast (last_active=%lds ago)\n",
+                "fallback to repl_broadcast "
+                "(broadcast_active=%lds_ago fwd_active=%lds_ago)\n",
+                (long)(now - g_last_broadcast_time),
                 (long)(now - g_fwd_last_active));
-        return;
-    }
-
-    /* kprobe 正在转发。稳定运行 HEALTH_TIMEOUT 秒后压制 repl_broadcast */
-    if (!g_repl_broadcast_suppressed) {
-        if (g_fwd_first_healthy == 0) {
-            g_fwd_first_healthy = now;
-        } else if (now - g_fwd_first_healthy >= KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
-            g_repl_broadcast_suppressed = 1;
-            fprintf(stderr, "kprobe fwd: proven healthy for %ds, "
-                    "suppressing repl_broadcast\n",
-                    KVS_KPROBE_FWD_HEALTH_TIMEOUT);
-        }
     }
 }
 
@@ -1251,6 +1246,7 @@ static void *kprobe_fwd_slave_thread(void *arg) {
 int repl_kprobe_fwd_slave_init(int base_port) {
     int port = base_port + KVS_KPROBE_FWD_PORT_OFFSET;
     pthread_t tid;
+    g_kprobe_running = 1;
     if (pthread_create(&tid, NULL, kprobe_fwd_slave_thread,
                        (void *)(intptr_t)port) != 0) {
         fprintf(stderr, "kprobe fwd slave: failed to create thread\n");

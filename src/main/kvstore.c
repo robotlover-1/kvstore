@@ -478,14 +478,8 @@ void repl_remove_slave(conn_t *c) {
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
-    /* kprobe 转发接管时跳过 repl_broadcast（保底路径静默） */
-    if (g_repl_broadcast_suppressed) return;
-
-    g_last_broadcast_time = time(NULL);
-
     repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
-    repl_backlog_feed(raw, rawlen);
-    repl_note_broadcast(rawlen);
+
     pthread_mutex_lock(&g_repl_lock);
     conn_t **pp = &g_replicas;
     while (*pp) {
@@ -500,12 +494,15 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* 全量同步期间跳过实时广播（数据通过 backlog + eBPF 缓存处理） */
         if (g_repl_fullsync_in_progress) {
             pp = &c->next_replica;
             continue;
         }
-        /* eBPF 转发路径同时运行（best effort），repl_broadcast 作为可靠保底 */
+        /* kprobe fwd healthy slaves are served by ringbuf callback */
+        if (c->fwd_healthy) {
+            pp = &c->next_replica;
+            continue;
+        }
         if (repl_realtime_send(c, raw, rawlen) != 0) {
             if (repl_handle_replica_send_failure(c, pp)) continue;
             pp = &c->next_replica;

@@ -304,14 +304,16 @@ static int replay_file(const char *path, unsigned long long skip_bytes) {
 }
 
 /*
- * 恢复 dump 文件（二进制格式）：
- *   [8]  uint64_t aof_offset          — AOF 偏移量，用于跳过早期 AOF
+ * 恢复 dump 文件（统一 KVSD 格式）：
+ *   [8]  uint64_t aof_offset               — AOF 偏移量，用于跳过早期 AOF
  *   重复：
- *     [1]  uint8_t  engine_id         — KVS_ENGINE_xxx
+ *     [1]  uint8_t  engine_id              — KVS_ENGINE_xxx
+ *     [1]  uint8_t  flags                  — KVSD_FLAG_HAS_EXPIRE 等
  *     [4]  uint32_t klen
  *     [klen] key
  *     [4]  uint32_t vlen
  *     [vlen] value
+ *     [8]  uint64_t expire_at_ms           — 仅当 flags & KVSD_FLAG_HAS_EXPIRE
  *
  * DOC 引擎的 value 格式：field1=val1 field2=val2 ...
  * 返回 aof_offset
@@ -339,13 +341,24 @@ unsigned long long replay_dump_file(const char *path) {
     memcpy(&aof_offset, mapped + pos, sizeof(aof_offset));
     pos += sizeof(aof_offset);
 
-    /* parse entries: uint8_t engine, uint32_t klen, key, uint32_t vlen, value */
-    while (pos + 1 + 4 <= size) {
-        uint8_t engine_id;
+    /* parse entries: engine, flags, klen, key, vlen, value, optional expire_ms */
+    while (pos + 2 + 4 <= size) {
+        uint8_t engine_id, flags;
         uint32_t klen, vlen;
         char *key, *value;
 
         engine_id = mapped[pos++];
+
+        /* sanity check: engine_id must be 1-5 */
+        if (engine_id < 1 || engine_id > 5) {
+            fprintf(stderr, "replay_dump_file: invalid engine_id %u at pos %zu (old format KVSD file?)\n",
+                (unsigned int)engine_id, pos - 1);
+            break;
+        }
+
+        /* read flags (new in unified KVSD format) */
+        if (pos + 1 > size) break;
+        flags = mapped[pos++];
 
         if (pos + 4 > size) break;
         memcpy(&klen, mapped + pos, sizeof(klen));
@@ -407,6 +420,23 @@ unsigned long long replay_dump_file(const char *path) {
             break;
         default:
             break;
+        }
+
+        /* restore TTL if present */
+        if (flags & KVSD_FLAG_HAS_EXPIRE) {
+            uint64_t expire_at_ms;
+            if (pos + sizeof(expire_at_ms) <= size) {
+                memcpy(&expire_at_ms, mapped + pos, sizeof(expire_at_ms));
+                pos += sizeof(expire_at_ms);
+                long long ttl_ms = (long long)expire_at_ms - kvs_now_ms();
+                if (ttl_ms > 0) {
+                    kvs_expire_set(&global_expire, engine_id, key, ttl_ms);
+                }
+            } else {
+                kvs_free(key);
+                kvs_free(value);
+                break;
+            }
         }
 
         kvs_free(key);

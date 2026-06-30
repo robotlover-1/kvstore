@@ -48,6 +48,9 @@
 #define KVS_REPL_TRANSPORT_KPROBE_RDMA 4
 #define KVS_REPL_TRANSPORT_EBPF_TCP 5
 
+/* KVSD format flags */
+#define KVSD_FLAG_HAS_EXPIRE  0x01   /* record has 8-byte expire_ms after value */
+
 /* Replication send context: which transport to use */
 #define KVS_REPL_SEND_FULLSYNC  1   /* bulk existing data: RDMA */
 #define KVS_REPL_SEND_REALTIME  2   /* incremental real-time: eBPF */
@@ -503,6 +506,7 @@ int persist_recover_in_progress(void);
 int kvs_snapshot_to_fp(FILE *fp);
 int kvs_snapshot_to_fd(int fd);
 int kvs_dump_to_fd(int fd, unsigned long long aof_offset);
+unsigned long long replay_dump_file(const char *path);
 int kvs_load_dump_from_fd(int fd);
 int persist_bgsave_start(void);
 int persist_bgsave_poll(void);

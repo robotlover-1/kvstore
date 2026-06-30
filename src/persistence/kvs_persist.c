@@ -316,7 +316,7 @@ static int replay_file(const char *path, unsigned long long skip_bytes) {
  * DOC 引擎的 value 格式：field1=val1 field2=val2 ...
  * 返回 aof_offset
  */
-static unsigned long long replay_dump_file(const char *path) {
+unsigned long long replay_dump_file(const char *path) {
     int fd;
     struct stat st;
     unsigned char *mapped;

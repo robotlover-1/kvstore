@@ -623,6 +623,13 @@ static int queue_snapshot(conn_t *c) {
         }
         /* 通知 client_capture: REPLDONE 已发送（用户态路径，eBPF+tcp 不经过 kprobe） */
         repl_client_capture_note_repldone();
+
+        /* 也通过 TCP 发送 REPLDONE，利用 TCP 顺序保证：后续同一 c->fd
+         * 上的增量数据不会在 REPLDONE 之前到达 slave。修复 RDMA REPLDONE
+         * 与 TCP 增量数据之间的传输层竞态。 */
+        if (rdma_ok) {
+            send(c->fd, buf, done, MSG_NOSIGNAL);
+        }
     }
     c->repl_fullsync_pending = 0;
 
@@ -636,16 +643,14 @@ static int queue_snapshot(conn_t *c) {
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
     }
 
-    /* Flush eBPF 缓存的客户端数据，成功后标记 kprobe fwd 健康。
-     * fwd_healthy 延迟 1 秒激活，确保 RDMA REPLDONE 在增量数据之前到达 slave。
-     * RDMA 和 TCP 是不同传输层，无顺序保证；若 kprobe fwd 的 TCP 数据先于
-     * RDMA REPLDONE 到达 slave，会被 g_slave_loading_fullsync=1 拦截为
-     * KVSD 二进制而丢弃。 */
+    /* Flush eBPF 缓存的客户端数据，REPLDONE 已通过 TCP 发送，
+     * 后续增量数据（kprobe fwd 或 repl_broadcast）都在同一 TCP 连接上，
+     * 不会先于 REPLDONE 到达 slave。 */
     int cache_flushed = repl_client_capture_flush_to_slave(c);
     if (cache_flushed >= 0) {
-        c->fwd_healthy = 0;  /* 先不激活，等 REPLDONE 送达 */
-        c->fwd_last_active = time(NULL);  /* 记录全量完成时间 */
-        fprintf(stderr, "kprobe fwd: pending for slave fd=%d (waiting REPLDONE delivery)\n", c->fd);
+        c->fwd_healthy = 1;
+        c->fwd_last_active = time(NULL);
+        fprintf(stderr, "kprobe fwd: healthy for slave fd=%d (post-flush)\n", c->fd);
     } else {
         c->fwd_healthy = 0;
         fprintf(stderr, "kprobe fwd: cache flush failed, slave fd=%d uses repl_broadcast\n", c->fd);

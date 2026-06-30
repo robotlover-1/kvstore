@@ -1137,24 +1137,6 @@ void repl_kprobe_fwd_health_check(void) {
         }
     }
 
-    /* 1.5. 全量同步后激活：fwd_healthy=0 但 fwd_last_active 在 1-5s 前
-     * 说明全量同步刚完成，延迟已足够 REPLDONE 送达 slave，可以激活 kprobe fwd */
-    #define KVS_KPROBE_FWD_ACTIVATE_DELAY 1  /* 全量同步后等待 1 秒再激活 */
-    pthread_mutex_lock(&g_repl_lock);
-    for (conn_t *c = g_replicas; c; c = c->next_replica) {
-        if (!c->fwd_healthy && !c->repl_draining && !c->repl_fullsync_pending
-            && c->fwd_last_active > 0
-            && now - c->fwd_last_active > KVS_KPROBE_FWD_ACTIVATE_DELAY
-            && now - c->fwd_last_active < KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
-            c->fwd_healthy = 1;
-            c->fwd_last_active = now;
-            fprintf(stderr, "kprobe fwd: activated for slave fd=%d "
-                    "(post-fullsync, delay=%lds)\n",
-                    c->fd, (long)(now - c->fwd_last_active + KVS_KPROBE_FWD_ACTIVATE_DELAY));
-        }
-    }
-    pthread_mutex_unlock(&g_repl_lock);
-
     /* 2. 无写流量 — 不判故障，检查恢复条件 */
     if (now - g_last_write_ts > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
         pthread_mutex_lock(&g_repl_lock);

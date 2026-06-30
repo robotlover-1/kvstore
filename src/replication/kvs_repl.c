@@ -2497,18 +2497,6 @@ static void *slave_thread(void *arg) {
                         parse_resp_stream(NULL, buf, &blen, 1);
                     }
 
-                    /* 全量同步完成时清空 buffer 中的 KVSD 二进制尾字节。
-                     * parse_resp_stream 的 fullsync 拦截消费 KVSD 后，
-                     * buf 中残留的二进制尾字节（含 \0）会令 RESP 解析器永久失步。
-                     * target_bytes 归零表示 fullsync 刚结束。*/
-                    static unsigned long long last_target = 0;
-                    if (last_target > 0 && g_slave_fullsync_target_bytes == 0 && blen > 0) {
-                        fprintf(stderr, "slave: post-fullsync flush %zu bytes (first=0x%02x)\n",
-                                blen, buf[0]);
-                        blen = 0;
-                    }
-                    last_target = g_slave_fullsync_target_bytes;
-
                     /* 无数据时短暂休眠避免忙循环 */
                     if (!had_new_data)
                         usleep(1000);

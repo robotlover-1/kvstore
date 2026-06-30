@@ -207,6 +207,13 @@ $(TEST_REPL_GAP_BIN): $(TEST_REPL_GAP_SRC)
 check-repl-gap: $(TEST_REPL_GAP_BIN)
 	./$(TEST_REPL_GAP_BIN) --master-port $(REPL_MASTER_PORT) --slave-port $(REPL_SLAVE_PORT) --pre-count 3000 --post-count 1000
 
+# ---- bpf_probe_read_user 验证 ----
+VERIFY_BPF_READ_USER_SRC=tests/verify_bpf_read_user.c
+VERIFY_BPF_READ_USER_BIN=tests/verify_bpf_read_user
+
+$(VERIFY_BPF_READ_USER_BIN): $(VERIFY_BPF_READ_USER_SRC)
+	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz
+
 check-uring-persist-c: $(TEST_URING_PERSIST_BIN)
 	./$(TEST_URING_PERSIST_BIN) --port $(URING_PERSIST_PORT) --count $(URING_PERSIST_COUNT) --appendfsync $(URING_PERSIST_APPEND_FSYNC)
 

@@ -1,26 +1,34 @@
-# Task 5 Report: queue_snapshot() FILE* -> fd, kvs_snapshot_to_fp -> kvs_dump_to_fd
+# Task 5 Report
 
-## Status: Completed
+## Exact Line Changes
 
-## Changes
+File: `src/main/kvstore.c`
 
-- 1 file modified: `src/main/kvstore.c`
-- `queue_snapshot()` 内改动:
-  1. `FILE *fp;` -> `int fd;`（变量声明）
-  2. `kvs_snapshot_to_fp(fp)` -> `kvs_dump_to_fd(fd, snap_base_offset)`（生成 KVSD 二进制而非 RESP 文本）
-  3. 3次 fopen/fclose 缩减为 1次 open/close 周期
-  4. 文件大小由 `fread` 循环累加 -> `lseek(fd, 0, SEEK_END)` 一次获取
-  5. `snap_base_offset` 传入 `kvs_dump_to_fd()` 作为 aof_offset 参数
-  6. 所有错误路径显式 `close(fd)` + `unlink(tmp_path)` 后 goto out
-  7. 删除 `out:` 标签下的 `if (fp) fclose(fp);`
-- Header 格式（`+FULLRESYNC`）和 `repl_send_chunked` 调用保持不变
+1. **Lines 627-642 removed** — Deleted the entire kprobe fwd connection setup block:
+   - Removed `extern volatile int g_repl_broadcast_suppressed`
+   - Removed `extern volatile time_t g_fwd_last_active`
+   - Removed `extern volatile int g_fwd_healthy`
+   - Removed `repl_kprobe_fwd_connect_from_replica(c, g_cfg.port)` call
+   - Replaced with comment: `/* kprobe fwd 作为增量同步主路径（共享 c->fd），待 flush 成功后标记 healthy */`
 
-## Verification
+2. **Lines 633-642 (new)** — Moved `cache_flushed` declaration up and added per-slave `fwd_healthy` initialization:
+   - `int cache_flushed = repl_client_capture_flush_to_slave(c)` moved from old line 651 to new line 634
+   - Added `c->fwd_healthy = 1`, `c->fwd_last_active = time(NULL)` on flush success
+   - Added `c->fwd_healthy = 0` on flush failure
+   - Uses per-slave `conn_t` struct fields instead of globals
 
-- `make clean && make` -- 编译通过，零错误、零警告
-- `queue_snapshot()` 内无 `fp` 残留引用
-- `fcntl.h` / `unistd.h` 已通过 `kvstore/kvstore.h` 间接包含
+3. **Old `cache_flushed` declaration removed** — The original `int cache_flushed` at old line 651 no longer exists; variable now declared only once at new line 634.
 
-## Risk
+## Build Result
 
-None.
+- `kvstore.o` compiled clean — no warnings or errors
+- All errors in `kvs_repl_kprobe.c` only, referencing deleted globals (`g_kprobe_fwd_fd`, `g_fwd_healthy`, `g_fwd_last_active`) — expected, those are cleaned up in later tasks
+
+## Commit
+
+```
+d5221311a168346d4a339eaec775ff0bef4c21b9
+refactor: queue_snapshot sets per-slave fwd_healthy after flush, removes port+13 connect
+```
+
+## Status: DONE

@@ -1863,28 +1863,6 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             return 0;
         }
 
-        /* 全量同步→增量转换：buffer 中可能残留 KVSD 二进制尾字节（含 \0），
-         * 全量完成后仅扫描一次，跳过后正常解析。*/
-        if (from_replication && !g_slave_loading_fullsync
-            && g_slave_fullsync_target_bytes == 0) {
-            static int once = 0;
-            if (!once) {
-                size_t skipped = 0;
-                while (pos + skipped < *len) {
-                    unsigned char c = buf[pos + skipped];
-                    if (c == '*' || c == '+' || c == '-' || c == ':' || c == '$')
-                        break;
-                    skipped++;
-                }
-                once = 1;
-                if (skipped > 0) {
-                    fprintf(stderr, "RESP_SKIP: %zu bytes post-fullsync residue\n", skipped);
-                    pos += skipped;
-                    if (pos >= *len) { *len = 0; return 0; }
-                }
-            }
-        }
-
         if (buf[pos] == '+') {
             size_t line_start = pos + 1;
             while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;

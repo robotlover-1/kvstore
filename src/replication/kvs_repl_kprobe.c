@@ -1286,10 +1286,15 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
         g_cache_bytes += payload_len;
         pthread_mutex_unlock(&g_cache_lock);
     }
-    /* STATE_INCR: 增量同步 — kprobe fwd 直接 send() 到 c->fd。 */
-    static long long fwd_n = 0;
+    /* STATE_INCR: 增量同步 — kprobe fwd 直接 send() 到 c->fd。
+     * 先在锁内收集 fd 列表，再在锁外 send()，避免持锁阻塞 repl_broadcast。 */
     if (!is_repl_control(payload, payload_len)) {
-        fwd_n++;
+        /* BPF 用 CLIENT_ENTRY_MAX_LEN 读取 iovec，实际数据可能远小于此值，
+         * 尾部为零填充。trim 掉尾部的 \0 以避免污染 slave 的 RESP 解析器。 */
+        while (payload_len > 0 && payload[payload_len - 1] == 0)
+            payload_len--;
+        if (payload_len == 0) return 0;
+
         #define MAX_FWD_FDS 16
         int fds[MAX_FWD_FDS];
         conn_t *targets[MAX_FWD_FDS];
@@ -1328,8 +1333,6 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
             }
         }
     }
-    if (fwd_n <= 3 || fwd_n % 500 == 0)
-        fprintf(stderr, "FWD:%lld\n", fwd_n);
     return 0;
 }
 

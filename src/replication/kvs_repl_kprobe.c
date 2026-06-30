@@ -1137,12 +1137,32 @@ void repl_kprobe_fwd_health_check(void) {
         }
     }
 
-    /* 2. 无写流量 — 不判故障，检查恢复条件 */
+    /* 1.5. 全量同步后激活：fwd_last_active 记录全量完成时间，
+     * 等待 2 秒确保 slave 侧 RDMA fullsync 彻底完成后激活 kprobe fwd。*/
+    #define KVS_FWD_POST_FULLSYNC_DELAY 2
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->fwd_healthy) continue;
+        if (c->repl_draining || c->repl_fullsync_pending) continue;
+        if (c->fwd_last_active == 0) continue;  /* 不是 pending 状态 */
+        if (now - c->fwd_last_active > KVS_FWD_POST_FULLSYNC_DELAY) {
+            c->fwd_healthy = 1;
+            c->fwd_last_active = now;
+            fprintf(stderr, "kprobe fwd: activated for slave fd=%d "
+                    "(post-fullsync, +%lds)\n",
+                    c->fd, (long)(now - c->fwd_last_active));
+        }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+
+    /* 2. 无写流量 — 不判故障，检查恢复条件。
+     * 仅恢复 fwd_last_active==0 的 slave（从未 healthy 过，非 pending）。*/
     if (now - g_last_write_ts > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
         pthread_mutex_lock(&g_repl_lock);
         for (conn_t *c = g_replicas; c; c = c->next_replica) {
             if (!c->fwd_healthy && !c->repl_draining
-                && !c->repl_fullsync_pending) {
+                && !c->repl_fullsync_pending
+                && c->fwd_last_active == 0) {
                 c->fwd_healthy = 1;
                 c->fwd_last_active = now;
                 fprintf(stderr, "kprobe fwd: recovered slave fd=%d "

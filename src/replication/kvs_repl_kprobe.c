@@ -117,9 +117,6 @@ static void *kprobe_rdma_slave_poll(void *arg);
 /* 供 reactor 定时器调用 */
 void repl_kprobe_fwd_health_check(void);
 
-/* kprobe 转发独立连接 */
-int repl_kprobe_fwd_connect_from_replica(conn_t *c, int slave_port);
-int repl_kprobe_fwd_slave_init(int base_port);
 
 /* ============================================================
  * BPF 加载与管理

@@ -1288,8 +1288,6 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
     }
     /* STATE_INCR: 增量同步 — kprobe fwd 直接 send() 到 c->fd。
      * 先在锁内收集 fd 列表，再在锁外 send()，避免持锁阻塞 repl_broadcast。 */
-    static long long fwd_count = 0;
-    static long long fwd_drop = 0;
     if (!is_repl_control(payload, payload_len)) {
         #define MAX_FWD_FDS 16
         int fds[MAX_FWD_FDS];
@@ -1326,18 +1324,7 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
             }
             if (total_sent == payload_len) {
                 targets[i]->fwd_last_active = time(NULL);
-            } else {
-                fwd_drop++;
-                if (fwd_drop == 1 || fwd_drop % 1000 == 0) {
-                    fprintf(stderr, "kprobe fwd: send failed fd=%d sent=%zu/%u errno=%d (drop=%lld)\n",
-                            fds[i], total_sent, payload_len, errno, fwd_drop);
-                }
             }
-        }
-        fwd_count++;
-        if (fwd_count == 1 || fwd_count % 5000 == 0) {
-            fprintf(stderr, "kprobe fwd: forwarded %lld commands, dropped %lld\n",
-                    fwd_count, fwd_drop);
         }
     }
 

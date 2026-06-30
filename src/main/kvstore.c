@@ -1778,14 +1778,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             }
             if (!persist_recover_in_progress()) {
                 repl_slave_note_applied(rawlen);
-                static long long slave_applied = 0;
-                slave_applied++;
-                if (slave_applied == 1 || slave_applied % 5000 == 0) {
-                    fprintf(stderr, "slave: applied %lld write commands, "
-                            "last=%s key=%.*s\n",
-                            slave_applied, cmd,
-                            argl[1] < 32 ? (int)argl[1] : 32, argv[1]);
-                }
             }
         }
         if (!from_replication && is_write_cmd(cmd)) {

@@ -2448,30 +2448,14 @@ static void *slave_thread(void *arg) {
                      * the first KVSD chunk arrives. */
                     ssize_t r = recv(tcp_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
                     if (r > 0) {
-                        static long long incr_bytes = 0;
-                        static long long incr_count = 0;
-                        incr_bytes += r;
-                        incr_count++;
-                        if (incr_count == 1 || incr_count % 1000 == 0) {
-                            fprintf(stderr, "slave incr: recv %lld packets, %lld bytes total\n",
-                                    incr_count, incr_bytes);
-                        }
                         blen += (size_t)r;
                         had_new_data = 1;
-                        if (incr_count == 1) {
-                            fprintf(stderr, "slave incr: first recv %zd bytes, "
-                                    "preview: %.*s\n", r,
-                                    (int)(r < 64 ? r : 64), buf + blen - r);
-                        }
                         parse_resp_stream(NULL, buf, &blen, 1);
                         repl_slave_ack_heartbeat();
                         repl_set_link_state(1);
                     } else if (r == 0) {
-                        fprintf(stderr, "slave incr: TCP connection closed by master\n");
                         break;
                     } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        fprintf(stderr, "slave incr: recv error errno=%d %s\n",
-                                errno, strerror(errno));
                         break;
                     }
 

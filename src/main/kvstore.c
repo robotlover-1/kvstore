@@ -1863,27 +1863,25 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             return 0;
         }
 
-        /* 全量同步→增量转换：跳过 buffer 中残留的 KVSD 二进制尾字节。
-         * 当 g_slave_loading_fullsync 刚变为 0 时，buf 开头可能还有
-         * 未消费完的 KVSD 二进制（含 \0），继续当 RESP 解析会永久失步。
-         * 扫描找到第一个 RESP 标记字节后继续。*/
+        /* 全量同步→增量转换：buffer 中可能残留 KVSD 二进制尾字节（含 \0），
+         * 全量完成后仅扫描一次，跳过后正常解析。*/
         if (from_replication && !g_slave_loading_fullsync
             && g_slave_fullsync_target_bytes == 0) {
-            static int did_skip = 0;
-            size_t skipped = 0;
-            while (pos + skipped < *len) {
-                unsigned char c = buf[pos + skipped];
-                if (c == '*' || c == '+' || c == '-' || c == ':' || c == '$')
-                    break;
-                skipped++;
-            }
-            if (skipped > 0 && !did_skip) {
-                fprintf(stderr, "RESP_SKIP: %zu bytes post-fullsync residue\n", skipped);
-                did_skip = 1;
-            }
-            if (skipped > 0) {
-                pos += skipped;
-                if (pos >= *len) { *len = 0; return 0; }
+            static int once = 0;
+            if (!once) {
+                size_t skipped = 0;
+                while (pos + skipped < *len) {
+                    unsigned char c = buf[pos + skipped];
+                    if (c == '*' || c == '+' || c == '-' || c == ':' || c == '$')
+                        break;
+                    skipped++;
+                }
+                once = 1;
+                if (skipped > 0) {
+                    fprintf(stderr, "RESP_SKIP: %zu bytes post-fullsync residue\n", skipped);
+                    pos += skipped;
+                    if (pos >= *len) { *len = 0; return 0; }
+                }
             }
         }
 

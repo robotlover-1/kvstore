@@ -42,6 +42,8 @@
 /* ---- kprobe 转发健康检查 ---- */
 #define KVS_KPROBE_FWD_HEALTH_TIMEOUT 5  /* 5秒无数据判定异常 */
 
+extern pthread_mutex_t g_repl_lock;       /* 定义在 kvstore.c */
+extern volatile time_t g_last_write_ts;   /* 定义在 kvstore.c */
 
 /* ---- BPF Map FDs ---- */
 static struct bpf_object *g_kprobe_obj = NULL;
@@ -1128,23 +1130,47 @@ void repl_client_capture_note_repldone(void) {
  * NOTE: 不再自动压制 repl_broadcast。双路径并行（kprobe fwd + repl_broadcast）
  * 是从机去重的设计。 */
 void repl_kprobe_fwd_health_check(void) {
-    extern volatile time_t g_last_broadcast_time;
     time_t now = time(NULL);
 
-    if (!g_fwd_healthy) return;
-
-    /* 有客户端流量（repl_broadcast 近期活跃）但 kprobe fwd 没有转发 →
-     * kprobe fwd 路径异常 */
-    if (now - g_last_broadcast_time < KVS_KPROBE_FWD_HEALTH_TIMEOUT &&
-        now - g_fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
-        g_fwd_healthy = 0;
-        g_repl_broadcast_suppressed = 0;
-        fprintf(stderr, "kprobe fwd: health check FAILED, "
-                "fallback to repl_broadcast "
-                "(broadcast_active=%lds_ago fwd_active=%lds_ago)\n",
-                (long)(now - g_last_broadcast_time),
-                (long)(now - g_fwd_last_active));
+    /* 1. 全局检测: BPF client_capture 是否还在运行 */
+    /* repl_client_capture_get_stats 返回 0 表示 BPF 未激活 — 仅作日志，不自动降级 */
+    if (repl_client_capture_get_stats(NULL, NULL, NULL, NULL, NULL) == 0) {
+        static int bpfd_quiet = 0;
+        if (!bpfd_quiet) {
+            fprintf(stderr, "kprobe fwd: BPF client_capture not active\n");
+            bpfd_quiet = 1;
+        }
     }
+
+    /* 2. 无写流量 — 不判故障，检查恢复条件 */
+    if (now - g_last_write_ts > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
+        pthread_mutex_lock(&g_repl_lock);
+        for (conn_t *c = g_replicas; c; c = c->next_replica) {
+            if (!c->fwd_healthy && !c->repl_draining
+                && !c->repl_fullsync_pending) {
+                c->fwd_healthy = 1;
+                c->fwd_last_active = now;
+                fprintf(stderr, "kprobe fwd: recovered slave fd=%d "
+                        "(idle window)\n", c->fd);
+            }
+        }
+        pthread_mutex_unlock(&g_repl_lock);
+        return;
+    }
+
+    /* 3. 有写流量 — 检查 per-slave 转发活跃度 */
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (!c->fwd_healthy) continue;
+        if (c->repl_draining || c->repl_fullsync_pending) continue;
+        if (now - c->fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
+            c->fwd_healthy = 0;
+            fprintf(stderr, "kprobe fwd: slave fd=%d unhealthy "
+                    "(fwd_last_active=%lds_ago), fallback to repl_broadcast\n",
+                    c->fd, (long)(now - c->fwd_last_active));
+        }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
 }
 
 /* ============================================================

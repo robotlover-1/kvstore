@@ -1793,7 +1793,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                 goto out;
             }
-            if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+            if (g_cfg.role == ROLE_MASTER) {
+                g_last_write_ts = time(NULL);
+                repl_backlog_feed(raw, rawlen);
+                repl_note_broadcast(rawlen);
+                repl_broadcast(raw, rawlen);   /* 内部判断 per-slave fwd_healthy */
+            }
         }
     } else if (rc == 1 && should_reply_missing) {
         if (!strcmp(op, "SET")) n = resp_simple_string(resp, BUFFER_CAP, "OK");

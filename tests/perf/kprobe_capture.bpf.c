@@ -10,14 +10,32 @@
  *   size_t len         = dx (PT_REGS_PARM3)
  *   返回值 (ax)         = 实际接收字节数
  */
-#include "vmlinux.h"
+#include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_core_read.h>
-#include <bpf/bpf_tracing.h>
 
 #ifndef BPF_MAP_TYPE_RINGBUF
 #define BPF_MAP_TYPE_RINGBUF 27
 #endif
+
+/* x86_64 pt_regs — 替代 vmlinux.h，避免 CO-RE BTF 依赖 */
+struct pt_regs {
+    unsigned long r15, r14, r13, r12, bp, bx;
+    unsigned long r11, r10, r9, r8;
+    unsigned long ax, cx, dx, si, di;
+    unsigned long orig_ax, ip, cs, flags, sp, ss;
+};
+
+/* tracepoint 原始参数结构 */
+struct trace_event_raw_sys_enter {
+    unsigned long long unused;
+    long id;
+    unsigned long args[6];
+};
+struct trace_event_raw_sys_exit {
+    unsigned long long unused;
+    long id;
+    long ret;
+};
 
 #define CAPTURE_MAX_DATA 2048
 #define STAT_HIT         0
@@ -168,59 +186,9 @@ static __always_inline int read_iov_data(unsigned long msg_ptr,
     return (int)safe_len;
 }
 
-/* 尝试从 sk->sk_receive_queue 的 sk_buff 直接读内核态数据
- * 避免 bpf_probe_read_user 的额外用户态拷贝
- *
- * 适用条件：tcp_recvmsg 返回时，skb 数据可能仍在接收到队列中
- * 返回：成功读取的字节数，失败返回 0（调用方应回退 read_iov_data） */
-static __always_inline int read_skb_data(struct sock *sk,
-    unsigned char *buf, int max_len, int expected_len)
-{
-    if (!sk || max_len <= 0 || expected_len <= 0)
-        return 0;
-
-    /* 读取 sk_receive_queue.next（第一个 skb） */
-    struct sk_buff *skb = NULL;
-    if (bpf_core_read(&skb, sizeof(skb), &sk->sk_receive_queue.next) != 0)
-        return 0;
-
-    int found = 0;
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-        if (!skb || found)
-            break;
-
-        unsigned int data_len = 0;
-        if (bpf_core_read(&data_len, sizeof(data_len), &skb->len) != 0)
-            break;
-
-        /* 长度匹配即认为是目标 skb */
-        if (data_len >= (unsigned int)expected_len &&
-            data_len <= (unsigned int)max_len) {
-            unsigned char *data = NULL;
-            if (bpf_core_read(&data, sizeof(data), &skb->data) == 0 && data) {
-                unsigned long long safe_len = (unsigned long long)expected_len;
-                if (safe_len > (unsigned long long)max_len)
-                    safe_len = (unsigned long long)max_len;
-                if (bpf_probe_read_kernel(buf, (__u32)safe_len, data) == 0) {
-                    found = 1;
-                    break;
-                }
-            }
-        }
-
-        /* 下一个 skb */
-        if (bpf_core_read(&skb, sizeof(skb), &skb->next) != 0)
-            break;
-    }
-
-    return found ? expected_len : 0;
-}
-
-/* ──── fentry: 在 tcp_recvmsg 入口保存 msg 和 sk 指针 ────
- * 不使用 BPF_PROG 宏 — 用原始 u64 *ctx 避免 BTF typed pointer 被 verifier 拒绝 */
+/* ──── fentry: tcp_recvmsg 入口保存 msg 和 sk ──── */
 SEC("fentry/tcp_recvmsg")
-int fentry_recv(u64 *ctx)
+int fentry_recv(__u64 *ctx)
 {
     /* ctx[0]=sk, ctx[1]=msg, ctx[2]=len (fentry: ctx = 函数参数) */
     /* CTL_PID=0 表示禁用（PID+enabled 合并） */
@@ -252,7 +220,7 @@ int fentry_recv(u64 *ctx)
  *   ctx[0]=sk, ctx[1]=msg, ctx[2]=len
  * 因此不能依赖 ctx[0] 做 retval 检查，改用 PID 过滤避免非目标进程的开销 */
 SEC("fexit/tcp_recvmsg")
-int fexit_recv(u64 *ctx)
+int fexit_recv(__u64 *ctx)
 {
     /* CTL_PID=0 表示禁用（PID+enabled 合并） */
     __u64 target_pid = ctl_get(CTL_PID);

@@ -4857,7 +4857,7 @@ sudo python3 tools/bench/bench_mem_backend.py \
    └──────────────────────────────────┘
 
    ③ 回显和 ⑤ 异步转发并行：kprobe 不阻塞 ②→③ 的主路径
-   kprobe 转发走独立连接 (port+13)，与 sync 的 TCP 连接完全隔离
+   kprobe 转发共用 slave_fd，与 sync 在同一 TCP 连接上（与生产代码对齐）
 ```
 
 **三种模式实现差异**（都在同一个 main 函数中，`--mode` 切换）：
@@ -4867,9 +4867,9 @@ sudo python3 tools/bench/bench_mem_backend.py \
 | -------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `none`   | `read(client) → write_full(client)`                      | 无转发                                                                                                |
 | `sync`   | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步`write()` 跨机 TCP → slave port 15801                                              |
-| `kprobe` | `read(client) → write_full(client)`                      | BPF 内核截获 → ringbuf → 异步线程`write_full(kprobe_fwd_fd)` → slave **port 15801+13（独立连接）** |
+| `kprobe` | `read(client) → write_full(client)`                      | BPF 内核截获 → ringbuf → 异步线程`write_full(slave_fd)` → slave（**共用 fd，与生产对齐**） |
 
-> kprobe 转发走独立 TCP 连接（port+13），不与 sync 共用 fd。Slave 侧 `test_slave_receiver` 双端口监听（sync=port, kprobe=port+13），与生产代码 `repl_kprobe_fwd_connect_from_replica()` + `kprobe_fwd_slave_thread()` 架构一致。
+> kprobe 转发共用 sync 的 slave_fd（不额外建连接）。Slave 侧单端口监听。与生产代码 `client_ringbuf_cb() → send(c->fd)` 架构一致。
 
 **kprobe BPF 程序**（`kprobe_capture.bpf.c`）工作细节：
 
@@ -4954,40 +4954,36 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 | bpf_ringbuf_reserve                | ✅       | ❌       | kernel 6.1 verifier 拒变量大小                   |
 | SNDBUF 256KB                       | ✅       | N/A      | 测试 harness 特有，生产走 RDMA/repl_broadcast    |
 
-> **测试与生产架构现已对齐**：核心 5 项优化一致。测试 bench 的 slave receiver 也改为双端口模式（sync=port, kprobe=port+13），与生产代码的独立转发连接一致。
+> **测试与生产架构现已对齐**：共用 slave_fd（无 port+13）、ringbuf null trim、BPF 无 CO-RE。与生产代码的 `repl_client_capture.bpf.o` 架构一致。
 
-**本地基准（2026-07-01 重测，10K 请求，kernel 6.1.176，本地回环）**
+**本地基准（2026-07-01 重测，10K 请求，kernel 6.1.176，共用 fd + null trim，无 CO-RE）**
 
-| Payload | none QPS | sync QPS | sync slave | sync vs none |
-| ------- | -------: | -------: | ---------: | -----------: |
-| 64B     |   33,846 |   41,744 |     10,377 |       +23.3% |
-| 128B    |   26,954 |   30,733 |     10,276 |       +14.0% |
-| 256B    |   28,495 |   26,614 |     10,017 |        −6.6% |
-| 512B    |   27,133 |   28,608 |     10,440 |        +5.4% |
-| 1024B   |   26,730 |   35,561 |     10,361 |       +33.0% |
-| 2048B   |   26,947 |   27,316 |     10,474 |        +1.4% |
-| 4096B   |   25,864 |   23,185 |     10,390 |       −10.4% |
+| Payload | none QPS | sync QPS | kprobe QPS | kprobe fwd | kprobe vs sync |
+| ------- | -------: | -------: | ---------: | ---------: | -------------: |
+| 64B     |   22,832 |   27,532 |     17,657 |     35,597 |        −35.9% |
+| 128B    |   21,229 |   23,129 |     19,760 |     37,723 |        −14.6% |
+| 256B    |   23,909 |   25,669 |     18,228 |     36,299 |        −29.0% |
+| 512B    |   20,596 |   24,708 |     17,096 |     38,820 |        −30.8% |
+| 1024B   |   22,299 |   26,642 |     18,983 |     37,923 |        −28.7% |
+| 2048B   |   21,402 |   19,797 |     19,422 |     34,722 |         −1.9% |
+| 4096B   |   25,200 |   21,175 |     19,398 |     26,952 |         −8.4% |
 
-> sync slave 列是同步转发到 slave 端实际接收的请求数（目标 10,000）。本地回环下 sync slave ≈ 10K（~100% 到达率），跨机场景 slave 接收量受网络延迟影响更大。
->
-> none 基准 ~26-34K QPS，比旧数据（24-37K）基本一致。VM 环境 CPU 频率波动可能导致个别点 QPS 跳跃。
+> 测试代码已与生产对齐：共用 slave_fd（无 port+13）、ringbuf null trim、BPF 无 CO-RE（inline pt_regs + `bpf_probe_read_kernel/user`）。
 
-**优化前跨机 kprobe 对比** (kernel 5.15, 50K 请求, kprobe 独立连接，跨虚拟机，上次测试数据保留)
+**跨机参考数据** (kernel 5.15, 50K 请求，上次跨虚拟机测试)
 
 
-| Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
-| ------- | -------: | -------: | ---------: | -------------: | ---------: |
-| 64B     |   36,963 |   19,986 |     30,718 |         +53.7% |     48,391 |
-| 128B    |   27,529 |   17,428 |     13,875 |        −20.4% |     52,162 |
-| 256B    |   29,493 |   15,652 |     13,959 |        −10.8% |     51,195 |
-| 512B    |   31,146 |   16,778 |   68,914¹ |           —¹ |     28,302 |
-| 1024B   |   25,211 |   15,951 |     14,479 |         −9.2% |     52,240 |
-| 2048B   |   25,353 |   17,145 |   78,518¹ |           —¹ |    100,649 |
-| 4096B   |   24,377 |   15,812 |     12,022 |        −24.0% |     51,786 |
+| Payload | none QPS | sync QPS | kprobe QPS | kprobe fwd |
+| ------- | -------: | -------: | ---------: | ---------: |
+| 64B     |   36,963 |   19,986 |     30,718 |     48,391 |
+| 128B    |   27,529 |   17,428 |     13,875 |     52,162 |
+| 256B    |   29,493 |   15,652 |     13,959 |     51,195 |
+| 512B    |   31,146 |   16,778 |   68,914¹ |     28,302 |
+| 1024B   |   25,211 |   15,951 |     14,479 |     52,240 |
+| 2048B   |   25,353 |   17,145 |   78,518¹ |    100,649 |
+| 4096B   |   24,377 |   15,812 |     12,022 |     51,786 |
 
-> ¹ 512B/2048B kprobe QPS 异常偏高（VM CPU 频率波动测量噪声），忽略。
->
-> 注意：kprobe 跨机测试需要 BTF 支持的 BPF 加载环境。当前测试工具（`kprobe_capture.bpf.o`）依赖 vmlinux BTF，未能在本环境加载。以上 kprobe 数据保留自上次跨机测试。生产代码使用 `repl_client_capture.bpf.o` 绕过 BTF 限制。
+> ¹ 跨机 VM CPU 频率波动异常，忽略。
 
 **关键发现**
 

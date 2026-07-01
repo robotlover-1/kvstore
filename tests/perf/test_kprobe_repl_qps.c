@@ -187,8 +187,7 @@ static void *async_forward_thread(void *arg) {
     return NULL;
 }
 
-/* ========== ringbuf 消费者（转发到 slave port+13） ========== */
-#define KPROBE_PORT_OFFSET 13
+/* ========== ringbuf 消费者（共用 slave_fd，与生产代码对齐） ========== */
 
 typedef struct {
     struct bpf_object *obj;
@@ -205,6 +204,12 @@ static int ringbuf_cb(void *ctx, void *data, size_t len) {
     __u32 plen;
     __builtin_memcpy(&plen, data, 4);
     if (plen == 0 || plen > len - 4) return 0;
+
+    /* 与生产代码对齐：trim 尾部的零填充。BPF read_iov_data 返回 iov 长度而非
+     * tcp_recvmsg 实际字节数，尾部为零填充。 */
+    while (plen > 0 && *((const char *)data + 4 + plen - 1) == 0)
+        plen--;
+    if (plen == 0) return 0;
 
     if (write_full(rf->fwd_fd, (const char *)data + 4, plen) < 0)
         return 1; /* stop */
@@ -752,17 +757,9 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                 setsockopt(slave_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
             }
 
-            /* kprobe 转发独立连接 (port+13，不与 sync 共用 fd) */
+            /* kprobe 转发共用 slave_fd（与生产代码对齐：共用 c->fd） */
             if (use_bpf) {
-                kprobe_fwd_fd = socket(AF_INET, SOCK_STREAM, 0);
-                set_nodelay(kprobe_fwd_fd);
-                sa.sin_port = htons(g_slave_port + KPROBE_PORT_OFFSET);
-                if (connect(kprobe_fwd_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-                    fprintf(stderr, "kprobe fwd: connect to %s:%d failed: %s\n",
-                            g_slave_host, g_slave_port + KPROBE_PORT_OFFSET, strerror(errno));
-                    close(kprobe_fwd_fd);
-                    kprobe_fwd_fd = -1;
-                }
+                kprobe_fwd_fd = slave_fd;
             }
         }
     }
@@ -849,7 +846,7 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
         async_ring_free(&async_ring);
     }
     if (slave_fd >= 0) close(slave_fd);
-    if (kprobe_fwd_fd >= 0) close(kprobe_fwd_fd);
+    /* kprobe_fwd_fd == slave_fd，不重复 close */
 
     close(listen_fd);
 

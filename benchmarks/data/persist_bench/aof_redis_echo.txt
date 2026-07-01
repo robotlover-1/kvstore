@@ -1,12 +1,13 @@
-echo: -nanecho: 112920.00echo: 111150.00echo: 110192.00echo: 109805.00echo: 110620.80echo: 110936.66echo: 110644.57echo: 110835.00echo: 110700.45echo: 110628.80echo: 110472.37echo: 110157.34echo: 109977.54echo: 110027.71echo: 109905.07echo: 109672.00echo: 109615.53echo: 109768.66echo: 109728.21echo: 109690.60echo: 109636.38echo: 109522.91echo: 109591.13echo: 109473.66echo: 109418.24echo: 109462.30echo: 109465.93echo: 109467.57echo: 109588.83echo: 109512.80echo: 109516.13echo: 109516.50echo: 109431.15echo: 109458.94echo: 109462.52echo: 109494.34====== echo ======
-  1000000 requests completed in 9.13 seconds
+echo: -nanecho: 114820.00echo: 113882.00echo: 112940.00echo: 112499.00echo: 111647.20echo: 111586.00echo: 111378.29echo: 111272.50echo: 111336.00echo: 111046.00echo: 110966.91echo: 110869.34echo: 110292.30echo: 110243.71echo: 110237.87echo: 110228.00echo: 110173.41echo: 110112.45echo: 110144.84echo: 110206.80echo: 110229.52echo: 110205.45echo: 110138.78echo: 110079.84echo: 109934.88echo: 109977.84echo: 110042.37echo: 110051.14echo: 109944.97echo: 109859.73echo: 109743.09echo: 109615.12echo: 109534.66echo: 109487.18echo: 109494.29echo: 109477.55====== echo ======
+  1000000 requests completed in 9.14 seconds
   50 parallel clients
   64 bytes payload
   keep alive: 1
 
-99.78% <= 1 milliseconds
+99.90% <= 1 milliseconds
 99.98% <= 2 milliseconds
-99.99% <= 3 milliseconds
-100.00% <= 3 milliseconds
-109541.02 requests per second
+100.00% <= 8 milliseconds
+100.00% <= 9 milliseconds
+100.00% <= 9 milliseconds
+109457.09 requests per second
 

@@ -147,6 +147,13 @@ TEST_REPL_5W5W_BIN=tests/test_repl_5w5w
 $(TEST_REPL_5W5W_BIN): $(TEST_REPL_5W5W_SRC) $(INC_DIR)/kvstore.h
 	$(CC) $(CFLAGS) -o $@ $<
 
+# ---- kprobe 主从转发 QPS 测试 ----
+TEST_KPROBE_REPL_QPS_SRC=tests/perf/test_kprobe_repl_qps.c
+TEST_KPROBE_REPL_QPS_BIN=tests/perf/test_kprobe_repl_qps
+
+$(TEST_KPROBE_REPL_QPS_BIN): $(TEST_KPROBE_REPL_QPS_SRC)
+	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz -lpthread
+
 # ---- eBPF 独立守护进程 ----
 EBPF_DAEMON_SRC=tools/ebpf/repl_ebpf_daemon.c
 EBPF_DAEMON_BIN=tools/ebpf/repl_ebpf_daemon

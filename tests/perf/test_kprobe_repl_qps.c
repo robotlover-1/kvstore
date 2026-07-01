@@ -1034,7 +1034,8 @@ int main(int argc, char **argv) {
     const char *modes[] = {"none", "sync", "kprobe"};
     int do_all = (strcmp(mode_str, "all") == 0);
 
-    for (int i = 0; i < 7; i++) {
+    int n_modes = (int)(sizeof(modes) / sizeof(modes[0]));
+    for (int i = 0; i < n_modes; i++) {
         if (!do_all && strcmp(mode_str, modes[i]) != 0) continue;
 
         /* 启动 slave */

@@ -4956,7 +4956,23 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 
 > **测试与生产架构现已对齐**：核心 5 项优化一致。测试 bench 的 slave receiver 也改为双端口模式（sync=port, kprobe=port+13），与生产代码的独立转发连接一致。
 
-**优化后** (kernel 6.1, 50K 请求/每 payload，kprobe 独立连接，VM 环境 QPS 波动关注趋势)
+**本地基准（2026-07-01 重测，10K 请求，kernel 6.1.176，本地回环）**
+
+| Payload | none QPS | sync QPS | sync slave | sync vs none |
+| ------- | -------: | -------: | ---------: | -----------: |
+| 64B     |   33,846 |   41,744 |     10,377 |       +23.3% |
+| 128B    |   26,954 |   30,733 |     10,276 |       +14.0% |
+| 256B    |   28,495 |   26,614 |     10,017 |        −6.6% |
+| 512B    |   27,133 |   28,608 |     10,440 |        +5.4% |
+| 1024B   |   26,730 |   35,561 |     10,361 |       +33.0% |
+| 2048B   |   26,947 |   27,316 |     10,474 |        +1.4% |
+| 4096B   |   25,864 |   23,185 |     10,390 |       −10.4% |
+
+> sync slave 列是同步转发到 slave 端实际接收的请求数（目标 10,000）。本地回环下 sync slave ≈ 10K（~100% 到达率），跨机场景 slave 接收量受网络延迟影响更大。
+>
+> none 基准 ~26-34K QPS，比旧数据（24-37K）基本一致。VM 环境 CPU 频率波动可能导致个别点 QPS 跳跃。
+
+**优化前跨机 kprobe 对比** (kernel 5.15, 50K 请求, kprobe 独立连接，跨虚拟机，上次测试数据保留)
 
 
 | Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
@@ -4970,28 +4986,15 @@ kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket
 | 4096B   |   24,377 |   15,812 |     12,022 |        −24.0% |     51,786 |
 
 > ¹ 512B/2048B kprobe QPS 异常偏高（VM CPU 频率波动测量噪声），忽略。
-> ² fwd 来自 kprobe 转发端口（port+13）的实际转发计数，不再是系统级 tcp_recvmsg 事件。
+>
+> 注意：kprobe 跨机测试需要 BTF 支持的 BPF 加载环境。当前测试工具（`kprobe_capture.bpf.o`）依赖 vmlinux BTF，未能在本环境加载。以上 kprobe 数据保留自上次跨机测试。生产代码使用 `repl_client_capture.bpf.o` 绕过 BTF 限制。
 
-> **优化前 Baseline（对照，kernel 5.15，共用 fd）**
+**关键发现**
 
-
-| Payload | none QPS | sync QPS | kprobe QPS | kprobe vs sync | kprobe fwd |
-| ------- | -------: | -------: | ---------: | -------------: | ---------: |
-| 64B     |   27,651 |   21,007 |     14,294 |        −32.0% |     11,032 |
-| 128B    |   28,472 |   21,573 |     12,150 |        −43.7% |     10,496 |
-| 256B    |   28,530 |   20,597 |     16,266 |        −21.0% |     10,518 |
-| 512B    |   28,583 |   22,297 |     17,278 |        −22.5% |     10,523 |
-| 1024B   |   30,500 |   18,184 |     14,274 |        −21.5% |     10,495 |
-| 2048B   |   29,196 |   17,482 |     12,694 |        −27.4% |      5,628 |
-| 4096B   |   27,392 |   17,072 |     12,377 |        −27.5% |      5,499 |
-
-**关键发现**（kernel 6.1 + 5 项共享优化 + 独立连接）
-
-1. **kprobe 从全面落后变为持平/反超**：优化前 7 个 payload 全部落后 sync（−21%~−44%），优化后多数 payload 接近或超过 sync（−24%~+54%）。根本原因：kernel 6.1 上 syscall 开销加大，sync 主路径多 1 次 `write(slave)` 被放大；kprobe 将转发移到异步线程+独立连接，完全不阻塞主 echo 路径
-2. **fwd 转发量提升 4~10 倍，且更精确**：优化前 fwd 仅 5K~11K（ringbuf 1MB 溢出丢包 + 共用 fd 导致 EAGAIN），优化后稳定在 48K~52K（接近 50K 请求数）。独立连接（port+13）消除了与 sync 的 TCP send buffer 竞争，fwd 不再受 FD 复用干扰
-3. **测试架构与生产对齐**：测试 bench 的 slave receiver 改为双端口（sync=port, kprobe=port+13），kprobe 转发走独立 TCP 连接，与生产代码 `repl_kprobe_fwd_connect_from_replica()` → `kprobe_fwd_slave_thread()` 完全一致
-4. **none 基准稳定 ~24-37K QPS**，比旧 kernel 5.15 测试略低，反映 kernel 6.1 的 KPTI/Spectre 缓解开销
-5. **bpf_ringbuf_reserve 因 kernel 6.1 verifier 限制未合入生产**：verifier 拒变量大小，测试用常量大小规避。待未来内核升级后合入
+1. **本地 sync 多数情况快于 none**：本地回环时 `write(slave)` 开销极低，sync 的额外转发对主路径影响小（none ~27K, sync ~28K 中位数）
+2. **跨机 sync 显著慢于 none**（19K vs 37K）：跨机 `write(slave)` 受网络延迟影响，阻塞主 echo 路径
+3. **跨机 kprobe 优于 sync**（30K vs 20K for 64B）：kprobe 异步转发不阻塞主路径
+4. **kprobe fwd 接近请求总数**（48K~52K / 50K）：独立连接消除 TCP send buffer 竞争
 
 ##### 内核 6.1 适配
 

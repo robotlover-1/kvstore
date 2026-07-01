@@ -1031,7 +1031,7 @@ int main(int argc, char **argv) {
 
     print_header();
 
-    const char *modes[] = {"none", "sync", "async", "tc", "kprobe", "fentry", "tp"};
+    const char *modes[] = {"none", "sync", "kprobe"};
     int do_all = (strcmp(mode_str, "all") == 0);
 
     for (int i = 0; i < 7; i++) {

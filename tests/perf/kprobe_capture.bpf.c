@@ -186,7 +186,8 @@ static __always_inline int read_iov_data(unsigned long msg_ptr,
     return (int)safe_len;
 }
 
-/* ──── fentry: tcp_recvmsg 入口保存 msg 和 sk ──── */
+/* ──── fentry/fexit/tp 禁用：需要 BTF，改用 kprobe ──── */
+#if 0
 SEC("fentry/tcp_recvmsg")
 int fentry_recv(__u64 *ctx)
 {
@@ -275,6 +276,7 @@ int fexit_recv(__u64 *ctx)
 }
 
 /* ──── 旧 kprobe 版本保留作为 fallback ──── */
+#endif /* fentry/fexit/tp disabled */
 SEC("kprobe/tcp_recvmsg")
 int kp_recv_entry(struct pt_regs *ctx)
 {

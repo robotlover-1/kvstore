@@ -43,6 +43,7 @@
 #define KVS_KPROBE_FWD_HEALTH_TIMEOUT 5  /* 5秒无数据判定异常 */
 
 extern pthread_mutex_t g_repl_lock;       /* 定义在 kvstore.c */
+long long g_fwd_log_count = 0;             /* kprobe fwd 累计转发次数 */
 extern volatile time_t g_last_write_ts;   /* 定义在 kvstore.c */
 
 /* ---- BPF Map FDs ---- */
@@ -1127,6 +1128,23 @@ void repl_client_capture_note_repldone(void) {
 void repl_kprobe_fwd_health_check(void) {
     time_t now = time(NULL);
 
+    /* 0. 增量传输日志: 定期写入 kvstore_transport.log */
+    extern long long g_fwd_log_count;
+    static long long last_logged = 0;
+    if (g_fwd_log_count > last_logged) {
+        static FILE *log_fp = NULL;
+        if (!log_fp) log_fp = fopen("kvstore_transport.log", "a");
+        if (log_fp) {
+            time_t t = time(NULL);
+            struct tm *tm = localtime(&t);
+            char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+            fprintf(log_fp, "[%s] incremental using kprobe-fwd: %lld commands (total)\n",
+                    ts, g_fwd_log_count);
+            fflush(log_fp);
+        }
+        last_logged = g_fwd_log_count;
+    }
+
     /* 1. 全局检测: BPF client_capture 是否还在运行 */
     /* repl_client_capture_get_stats 返回 0 表示 BPF 未激活 — 仅作日志，不自动降级 */
     if (repl_client_capture_get_stats(NULL, NULL, NULL, NULL, NULL) == 0) {
@@ -1332,9 +1350,11 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
                 targets[i]->fwd_last_active = time(NULL);
             }
         }
-        /* 记录 kprobe fwd 传输日志 */
-        extern void repl_note_send_context(const char *, size_t, unsigned long long, const unsigned char *);
-        repl_note_send_context("kprobe-fwd", payload_len, 0, payload);
+        /* 计数 kprobe fwd 转发次数，由健康检查定时写入传输日志 */
+        static long long fwd_log_count = 0;
+        fwd_log_count++;
+        extern long long g_fwd_log_count;
+        g_fwd_log_count = fwd_log_count;
     }
     return 0;
 }

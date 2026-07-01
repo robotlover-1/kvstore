@@ -1332,6 +1332,9 @@ static int client_ringbuf_cb(void *ctx, void *data, size_t size) {
                 targets[i]->fwd_last_active = time(NULL);
             }
         }
+        /* 记录 kprobe fwd 传输日志 */
+        extern void repl_note_send_context(const char *, size_t, unsigned long long, const unsigned char *);
+        repl_note_send_context("kprobe-fwd", payload_len, 0, payload);
     }
     return 0;
 }

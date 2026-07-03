@@ -681,12 +681,12 @@ static const repl_transport_ops_t *repl_transport_ops_for_context(int send_ctx) 
 
 | 配置 | 说明 | 默认值 |
 |------|------|--------|
-| `--repl-fullsync-transport` | 全量传输方式 | `tcp` |
+| `--repl-fullsync-transport` | 全量传输方式 | `rdma` |
 | `--repl-realtime-transport` | 实时传输方式 | `tcp` |
-| `--rdma-dev` | RDMA 设备名 | `rxe0` |
+| `--rdma-dev` | RDMA 设备名 | `siw0` |
 | `--rdma-ib-port` | IB 端口 | `1` |
 | `--rdma-gid-idx` | GID 索引 | `1` |
 | `--rdma-port` | RDMA 监听端口（0=自动） | `0` |
 | `--rdma-chunk-size` | 单次发送大小 | `262144` |
-| `--rdma-recv-slots` | 接收槽位数量 | `32` |
+| `--rdma-recv-slots` | 接收槽位数量 | `64` |
 | `--rdma-qp-wr-depth` | QP WR 深度 | `64` |

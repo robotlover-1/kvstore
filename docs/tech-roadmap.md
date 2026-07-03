@@ -863,7 +863,7 @@ flowchart TD
 
 ```conf
 repl_fullsync_transport=rdma    # 全量同步走 RDMA
-repl_realtime_transport=ebpf    # 实时同步走 eBPF
+repl_realtime_transport=ebpf+tcp    # 增量同步走 eBPF+tcp（推荐）
 ```
 
 ### 6.4 TCP 复制实现
@@ -1432,27 +1432,27 @@ void kvs_active_expire_cycle(int budget) {
 ```c
 kv_config_t g_cfg = {
     .role = ROLE_MASTER,
-    .port = 5000,
-    .master_host = "127.0.0.1",
-    .master_port = 5000,
+    .port = 5160,
+    .master_host = "192.168.233.128",
+    .master_port = 5160,
     .dump_path = "kvstore.dump",
     .aof_path = "kvstore.aof",
     .mem_backend = "libc",
     .net_backend = "reactor",
     .repl_transport_backend = "tcp",
     .repl_fullsync_transport = "rdma",
-    .repl_realtime_transport = "ebpf",
+    .repl_realtime_transport = "tcp",
     .ebpf_obj_path = "build/replication/bpf/repl_sockmap.bpf.o",
     .ebpf_pin_path = "/sys/fs/bpf/kvstore_repl_sockmap",
     .ebpf_enabled = 0,
     .ebpf_redirect = 0,
     .ebpf_redirect_key = 0,
     .ebpf_forward = 0,
-    .rdma_dev = "rxe0",
+    .rdma_dev = "siw0",
     .rdma_ib_port = 1,
     .rdma_gid_idx = 1,
     .rdma_port = 0,
-    .rdma_recv_slots = 32,
+    .rdma_recv_slots = 64,
     .rdma_chunk_size = BUFFER_CAP * 4,  // 262144
     .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
@@ -1465,6 +1465,8 @@ kv_config_t g_cfg = {
     .sentinel_down_after_ms = 5000,
     .sentinel_failover_timeout_ms = 10000,
     .sentinel_quorum = 1,
+    .kprobe_enabled = 1,
+    .repl_kprobe_obj_path = "build/replication/bpf/repl_kprobe.bpf.o",
 };
 ```
 
@@ -1707,27 +1709,29 @@ make check-repl-rdma-stress \
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `--port` | 监听端口 | 5000 |
+| `--port` | 监听端口 | 5160 |
 | `--net` | 网络模型: reactor/proactor/ntyco | reactor |
 | `--mem` | 内存后端: libc/jemalloc/custom | libc |
 | `--role` | 角色: master/slave | master |
-| `--master-host` | 主节点地址 | 127.0.0.1 |
-| `--master-port` | 主节点端口 | 5000 |
+| `--master-host` | 主节点地址 | 192.168.233.128 |
+| `--master-port` | 主节点端口 | 5160 |
 | `--repl-transport` | 复制传输（单模式）: tcp/rdma/ebpf | tcp |
 | `--repl-fullsync-transport` | 全量同步传输: tcp/rdma | rdma |
-| `--repl-realtime-transport` | 实时同步传输: tcp/ebpf/sockmap | ebpf |
+| `--repl-realtime-transport` | 实时同步传输: tcp/ebpf+tcp/kprobe-rdma/ebpf/tcp | tcp |
 | `--ebpf-obj` | eBPF 对象文件路径 | build/replication/bpf/... |
 | `--ebpf-pin` / `--ebpf-pin-path` | eBPF pin 路径 | /sys/fs/bpf/kvstore_repl_sockmap |
 | `--ebpf-redirect` | 启用 eBPF 重定向 | 0 |
 | `--ebpf-redirect-key` | eBPF 重定向 key | 0 |
 | `--ebpf-forward` | 启用 eBPF 转发 | 0 |
-| `--rdma-dev` | RDMA 设备 | rxe0 |
+| `--rdma-dev` | RDMA 设备 | siw0 |
 | `--rdma-ib-port` | RDMA IB 端口 | 1 |
 | `--rdma-gid-idx` | RDMA GID 索引 | 1 |
 | `--rdma-port` | RDMA 监听端口（0=自动: 主端口+1） | 0 |
-| `--rdma-recv-slots` | RDMA 接收槽位数 | 32 |
+| `--rdma-recv-slots` | RDMA 接收槽位数 | 64 |
 | `--rdma-chunk-size` | RDMA 分块大小（默认 BUFFER_CAP*4=262144） | 262144 |
 | `--rdma-qp-wr-depth` | RDMA QP WR 深度 | 64 |
+| `--kprobe-enabled` | 启用 kprobe 捕获 | 1 |
+| `--kprobe-obj` | kprobe BPF 对象文件路径 | build/replication/bpf/repl_kprobe.bpf.o |
 | `--appendfsync` | AOF 同步: always/everysec | always |
 | `--dump` | dump 文件路径 | kvstore.dump |
 | `--aof` | AOF 文件路径 | kvstore.aof |

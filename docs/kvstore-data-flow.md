@@ -143,13 +143,15 @@ handle_parsed_command(c, argc=3, argv=["SET","key","value"], from_replication=0)
     │      └─ 遍历 g_replicas 链表，只发给"已全量同步完、处于增量稳态"的 slave:
     │           ├─ 跳过 repl_draining:    该连接正在断开，发了也收不到
     │           ├─ 跳过 repl_fullsync_pending: 还没拿到全量基准数据
-    │           ├─ g_repl_fullsync_in_progress 时跳过: 有 slave 在全量同步，
-    │           │      增量数据暂由 client_capture 缓存，等全量完成后再补发
+    │           ├─ 跳过 g_repl_fullsync_in_progress: 全局全量同步中，增量数据由
+    │           │      client_capture BPF 缓存 (L1/L2)，全量完成后 flush
+    │           ├─ 跳过 c->fwd_healthy=1: 已被 kprobe ringbuf 回调直接 send() 服务
     │           └─ 对每条有效连接: repl_realtime_send(c, raw, rawlen)
     │                └─ transport ops → send()
-    │                     ├─ TCP:    queue_bytes → reactor on_write → send()
-    │                     ├─ eBPF:   queue_bytes → send() → BPF sk_msg 内核拦截重定向
-    │                     └─ kprobe: 返回 -1，由内核态 kprobe 拦截 send() 后经
+    │                     ├─ TCP / ebpf+tcp: queue_bytes → reactor on_write → send()
+    │                     │      (fwd_healthy=1 时跳过，由 kprobe ringbuf 直发)
+    │                     ├─ eBPF sockmap: queue_bytes → send() → BPF sk_msg 内核拦截重定向
+    │                     └─ kprobe-rdma: 返回 -1，由内核态 kprobe 拦截 send() 后经
     │                               ringbuf→RDMA WRITE 转发; TCP 路径同时运行作保底
     │
     └─ 6. queue_bytes(c, response)              回复客户端 "+OK\r\n"
@@ -545,22 +547,20 @@ SLAVE 启动                          MASTER
   Client → Master 的 TCP 数据
        │
        ▼
-  repl_client_capture.bpf.c:
-    ├─ kprobe/tcp_recvmsg:  捕获 fd，记录到 per-CPU map
-    ├─ kretprobe/tcp_recvmsg: 读返回值（收到的字节数）
+  repl_client_capture.bpf.c (3 个 hook):
+    ├─ kprobe/tcp_recvmsg:   保存 msg 指针到 per-CPU map
+    ├─ kretprobe/tcp_recvmsg: 读返回值 + iovec 数据 → bpf_ringbuf_output
+    ├─ kprobe/tcp_sendmsg:   探测 REPLDONE → 提前清零 FULLSYNC_IN_PROGRESS
     │
-    ├─ L1 缓存 (BPF ringbuf):
-    │    直接将数据写入 BPF ringbuf
-    │    用户态 ring_buffer__poll 消费
-    │
-    └─ L2 缓存 (文件):
-         当 ringbuf 满或 L1 flush 触发时
-         写入临时文件
+    ├─ L1 缓存 (内存):  数据写入 g_cache_head 链表 (4MB 上限)
+    └─ L2 缓存 (磁盘):  L1 超限时 spill 到 /tmp/kvstore_fs_cache.<pid>
        
   全量同步完成后:
-    ├─ client_capture L2 flush: 回放文件中的缓存命令
-    ├─ client_capture L1 flush: 回放 ringbuf 中的剩余命令
-    └─ REPLDONE 检测: 确认 slave offset 追上 master offset
+    ├─ g_repl_fullsync_in_progress = 0  (用户态)
+    ├─ repl_client_capture_set_fullsync(0)  (通知 BPF)
+    ├─ client_capture L1+L2 flush: 通过 repl_send_chunked 发送缓存数据
+    ├─ c->fwd_healthy = 1  (启用 kprobe 直发)
+    └─ BPF REPLDONE 检测: kprobe/tcp_sendmsg 在 REPLDONE 发出时提前切增量模式
 ```
 
 ### 5.3 部分重同步（CONTINUE）
@@ -648,7 +648,7 @@ Backlog 是 1MB 环形缓冲，正常运行时**一直都**在记录。不是全
                                         │              │ → ringbuf → RDMA WRITE           │
                                         │ ebpf+tcp     │ BPF kprobe (hook tcp_recvmsg)      │
                                         │              │ client_capture → ringbuf          │
-                                        │              │ → forward_to_slave (TCP port+13)  │
+                                        │              │ → send(c->fd) 共用 slave TCP 连接  │
                                         └──────────────┴──────────────────────────────────┘
 
 两个配置独立:
@@ -662,7 +662,7 @@ Backlog 是 1MB 环形缓冲，正常运行时**一直都**在记录。不是全
 |----------|---------|----------|---------|
 | `repl_sockmap.bpf.o` | sk_msg (sendmsg) | `repl_realtime_transport=ebpf/sockmap` | sockmap redirect |
 | `repl_kprobe.bpf.o` | kprobe (tcp_sendmsg) | `repl_realtime_transport=kprobe-rdma` | ringbuf → RDMA WRITE |
-| `repl_client_capture.bpf.o` | kprobe (tcp_recvmsg) | `kprobe_enabled=1` 且 role=MASTER | ringbuf → TCP forward |
+| `repl_client_capture.bpf.o` | kprobe/kretprobe (tcp_recvmsg) + kprobe (tcp_sendmsg) | `kprobe_enabled=1` 且 role=MASTER | ringbuf → send(c->fd) 共用连接，fwd_healthy=1 时 repl_broadcast 跳过 |
 
 ### 6.2 模式 A: 纯 TCP
 
@@ -747,10 +747,8 @@ kprobe_enabled=1 且 role=MASTER:
 **Slave 初始化：**
 ```
 kprobe_enabled=1 且 role=SLAVE:
-  → repl_kprobe_fwd_slave_init(port)
-    → 设置 g_kprobe_running = 1（确保监听线程不会在非 kprobe-rdma 模式下立即退出）
-    → 在 port+13 上启动 TCP 监听
-    → accept 连接 → read → parse_resp_stream(from_replication=1)
+  → 无需特殊初始化，增量数据通过同一条 TCP 连接 (slave_fd) 接收
+  → parse_resp_stream(NULL, buf, &len, from_replication=1)
 ```
 
 **完整数据流：**
@@ -761,55 +759,54 @@ Client 发送 SET key val
     ▼
 Master 内核 tcp_recvmsg()
     │
-    ├─ repl_broadcast 路径 (永久保底):
-    │   数据 → 用户态 → parse_resp_stream → handle_parsed_command
-    │     → repl_broadcast(raw, rawlen)
-    │     → send() → TCP → slave 主端口
-    │   (从不会被自动压制，与 kprobe 路径永久并行)
+    ├─ kprobe 路径 (内核态拦截):
+    │     BPF kprobe/kretprobe 在 tcp_recvmsg 拦截客户端原始 TCP 数据
+    │       → BPF ringbuf: [4B len][payload]
+    │       → 用户态 ring_buffer__poll (client_poll_thread, 5ms 间隔)
+    │       → client_ringbuf_cb()
+    │           │
+    │           ├─ g_repl_fullsync_in_progress=1 (全量同步中):
+    │           │    缓存到 L1 (内存链表, 4MB 上限) / L2 (临时文件)
+    │           │
+    │           └─ g_repl_fullsync_in_progress=0 (增量同步):
+    │                遍历 replicas 链表，对 fwd_healthy=1 的 slave:
+    │                  send(c->fd, payload, len)  ← 共用 slave TCP 连接 (c->fd)
     │
-    └─ kprobe 路径 (内核态拦截):
-         BPF kprobe 在 tcp_recvmsg 拦截客户端原始 TCP 数据
-           → BPF ringbuf: [4B len][payload]
-           → 用户态 ring_buffer__poll
-           → client_ringbuf_cb()
-               │
-               ├─ g_repl_fullsync_in_progress=1:
-               │    缓存到 L1 (内存链表) / L2 (临时文件)
-               │
-               └─ g_fwd_healthy=1:
-                    forward_to_slave(payload, len)
-                      → send(g_kprobe_fwd_fd, ...)  ← 独立 TCP 连接
-                      → TCP ──────────────────────→ slave:port+13
-                      → parse_resp_stream(NULL, buf, len, from_replication=1)
+    └─ repl_broadcast 路径 (保底):
+         parse_resp_stream → handle_parsed_command
+           → repl_broadcast(raw, rawlen)
+           → 对 fwd_healthy=1 的 slave 跳过 (已被 kprobe 路径服务)
+           → 对 fwd_healthy=0 的 slave 走 TCP send()
 ```
 
-**probe mode（双路径永久并行）：**
+**全量→增量切换（queue_snapshot 尾部）：**
 
 ```
-全量同步完成时 (queue_snapshot 尾部):
-  ├─ repl_kprobe_fwd_connect_from_replica() ← 建立 port+13 独立连接
-  │    ├─ 成功 → g_fwd_healthy = 1, g_repl_broadcast_suppressed = 0
-  │    └─ 失败 → g_fwd_healthy = 0, 跳过 probe mode
-  ├─ repl_client_capture_flush_to_slave()  ← 先刷全量同步期间缓存的数据
-  └─ 进入双路径并行:
-       ├─ kprobe fwd: BPF 捕获 → forward_to_slave → send(fwd_fd)
-       └─ repl_broadcast: 始终激活，永不自动压制
-       
-健康检查 (repl_kprobe_fwd_health_check, 每 100ms):
-  ├─ g_fwd_healthy == 0 → 直接返回
-  └─ g_fwd_healthy == 1:
-       └─ repl_broadcast 近期活跃 AND kprobe fwd 近期无转发 → 标记异常
-          (两者都空闲 → 不判定失败，无流量不是 kprobe fwd 的问题)
-
-注意: 不再自动压制 repl_broadcast。从机靠 repl_offset 去重，双路径并行不丢数据。
+① g_repl_fullsync_in_progress = 0        ← 用户态关标志
+② repl_client_capture_set_fullsync(0)     ← 通知 BPF: 切换增量模式
+   (BPF 侧可能更早切换: kprobe/tcp_sendmsg 探测到 REPLDONE 时主动清零)
+③ repl_client_capture_flush_to_slave(c)   ← 刷 L1+L2 缓存
+   └─ 成功 → c->fwd_healthy = 1, c->fwd_last_active = now
+   └─ 失败 → c->fwd_healthy = 0 (回退到 repl_broadcast)
+④ backlog gap 回放 (仅当无缓存数据时)
 ```
 
-**为什么这条路径更高效：**
+**fwd_healthy 健康检查 (repl_kprobe_fwd_health_check, 由 reactor 定时调用)：**
 
-| | repl_broadcast 路径 | kprobe forward 路径 |
-|---|---|---|
-| 数据来源 | 用户态 RESP 解析后 `resp_build_cmdN` 重建 | 内核态从 TCP 流中原始截获 |
-| 关键省略 | — | **省去 RESP parse + rebuild**，直接转发原始字节 |
+```
+对每个 replica:
+  fwd_healthy=1 且 fwd_last_active 超时 (5s) 且近期有写:
+    → c->fwd_healthy = 0  ← 标记不健康，回退到 repl_broadcast
+  fwd_healthy=0 且近期无写 (5s 空闲窗口):
+    → c->fwd_healthy = 1  ← 恢复健康
+```
+
+**关键设计点：**
+
+- **共用 TCP 连接**：kprobe 转发和 repl_broadcast 共用同一个 `c->fd`，不再有 port+13 独立连接
+- **TCP 顺序保证**：REPLDONE 通过 TCP 发送（即使全量走 RDMA），确保后续 kprobe fwd 数据在 REPLDONE 之后到达 slave
+- **BPF 侧提前切换**：`kprobe/tcp_sendmsg` 探测到 REPLDONE 时立即清除 FULLSYNC_IN_PROGRESS，比用户态更早
+- **fwd_healthy 互斥**：kprobe 转发和 repl_broadcast 互斥——fwd_healthy=1 时 repl_broadcast 跳过该 slave，避免重复发送
 
 ### 6.6 传输层抽象
 
@@ -845,13 +842,14 @@ repl_transport_ops_t:
     → 根据 repl_realtime_transport 配置选择 (tcp/ebpf/kprobe-rdma/ebpf+tcp)
 
 注意: eBPF+TCP 的 kprobe 转发路径不在 transport ops 框架内 —
-      它通过 client_capture BPF (hook tcp_recvmsg) + 独立 TCP 连接 (port+13) 实现。
+      它通过 client_capture BPF (hook tcp_recvmsg) + 共用 slave TCP 连接 (c->fd) 实现。
+      fwd_healthy=1 时 repl_broadcast 跳过该 slave，由 ringbuf 回调直接 send(c->fd)。
 
 Fallback 机制:
   如果 RDMA/eBPF 发送失败 → 自动 fallback 到 TCP
-  kprobe forward 连接失败 → g_fwd_healthy=0 → 跳过 probe mode
-  kprobe forward 健康检查失败 → g_fwd_healthy=0 → kprobe 路径停止转发, repl_broadcast 保底
-  (不再自动压制 repl_broadcast; 双路径永久并行去重)
+  kprobe forward 启动失败 → c->fwd_healthy=0 → repl_broadcast 负责该 slave
+  kprobe forward 健康检查失败 → c->fwd_healthy=0 → kprobe 路径停止转发, repl_broadcast 保底
+  (fwd_healthy=1 时 repl_broadcast 跳过该 slave，避免重复发送)
 ```
 
 ---
@@ -978,8 +976,12 @@ typedef struct conn_s {
     long long repl_last_send_ms;     // 上次发送时间
     long long repl_last_ack_ms;      // 上次 ACK 时间
     unsigned char inbuf[65536];      // 输入缓冲
-    unsigned char outbuf[65536];     // 输出环形缓冲
-    size_t out_head, out_tail, out_len;
+    unsigned char out_ring[65536];   // 输出环形缓冲
+    size_t out_ring_head;            // 读位置
+    size_t out_ring_tail;            // 写位置
+    size_t out_ring_len;             // 待发送字节数
+    int fwd_healthy;                 // kprobe 转发健康状态
+    time_t fwd_last_active;          // 上次成功转发时间戳
     struct conn_s *next_replica;     // replica 链表
 } conn_t;
 ```
@@ -1002,15 +1004,12 @@ typedef struct repl_backlog_s {
 
 ```c
 // include/kvstore/replication/repl_kprobe.h
-typedef struct kprobe_rdma_ringbuf_s {
-    // 16 字节 header (cache line 对齐)
-    volatile uint64_t producer_head;  // Master 写入 (RDMA WRITE)
-    volatile uint64_t consumer_tail;  // Slave 读取后更新
-    uint8_t _pad[48];                 // padding to 64B
-  
-    // slot 数组: 1024 slots × 512 bytes
-    uint8_t slots[1024][512];
+typedef struct __attribute__((packed)) kprobe_rdma_ringbuf_s {
+    volatile uint64_t producer_head;   /* Master WRITE 更新 */
+    volatile uint64_t consumer_tail;   /* Slave 本地更新 */
+    unsigned char slots[KPROBE_RDMA_SLOT_COUNT * KPROBE_RDMA_SLOT_CAPACITY];
 } kprobe_rdma_ringbuf_t;
+// 每个 slot: [4B payload_len][payload_len bytes RESP 数据]
 ```
 
 ### 8.4 AOF 缓冲区

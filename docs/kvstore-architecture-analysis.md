@@ -882,12 +882,12 @@ flowchart LR
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `--port` | 5000 | 监听端口 |
+| `--port` | 5160 | 监听端口 |
 | `--net` | reactor | 网络模型 |
 | `--mem` | libc | 内存后端 |
 | `--role` | master | 主/从角色 |
 | `--repl-fullsync-transport` | rdma | 全量同步传输 |
-| `--repl-realtime-transport` | ebpf | 实时同步传输 |
+| `--repl-realtime-transport` | tcp | 实时同步传输 |
 | `--appendfsync` | always | AOF fsync 策略 |
 | `--autosnap` | (空) | 自动快照规则 |
 
@@ -935,7 +935,7 @@ flowchart TB
 ```bash
 # 自动启动 kvstore，运行测试，自动清理
 python3 ./run_with_kvstore.py --bin ./kvstore \
-    --host 127.0.0.1 --port 5000 -- \
+    --host 127.0.0.1 --port 5160 -- \
     bash ./test_resp_nc_strict.sh {HOST} {PORT}
 ```
 

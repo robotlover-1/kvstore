@@ -288,8 +288,6 @@ int reactor_start(void) {
             }
         }
 
-        /* flush pending AOF buffered data */
-        persist_flush_pending();
     }
 
     return 0;

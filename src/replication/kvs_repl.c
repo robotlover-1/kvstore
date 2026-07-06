@@ -1918,6 +1918,8 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
     repl_slave_state_save();
 }
 
+static int repl_slave_send_repldone(void);
+
 void repl_slave_finish_fullsync(void) {
     g_slave_loading_fullsync = 0;
     g_slave_fullsync_target_bytes = 0;
@@ -1975,7 +1977,7 @@ void repl_slave_finish_fullsync(void) {
                 g_slave_fullsync_tmp_fd);
     }
     repl_slave_state_save();
-    repl_slave_send_ack();
+    repl_slave_send_repldone();
 }
 
 void repl_slave_note_applied(size_t rawlen) {
@@ -2057,6 +2059,23 @@ int repl_slave_send_ack(void) {
             return 0;
         }
     }
+    return -1;
+}
+
+static int repl_slave_send_repldone(void) {
+    unsigned char cmd[128];
+    size_t n;
+
+    if (g_slave_fd < 0) return -1;
+
+    n = resp_build_cmd1(cmd, sizeof(cmd), "REPLDONE");
+
+    ssize_t sent = send(g_slave_fd, cmd, n, 0);
+    if (sent == (ssize_t)n) {
+        fprintf(stderr, "repl: slave sent REPLDONE to master\n");
+        return 0;
+    }
+    fprintf(stderr, "repl: slave REPLDONE send failed: %s\n", strerror(errno));
     return -1;
 }
 

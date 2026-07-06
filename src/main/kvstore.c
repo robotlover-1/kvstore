@@ -153,8 +153,8 @@ static int parse_appendfsync_policy(const char *s, kvs_aof_fsync_policy_t *out) 
         *out = KVS_AOF_FSYNC_ALWAYS;
         return 0;
     }
-    if (!strcasecmp(s, "everysec")) {
-        *out = KVS_AOF_FSYNC_EVERYSEC;
+    if (!strcasecmp(s, "off")) {
+        *out = KVS_AOF_FSYNC_OFF;
         return 0;
     }
     return -1;
@@ -2304,7 +2304,7 @@ int main(int argc, char **argv) {
                 "  --rdma-recv-slots N     接收槽位数 (默认 64)\n"
                 "  --rdma-chunk-size SIZE  分块大小 (默认 262144)\n"
                 "  --rdma-qp-wr-depth N    QP 队列深度 (默认 64)\n"
-                "  --appendfsync always|everysec  AOF fsync 策略 (默认 always)\n"
+                "  --appendfsync always|off  AOF fsync 策略 (默认 always)\n"
                 "  --ebpf-enabled          启用 eBPF sockmap\n"
                 "  --ebpf-obj PATH         eBPF 对象文件路径\n"
                 "  --ebpf-pin PATH         eBPF pin 路径\n"

@@ -129,9 +129,14 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
         if (proxy_slave_is_connected(&g_slave)) {
             ssize_t n = send(proxy_slave_fd(&g_slave), payload, plen,
                              MSG_NOSIGNAL);
-            if (n < 0) {
-                fprintf(stderr, "ebpf-proxy: send to slave failed, "
-                        "buffering\n");
+            if (n != (ssize_t)plen) {
+                if (n < 0) {
+                    fprintf(stderr, "ebpf-proxy: send to slave failed, "
+                            "buffering\n");
+                } else {
+                    fprintf(stderr, "ebpf-proxy: partial send %zd/%zu, "
+                            "buffering remainder\n", n, plen);
+                }
                 cache_append(&g_cache, payload, plen);
                 g_state = STATE_BUFFERING;
             }
@@ -183,7 +188,11 @@ static void main_loop(void) {
                     if (delay > 5000) delay = 5000;
                     fprintf(stderr, "ebpf-proxy: reconnect attempt %d, "
                             "sleeping %ums\n", attempt, delay);
-                    usleep(delay * 1000);
+                    /* 在退避期间继续 poll ringbuf，防止 ringbuf 满丢数据 */
+                    int poll_iters = (int)(delay / 100);
+                    for (int i = 0; i < poll_iters && !g_shutdown; i++) {
+                        ring_buffer__poll(g_rb, 100);
+                    }
                     g_slave.backoff_ms *= 2;
                     if (g_slave.backoff_ms > g_slave.backoff_max_ms)
                         g_slave.backoff_ms = g_slave.backoff_max_ms;

@@ -562,6 +562,9 @@ static int queue_snapshot(conn_t *c) {
     /* 记录全量同步启动时的 offset，用于后续回放 gap */
     unsigned long long snap_base_offset = repl_master_offset();
 
+    /* 全量同步期间抑制增量广播，避免 KVSD 数据流被 repl_broadcast 写穿插 */
+    g_repl_fullsync_in_progress = 1;
+
     /* 尝试启动 RDMA */
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
         if (repl_rdma_start_fullsync(c) == 0) {
@@ -1119,6 +1122,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         /* Master 侧：slave 发来 REPLDONE 表示全量同步在 slave 侧已完成 */
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
             c->repl_fullsync_pending = 0;
+            g_repl_fullsync_in_progress = 0;
             repl_rdma_log("master_repldone - slave fullsync complete");
             return 0;
         }
@@ -2370,6 +2374,19 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "master: ebpf-proxy proxy_cfg not available, "
                     "continuing without ebpf-proxy\n");
+        }
+    }
+
+    /* kprobe+RDMA 增量同步初始化 */
+    if (g_cfg.kprobe_enabled &&
+        !strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
+        if (g_cfg.role == ROLE_MASTER) {
+            if (repl_kprobe_rdma_master_init() != 0) {
+                fprintf(stderr, "kprobe rdma master init failed, disabling\n");
+                g_cfg.kprobe_enabled = 0;
+            }
+        } else if (g_cfg.role == ROLE_SLAVE) {
+            repl_kprobe_rdma_slave_init();
         }
     }
 

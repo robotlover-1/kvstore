@@ -387,8 +387,6 @@ extern int g_epfd;
 extern conn_t *g_replicas;
 extern pthread_mutex_t g_repl_lock;
 extern volatile int g_repl_fullsync_in_progress;
-extern volatile int g_repl_client_capture_active;
-extern int g_repl_capture_slave_fd;
 extern int g_aof_fd;
 
 void *kvs_malloc(size_t size);
@@ -561,13 +559,6 @@ typedef struct {
     unsigned long long kprobe_bytes;
     int kprobe_initialized;
     int rdma_connected;
-    /* client_capture (eBPF+tcp 路径4) 统计 */
-    int client_capture_active;
-    unsigned long long client_capture_hits;
-    unsigned long long client_capture_cached;
-    unsigned long long client_capture_repldone_detect;
-    unsigned long long client_cache_l1_flushed;
-    unsigned long long client_cache_l2_flushed;
 } kvs_repl_kprobe_stats_t;
 
 int repl_kprobe_rdma_master_init(void);

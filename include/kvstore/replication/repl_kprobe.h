@@ -58,14 +58,4 @@ int repl_kprobe_rdma_set_fd(int fd);
 
 void repl_kprobe_fwd_health_check(void);
 
-/* ---- Client capture 接口 ---- */
-int repl_client_capture_init(void);
-void repl_client_capture_set_fullsync(int in_progress);
-int repl_client_capture_flush_to_slave(conn_t *c);
-void repl_client_capture_cleanup(void);
-void repl_client_capture_note_repldone(void);
-int repl_client_capture_get_stats(unsigned long long *hits,
-    unsigned long long *cached, int *repldone_detect,
-    int *l1_flushed, int *l2_flushed);
-
 #endif /* REPL_KPROBE_H */

@@ -31,6 +31,9 @@
 #define CLIENT_ENTRY_HDR_SZ    4
 #define CLIENT_ENTRY_MAX_LEN   8192
 
+#define KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE  3
+#define KVS_EBPF_CLIENT_STAT_REPLSYNC_DETECT 8
+
 /* x86_64 pt_regs */
 struct pt_regs {
     unsigned long r15;    unsigned long r14;
@@ -60,6 +63,15 @@ struct {
     __type(value, __u64);
 } client_ctl SEC(".maps");
 
+/* proxy_cfg — master↔ebpf-proxy 共享配置通道
+ * BPF 内核代码不读写此 map，仅用于随 BPF 加载自动创建并 pin */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16);
+    __type(key, char[32]);
+    __type(value, __u64);
+} proxy_cfg SEC(".maps");
+
 /* Stats Map:
  * [0]: HIT              — 总命中次数
  * [1]: SKIP_PID         — PID 不匹配跳过
@@ -68,7 +80,8 @@ struct {
  * [4]: READ_ERR         — probe_read 失败
  * [5]: CACHED           — 缓存条目数
  * [6]: RETPROBE_MISS    — kretprobe 未找到 entry 保存的 msg 指针
- * [7]: REPLDONE_DETECT  — tcp_sendmsg 探测到 REPLDONE
+ * [7]: REPLDONE_DETECT  — 探测到 REPLDONE
+ * [8]: REPLSYNC_DETECT  — 探测到 REPLSYNC
  */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -211,102 +224,81 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
     payload_len = (__u32)data_len;
     __builtin_memcpy(*entry, &payload_len, 4);
 
-    /* 写入 ringbuf */
+    /* ── 检测 REPLSYNC（全量同步开始）── */
+    {
+        int found = 0;
+#pragma unroll
+        for (int i = 0; i < 56; i++) {  /* 56 = 64 - 8 */
+            if (!found && i + 8 <= data_len &&
+                (*entry)[4 + i] == 'R' && (*entry)[4 + i + 1] == 'E' &&
+                (*entry)[4 + i + 2] == 'P' && (*entry)[4 + i + 3] == 'L' &&
+                (*entry)[4 + i + 4] == 'S' && (*entry)[4 + i + 5] == 'Y' &&
+                (*entry)[4 + i + 6] == 'N' && (*entry)[4 + i + 7] == 'C') {
+                found = 1;
+            }
+        }
+        if (found) {
+            __u32 ctl_key = KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE;
+            __u64 one = 1;
+            bpf_map_update_elem(&client_ctl, &ctl_key, &one, 0);
+            __u64 *st = bpf_map_lookup_elem(&client_stats,
+                &(__u32){KVS_EBPF_CLIENT_STAT_REPLSYNC_DETECT});
+            if (st) __sync_fetch_and_add(st, 1);
+        }
+    }
+
+    /* ── 检测 REPLDONE（全量同步完成）── */
+    {
+        int found = 0;
+#pragma unroll
+        for (int i = 0; i < 56; i++) {
+            if (!found && i + 8 <= data_len &&
+                (*entry)[4 + i] == 'R' && (*entry)[4 + i + 1] == 'E' &&
+                (*entry)[4 + i + 2] == 'P' && (*entry)[4 + i + 3] == 'L' &&
+                (*entry)[4 + i + 4] == 'D' && (*entry)[4 + i + 5] == 'O' &&
+                (*entry)[4 + i + 6] == 'N' && (*entry)[4 + i + 7] == 'E') {
+                found = 1;
+            }
+        }
+        if (found) {
+            /* 清除 fullsync 状态 */
+            __u32 ctl_key = KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE;
+            __u64 zero = 0;
+            bpf_map_update_elem(&client_ctl, &ctl_key, &zero, 0);
+
+            /* 写 magic flush 通知到 ringbuf */
+            __u32 magic = 0xFFFFFFFF;
+            __builtin_memcpy(*entry, &magic, 4);
+            bpf_ringbuf_output(&client_cache_ringbuf, *entry, 4, 0);
+
+            __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){7});
+            if (st) __sync_fetch_and_add(st, 1);
+
+            /* 不继续写正常 ringbuf entry（已写 magic） */
+            return 0;
+        }
+    }
+
+    /* 写入 ringbuf（正常数据路径） */
     int entry_size = CLIENT_ENTRY_HDR_SZ + data_len;
     if (bpf_ringbuf_output(&client_cache_ringbuf, *entry, entry_size, 0) != 0) {
-        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){2}); /* RB_ERR */
+        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){2});
         if (st) __sync_fetch_and_add(st, 1);
         return 0;
     }
 
     /* 更新统计 */
-    __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){0}); /* HIT */
+    __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){0});
     if (st) __sync_fetch_and_add(st, 1);
 
-    __u64 *in_progress = bpf_map_lookup_elem(&client_ctl, &(__u32){3});
+    __u64 *in_progress = bpf_map_lookup_elem(&client_ctl,
+        &(__u32){KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE});
     if (in_progress && *in_progress) {
-        st = bpf_map_lookup_elem(&client_stats, &(__u32){5}); /* CACHED */
+        st = bpf_map_lookup_elem(&client_stats, &(__u32){5});
         if (st) __sync_fetch_and_add(st, 1);
     }
 
     return 0;
-}
-
-/* ──── kprobe: 探测 REPLDONE 发送 → 自动关闭全量同步标志 ────
- *
- * Hook tcp_sendmsg，拦截 Master 发出的数据。
- * 当检测到 REPLDONE 时，自动清除 client_ctl[3] (FULLSYNC_IN_PROGRESS)。
- *
- * 这比用户态 queue_snapshot() 中调用 repl_client_capture_set_fullsync(0)
- * 更早一步——REPLDONE 报文刚发出，BPF 就切到 INCR 模式。
- *
- * x86_64 调用约定 (tcp_sendmsg):
- *   struct sock *sk   = di (PT_REGS_PARM1)
- *   struct msghdr *msg = si (PT_REGS_PARM2)
- *   size_t size        = dx (PT_REGS_PARM3)
- */
-SEC("kprobe/tcp_sendmsg")
-int kprobe_client_sendmsg(struct pt_regs *ctx)
-{
-	/* CTL_PID=0 表示禁用 */
-	__u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
-	if (!ctl_pid || !*ctl_pid)
-		return 0;
-
-	/* PID 过滤 — 只关注 Master 进程发出的数据 */
-	__u32 pid = bpf_get_current_pid_tgid() >> 32;
-	if (pid != (__u32)(*ctl_pid))
-		return 0;
-
-	/* 只在全量同步进行中才探测 REPLDONE */
-	__u64 *in_progress = bpf_map_lookup_elem(&client_ctl, &(__u32){3});
-	if (!in_progress || !*in_progress)
-		return 0;
-
-	/* 4. 获取 msg 指针 (si = PT_REGS_PARM2) */
-	unsigned long msg_ptr = (unsigned long)ctx->si;
-	if (!msg_ptr)
-		return 0;
-
-	/* 5. 读取发送数据到临时缓冲区 */
-	__u32 map_key = 0;
-	unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
-	entry = bpf_map_lookup_elem(&client_tmpbuf, &map_key);
-	if (!entry) return 0;
-
-	int data_len = read_recv_data(msg_ptr, *entry, CLIENT_ENTRY_MAX_LEN);
-	if (data_len < 8)  /* "REPLDONE" 至少 8 字节 */
-		return 0;
-
-	/* 6. 在前 64 字节中扫描 "REPLDONE" 子串
-	 * 64 字节足够覆盖 RESP 头 (*1\r\n$8\r\n 最多 10 字节) + 数据
-	 * 使用固定上限 + pragma unroll 保证 verifier 接受 */
-	int found = 0;
-#pragma unroll
-	for (int i = 0; i < 64; i++) {
-		if (!found && i + 8 <= data_len &&
-		    (*entry)[i] == 'R' && (*entry)[i+1] == 'E' &&
-		    (*entry)[i+2] == 'P' && (*entry)[i+3] == 'L' &&
-		    (*entry)[i+4] == 'D' && (*entry)[i+5] == 'O' &&
-		    (*entry)[i+6] == 'N' && (*entry)[i+7] == 'E') {
-			found = 1;
-		}
-	}
-
-	if (!found)
-		return 0;
-
-	/* 7. 检测到 REPLDONE → 自动清除 FULLSYNC_IN_PROGRESS
-	 * 此后 BPF 内核态已知全量同步结束，用户态 flush 后即可转发 */
-	__u32 ctl_key = 3;
-	__u64 zero = 0;
-	bpf_map_update_elem(&client_ctl, &ctl_key, &zero, 0);
-
-	/* 8. 统计 */
-	__u64 *stat = bpf_map_lookup_elem(&client_stats, &(__u32){7}); /* REPLDONE_DETECT */
-	if (stat) __sync_fetch_and_add(stat, 1);
-
-	return 0;
 }
 
 char _license[] SEC("license") = "GPL";

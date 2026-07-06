@@ -161,6 +161,27 @@ EBPF_DAEMON_BIN=tools/ebpf/repl_ebpf_daemon
 $(EBPF_DAEMON_BIN): $(EBPF_DAEMON_SRC)
 	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz
 
+# ---- ebpf-proxy 独立代理进程 ----
+EBPF_PROXY_SRC = src/ebpf_proxy/main.c src/ebpf_proxy/proxy_cache.c src/ebpf_proxy/proxy_slave.c
+EBPF_PROXY_BIN = build/ebpf_proxy
+EBPF_PROXY_CFLAGS = -Wall -Wextra -O2 -I./include
+
+$(EBPF_PROXY_BIN): $(EBPF_PROXY_SRC)
+	@mkdir -p build
+	$(CC) $(EBPF_PROXY_CFLAGS) -o $@ $(EBPF_PROXY_SRC) -lbpf -lelf -lz -lpthread
+
+ebpf-proxy: $(EBPF_PROXY_BIN)
+
+# ---- client_capture BPF 对象文件 ----
+CLIENT_CAPTURE_BPF_SRC = src/replication/bpf/repl_client_capture.bpf.c
+CLIENT_CAPTURE_BPF_OBJ = build/replication/bpf/repl_client_capture.bpf.o
+
+$(CLIENT_CAPTURE_BPF_OBJ): $(CLIENT_CAPTURE_BPF_SRC)
+	@mkdir -p build/replication/bpf
+	$(CLANG) $(BPF_KPROBE_CFLAGS) -c $< -o $@
+
+client_capture_bpf: $(CLIENT_CAPTURE_BPF_OBJ)
+
 # ---- 持久化演示测试 ----
 TEST_PERSIST_DUMP_SRC=tests/test_persist_dump_demo.c
 TEST_PERSIST_DUMP_BIN=test_persist_dump_demo
@@ -347,4 +368,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic tools/ebpf/repl_ebpf_daemon
+.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf

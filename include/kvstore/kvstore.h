@@ -76,8 +76,8 @@
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
 typedef enum {
-    KVS_AOF_FSYNC_ALWAYS = 0,
-    KVS_AOF_FSYNC_EVERYSEC = 1,
+    KVS_AOF_FSYNC_OFF    = 0,
+    KVS_AOF_FSYNC_ALWAYS = 1,
 } kvs_aof_fsync_policy_t;
 
 #if ENABLE_ARRAY
@@ -522,7 +522,7 @@ int persist_set_aof_policy(kvs_aof_fsync_policy_t policy);
 kvs_aof_fsync_policy_t persist_get_aof_policy(void);
 const char *persist_aof_policy_name(void);
 int persist_force_aof_flush(void);
-void persist_flush_pending(void);
+
 void persist_note_write(void);
 unsigned long long persist_dirty_count(void);
 long long persist_last_snapshot_ms(void);

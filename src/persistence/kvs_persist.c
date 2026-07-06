@@ -27,16 +27,7 @@ static int g_bgsave_status = 0; /* 0 idle, 1 running, 2 ok, 3 err */
 static unsigned long long g_bgsave_base_dirty = 0;
 static long long g_last_snapshot_ms = 0;
 
-static int g_aof_dirty = 0;
-static long long g_aof_last_flush_ms = 0;
-
 static int g_aof_disabled = 0;
-
-/* AOF write buffer: batch small RESP commands into larger io_uring writes */
-#define AOF_BUF_SIZE 65536
-static unsigned char g_aof_buf[AOF_BUF_SIZE];
-static size_t g_aof_buf_len = 0;
-static long long g_aof_buffered_since_ms = 0;
 
 int persist_aof_disable(void) {
     g_aof_disabled = 1;
@@ -138,106 +129,13 @@ int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long
     return 0;
 }
 
-/* batch write + fsync: submit both SQEs, wait once, dispatch CQEs by result value.
- * CQE order is NOT guaranteed — write returns >0 (bytes), fsync returns 0 on success. */
-static int persist_write_and_fsync_uring(int fd, const unsigned char *buf, size_t len,
-                                          off_t *offset) {
-    struct io_uring_sqe *sqe_w, *sqe_f;
-    struct io_uring_cqe *cqe;
-    int rc, r1, r2;
-
-    if (persist_uring_init_once() != 0) return -1;
-
-    /* submit write SQE */
-    sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) return -1;
-    io_uring_prep_write(sqe_w, fd, buf, len, offset ? *offset : -1);
-
-    /* submit fsync SQE */
-    sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) return -1;
-    io_uring_prep_fsync(sqe_f, fd, IORING_FSYNC_DATASYNC);
-
-    /* wait for both completions */
-    rc = io_uring_submit_and_wait(&g_persist_uring, 2);
-    if (rc < 0) return -1;
-
-    /* collect first CQE */
-    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
-    if (rc < 0 || !cqe) return -1;
-    r1 = cqe->res;
-    io_uring_cqe_seen(&g_persist_uring, cqe);
-
-    /* collect second CQE */
-    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
-    if (rc < 0 || !cqe) return -1;
-    r2 = cqe->res;
-    io_uring_cqe_seen(&g_persist_uring, cqe);
-
-    /* dispatch by result: write returns >0 (bytes), fsync returns 0 on success */
-    if (r1 > 0) {
-        /* r1 is write bytes, r2 is fsync result */
-        if (r2 < 0) return -1;
-        if (offset) *offset += r1;
-        return 0;
-    } else if (r2 > 0) {
-        /* r2 is write bytes, r1 is fsync result */
-        if (r1 < 0) return -1;
-        if (offset) *offset += r2;
-        return 0;
-    }
-    /* neither returned positive bytes — both failed */
-    return -1;
-}
-
 static int persist_fsync_fd_best_effort(int fd) {
     if (persist_fsync_fd_uring(fd) == 0) return 0;
     return fsync(fd);
 }
 
-/* flush AOF buffer to disk */
-static int persist_aof_flush_buffer(void) {
-    off_t off;
-    int rc;
-
-    if (g_aof_buf_len == 0 || g_aof_fd < 0) return 0;
-
-    off = (off_t)g_aof_write_offset;
-
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        /* ALWAYS: per-command, direct syscall 比 io_uring submit_and_wait 快 */
-        rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
-        if (rc != 0) return -1;
-        if (fdatasync(g_aof_fd) != 0) return -1;
-    } else {
-        /* EVERYSEC: batch write + fsync via io_uring */
-        rc = persist_write_and_fsync_uring(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
-        if (rc != 0) {
-            rc = persist_write_fd_sync(g_aof_fd, g_aof_buf, g_aof_buf_len, &off);
-            if (rc != 0) return -1;
-            rc = persist_fsync_fd_best_effort(g_aof_fd);
-            if (rc != 0) return -1;
-        }
-    }
-
-    g_aof_write_offset = (long long)off;
-    g_aof_buf_len = 0;
-    g_aof_dirty = 0;
-    g_aof_last_flush_ms = kvs_now_ms();
-    g_aof_buffered_since_ms = 0;
-    return 0;
-}
-
 int persist_fsync_fd(int fd) {
     return persist_fsync_fd_best_effort(fd);
-}
-
-/* flush pending AOF buffered data to disk after each reactor iteration.
- * only active in ALWAYS mode; everysec has its own timer. */
-void persist_flush_pending(void) {
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
-        persist_aof_flush_buffer();
-    }
 }
 
 static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
@@ -556,8 +454,6 @@ static int finalize_rewrite_parent(void) {
     free_rewrite_buffer_locked();
     pthread_mutex_unlock(&g_rewrite_buf_lock);
 
-    g_aof_dirty = 0;
-    g_aof_last_flush_ms = kvs_now_ms();
     return 0;
 }
 
@@ -567,7 +463,6 @@ int persist_init(void) {
         return 0;
     }
     g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    g_aof_last_flush_ms = kvs_now_ms();
     if (g_aof_fd < 0) return -1;
     g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
@@ -576,8 +471,6 @@ int persist_init(void) {
 
 void persist_close(void) {
     if (g_aof_fd >= 0) {
-        /* flush any buffered AOF data before fsync+close */
-        if (g_aof_buf_len > 0) persist_aof_flush_buffer();
         persist_flush_aof_fd(g_aof_fd);
         close(g_aof_fd);
     }
@@ -586,7 +479,7 @@ void persist_close(void) {
 }
 
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy) {
-    if (policy != KVS_AOF_FSYNC_ALWAYS && policy != KVS_AOF_FSYNC_EVERYSEC) return -1;
+    if (policy != KVS_AOF_FSYNC_OFF && policy != KVS_AOF_FSYNC_ALWAYS) return -1;
     g_cfg.aof_fsync = policy;
     return 0;
 }
@@ -596,51 +489,69 @@ kvs_aof_fsync_policy_t persist_get_aof_policy(void) {
 }
 
 const char *persist_aof_policy_name(void) {
-    return g_cfg.aof_fsync == KVS_AOF_FSYNC_EVERYSEC ? "everysec" : "always";
+    return g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS ? "always" : "off";
 }
 
 int persist_force_aof_flush(void) {
     if (g_aof_fd < 0) return -1;
-    if (persist_aof_flush_buffer() != 0) return -1;
+    if (persist_fsync_fd_best_effort(g_aof_fd) != 0) return -1;
     return 0;
 }
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
-    if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;
+    struct io_uring_sqe *sqe_w, *sqe_f;
+    struct io_uring_cqe *cqe;
+    off_t off;
+    int rc, r1, r2;
 
-    /* if single command exceeds buffer, flush first then write directly */
-    if (len >= AOF_BUF_SIZE) {
-        if (persist_aof_flush_buffer() != 0) return -1;
-        off_t off = (off_t)g_aof_write_offset;
-        if (persist_write_and_fsync_uring(g_aof_fd, buf, len, &off) != 0) {
-            if (persist_write_fd_sync(g_aof_fd, buf, len, &off) != 0) return -1;
-        }
-        g_aof_write_offset = (long long)off;
+    if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;
+    if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return 0;
+
+    if (persist_uring_init_once() != 0) return -1;
+
+    off = (off_t)g_aof_write_offset;
+
+    /* submit write SQE */
+    sqe_w = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_w) return -1;
+    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
+
+    /* submit fsync SQE */
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_f) return -1;
+    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+
+    /* wait for both completions */
+    rc = io_uring_submit_and_wait(&g_persist_uring, 2);
+    if (rc < 0) return -1;
+
+    /* collect first CQE */
+    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
+    if (rc < 0 || !cqe) return -1;
+    r1 = cqe->res;
+    io_uring_cqe_seen(&g_persist_uring, cqe);
+
+    /* collect second CQE */
+    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
+    if (rc < 0 || !cqe) return -1;
+    r2 = cqe->res;
+    io_uring_cqe_seen(&g_persist_uring, cqe);
+
+    /* dispatch by result: write returns >0 (bytes), fsync returns 0 on success */
+    if (r1 > 0) {
+        if (r2 < 0) return -1;
+        off += r1;
+    } else if (r2 > 0) {
+        if (r1 < 0) return -1;
+        off += r2;
     } else {
-        /* buffer the write */
-        if (g_aof_buf_len + len > AOF_BUF_SIZE) {
-            if (persist_aof_flush_buffer() != 0) return -1;
-        }
-        memcpy(g_aof_buf + g_aof_buf_len, buf, len);
-        g_aof_buf_len += len;
-        /* offset updated in persist_aof_flush_buffer after actual write */
+        return -1;
     }
 
-    /* track when first byte was buffered for group-commit time threshold */
-    if (g_aof_buffered_since_ms == 0) g_aof_buffered_since_ms = kvs_now_ms();
-
-    g_aof_dirty = 1;
+    g_aof_write_offset = (long long)off;
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    /* ALWAYS mode: buffer accumulates; flushed at reactor iteration end
-     * (persist_flush_pending) or on 2ms timeout as latency ceiling */
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
-        if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
-            persist_aof_flush_buffer();
-            g_aof_buffered_since_ms = 0;
-        }
-    }
     return 0;
 }
 
@@ -685,8 +596,6 @@ int persist_recover(void) {
     g_dirty_counter = 0;
     g_last_snapshot_ms = kvs_now_ms();
     g_bgsave_last_end_ms = g_last_snapshot_ms;
-    g_aof_last_flush_ms = g_last_snapshot_ms;
-    g_aof_dirty = 0;
 
     /* 清理恢复过程中已过期的 TTL key（短 TTL 可能在恢复期间已过期） */
     kvs_active_expire_cycle(1000000);
@@ -934,20 +843,6 @@ int persist_build_recover_text(char *buf, size_t cap) {
 }
 
 int persist_autosnap_cron(void) {
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_EVERYSEC && g_aof_dirty) {
-        long long now = kvs_now_ms();
-        if (now - g_aof_last_flush_ms >= 1000) {
-            persist_force_aof_flush();
-        }
-    }
-
-    /* ALWAYS mode: flush pending buffered data if timeout exceeded */
-    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS && g_aof_buf_len > 0) {
-        if (kvs_now_ms() - g_aof_buffered_since_ms >= 2) {
-            persist_aof_flush_buffer();
-        }
-    }
-
     persist_bgsave_poll();
     persist_bgrewriteaof_poll();
 

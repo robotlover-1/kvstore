@@ -1,6 +1,7 @@
 
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
+#include <bpf/bpf.h>
 #include <signal.h>
 #include <ctype.h>
 #include <strings.h>
@@ -65,12 +66,6 @@ pthread_mutex_t g_repl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 全量同步进行中标志 — 同步期间跳过实时广播，启停 RDMA */
 volatile int g_repl_fullsync_in_progress = 0;
-
-/* eBPF+tcp 新增量路径标志 — 启用时 client_capture 直接转发到 slave，repl_broadcast 跳过 */
-volatile int g_repl_client_capture_active = 0;
-
-/* Master 侧 slave 的 TCP 连接 fd（供 client_capture 转发引擎使用） */
-int g_repl_capture_slave_fd = -1;
 
 volatile time_t g_last_write_ts = 0;   /* 最后一次写命令时间戳，健康检查用 */
 
@@ -567,10 +562,6 @@ static int queue_snapshot(conn_t *c) {
     /* 记录全量同步启动时的 offset，用于后续回放 gap */
     unsigned long long snap_base_offset = repl_master_offset();
 
-    /* NEW: 进入全量同步模式 — 设置标志，通知 eBPF 开始缓存客户端数据 */
-    g_repl_fullsync_in_progress = 1;
-    repl_client_capture_set_fullsync(1);
-
     /* 尝试启动 RDMA */
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
         if (repl_rdma_start_fullsync(c) == 0) {
@@ -614,43 +605,13 @@ static int queue_snapshot(conn_t *c) {
     repl_note_fullsync(total);
     c->repl_offset_sent = repl_master_offset();
     c->repl_last_send_ms = kvs_now_ms();
-    size_t done = resp_build_cmd1(buf, buf_size, "REPLDONE");
-    repl_note_send_context("fullsync-done", done, repl_master_offset(), buf);
-    /* 通过全量传输层（RDMA 或 TCP）发送 REPLDONE */
-    if (repl_send_chunked(c, buf, done) != 0) {
-        repl_rdma_log("queue_snapshot - REPLDONE send failed");
-        goto out;
-    }
-    repl_client_capture_note_repldone();
-
-    c->repl_fullsync_pending = 0;
-
-    g_repl_fullsync_in_progress = 0;
-    repl_client_capture_set_fullsync(0);
-
     if (rdma_ok) {
         repl_rdma_stop_fullsync();
         repl_rdma_log("queue_snapshot - RDMA stopped after fullsync");
-        /* 全量同步使用 RDMA 时，也通过 TCP 发送 REPLDONE。
-         * TCP 顺序保证后续同一 c->fd 上的 kprobe fwd 增量数据
-         * 一定在 REPLDONE 之后到达 slave，彻底消除 RDMA/TCP 竞态。 */
-        send(c->fd, buf, done, MSG_NOSIGNAL);
     }
 
-    /* Flush eBPF 缓存。TCP REPLDONE 已确保顺序，立即激活 kprobe fwd。 */
-    int cache_flushed = repl_client_capture_flush_to_slave(c);
-    if (cache_flushed >= 0) {
-        c->fwd_healthy = 1;
-        c->fwd_last_active = time(NULL);
-        fprintf(stderr, "kprobe fwd: healthy for slave fd=%d (post-flush)\n", c->fd);
-    } else {
-        c->fwd_healthy = 0;
-        fprintf(stderr, "kprobe fwd: cache flush failed, slave fd=%d uses repl_broadcast\n", c->fd);
-    }
-
-    /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset）
-     * 仅当 eBPF 缓存未启用/无数据时才回放 backlog，避免数据重复 */
-    if (cache_flushed == 0 && repl_master_offset() > snap_base_offset) {
+    /* 回放全量同步期间累积的 gap 数据（从快照基址到当前 offset） */
+    if (repl_master_offset() > snap_base_offset) {
         unsigned long long gap = repl_master_offset() - snap_base_offset;
         repl_rdma_log("queue_snapshot - replaying gap offset=%llu bytes=%llu",
             snap_base_offset, gap);
@@ -659,8 +620,6 @@ static int queue_snapshot(conn_t *c) {
         } else {
             repl_rdma_log("queue_snapshot - gap replay OK");
         }
-    } else if (cache_flushed > 0) {
-        repl_rdma_log("queue_snapshot - backlog gap skipped (cache flushed %d items)", cache_flushed);
     }
 
     ret = 0;
@@ -1109,15 +1068,32 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             c->repl_transport_kind = KVS_REPL_TRANSPORT_EBPF_TCP;
             fprintf(stderr, "repl: replica transport set to ebpf+tcp\n");
         }
+        /* 向 ebpf-proxy 写入 slave 地址 */
+        {
+            char cfg_path[512];
+            snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
+            int proxy_cfg_fd = bpf_obj_get(cfg_path);
+            if (proxy_cfg_fd >= 0) {
+                __u64 val;
+                char key[32];
+                struct sockaddr_in peer;
+                socklen_t peer_len = sizeof(peer);
+                if (getpeername(c->fd, (struct sockaddr *)&peer, &peer_len) == 0) {
+                    val = (__u64)(peer.sin_addr.s_addr);
+                    snprintf(key, sizeof(key), "slave_addr");
+                    bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+                    val = (__u64)(peer.sin_port);
+                    snprintf(key, sizeof(key), "slave_port");
+                    bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+                    fprintf(stderr, "master: wrote slave addr to ebpf-proxy\n");
+                }
+                close(proxy_cfg_fd);
+            }
+        }
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
 
-        /* eBPF+tcp 路径: 记录 slave fd 供转发引擎使用 */
-        if (g_repl_client_capture_active) {
-            g_repl_capture_slave_fd = c->fd;
-            fprintf(stderr, "client_capture: capture slave fd=%d\n", c->fd);
-        }
         if (can_continue) {
             repl_note_partialsync_result(1);
             repl_backlog_send_continue(c, req_offset);
@@ -1140,8 +1116,18 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {
-        repl_rdma_log("slave_parse - REPLDONE");
-        repl_slave_finish_fullsync();
+        /* Master 侧：slave 发来 REPLDONE 表示全量同步在 slave 侧已完成 */
+        if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
+            c->repl_fullsync_pending = 0;
+            repl_rdma_log("master_repldone - slave fullsync complete");
+            return 0;
+        }
+        /* Slave 侧兼容（旧代码路径，保留以防万一） */
+        if (g_cfg.role == ROLE_SLAVE) {
+            repl_rdma_log("slave_parse - REPLDONE (legacy)");
+            repl_slave_finish_fullsync();
+            return 0;
+        }
         return 0;
     }
     if (!strcmp(cmd, "KPROBEMR")) {
@@ -1165,13 +1151,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
-        unsigned long long cc_hits = 0, cc_cached = 0;
-        int cc_active = 0, cc_repld = 0, cc_l1 = 0, cc_l2 = 0;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         repl_ebpf_get_stats(&ebpf_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
-        cc_active = repl_client_capture_get_stats(
-            &cc_hits, &cc_cached, &cc_repld, &cc_l1, &cc_l2);
 
         unsigned long long max_replica_applied = 0;
         unsigned long long max_replica_durable = 0;
@@ -1254,12 +1236,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "kprobe_ringbuf_bytes:%llu\n"
             "kprobe_rdma_writes:%llu\n"
             "kprobe_rdma_errors:%llu\n"
-            "client_capture_active:%d\n"
-            "client_capture_hits:%llu\n"
-            "client_capture_cached:%llu\n"
-            "client_capture_repldone_detect:%d\n"
-            "client_cache_l1_flushed:%d\n"
-            "client_cache_l2_flushed:%d\n"
             "%s",
             g_cfg.role == ROLE_MASTER ? "master" : "slave",
             kvs_mem_backend_name(),
@@ -1335,8 +1311,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             kprobe_stats.total_bytes,
             kprobe_stats.rdma_writes,
             kprobe_stats.rdma_errors,
-            cc_active, cc_hits, cc_cached,
-            cc_repld, cc_l1, cc_l2,
             recover_n >= 0 ? recover : "");
 
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
@@ -2370,32 +2344,32 @@ int main(int argc, char **argv) {
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
-    if (g_cfg.ebpf_enabled) {
-        if (g_cfg.role == ROLE_MASTER && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
-                || !strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap"))) {
-            if (repl_ebpf_init() != 0) {
-                fprintf(stderr, "ebpf init failed, falling back to tcp replication transport\n");
-                /* Non-fatal: continue with TCP fallback */
-            }
+    /* 向 ebpf-proxy 传递 master 配置（通过 pinned proxy_cfg map） */
+    if (g_cfg.role == ROLE_MASTER) {
+        int proxy_cfg_fd = -1;
+        char cfg_path[512];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
+        /* 等待 proxy 启动并 pin maps（最多 30s） */
+        for (int retry = 0; retry < 60; retry++) {
+            proxy_cfg_fd = bpf_obj_get(cfg_path);
+            if (proxy_cfg_fd >= 0) break;
+            usleep(500000);
         }
-    }
-    /* kprobe+RDMA 增量同步初始化 */
-    if (g_cfg.kprobe_enabled &&
-        !strcasecmp(g_cfg.repl_realtime_transport, "kprobe-rdma")) {
-        if (g_cfg.role == ROLE_MASTER) {
-            if (repl_kprobe_rdma_master_init() != 0) {
-                fprintf(stderr, "kprobe rdma master init failed, disabling\n");
-                g_cfg.kprobe_enabled = 0;
-            }
-        } else if (g_cfg.role == ROLE_SLAVE) {
-            repl_kprobe_rdma_slave_init();
-        }
-    }
-
-    /* Client capture 初始化 — 用于全量同步期间缓存客户端写入 */
-    if (g_cfg.kprobe_enabled && g_cfg.role == ROLE_MASTER) {
-        if (repl_client_capture_init() != 0) {
-            fprintf(stderr, "client capture init failed, continuing without cache\n");
+        if (proxy_cfg_fd >= 0) {
+            __u64 val;
+            char key[32];
+            val = (__u64)getpid();
+            snprintf(key, sizeof(key), "master_pid");
+            bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+            val = (__u64)g_cfg.port;
+            snprintf(key, sizeof(key), "master_port");
+            bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+            fprintf(stderr, "master: wrote config to ebpf-proxy (pid=%d port=%d)\n",
+                    getpid(), g_cfg.port);
+            close(proxy_cfg_fd);
+        } else {
+            fprintf(stderr, "master: ebpf-proxy proxy_cfg not available, "
+                    "continuing without ebpf-proxy\n");
         }
     }
 

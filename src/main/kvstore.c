@@ -992,7 +992,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     kvs_ascii_upper(argv[0]);
     const char *cmd = argv[0];
 
-    if (g_cfg.role == ROLE_SLAVE && !from_replication && is_readonly_slave_blocked(cmd)) {
+    /* ebpf+tcp: proxy 直连 slave 转发写命令，需放行 */
+    if (g_cfg.role == ROLE_SLAVE && !from_replication
+        && !(c && !strcasecmp(repl_realtime_transport_name(), "ebpf+tcp"))
+        && is_readonly_slave_blocked(cmd)) {
         n = resp_error(resp, BUFFER_CAP, "read only slave");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;

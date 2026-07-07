@@ -1125,9 +1125,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
             c->repl_fullsync_pending = 0;
             g_repl_fullsync_in_progress = 0;
-            /* 回放全量同步期间积压的增量数据 */
-            if (repl_master_offset() > c->repl_offset_sent) {
-                repl_backlog_write_range(c, c->repl_offset_sent);
+            /* 回放全量同步期间积压的增量数据。
+             * 用 backlog 自身的 start_offset，而非 c->repl_offset_sent
+             * （后者在 queue_snapshot 中设置为全量开始时的值，但 backlog
+             *  在第一条增量数据写入时才初始化，start_offset 可能更大） */
+            if (repl_backlog_histlen() > 0 && repl_master_offset() > repl_backlog_start_offset()) {
+                repl_backlog_write_range(c, repl_backlog_start_offset());
                 c->repl_offset_sent = repl_master_offset();
             }
             repl_rdma_log("master_repldone - slave fullsync complete");

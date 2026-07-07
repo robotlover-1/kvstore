@@ -496,6 +496,7 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             continue;
         }
         if (g_repl_fullsync_in_progress) {
+            repl_backlog_feed(raw, rawlen);
             pp = &c->next_replica;
             continue;
         }

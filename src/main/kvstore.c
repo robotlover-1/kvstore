@@ -2369,12 +2369,15 @@ int main(int argc, char **argv) {
         if (proxy_cfg_fd >= 0) {
             __u64 val;
             char key[32];
+            int rc;
             val = (__u64)getpid();
             snprintf(key, sizeof(key), "master_pid");
-            bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+            rc = bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+            if (rc != 0) fprintf(stderr, "master: write master_pid failed: %s\n", strerror(errno));
             val = (__u64)g_cfg.port;
             snprintf(key, sizeof(key), "master_port");
-            bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+            rc = bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
+            if (rc != 0) fprintf(stderr, "master: write master_port failed: %s\n", strerror(errno));
             fprintf(stderr, "master: wrote config to ebpf-proxy (pid=%d port=%d)\n",
                     getpid(), g_cfg.port);
             close(proxy_cfg_fd);

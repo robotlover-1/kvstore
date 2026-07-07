@@ -125,6 +125,18 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
         return 0;
     }
 
+    /* 过滤 slave→master 复制控制命令，防止回传 slave */
+    if (plen >= 7) {
+        size_t scan = plen < 128 ? plen : 128;
+        for (size_t i = 0; i + 7 <= scan; i++) {
+            if ((scan - i >= 8 && memcmp(payload + i, "REPLSYNC", 8) == 0) ||
+                memcmp(payload + i, "REPLACK", 7) == 0 ||
+                (scan - i >= 8 && memcmp(payload + i, "REPLDONE", 8) == 0)) {
+                return 0;  /* 静默丢弃控制命令 */
+            }
+        }
+    }
+
     if (g_state == STATE_FORWARDING) {
         if (proxy_slave_is_connected(&g_slave)) {
             ssize_t n = send(proxy_slave_fd(&g_slave), payload, plen,

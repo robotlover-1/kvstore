@@ -657,24 +657,48 @@ redis-cli -p 5160 INFO
 
 测试流程：预存 5w 条数据到 Master → 监控 Slave 全量同步(RDMA) → 再写 5w 条增量 → 监控增量同步(eBPF+tcp) → 验证 eBPF+tcp 传输状态 → 验证 Slave 最终 10w 条数据一致性。
 
-**启动顺序（重要）**: ① Master → ② 本脚本 → ③ Slave（看到"等待 Slave 连接"提示后再启动）
+**启动顺序（重要）**: ① ebpf-proxy → ② Master → ③ 本脚本 → ④ Slave（看到"等待 Slave 连接"提示后再启动）
 
 ```bash
 # ── 方式一: RDMA 全量 + eBPF+tcp 增量（双虚拟机，推荐，需 root）──
+#
+# 架构:
+#   ebpf-proxy (VM1) ──TCP──→ slave proxy listener (VM2, port+1)
+#   master (VM1) ──RDMA──→ slave (VM2)
+#   master (VM1) ──TCP──→ slave (VM2, 控制命令)
+#
+# 增量数据流: Client → master recvmsg → BPF kprobe 捕获
+#   → ringbuf → ebpf-proxy → TCP → slave proxy listener (port+1)
+#   → slave thread (from_replication=1) → apply + update offset
 
-# 终端 1 (VM1, 先启动 Master):
+# 终端 1 (VM1, Master 机器 — 先启动 ebpf-proxy):
+sudo rm -rf /sys/fs/bpf/kvstore_repl_sockmap
+sudo pkill -9 ebpf_proxy kvstore 2>/dev/null
+sudo nohup ./build/ebpf_proxy \
+    --pin-path /sys/fs/bpf/kvstore_repl_sockmap \
+    --obj-path build/replication/bpf/repl_client_capture.bpf.o \
+    > /tmp/ebpf_proxy.log 2>&1 &
+# 确认: grep "waiting for master config" /tmp/ebpf_proxy.log
+
+# 终端 2 (VM1, Master 机器 — 再启动 Master):
 sudo rm -f kvstore_transport.log kvstore.aof
-sudo ./kvstore kvstore.conf --role master
+sudo nohup ./kvstore kvstore.conf --role master > /tmp/kvstore_master.log 2>&1 &
+# 确认: grep "wrote config" /tmp/kvstore_master.log
+#       grep "state=FORWARDING" /tmp/ebpf_proxy.log
 
-# 终端 2 (任意机器, Master 启动后运行):
+# 终端 3 (任意机器, Master 启动后运行测试):
 ./tests/test_repl_5w5w --config tests/test.conf
 
-# 终端 3 (VM2, 看到"等待 Slave 连接..."后再启动 Slave):
+# 终端 4 (VM2, Slave 机器 — 看到"等待 Slave 连接..."后再启动):
 sudo rm -f kvstore.dump kvstore.aof
-sudo ./kvstore kvstore.conf --role slave
+sudo nohup ./kvstore kvstore.conf --role slave > /tmp/kvstore_slave.log 2>&1 &
+# 确认: grep "proxy listener on port" /tmp/kvstore_slave.log
+#       (应输出: repl ebpf-tcp: proxy listener on port 5161)
+#       grep "proxy connected" /tmp/kvstore_slave.log
+#       (应输出: repl ebpf-tcp: proxy connected fd=8)
 
 # ── 方式二: RDMA 全量 + kprobe+RDMA 增量（双虚拟机，需 root）──
-# 同方式一，但 repl_realtime_transport=kprobe-rdma
+# 同方式一，但 repl_realtime_transport=kprobe-rdma，无需 ebpf-proxy
 
 # ── 方式三: TCP 全量 + TCP 增量（单机，无需 root）──
 

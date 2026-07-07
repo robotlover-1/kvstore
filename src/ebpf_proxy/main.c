@@ -260,13 +260,22 @@ static int load_and_attach_bpf(void) {
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", g_pin_path, name);
         unlink(path);
-        bpf_map__pin(map, path);
+        int rc = bpf_map__pin(map, path);
+        if (rc != 0) {
+            fprintf(stderr, "ebpf-proxy: pin map '%s' to %s failed: %s\n",
+                    name, path, strerror(errno));
+        } else {
+            fprintf(stderr, "ebpf-proxy: pinned map '%s' to %s\n", name, path);
+        }
     }
 
     /* 打开自己的 pinned maps */
-    open_pinned_map("client_ctl", &g_client_ctl_fd);
-    open_pinned_map("proxy_cfg", &g_proxy_cfg_fd);
-    open_pinned_map("client_stats", &g_client_stats_fd);
+    if (open_pinned_map("client_ctl", &g_client_ctl_fd) != 0)
+        fprintf(stderr, "ebpf-proxy: open client_ctl failed\n");
+    if (open_pinned_map("proxy_cfg", &g_proxy_cfg_fd) != 0)
+        fprintf(stderr, "ebpf-proxy: open proxy_cfg failed\n");
+    if (open_pinned_map("client_stats", &g_client_stats_fd) != 0)
+        fprintf(stderr, "ebpf-proxy: open client_stats failed\n");
 
     /* attach kprobe entry */
     prog = bpf_object__find_program_by_name(g_bpf_obj, "kprobe_client_recv_entry");

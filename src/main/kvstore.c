@@ -1123,13 +1123,19 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         unsigned long long applied_offset = argc >= 2 ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
         repl_replica_update_ack(c, applied_offset, durable_offset);
-        /* 若 slave 落后且 backlog 有数据，主动推送追赶 */
+        /* 若 slave 落后且 backlog 有数据，推送追赶。
+         * ring buffer 满时短暂等待 reactor drain 后重试。 */
         if (c && repl_master_offset() > applied_offset
             && repl_backlog_histlen() > 0
             && applied_offset >= repl_backlog_start_offset()
             && applied_offset <= repl_backlog_end_offset()) {
-            repl_backlog_write_range(c, applied_offset);
-            c->repl_offset_sent = repl_master_offset();
+            for (int retry = 0; retry < 10; retry++) {
+                if (repl_backlog_write_range(c, applied_offset) == 0) {
+                    c->repl_offset_sent = repl_master_offset();
+                    break;
+                }
+                usleep(100000);  /* 100ms — 等待 reactor drain ring buffer */
+            }
         }
         return 0;
     }

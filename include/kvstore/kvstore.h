@@ -246,7 +246,7 @@ typedef struct kvs_expire_table_s {
 } kvs_expire_table_t;
 extern kvs_expire_table_t global_expire;
 
-#define OUT_RING_SIZE 262144
+#define OUT_RING_SIZE (1024 * 1024)
 
 typedef struct conn_s {
     int fd;

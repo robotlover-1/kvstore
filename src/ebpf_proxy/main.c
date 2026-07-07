@@ -143,8 +143,9 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
                              MSG_NOSIGNAL);
             if (n != (ssize_t)plen) {
                 if (n < 0) {
-                    fprintf(stderr, "ebpf-proxy: send to slave failed "
-                            "(errno=%d), buffering\n", errno);
+                    fprintf(stderr, "ebpf-proxy: send to slave fd=%d failed "
+                            "(errno=%d: %s), buffering\n",
+                            proxy_slave_fd(&g_slave), errno, strerror(errno));
                 } else {
                     fprintf(stderr, "ebpf-proxy: partial send %zd/%zu, "
                             "buffering remainder\n", n, plen);

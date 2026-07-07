@@ -8,7 +8,7 @@
 #include <infiniband/verbs.h>
 #endif
 
-#define KVS_REPL_BACKLOG_SIZE (1024 * 1024)
+#define KVS_REPL_BACKLOG_SIZE (10 * 1024 * 1024)
 
 /* 传输层日志 */
 static FILE *g_transport_log = NULL;

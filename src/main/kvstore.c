@@ -2354,12 +2354,16 @@ int main(int argc, char **argv) {
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
     /* 向 ebpf-proxy 传递 master 配置（通过 pinned proxy_cfg map）
-     * 非阻塞：proxy 未启动则跳过，避免阻塞 reactor 启动 */
+     * 重试几次：proxy 可能正在 pin maps */
     if (g_cfg.role == ROLE_MASTER) {
         int proxy_cfg_fd = -1;
         char cfg_path[512];
         snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
-        proxy_cfg_fd = bpf_obj_get(cfg_path);
+        for (int retry = 0; retry < 10; retry++) {
+            proxy_cfg_fd = bpf_obj_get(cfg_path);
+            if (proxy_cfg_fd >= 0) break;
+            usleep(100000);  /* 100ms */
+        }
         if (proxy_cfg_fd >= 0) {
             __u64 val;
             char key[32];
@@ -2373,8 +2377,8 @@ int main(int argc, char **argv) {
                     getpid(), g_cfg.port);
             close(proxy_cfg_fd);
         } else {
-            fprintf(stderr, "master: ebpf-proxy proxy_cfg not available, "
-                    "continuing without ebpf-proxy\n");
+            fprintf(stderr, "master: ebpf-proxy proxy_cfg not available (%s), "
+                    "continuing without ebpf-proxy\n", strerror(errno));
         }
     }
 

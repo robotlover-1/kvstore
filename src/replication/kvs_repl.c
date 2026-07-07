@@ -1449,6 +1449,7 @@ const char *repl_transport_configured_name(void) {
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     if (use_rdma_fullsync && use_ebpf_tcp_realtime) return "rdma+ebpf-tcp";
+    if (use_ebpf_tcp_realtime) return "tcp+ebpf-tcp";
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return "rdma";
     if (!strcasecmp(g_cfg.repl_transport_backend, "ebpf") || !strcasecmp(g_cfg.repl_transport_backend, "sockmap")) return "ebpf";
     if (!strcasecmp(g_cfg.repl_transport_backend, "kprobe-rdma")) return "kprobe-rdma";
@@ -1464,6 +1465,7 @@ const char *repl_transport_active_name(void) {
     if (use_rdma_fullsync && use_kprobe_realtime) return "rdma+kprobe";
     if (use_rdma_fullsync && use_ebpf_realtime) return "rdma+ebpf";
     if (use_rdma_fullsync && use_ebpf_tcp_realtime) return "rdma+ebpf-tcp";
+    if (use_ebpf_tcp_realtime) return "tcp+ebpf-tcp";
     return g_repl_transport_active[0] ? g_repl_transport_active : repl_transport_configured_name();
 }
 

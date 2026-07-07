@@ -535,10 +535,20 @@ int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int s
     while (off < len) {
         size_t chunk = len - off;
         if (chunk > chunk_cap) chunk = chunk_cap;
+        int rc;
         if (send_ctx == KVS_REPL_SEND_REALTIME) {
-            if (repl_realtime_send(c, buf + off, chunk) != 0) return -1;
+            rc = repl_realtime_send(c, buf + off, chunk);
         } else {
-            if (repl_fullsync_send(c, buf + off, chunk) != 0) return -1;
+            rc = repl_fullsync_send(c, buf + off, chunk);
+        }
+        if (rc != 0) {
+            /* ring buffer full — 重试 send，等待 TCP 窗口释放 */
+            for (int r = 0; r < 30; r++) {
+                ssize_t w = send(c->fd, buf + off, chunk, MSG_NOSIGNAL);
+                if (w == (ssize_t)chunk) break;
+                if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+                usleep(100000);  /* 100ms */
+            }
         }
         off += chunk;
     }

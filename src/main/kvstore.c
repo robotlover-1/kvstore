@@ -2348,17 +2348,13 @@ int main(int argc, char **argv) {
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
     if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
-    /* 向 ebpf-proxy 传递 master 配置（通过 pinned proxy_cfg map） */
+    /* 向 ebpf-proxy 传递 master 配置（通过 pinned proxy_cfg map）
+     * 非阻塞：proxy 未启动则跳过，避免阻塞 reactor 启动 */
     if (g_cfg.role == ROLE_MASTER) {
         int proxy_cfg_fd = -1;
         char cfg_path[512];
         snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
-        /* 等待 proxy 启动并 pin maps（最多 30s） */
-        for (int retry = 0; retry < 60; retry++) {
-            proxy_cfg_fd = bpf_obj_get(cfg_path);
-            if (proxy_cfg_fd >= 0) break;
-            usleep(500000);
-        }
+        proxy_cfg_fd = bpf_obj_get(cfg_path);
         if (proxy_cfg_fd >= 0) {
             __u64 val;
             char key[32];

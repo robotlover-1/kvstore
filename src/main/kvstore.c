@@ -499,8 +499,10 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* kprobe fwd healthy slaves are served by ringbuf callback */
-        if (c->fwd_healthy) {
+        /* kprobe fwd healthy slaves are served by ringbuf callback.
+         * ebpf+tcp transport: proxy handles forwarding independently,
+         * repl_broadcast must always send via TCP (fwd_healthy ignored). */
+        if (c->fwd_healthy && c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) {
             pp = &c->next_replica;
             continue;
         }

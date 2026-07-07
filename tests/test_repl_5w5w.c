@@ -631,8 +631,17 @@ static int run_test(void) {
             progress_print(line1);
             progress_print(ANSI_GREEN "  全量同步完成!" ANSI_RESET);
         } else {
-            /* 全量同步尚未开始 — 但若轮询超过 30s 且 loading 始终为 0，
-             * 可能全量同步已完成但 loading=1→0 被漏掉了。用 HGET 兜底验证。 */
+            /* 全量同步尚未开始 —
+             * 若 slave_off > 0 说明全量同步已完成（loading=1→0 太快被漏掉） */
+            if (!fullsync_started && slave_off > 0) {
+                fullsync_done = 1;
+                fullsync_started = 1;
+                progress_clear();
+                progress_print(line1);
+                progress_print(ANSI_GREEN "  全量同步完成 (快速模式)" ANSI_RESET);
+                break;
+            }
+            /* 若轮询超过 30s 且 loading 始终为 0，用 HGET 兜底验证。 */
             if (!fullsync_checked_hget && i > 60) { /* 60×500ms = 30s */
                 int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
                 if (vfd >= 0) {

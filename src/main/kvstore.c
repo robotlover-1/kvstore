@@ -500,10 +500,10 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* ebpf+tcp: proxy 独立进程全权转发, repl_broadcast 不发送。
-         * kprobe fwd: healthy slave 由 ringbuf callback 转发。 */
-        if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP ||
-            c->fwd_healthy) {
+        /* kprobe fwd healthy slaves served by ringbuf callback.
+         * ebpf+tcp: proxy handles forwarding independently,
+         * repl_broadcast must always send (fwd_healthy ignored). */
+        if (c->fwd_healthy && c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) {
             pp = &c->next_replica;
             continue;
         }

@@ -500,10 +500,10 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* kprobe fwd healthy slaves served by ringbuf callback.
-         * ebpf+tcp: proxy handles forwarding independently,
-         * repl_broadcast must always send (fwd_healthy ignored). */
-        if (c->fwd_healthy && c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) {
+        /* ebpf+tcp: proxy 独立进程全权转发, repl_broadcast 不发送。
+         * kprobe fwd: healthy slave 由 ringbuf callback 转发。 */
+        if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP ||
+            c->fwd_healthy) {
             pp = &c->next_replica;
             continue;
         }
@@ -1802,6 +1802,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (!persist_recover_in_progress()) {
                 repl_slave_note_applied(rawlen);
             }
+        }
+        /* ebpf+tcp: proxy 转发的写命令也需更新 slave offset */
+        if (!from_replication && is_write_cmd(cmd)
+            && g_cfg.role == ROLE_SLAVE
+            && !strcasecmp(repl_realtime_transport_name(), "ebpf+tcp")) {
+            repl_slave_note_applied(rawlen);
         }
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();

@@ -1813,8 +1813,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (g_cfg.role == ROLE_MASTER) {
                 g_last_write_ts = time(NULL);
                 repl_backlog_feed(raw, rawlen);
-                repl_note_broadcast(rawlen);   /* 无条件计数 — offset 必须对所有写命令递增 */
-                repl_broadcast(raw, rawlen);   /* 内部判断 per-slave fwd_healthy，仅 unhealthy slave 走 TCP 发送 */
+                repl_note_broadcast(rawlen);   /* 无条件计数 — offset 反映所有写命令 */
+                repl_broadcast(raw, rawlen);
             }
         }
     } else if (rc == 1 && should_reply_missing) {

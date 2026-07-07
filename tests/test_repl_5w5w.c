@@ -847,7 +847,7 @@ static int run_test(void) {
         }
         progress_print(line2);
 
-        /* 用 offset 判断是否完成（允许 100B 累计舍入误差） */
+        /* 用 offset 判断是否完成（允许 100B 累计误差） */
         if (slave_off + 100 >= master_off && master_off > 0) {
             caught_up = 1;
             progress_clear();

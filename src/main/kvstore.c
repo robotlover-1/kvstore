@@ -507,10 +507,13 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             continue;
         }
         if (repl_realtime_send(c, raw, rawlen) != 0) {
-            /* buffer full — 跳过本次发送，数据在 backlog 中。
-             * slave 通过 REPLACK 触发 backlog 追回。 */
-            pp = &c->next_replica;
-            continue;
+            /* ring buffer full — 直接阻塞 send，不丢数据 */
+            ssize_t w = send(c->fd, raw, rawlen, MSG_NOSIGNAL);
+            if (w != (ssize_t)rawlen) {
+                if (repl_handle_replica_send_failure(c, pp)) continue;
+                pp = &c->next_replica;
+                continue;
+            }
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();
@@ -1119,10 +1122,6 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         unsigned long long applied_offset = argc >= 2 ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
         repl_replica_update_ack(c, applied_offset, durable_offset);
-        /* 若 slave 落后且 backlog 有数据，主动推送追赶 */
-        if (c && repl_master_offset() > applied_offset && repl_backlog_histlen() > 0) {
-            repl_backlog_write_range(c, applied_offset);
-        }
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {

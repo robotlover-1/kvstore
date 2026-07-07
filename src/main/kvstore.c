@@ -508,7 +508,8 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             continue;
         }
         if (repl_realtime_send(c, raw, rawlen) != 0) {
-            /* buffer full — 跳过，不删 replica，下次重试 */
+            /* buffer full — 喂入 backlog，slave 通过 REPLACK 追回 */
+            repl_backlog_feed(raw, rawlen);
             pp = &c->next_replica;
             continue;
         }
@@ -1122,6 +1123,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         unsigned long long applied_offset = argc >= 2 ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
         repl_replica_update_ack(c, applied_offset, durable_offset);
+        /* 若 slave 落后，从 backlog 推送追赶 */
+        if (c && repl_master_offset() > applied_offset
+            && repl_backlog_histlen() > 0) {
+            repl_backlog_write_range(c, applied_offset);
+        }
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {

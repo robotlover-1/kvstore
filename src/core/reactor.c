@@ -124,8 +124,7 @@ static void on_read(conn_t *c) {
         ssize_t n = recv(c->fd, c->inbuf + c->in_len, sizeof(c->inbuf) - c->in_len, 0);
         if (n > 0) {
             c->in_len += (size_t)n;
-            parse_resp_stream(c, c->inbuf, &c->in_len,
-                (c && strstr(repl_realtime_transport_name(), "ebpf+tcp")) ? 1 : 0);
+            parse_resp_stream(c, c->inbuf, &c->in_len, 0);
             continue;
         }
 

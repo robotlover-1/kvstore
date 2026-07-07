@@ -355,9 +355,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 等待 master 写配置 */
+    /* 等待 master 写配置（持续重试，master 可能后启动） */
     fprintf(stderr, "ebpf-proxy: waiting for master config...\n");
-    if (wait_for_master_pid(30000) != 0) {
+    if (wait_for_master_pid(300000) != 0) {
         fprintf(stderr, "ebpf-proxy: timeout waiting for master pid\n");
         cleanup();
         return 1;

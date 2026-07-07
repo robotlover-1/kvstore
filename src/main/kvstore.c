@@ -1080,7 +1080,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             int proxy_cfg_fd = bpf_obj_get(cfg_path);
             if (proxy_cfg_fd >= 0) {
                 __u64 val;
-                char key[32];
+                char key[32] = {0};
                 struct sockaddr_in peer;
                 socklen_t peer_len = sizeof(peer);
                 if (getpeername(c->fd, (struct sockaddr *)&peer, &peer_len) == 0) {
@@ -2361,14 +2361,14 @@ int main(int argc, char **argv) {
         int proxy_cfg_fd = -1;
         char cfg_path[512];
         snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
-        for (int retry = 0; retry < 10; retry++) {
+        for (int retry = 0; retry < 300; retry++) {
             proxy_cfg_fd = bpf_obj_get(cfg_path);
             if (proxy_cfg_fd >= 0) break;
             usleep(100000);  /* 100ms */
         }
         if (proxy_cfg_fd >= 0) {
             __u64 val;
-            char key[32];
+            char key[32] = {0};
             int rc;
             val = (__u64)getpid();
             snprintf(key, sizeof(key), "master_pid");

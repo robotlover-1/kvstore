@@ -499,21 +499,16 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* kprobe fwd healthy slaves are served by ringbuf callback.
-         * ebpf+tcp transport: proxy handles forwarding independently,
-         * repl_broadcast must always send via TCP (fwd_healthy ignored). */
-        if (c->fwd_healthy && c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) {
+        /* ebpf+tcp: proxy 独立进程全权转发，repl_broadcast 不发送。
+         * kprobe fwd: healthy slave 由 ringbuf callback 转发。 */
+        if (c->fwd_healthy || c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) {
             pp = &c->next_replica;
             continue;
         }
         if (repl_realtime_send(c, raw, rawlen) != 0) {
-            /* ring buffer full — 直接阻塞 send，不丢数据 */
-            ssize_t w = send(c->fd, raw, rawlen, MSG_NOSIGNAL);
-            if (w != (ssize_t)rawlen) {
-                if (repl_handle_replica_send_failure(c, pp)) continue;
-                pp = &c->next_replica;
-                continue;
-            }
+            if (repl_handle_replica_send_failure(c, pp)) continue;
+            pp = &c->next_replica;
+            continue;
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();

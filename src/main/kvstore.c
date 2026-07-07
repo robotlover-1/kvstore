@@ -500,8 +500,10 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
-        /* kprobe fwd healthy slaves served by ringbuf callback */
-        if (c->fwd_healthy) {
+        /* kprobe fwd healthy slaves served by ringbuf callback.
+         * ebpf+tcp: proxy handles forwarding independently,
+         * repl_broadcast must always send (fwd_healthy ignored). */
+        if (c->fwd_healthy && c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) {
             pp = &c->next_replica;
             continue;
         }
@@ -1131,8 +1133,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
              * 用 backlog 自身的 start_offset，而非 c->repl_offset_sent
              * （后者在 queue_snapshot 中设置为全量开始时的值，但 backlog
              *  在第一条增量数据写入时才初始化，start_offset 可能更大） */
+            fprintf(stderr, "master: REPLDONE replaying backlog histlen=%llu "
+                    "master_off=%llu backlog_start=%llu\n",
+                    repl_backlog_histlen(), repl_master_offset(),
+                    repl_backlog_start_offset());
             if (repl_backlog_histlen() > 0 && repl_master_offset() > repl_backlog_start_offset()) {
-                repl_backlog_write_range(c, repl_backlog_start_offset());
+                int rc = repl_backlog_write_range(c, repl_backlog_start_offset());
+                fprintf(stderr, "master: backlog replay rc=%d\n", rc);
                 c->repl_offset_sent = repl_master_offset();
             }
             repl_rdma_log("master_repldone - slave fullsync complete");

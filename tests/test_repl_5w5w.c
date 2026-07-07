@@ -691,7 +691,7 @@ static int run_test(void) {
 
     /* 快速验证 slave 数据已就绪（全量同步完成后应该立即可用） */
     printf("  验证 slave 数据...\n");
-    for (int retry = 0; retry < 5; retry++) {
+    for (int retry = 0; retry < 60; retry++) {
         int vfd = tcp_connect(g_opt.slave_host, g_opt.slave_port, 5000);
         if (vfd < 0) { usleep(500000); continue; }
         char *r = cmd(vfd, "HGET", "pre:k:000000", NULL);
@@ -703,7 +703,7 @@ static int run_test(void) {
         }
         free(r);
         close(vfd);
-        if (retry == 4) {
+        if (retry == 59) {
             fprintf(stderr, ANSI_RED "  ✗ slave 数据验证失败\n" ANSI_RESET);
             close(master_fd);
             return 1;

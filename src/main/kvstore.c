@@ -1105,10 +1105,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                     val = (__u64)(peer.sin_addr.s_addr);
                     snprintf(key, sizeof(key), "slave_addr");
                     bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
-                    val = (__u64)g_cfg.port;
+                    val = (__u64)(g_cfg.port + 1);  /* proxy listener on slave port+1 */
                     snprintf(key, sizeof(key), "slave_port");
                     bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
-                    fprintf(stderr, "master: wrote slave addr to ebpf-proxy\n");
+                    fprintf(stderr, "master: wrote slave addr to ebpf-proxy (proxy port=%llu)\n",
+                            (unsigned long long)val);
                 }
                 close(proxy_cfg_fd);
             }

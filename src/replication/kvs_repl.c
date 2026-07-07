@@ -2417,6 +2417,38 @@ static void *slave_thread(void *arg) {
                             "using tcp-compatible path\n");
                 }
 
+                /* ── 创建 proxy 监听器 (port+1) ──
+                 * ebpf-proxy 通过此端口直连 slave，发送捕获的客户端写入数据。
+                 * 在发送 REPLSYNC 之前创建，确保 master 通知 proxy 时 listener 已就绪。 */
+                int proxy_listen_fd = -1;
+                int proxy_fd = -1;
+                int proxy_port = g_cfg.port + 1;
+                {
+                    proxy_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+                    if (proxy_listen_fd >= 0) {
+                        int yes = 1;
+                        setsockopt(proxy_listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+                        struct sockaddr_in paddr;
+                        memset(&paddr, 0, sizeof(paddr));
+                        paddr.sin_family = AF_INET;
+                        paddr.sin_port = htons((uint16_t)proxy_port);
+                        paddr.sin_addr.s_addr = htonl(INADDR_ANY);
+                        if (bind(proxy_listen_fd, (struct sockaddr *)&paddr, sizeof(paddr)) < 0) {
+                            fprintf(stderr, "repl ebpf-tcp: proxy listener bind port=%d failed: %s\n",
+                                    proxy_port, strerror(errno));
+                            close(proxy_listen_fd);
+                            proxy_listen_fd = -1;
+                        } else if (listen(proxy_listen_fd, 1) < 0) {
+                            fprintf(stderr, "repl ebpf-tcp: proxy listener listen failed: %s\n",
+                                    strerror(errno));
+                            close(proxy_listen_fd);
+                            proxy_listen_fd = -1;
+                        } else {
+                            fprintf(stderr, "repl ebpf-tcp: proxy listener on port %d\n", proxy_port);
+                        }
+                    }
+                }
+
                 {
                     unsigned char cmd[256];
                     char offbuf[32], durablebuf[32];
@@ -2457,11 +2489,41 @@ static void *slave_thread(void *arg) {
                 /* ═══ 混合接收循环 ═══
                  * 全量同步期间: RDMA 收全量 chunk + TCP 收控制命令
                  * 全量同步完成后: RDMA 断开，TCP 继续收增量数据
+                 * 同时接收 proxy 连接并读取 ebpf-proxy 转发的增量数据。
                  * 循环不退出——TCP 连接保持，增量数据持续到达 */
                 for (;;) {
                     if (slave_should_reconnect(gen)) break;
 
                     int had_new_data = 0;
+
+                    /* ── Accept proxy 连接（如尚未连接）── */
+                    if (proxy_fd < 0 && proxy_listen_fd >= 0) {
+                        proxy_fd = accept(proxy_listen_fd, NULL, NULL);
+                        if (proxy_fd >= 0) {
+                            fprintf(stderr, "repl ebpf-tcp: proxy connected fd=%d\n", proxy_fd);
+                        }
+                    }
+
+                    /* ── Proxy 增量数据 ── */
+                    if (proxy_fd >= 0) {
+                        ssize_t pr = recv(proxy_fd, buf + blen, sizeof(buf) - blen, MSG_DONTWAIT);
+                        if (pr > 0) {
+                            blen += (size_t)pr;
+                            had_new_data = 1;
+                            parse_resp_stream(NULL, buf, &blen, 1);
+                            repl_slave_ack_heartbeat();
+                            repl_set_link_state(1);
+                        } else if (pr == 0) {
+                            fprintf(stderr, "repl ebpf-tcp: proxy disconnected\n");
+                            close(proxy_fd);
+                            proxy_fd = -1;
+                        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            fprintf(stderr, "repl ebpf-tcp: proxy recv error: %s\n",
+                                    strerror(errno));
+                            close(proxy_fd);
+                            proxy_fd = -1;
+                        }
+                    }
 
                     /* ── TCP 控制消息 + 增量数据 ──
                      * FULLRESYNC arrives via TCP first; must process BEFORE
@@ -2525,6 +2587,10 @@ static void *slave_thread(void *arg) {
 
                 g_slave_fd = -1;
                 repl_transport_tcp_disconnect_slave(tcp_fd);
+                if (proxy_fd >= 0) close(proxy_fd);
+                if (proxy_listen_fd >= 0) close(proxy_listen_fd);
+                proxy_fd = -1;
+                proxy_listen_fd = -1;
                 g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
                 repl_set_link_state(0);
                 sleep(1);

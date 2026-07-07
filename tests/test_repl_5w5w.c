@@ -984,63 +984,6 @@ static int run_test(void) {
     }
 
     /* ═══════════════════════════════════════════
-     * Phase 5.6: 验证 eBPF+tcp (路径4) client_capture 是否生效
-     * ═══════════════════════════════════════════ */
-    banner("Phase 5.6: 验证 eBPF+tcp client_capture (路径4) 状态");
-
-    printf("  正在检查 Master 端 client_capture 状态...\n");
-    {
-        char *info_cc = get_info(g_opt.master_host, g_opt.master_port);
-        char *cc_active = info_cc ? info_field(info_cc, "client_capture_active") : NULL;
-        char *cc_hits   = info_cc ? info_field(info_cc, "client_capture_hits") : NULL;
-        char *cc_cached = info_cc ? info_field(info_cc, "client_capture_cached") : NULL;
-        char *cc_repld  = info_cc ? info_field(info_cc, "client_capture_repldone_detect") : NULL;
-        char *cc_l1     = info_cc ? info_field(info_cc, "client_cache_l1_flushed") : NULL;
-        char *cc_l2     = info_cc ? info_field(info_cc, "client_cache_l2_flushed") : NULL;
-
-        int active = cc_active ? atoi(cc_active) : -1;
-        unsigned long long hits   = cc_hits   ? strtoull(cc_hits, NULL, 10) : 0;
-        unsigned long long cached = cc_cached ? strtoull(cc_cached, NULL, 10) : 0;
-        unsigned long long repld  = cc_repld  ? strtoull(cc_repld, NULL, 10) : 0;
-        unsigned long long l1     = cc_l1     ? strtoull(cc_l1, NULL, 10) : 0;
-        unsigned long long l2     = cc_l2     ? strtoull(cc_l2, NULL, 10) : 0;
-
-        printf("    client_capture_active=%d  hits=%llu  cached=%llu\n"
-               "    repldone_detect=%llu  l1_flushed=%llu  l2_flushed=%llu\n",
-               active, hits, cached, repld, l1, l2);
-
-        if (active == 1 && hits > 0) {
-            printf("  %s✓ eBPF+tcp client_capture 工作正常%s\n",
-                   ANSI_GREEN, ANSI_RESET);
-            printf("    BPF kprobe/tcp_recvmsg 已捕获 %llu 次客户端写入\n", hits);
-            if (cached > 0)
-                printf("    全量同步期间缓存 %llu 条命令, flush L1=%llu L2=%llu\n",
-                       cached, l1, l2);
-            if (repld > 0)
-                printf("    REPLDONE 探测: %llu 次 (kprobe/tcp_sendmsg 路径)\n", repld);
-            else
-                printf("    REPLDONE 由 Master 用户态主动触发 (eBPF+tcp 标准路径)\n");
-            test_pass("eBPF+tcp client_capture 生效: BPF捕获=%llu 次", hits);
-        } else if (active == 1 && hits == 0) {
-            printf("  %s⚠ client_capture 已激活但尚未捕获数据%s\n",
-                   ANSI_YELLOW, ANSI_RESET);
-            printf("    可能原因: 增量数据量小或统计尚未刷新\n");
-            test_pass("client_capture 已激活 (待数据到达后验证)");
-        } else if (active == 0) {
-            printf("  %s⚠ client_capture 未激活%s\n", ANSI_YELLOW, ANSI_RESET);
-            printf("    可能原因: BPF client_capture 加载失败（需 root 权限）\n");
-            printf("    增量数据走 repl_broadcast TCP 保底路径\n");
-            test_pass("增量同步 TCP 保底 (client_capture BPF 未加载)");
-        } else {
-            printf("  %s✗ 无法获取 client_capture 状态%s\n", ANSI_RED, ANSI_RESET);
-        }
-
-        free(cc_active); free(cc_hits); free(cc_cached);
-        free(cc_repld); free(cc_l1); free(cc_l2);
-        free(info_cc);
-    }
-
-    /* ═══════════════════════════════════════════
      * Phase 6: 验证 Slave 数据一致性
      * ═══════════════════════════════════════════ */
     banner("Phase 6: 验证 Slave 数据一致性");

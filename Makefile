@@ -4,7 +4,7 @@ ENABLE_RDMA?=1
 ENABLE_EBPF?=1
 ENABLE_KPROBE_RDMA?=1
 BPF_CFLAGS?=-O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu
-BPF_KPROBE_CFLAGS?=-O2 -g -target bpf -D__TARGET_ARCH_x86 -I./include
+BPF_KPROBE_CFLAGS?=-O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu -I./include
 # kprobe-rdma 依赖 RDMA
 ifeq ($(ENABLE_KPROBE_RDMA),1)
 ENABLE_RDMA ?= 1

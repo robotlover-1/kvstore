@@ -505,13 +505,9 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             continue;
         }
         if (repl_realtime_send(c, raw, rawlen) != 0) {
-            /* buffer full — 直接阻塞 send，确保不丢数据 */
-            ssize_t w = send(c->fd, raw, rawlen, MSG_NOSIGNAL);
-            if (w != (ssize_t)rawlen) {
-                if (repl_handle_replica_send_failure(c, pp)) continue;
-                pp = &c->next_replica;
-                continue;
-            }
+            /* buffer full — 跳过，不删 replica，下次重试 */
+            pp = &c->next_replica;
+            continue;
         }
         c->repl_offset_sent = repl_master_offset();
         c->repl_last_send_ms = kvs_now_ms();

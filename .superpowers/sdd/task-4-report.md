@@ -1,26 +1,24 @@
 # Task 4 Report
 
-## Line Range Changed
-`src/main/kvstore.c:480-519` — entire `repl_broadcast` function body replaced.
+## Status: 完成
 
-## Changes Made
-1. Removed `if (g_repl_broadcast_suppressed) return;` (deleted global, Task 2)
-2. Removed `g_last_broadcast_time = time(NULL);` (deleted global, Task 2)
-3. Removed `repl_backlog_feed(raw, rawlen);` (moved to `handle_parsed_command`, Task 3)
-4. Removed `repl_note_broadcast(rawlen);` (moved to `handle_parsed_command`, Task 3)
-5. Added `if (c->fwd_healthy) { pp = &c->next_replica; continue; }` after fullsync checks — skips slaves served by kprobe fwd ringbuf callback
+### 做了什么
 
-## Build Result
-- `src/main/kvstore.c` compiles cleanly (no errors/warnings)
-- All remaining build errors are in `src/replication/kvs_repl_kprobe.c`:
-  - `g_fwd_healthy` undeclared (line 1411)
-  - `g_fwd_last_active` undeclared (line 1413)
-  - `g_kprobe_fwd_fd` undeclared (lines 1304, 1641)
-  - `KVS_KPROBE_FWD_PORT_OFFSET` undeclared (line 1240)
-- These are expected — they are the targets of Tasks 6-8.
+- 删除 `src/core/reactor.c:291-292`，即 `persist_flush_pending()` 调用及其注释
 
-## Commit
-- Hash: `cdcf107`
-- Message: `refactor: repl_broadcast only sends to unhealthy slaves`
+### 改动文件
 
-## Status: DONE
+- `src/core/reactor.c`：删除 2 行
+
+### Commit
+
+- `c2ed5e9` refactor: remove persist_flush_pending call from reactor loop
+
+### 编译验证
+
+- `make -j$(nproc)` 主代码编译成功（所有 `.o` 文件正常生成）
+- 唯一的编译错误是 BPF 文件 `repl_client_capture.bpf.c` 的 `asm/types.h` 找不到，属于预先存在的问题，与本次改动无关
+
+### 关注点
+
+- 无

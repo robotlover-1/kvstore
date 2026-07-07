@@ -1225,4 +1225,56 @@ Pipeline 模式默认启用（`send_pipeline_enabled = 1`），不影响 TCP/eBP
 
 - 增量同步（eBPF realtime）在 hybrid 模式下偶现 slave offset 不推进。当前怀疑为 eBPF daemon 未独立启动或 sockmap 未正确配置，与 Pipeline 改动无直接关联。
 
-这轮迭代结束后，项目已经从“功能堆叠”转入“可验证、可复盘、可继续维护”的状态。
+---
+
+## 12. 阶段十二：RDMA/kprobe 性能基准重测与代码对齐（2026-07-01）
+
+### 12.1 背景
+
+`test_rdma_throughput.c` 的 RDMA 实现与 `kvs_repl.c` 生产代码存在关键差距（无 pipeline、无 completion channel、usleep 忙等），且 README 中 kprobe 跨机 QPS 数据来源不确定（只测了 64B，但表格有 7 种 payload）。
+
+### 12.2 test_rdma_throughput 代码对齐
+
+#### 尝试过的方案
+
+1. **completion channel + CQ 轮询线程**（对齐生产代码 `repl_rdma_cq_poll_thread`）：本地 loopback 吞吐从 29 Gbps 暴跌到 10 Mbps。根因是 `ibv_poll_cq` 被两个线程并发调用——CQ 线程和 acquire_send_slot 的内联 poll——libibverbs 不保证 CQ 线程安全，导致 completion 丢失。
+
+2. **Pipeline 发送槽**（4/128/512 深度）：本地 loopback 正常，但跨机吞吐固定 ~365 Mbps（原 967 Mbps），与 pipeline depth 无关。
+
+3. **最终方案**：回退到与原代码一致的单 buffer + 高 inflight + 内联 poll。本地 loopback 45 Gbps（+55% vs 原 29 Gbps），跨机 365 Mbps。跨机退化后确认是 **kernel 6.1 rxe 驱动回归**（方向性验证：从机 kernel 5.15 发包 → 主机收 = 892 Mbps，主机 kernel 6.1 发包 → 从机收 = 365 Mbps，同一二进制）。
+
+#### 关键发现
+
+- completion channel 模式不适合单进程吞吐测试（CQ 并发 poll 无锁保护）
+- `volatile` 跨线程读写 `in_flight` 标志在 x86 TSO 上无问题，问题在并发 `ibv_poll_cq`
+- kernel 6.1 rxe 跨机 RoCEv2 发包性能约为 5.15 的 40%
+
+### 12.3 kprobe 跨机 QPS 重测
+
+全部 7 种 payload（64B-4096B）重新测试，10K 请求，共用 fd + null trim。
+
+#### 测试结果
+
+| Payload | none QPS | sync QPS | kprobe QPS | kprobe fwd | kprobe vs sync |
+| ------- | -------: | -------: | ---------: | ---------: | -------------: |
+| 64B | 29,259 | 22,242 | 15,556 | 10,507 | −30.1% |
+| 128B | 28,923 | 22,290 | 15,653 | 10,568 | −29.8% |
+| 256B | 28,026 | 20,607 | 12,031 | 10,500 | −41.6% |
+| 512B | 26,263 | 18,274 | 14,108 | 10,500 | −22.8% |
+| 1024B | 26,770 | 21,676 | 16,755 | 10,510 | −22.7% |
+| 2048B | 27,673 | 21,017 | 16,637 | 10,509 | −20.8% |
+| 4096B | 26,406 | 19,926 | 14,341 | 10,513 | −28.0% |
+
+#### 发现
+
+- kprobe ringbuf 严重溢出：`rb_err` ≈ step2 命中数（99.9% 丢弃率）。ringbuf 消费者 `write_full(slave_fd)` 被跨机 TCP 同步阻塞，消费跟不上 kprobe 产生速度
+- kprobe fwd 稳定在 ~10,500，与 payload 无关，受限于单 TCP 连接跨机转发带宽
+- 之前 README 中 kprobe > sync 的数据来自一次转发连接失败的测试（`connect slave: Connection refused`），转发实际未发生，QPS 虚高
+- 测试方法局限性：ringbuf 消费者与主 echo 路径同进程抢 CPU，无背压机制，kprobe QPS 不可靠。需要独立 CPU 核或独立进程才能测到有意义的数据
+
+### 12.4 修改文件
+
+- `tests/perf/test_rdma_throughput.c`：重写发送路径，移除 CQ 线程和 completion channel，回退到单 buffer + 内联 poll + 高 inflight
+- `README.md`：更新 RDMA 吞吐量关键发现、kprobe 跨机 QPS 表格和结论
+
+这轮迭代结束后，项目已经从”功能堆叠”转入”可验证、可复盘、可继续维护”的状态。

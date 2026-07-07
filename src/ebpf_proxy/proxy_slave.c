@@ -23,7 +23,7 @@ int proxy_slave_connect(proxy_slave_ctx_t *ctx) {
     struct timeval tv;
 
     if (!ctx || ctx->host[0] == '\0' || ctx->port <= 0) return -1;
-    if (ctx->fd >= 0) {
+    if (ctx->fd > 0) {
         close(ctx->fd);
         ctx->fd = -1;
     }
@@ -66,7 +66,7 @@ void proxy_slave_disconnect(proxy_slave_ctx_t *ctx) {
 }
 
 int proxy_slave_is_connected(proxy_slave_ctx_t *ctx) {
-    return ctx && ctx->fd >= 0;
+    return ctx && ctx->fd > 0;
 }
 
 int proxy_slave_fd(proxy_slave_ctx_t *ctx) {

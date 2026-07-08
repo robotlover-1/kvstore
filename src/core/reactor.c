@@ -149,6 +149,8 @@ static void on_read(conn_t *c) {
 
     if (c->out_ring_len > 0) mod_events(c, EPOLLIN | EPOLLOUT);
     else mod_events(c, EPOLLIN);
+
+    persist_reap_cqes();
 }
 
 static void on_write(conn_t *c) {
@@ -210,6 +212,18 @@ int reactor_start(void) {
         return -1;
     }
 
+    /* register persist uring eventfd for async AOF CQE notification */
+    {
+        int pefd = persist_uring_fd();
+        if (pefd >= 0) {
+            struct epoll_event pev;
+            memset(&pev, 0, sizeof(pev));
+            pev.events = EPOLLIN;
+            pev.data.fd = pefd;
+            epoll_ctl(g_epfd, EPOLL_CTL_ADD, pefd, &pev);
+        }
+    }
+
     conn_t *lc = (conn_t *)kvs_calloc(1, sizeof(*lc));
     if (!lc) {
         close(lfd);
@@ -255,6 +269,16 @@ int reactor_start(void) {
 
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
+
+            /* persist uring eventfd: reap completed async AOF writes */
+            if (fd == persist_uring_fd()) {
+                uint64_t val;
+                ssize_t nread = read(fd, &val, sizeof(val));
+                (void)nread;
+                persist_reap_cqes();
+                continue;
+            }
+
             conn_t *c = fdmap[fd];
             if (!c) continue;
 

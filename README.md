@@ -1564,45 +1564,51 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 
 ##### 测试结果
 
-> **2026-06-26 最终重测**（已修复：io_uring CQE 乱序、Redis HSET 3-arg 正确命令、crash 修复、persist_append_raw 返回值检查、关闭时 flush buffer）
+> **2026-07-08 重测**（异步 io_uring，无 group commit，一条命令一次 fdatasync）
+> 
+> **测试工具**：`redis-benchmark -n 1000000 -c 50 -P 1 -d 64 -r 1000000`
+> 
+> **运行方式**：`bash tools/bench/run_persist_bench.sh`
 
 
 | 配置                               | ECHO (QPS)  | HSET (QPS)  | vs baseline |
 | ---------------------------------- | ----------- | ----------- | ----------- |
-| **kvstore** (ECHO 基线)            | **126,855** | —          | —          |
-| ├─ AOF 关闭（`--aof-disable`）   | —          | **132,926** | baseline    |
-| ├─ AOF always（inline response） | —          | **63,504**  | 48%         |
-| └─ AOF everysec（每秒 fsync）    | —          | **129,316** | 97%         |
-| **Redis 5.0.7** (ECHO 基线)        | **119,261** | —          | —          |
-| ├─ 无 AOF                        | —          | **128,899** | baseline    |
-| ├─ AOF always                    | —          | **44,439**  | 34%         |
-| └─ AOF everysec                  | —          | **136,240** | 106%        |
+| **kvstore** (ECHO 基线)            | **116,741** | —          | —          |
+| ├─ AOF 关闭（`--aof-disable`）   | —          | **121,684** | baseline    |
+| ├─ AOF always（异步 io_uring）   | —          | **39,040**  | 32%         |
+| └─ AOF everysec                   | —          | N/A         | 不支持      |
+| **Redis 5.0.7** (ECHO 基线)        | **109,469** | —          | —          |
+| ├─ 无 AOF                        | —          | **116,877** | baseline    |
+| ├─ AOF always                    | —          | **42,434**  | 36%         |
+| └─ AOF everysec                  | —          | **119,033** | 102%        |
 
-> **注意**：Redis HSET 3-arg 的 hash field 操作比 kvstore HSET 2-arg 的简单 set 更重，因此上表中 Redis always 46,200 vs kvstore 49,135 的差距包含了操作语义差异。粗略估算 kvstore HSET 比 Redis HSET 快约 9%。
+> **注意**：kvstore AOF always（39,040）已接近 Redis AOF always（42,434），达到 Redis 的 **92%**。此测试使用异步 io_uring 实现，**不依赖 group commit**，每条命令独立 write + fdatasync。
 
 ##### 分析
 
-**① kvstore AOF always vs Redis AOF always**
+**① 异步 AOF always vs 同步 AOF always**
 
-kvstore HSET（63,504）比 Redis HSET（44,439）快约 43%。inline response 优化后，kvstore 的 group commit 在发送响应后批量 fsync，消除了 deferred response 导致的客户端串行化。Redis 5.0.7 的 AOF always 每条命令独立 fdatasync + openat/close，额外开销更大。
+kvstore 异步 io_uring（39,040 QPS）对比旧同步阻塞代码（~3,600 QPS，事件循环每条命令阻塞 150µs 等 fdatasync），**提升 ~11x**。异步化将 write+fdatasync 提交和等待解耦，事件循环在磁盘 I/O 期间继续处理其他连接，50 并发连接下可几乎打满磁盘 IOPS。
 
-**② AOF always 开销**
+**② kvstore AOF always vs Redis AOF always**
 
-kvstore AOF always（63,504）vs AOF 关闭（132,926）**−52%**。剩余开销来自：io_uring write+fsync 延迟（p50≈121µs, kernel 5.15 上 io_uring fsync 比 direct fdatasync 慢 55%）。
+kvstore（39,040）达到 Redis（42,434）的 **92%**。两者均使用一条命令一次 fdatasync 语义（无 group commit）。差距主要来自 Redis 使用 `fdatasync()` 系统调用（p50≈84µs），kvstore 使用 io_uring `IORING_FSYNC_DATASYNC`（p50≈121µs），kernel 5.15 上 io_uring fsync 比 direct fdatasync 慢 ~55%。
 
-Redis AOF always（44,439）vs 无 AOF（128,899）**−65%**。瓶颈是 per-command fdatasync（p50≈84µs） + openat/close（Redis 5.0.7 每条命令重开 AOF 文件）。
+**③ AOF always 开销**
 
-**③ AOF everysec 几乎无损耗**
+kvstore AOF always（39,040）vs AOF 关闭（121,684）**−68%**。开销来源：每条命令独立的 io_uring write + fdatasync 提交和完成等待。50 并发连接 × 单次 fdatasync ~150µs → 理论最大 ~333K QPS，实际受内核 io_uring 调度和磁盘延迟波动影响。
 
-kvstore everysec（131,579）为 baseline 的 95%，Redis everysec（138,122）为 baseline 的 106%，两者几乎无损失。
+Redis AOF always（42,434）vs 无 AOF（116,877）**−64%**。瓶颈是 per-command fdatasync（p50≈84µs）+ openat/close（Redis 5.0.7 每条命令重开 AOF 文件）。
 
-**④ io_uring CQE 乱序修复**
+**④ group commit 对比**
 
-原代码假设 write CQE 先于 fsync CQE 到达，kernel 5.15 上 ~42% 的调用中顺序颠倒，误触发 fallback。修复后统一走 io_uring batch 路径。修复前 QPS 虚高（80K，因 fallback 中的 direct fsync 比 io_uring fsync 快），修复后为真实的 50K。
+旧实现使用 group commit（inline response，响应先发后批量 fsync）达到 63,504 QPS。异步 io_uring 在**不使用 group commit**、保持一条命令一次 fsync 语义下，达到 39,040 QPS。group commit 提升 ~63%，但牺牲了持久性语义（响应可能在 fsync 前发送）。异步化保留了严格的 durable-before-reply 顺序。
 
-**⑤ 之前 README 中 Redis 120K AOF always 数据无效**
+**⑤ kvstore 不支持 everysec**
 
-此前 README 中 Redis AOF always 显示 123K QPS 是因为 benchmark 使用了 `HSET key:__rand_int__ value`（2-arg），Redis 返回 `ERR wrong number of arguments`——错误响应不写 AOF，速度极快。用正确的 3-arg HSET 得到的 46K 才是真实性能。
+kvstore 当前仅支持 `always` 和 `off` 两种 AOF 策略。Redis everysec（119,033 QPS）作为参考，group commit 在 Redis 侧已实现。
+
+> 完整优化历程：`docs/aof-group-commit.md`，异步化设计：`docs/superpowers/specs/2026-07-08-aof-always-async-design.md`。
 
 ##### 命令格式与引擎容量说明
 
@@ -1647,15 +1653,15 @@ time redis-cli -p 5190 SAVE
 > **有效 QPS** = 数据量 / (写入时间 + SAVE 总耗时)，模拟写入后 SAVE 的实际吞吐。
 > **dump 大小** 为 `stat --format=%s` 实测。
 >
-> **2026-06-26 重测**（`bash tools/bench/run_persist_bench.sh`），非 sudo，AOF 关闭。
+> **2026-07-08 重测**（`bash tools/bench/run_persist_bench.sh`），非 sudo，AOF 关闭。
 
 
 | 场景                  | 数据量 | SAVE 次数 | 写入 QPS  | 写入耗时 | 平均每次 SAVE | 有效 QPS |
 | --------------------- | ------ | --------- | --------- | -------- | ------------- | -------- |
-| **100w → SAVE × 1** | 100万  | 1         | **132,820 | 7.588s   | 3,854ms       | 87,398** |
-| 10w → SAVE × 10     | 10万   | 10        | **132,100 | 0.766s   | 383.1ms       | 21,751** |
-| 1w → SAVE × 100     | 1万    | 100       | **128,205 | 0.085s   | 41.5ms        | 2,360**  |
-| 1k → SAVE × 1000    | 1千    | 1000      | **90,909  | 0.015s   | 6.9ms         | 142**    |
+| **100w → SAVE × 1** | 100万  | 1         | **121,669 | 8.283s   | 5,071ms       | 74,886** |
+| 10w → SAVE × 10     | 10万   | 10        | **123,153 | 0.823s   | 505ms         | 17,021** |
+| 1w → SAVE × 100     | 1万    | 100       | **112,360 | 0.095s   | 54.5ms        | 1,802**  |
+| 1k → SAVE × 1000    | 1千    | 1000      | **62,500  | 0.021s   | 8.4ms         | 117**    |
 
 > **写入 QPS 为何随数据量变化？** 渐进式 rehash 使桶数随数据量动态增长（4096 → 8192 → ... → 1M+），
 > 每桶始终维持 0~2 节点，HSET 查找 O(1)。1k/1w 场景因数据量小（<0.1 秒完成），

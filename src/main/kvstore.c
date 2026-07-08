@@ -1457,7 +1457,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1484,7 +1484,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1511,7 +1511,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1598,7 +1598,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
             if (!from_replication) {
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1628,7 +1628,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
             if (!from_replication) {
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1654,7 +1654,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
             if (!from_replication) {
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
@@ -1827,7 +1827,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 /* 全量同步期间不写 AOF（数据保存在 dump 文件）
                  * 增量同步期间写入 AOF 用于持久化 */
                 persist_note_write();
-                int pr = persist_append_raw(raw, rawlen);
+                int pr = persist_append_prepare(raw, rawlen);
                 if (pr == KVS_PERSIST_PENDING || pr == KVS_PERSIST_OK) {
                     repl_slave_note_durable(rawlen);
                 }
@@ -1846,7 +1846,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         }
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
-            int pr = persist_append_raw(raw, rawlen);
+            int pr = persist_append_prepare(raw, rawlen);
             if (pr == KVS_PERSIST_ERR) {
                 n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                 if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);

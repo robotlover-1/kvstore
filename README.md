@@ -1682,6 +1682,20 @@ time redis-cli -p 5190 SAVE
 SAVE 耗时与数据量近似正比（~3.85ms/千条，大样本下线性度 >0.99），因为 `persist_save_dump()` 遍历 Hash 引擎的全部链地址表，
 将 key-value 写入 KVSD 二进制格式。dump 文件约 **19 bytes/条目**（含 8 字节 AOF 偏移头 + 1 字节 engine_id + 4 字节 key/value 长度前缀 + key 字符串 + value 序列化数据）。
 
+#### SAVE + AOF always 对比
+
+> **2026-07-08**，AOF always 模式下的 SAVE 测试。与上表（AOF 关闭）对比，写入阶段每条 HSET 额外执行 io_uring write + fdatasync，写入 QPS 受磁盘 IOPS 限制（~35-42K）。
+
+
+| 场景                  | 数据量 | SAVE 次数 | 写入 QPS  | 写入耗时 | 平均每次 SAVE | 有效 QPS |
+| --------------------- | ------ | --------- | --------- | -------- | ------------- | -------- |
+| **100w → SAVE × 1** | 100万  | 1         | **35,151** | 28.521s  | 7,708ms       | 27,601   |
+| 10w → SAVE × 10     | 10万   | 10        | **41,929** | 2.397s   | 753.7ms       | 10,066   |
+| 1w → SAVE × 100     | 1万    | 100       | **32,468** | 0.315s   | 76.8ms        | 1,250    |
+| 1k → SAVE × 1000    | 1千    | 1000      | **18,519** | 0.059s   | 11.3ms        | 87       |
+
+**与 AOF 关闭对比**：AOF always 下写入 QPS 约为关闭时的 **~30%**（35K vs 122K），差值完全是磁盘 fsync 开销。SAVE 本身不受 AOF 影响——`persist_save_dump()` 独立于 AOF 写入路径，SAVE 耗时的细微差异来自写入阶段 hash 表膨胀程度不同（AOF always 下写入更慢导致 SAVE 时表更小）。
+
 ```c
 int persist_save_dump(void) {
     // ① 打开文件 O_TRUNC

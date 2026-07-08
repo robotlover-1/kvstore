@@ -1853,7 +1853,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 goto out;
             }
             if (pr == KVS_PERSIST_PENDING && c) {
-                /* resp transferred to pending queue */
+                persist_pending_enqueue(c, resp, (size_t)n);
                 resp = NULL;
             }
             /* KVS_PERSIST_OK: aof disabled, resp sent later as normal */

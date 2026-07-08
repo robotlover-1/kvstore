@@ -103,12 +103,9 @@ static void persist_uring_close(void) {
     g_persist_uring_ready = 0;
 }
 
-void persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
+int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
     persist_pending_t *p = (persist_pending_t *)kvs_malloc(sizeof(*p));
-    if (!p) {
-        kvs_free(resp);
-        return;
-    }
+    if (!p) return -1;
     p->conn = c;
     p->resp = resp;
     p->resp_len = resp_len;
@@ -116,6 +113,7 @@ void persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
     p->cqe_ok = 0;
     p->last_error = 0;
     TAILQ_INSERT_TAIL(&g_persist_pending_head, p, link);
+    return 0;
 }
 
 void persist_reap_cqes(void) {
@@ -143,12 +141,15 @@ void persist_reap_cqes(void) {
 
         if (p->cqe_seen == 2) {
             TAILQ_REMOVE(&g_persist_pending_head, p, link);
-            if (p->cqe_ok == 2 && p->conn && p->conn->fd > 0) {
-                queue_bytes(p->conn, p->resp, p->resp_len);
-            } else if (p->last_error != 0 && p->conn) {
-                fprintf(stderr, "persist: fsync err %d, closing conn fd=%d\n",
-                        p->last_error, p->conn->fd);
-                p->conn->fd = -1;
+            if (p->cqe_ok == 2) {
+                if (p->conn && p->conn->fd > 0)
+                    queue_bytes(p->conn, p->resp, p->resp_len);
+            } else {
+                fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
+                        p->cqe_ok, p->last_error);
+                if (p->conn) {
+                    p->conn->fd = -1;
+                }
                 g_persist_fatal_error = 1;
             }
             kvs_free(p->resp);
@@ -162,6 +163,7 @@ int persist_uring_fd(void) {
 }
 
 void persist_drain_pending(void) {
+    if (!g_persist_uring_ready) return;
     while (!TAILQ_EMPTY(&g_persist_pending_head)) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
         persist_reap_cqes();
@@ -614,26 +616,25 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
+    /* ensure at least 2 free SQEs before preparing any — avoids
+       partial SQE on the ring when fsync SQE allocation fails */
+    if (io_uring_sq_space_left(&g_persist_uring) < 2) {
+        persist_reap_cqes();
+        if (io_uring_sq_space_left(&g_persist_uring) < 2)
+            return KVS_PERSIST_ERR;
+    }
+
     off_t off = (off_t)g_aof_write_offset;
 
     /* write SQE */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) {
-        /* SQ full — drain some CQEs and retry once */
-        persist_reap_cqes();
-        sqe_w = io_uring_get_sqe(&g_persist_uring);
-        if (!sqe_w) return KVS_PERSIST_ERR;
-    }
+    if (!sqe_w) return KVS_PERSIST_ERR;
     io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
 
-    /* fsync SQE */
+    /* fsync SQE (guaranteed available by the space check above) */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) {
-        persist_reap_cqes();
-        sqe_f = io_uring_get_sqe(&g_persist_uring);
-        if (!sqe_f) return KVS_PERSIST_ERR;
-    }
+    if (!sqe_f) return KVS_PERSIST_ERR;
     io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
 
     /* submit, do NOT wait */

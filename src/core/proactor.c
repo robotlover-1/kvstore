@@ -239,6 +239,7 @@ int proactor_start(unsigned short port) {
 
         free_req(req);
         io_uring_cqe_seen(&ring, cqe);
+        persist_reap_cqes();
         io_uring_submit(&ring);
     }
 

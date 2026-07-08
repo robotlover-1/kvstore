@@ -1457,10 +1457,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) != 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                     goto out;
+                }
+                if (pr == KVS_PERSIST_PENDING) {
+                    persist_pending_enqueue(c, (unsigned char *)resp, (size_t)n);
+                    resp = NULL;
                 }
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
@@ -1479,10 +1484,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) != 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                     goto out;
+                }
+                if (pr == KVS_PERSIST_PENDING) {
+                    persist_pending_enqueue(c, (unsigned char *)resp, (size_t)n);
+                    resp = NULL;
                 }
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
@@ -1501,10 +1511,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_integer(resp, BUFFER_CAP, 1);
             if (!from_replication) {
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) != 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                     goto out;
+                }
+                if (pr == KVS_PERSIST_PENDING) {
+                    persist_pending_enqueue(c, (unsigned char *)resp, (size_t)n);
+                    resp = NULL;
                 }
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
@@ -1583,10 +1598,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
             if (!from_replication) {
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) != 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                     goto out;
+                }
+                if (pr == KVS_PERSIST_PENDING) {
+                    persist_pending_enqueue(c, (unsigned char *)resp, (size_t)n);
+                    resp = NULL;
                 }
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
@@ -1608,10 +1628,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
             if (!from_replication) {
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) != 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                     goto out;
+                }
+                if (pr == KVS_PERSIST_PENDING) {
+                    persist_pending_enqueue(c, (unsigned char *)resp, (size_t)n);
+                    resp = NULL;
                 }
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
@@ -1629,10 +1654,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             n = resp_simple_string(resp, BUFFER_CAP, "OK");
             if (!from_replication) {
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) != 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_ERR) {
                     n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                     if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                     goto out;
+                }
+                if (pr == KVS_PERSIST_PENDING) {
+                    persist_pending_enqueue(c, (unsigned char *)resp, (size_t)n);
+                    resp = NULL;
                 }
                 if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
             }
@@ -1797,7 +1827,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 /* 全量同步期间不写 AOF（数据保存在 dump 文件）
                  * 增量同步期间写入 AOF 用于持久化 */
                 persist_note_write();
-                if (persist_append_raw(raw, rawlen) == 0) {
+                int pr = persist_append_raw(raw, rawlen);
+                if (pr == KVS_PERSIST_PENDING || pr == KVS_PERSIST_OK) {
                     repl_slave_note_durable(rawlen);
                 }
                 /* else: AOF write failed — durability not achieved,
@@ -1815,11 +1846,17 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         }
         if (!from_replication && is_write_cmd(cmd)) {
             persist_note_write();
-            if (persist_append_raw(raw, rawlen) != 0) {
+            int pr = persist_append_raw(raw, rawlen);
+            if (pr == KVS_PERSIST_ERR) {
                 n = resp_error(resp, BUFFER_CAP, "AOF write failed");
                 if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
                 goto out;
             }
+            if (pr == KVS_PERSIST_PENDING && c) {
+                /* resp transferred to pending queue */
+                resp = NULL;
+            }
+            /* KVS_PERSIST_OK: aof disabled, resp sent later as normal */
             if (g_cfg.role == ROLE_MASTER) {
                 g_last_write_ts = time(NULL);
                 repl_backlog_feed(raw, rawlen);
@@ -1833,7 +1870,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     } else {
         n = resp_error(resp, BUFFER_CAP, "operation failed");
     }
-    if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
+    if (c && resp) queue_bytes(c, (unsigned char *)resp, (size_t)n);
     goto out;
 out:
     kvs_free(resp);

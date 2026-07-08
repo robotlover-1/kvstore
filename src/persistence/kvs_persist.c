@@ -3,6 +3,13 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <liburing.h>
+#include <sys/eventfd.h>
+#include <sys/queue.h>
+
+/* ---- async append return codes ---- */
+#define KVS_PERSIST_OK      0
+#define KVS_PERSIST_PENDING 1
+#define KVS_PERSIST_ERR    (-1)
 
 int g_aof_fd = -1;
 pid_t g_bgsave_pid = -1;
@@ -48,20 +55,117 @@ static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
 static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
 static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ---- async append pending queue ---- */
+typedef struct persist_pending_s {
+    conn_t             *conn;
+    unsigned char      *resp;
+    size_t              resp_len;
+    int                 cqe_seen;
+    int                 cqe_ok;
+    int                 last_error;
+    TAILQ_ENTRY(persist_pending_s) link;
+} persist_pending_t;
+
+static TAILQ_HEAD(, persist_pending_s) g_persist_pending_head = TAILQ_HEAD_INITIALIZER(g_persist_pending_head);
+static int g_persist_eventfd = -1;
+static int g_persist_fatal_error = 0;
+/* ---- end async append ---- */
+
 static int g_persist_uring_ready = 0;
 static struct io_uring g_persist_uring;
 
 static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
-    if (io_uring_queue_init(64, &g_persist_uring, 0) != 0) return -1;
+    if (io_uring_queue_init(256, &g_persist_uring, 0) != 0) return -1;
+    g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_persist_eventfd < 0) {
+        io_uring_queue_exit(&g_persist_uring);
+        return -1;
+    }
+    if (io_uring_register_eventfd(&g_persist_uring, g_persist_eventfd) != 0) {
+        close(g_persist_eventfd);
+        g_persist_eventfd = -1;
+        io_uring_queue_exit(&g_persist_uring);
+        return -1;
+    }
     g_persist_uring_ready = 1;
     return 0;
 }
 
 static void persist_uring_close(void) {
     if (!g_persist_uring_ready) return;
+    if (g_persist_eventfd >= 0) {
+        io_uring_unregister_eventfd(&g_persist_uring);
+        close(g_persist_eventfd);
+        g_persist_eventfd = -1;
+    }
     io_uring_queue_exit(&g_persist_uring);
     g_persist_uring_ready = 0;
+}
+
+void persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
+    persist_pending_t *p = (persist_pending_t *)kvs_malloc(sizeof(*p));
+    if (!p) {
+        kvs_free(resp);
+        return;
+    }
+    p->conn = c;
+    p->resp = resp;
+    p->resp_len = resp_len;
+    p->cqe_seen = 0;
+    p->cqe_ok = 0;
+    p->last_error = 0;
+    TAILQ_INSERT_TAIL(&g_persist_pending_head, p, link);
+}
+
+void persist_reap_cqes(void) {
+    if (!g_persist_uring_ready) return;
+
+    struct io_uring_cqe *cqe;
+    while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
+        persist_pending_t *p = TAILQ_FIRST(&g_persist_pending_head);
+        if (!p) {
+            fprintf(stderr, "persist: CQE without pending entry\n");
+            io_uring_cqe_seen(&g_persist_uring, cqe);
+            continue;
+        }
+
+        if (cqe->res > 0) {
+            g_aof_write_offset += cqe->res;
+            p->cqe_ok++;
+        } else if (cqe->res == 0) {
+            p->cqe_ok++;
+        } else {
+            p->last_error = cqe->res;
+        }
+        p->cqe_seen++;
+        io_uring_cqe_seen(&g_persist_uring, cqe);
+
+        if (p->cqe_seen == 2) {
+            TAILQ_REMOVE(&g_persist_pending_head, p, link);
+            if (p->cqe_ok == 2 && p->conn && p->conn->fd > 0) {
+                queue_bytes(p->conn, p->resp, p->resp_len);
+            } else if (p->last_error != 0 && p->conn) {
+                fprintf(stderr, "persist: fsync err %d, closing conn fd=%d\n",
+                        p->last_error, p->conn->fd);
+                p->conn->fd = -1;
+                g_persist_fatal_error = 1;
+            }
+            kvs_free(p->resp);
+            kvs_free(p);
+        }
+    }
+}
+
+int persist_uring_fd(void) {
+    return g_persist_eventfd;
+}
+
+void persist_drain_pending(void) {
+    while (!TAILQ_EMPTY(&g_persist_pending_head)) {
+        io_uring_submit_and_wait(&g_persist_uring, 1);
+        persist_reap_cqes();
+    }
 }
 
 static int persist_uring_wait_single(void) {
@@ -470,6 +574,7 @@ int persist_init(void) {
 }
 
 void persist_close(void) {
+    persist_drain_pending();
     if (g_aof_fd >= 0) {
         persist_flush_aof_fd(g_aof_fd);
         close(g_aof_fd);
@@ -494,65 +599,50 @@ const char *persist_aof_policy_name(void) {
 
 int persist_force_aof_flush(void) {
     if (g_aof_fd < 0) return -1;
+    persist_drain_pending();
     if (persist_fsync_fd_best_effort(g_aof_fd) != 0) return -1;
     return 0;
 }
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
-    struct io_uring_cqe *cqe;
-    off_t off;
-    int rc, r1, r2;
 
-    if (g_aof_fd < 0) return g_aof_disabled ? 0 : -1;
-    if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return 0;
+    if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
+    if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
 
-    if (persist_uring_init_once() != 0) return -1;
+    if (g_persist_fatal_error) return KVS_PERSIST_ERR;
 
-    off = (off_t)g_aof_write_offset;
+    if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* submit write SQE */
+    off_t off = (off_t)g_aof_write_offset;
+
+    /* write SQE */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) return -1;
+    if (!sqe_w) {
+        /* SQ full — drain some CQEs and retry once */
+        persist_reap_cqes();
+        sqe_w = io_uring_get_sqe(&g_persist_uring);
+        if (!sqe_w) return KVS_PERSIST_ERR;
+    }
     io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
+    sqe_w->flags |= IOSQE_IO_LINK;
 
-    /* submit fsync SQE */
+    /* fsync SQE */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) return -1;
+    if (!sqe_f) {
+        persist_reap_cqes();
+        sqe_f = io_uring_get_sqe(&g_persist_uring);
+        if (!sqe_f) return KVS_PERSIST_ERR;
+    }
     io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
 
-    /* wait for both completions */
-    rc = io_uring_submit_and_wait(&g_persist_uring, 2);
-    if (rc < 0) return -1;
-
-    /* collect first CQE */
-    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
-    if (rc < 0 || !cqe) return -1;
-    r1 = cqe->res;
-    io_uring_cqe_seen(&g_persist_uring, cqe);
-
-    /* collect second CQE */
-    rc = io_uring_wait_cqe(&g_persist_uring, &cqe);
-    if (rc < 0 || !cqe) return -1;
-    r2 = cqe->res;
-    io_uring_cqe_seen(&g_persist_uring, cqe);
-
-    /* dispatch by result: write returns >0 (bytes), fsync returns 0 on success */
-    if (r1 > 0) {
-        if (r2 < 0) return -1;
-        off += r1;
-    } else if (r2 > 0) {
-        if (r1 < 0) return -1;
-        off += r2;
-    } else {
-        return -1;
-    }
-
-    g_aof_write_offset = (long long)off;
+    /* submit, do NOT wait */
+    int rc = io_uring_submit(&g_persist_uring);
+    if (rc < 0) return KVS_PERSIST_ERR;
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    return 0;
+    return KVS_PERSIST_PENDING;
 }
 
 int persist_save_dump(void) {

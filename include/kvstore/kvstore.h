@@ -498,6 +498,17 @@ int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats);
 
 int persist_init(void);
 void persist_close(void);
+
+/* async append return codes */
+#define KVS_PERSIST_OK      0
+#define KVS_PERSIST_PENDING 1
+#define KVS_PERSIST_ERR     -1
+
+void persist_reap_cqes(void);
+int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len);
+void persist_drain_pending(void);
+int persist_uring_fd(void);
+
 int persist_append_raw(const unsigned char *buf, size_t len);
 int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long *offset_io);
 int persist_fsync_fd(int fd);

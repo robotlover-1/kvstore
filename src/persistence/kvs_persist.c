@@ -6,11 +6,6 @@
 #include <sys/eventfd.h>
 #include <sys/queue.h>
 
-/* ---- async append return codes ---- */
-#define KVS_PERSIST_OK      0
-#define KVS_PERSIST_PENDING 1
-#define KVS_PERSIST_ERR    (-1)
-
 int g_aof_fd = -1;
 pid_t g_bgsave_pid = -1;
 long long g_bgsave_last_start_ms = 0;

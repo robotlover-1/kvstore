@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pipeline 批量性能基准测试 — kvstore vs Redis 不同 pipeline 深度
+# Pipeline 批量性能基准测试 — AOF always vs AOF disable，不同 pipeline 深度
 set -euo pipefail
 
 PROJ_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -155,11 +155,11 @@ run_pipe_bench() {
 # ==================== Phase 2: Pipeline 性能测试 ====================
 echo ""
 echo "============================================"
-echo " Phase 2: Pipeline 深度性能对比"
+echo " Phase 2: AOF always vs AOF disable 性能对比"
 echo "============================================"
 echo "label,pipeline_depth,qps" > "$OUTDIR/pipeline_summary.csv"
 
-TOTAL=$(( ${#PIPELINE_DEPTHS[@]} * 8 ))
+TOTAL=$(( ${#PIPELINE_DEPTHS[@]} * 6 ))
 CURRENT=0
 
 for P in "${PIPELINE_DEPTHS[@]}"; do
@@ -187,13 +187,6 @@ for P in "${PIPELINE_DEPTHS[@]}"; do
     run_pipe_bench "kvstore_aof_disable" $KVSTORE_PORT "$P" HSET key:__rand_int__ value
     cleanup_all
 
-    # --- kvstore AOF everysec ---
-    CURRENT=$((CURRENT + 1))
-    echo "--- $CURRENT/$TOTAL: kvstore_aof_everysec P=$P ---"
-    start_kvstore "--appendfsync everysec" || exit 1
-    run_pipe_bench "kvstore_aof_everysec" $KVSTORE_PORT "$P" HSET key:__rand_int__ value
-    cleanup_all
-
     # --- kvstore AOF always ---
     CURRENT=$((CURRENT + 1))
     echo "--- $CURRENT/$TOTAL: kvstore_aof_always P=$P ---"
@@ -206,13 +199,6 @@ for P in "${PIPELINE_DEPTHS[@]}"; do
     echo "--- $CURRENT/$TOTAL: redis_no_aof P=$P ---"
     start_redis "" || exit 1
     run_pipe_bench "redis_no_aof" $REDIS_PORT "$P" HSET key:__rand_int__ __rand_int__ value
-    cleanup_all
-
-    # --- redis AOF everysec (HSET 3-arg) ---
-    CURRENT=$((CURRENT + 1))
-    echo "--- $CURRENT/$TOTAL: redis_aof_everysec P=$P ---"
-    start_redis "--appendonly yes --appendfsync everysec" || exit 1
-    run_pipe_bench "redis_aof_everysec" $REDIS_PORT "$P" HSET key:__rand_int__ __rand_int__ value
     cleanup_all
 
     # --- redis AOF always (HSET 3-arg) ---

@@ -605,7 +605,12 @@ int persist_force_aof_flush(void) {
     return 0;
 }
 
-int persist_append_raw(const unsigned char *buf, size_t len) {
+void persist_submit_pending(void) {
+    if (!g_persist_uring_ready) return;
+    io_uring_submit(&g_persist_uring);
+}
+
+int persist_append_prepare(const unsigned char *buf, size_t len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
@@ -615,9 +620,10 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* ensure at least 2 free SQEs before preparing any — avoids
-       partial SQE on the ring when fsync SQE allocation fails */
+    /* ensure at least 2 free SQEs — if ring is filling up with
+       deferred submits, submit and reap to free slots */
     if (io_uring_sq_space_left(&g_persist_uring) < 2) {
+        persist_submit_pending();
         persist_reap_cqes();
         if (io_uring_sq_space_left(&g_persist_uring) < 2)
             return KVS_PERSIST_ERR;
@@ -631,18 +637,24 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
     io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
 
-    /* fsync SQE (guaranteed available by the space check above) */
+    /* fsync SQE */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_f) return KVS_PERSIST_ERR;
     io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
 
-    /* submit, do NOT wait */
-    int rc = io_uring_submit(&g_persist_uring);
-    if (rc < 0) return KVS_PERSIST_ERR;
+    /* NOTE: do NOT call io_uring_submit() — caller batches and
+       calls persist_submit_pending() when ready */
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
     return KVS_PERSIST_PENDING;
+}
+
+int persist_append_raw(const unsigned char *buf, size_t len) {
+    int rc = persist_append_prepare(buf, len);
+    if (rc == KVS_PERSIST_PENDING)
+        persist_submit_pending();
+    return rc;
 }
 
 int persist_save_dump(void) {

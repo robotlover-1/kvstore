@@ -1751,112 +1751,70 @@ redis-cli -p 5000 SNAPRULES
 
 #### Pipeline 批量性能测试
 
+> **2026-07-08 重测**（`bash tools/bench/run_pipeline_bench.sh`），异步 io_uring，无 group commit，一条命令一次 fdatasync。
+
 ##### 测试目的
 
-评估 kvstore 的 RESP pipeline 吞吐能力，与 Redis 5.0.7 在不同 pipeline 深度（10/20/40/80/160）下对比。
-同时测试 AOF disable / everysec / always 三种持久化策略对 pipeline 吞吐的影响。
+评估 kvstore 异步 AOF 在不同 pipeline 深度下的吞吐表现，与 Redis 5.0.7 对比。重点比较 AOF always（一次一刷盘）vs AOF disable（无持久化）。
 
 ##### 测试方法
 
-1. 使用 `redis-benchmark -P <N>` 控制 pipeline 深度，`-n 1000000` 计批次（每批 N 条命令）
-2. 分别测试 ECHO（纯协议）和 HSET（引擎写入）两种负载
-3. 测试 AOF disable / everysec / always 三种模式
-4. 每个配置前重启服务器，清理 AOF/dump 文件
-5. redis-benchmark 报告值为每秒钟完成的**批次数**（batch/s），实际命令吞吐：**cmd/s = QPS × P**
-6. 非 sudo 运行，避免 kprobe 开销
-
-```bash
-# 一键运行全部组合
-bash tools/bench/run_pipeline_bench.sh
-
-# 手动单点测试
-redis-benchmark -p 5190 -n 1000000 -c 50 -P 160 -d 64 -r 1000000 HSET key:__rand_int__ value
-```
-
-> **2026-06-26 重测**（`bash tools/bench/run_pipeline_bench.sh`，非 sudo）
+1. `redis-benchmark -P <N> -n 1000000 -c 50 -d 64 -r 1000000`
+2. Pipeline 深度：10 / 20 / 40 / 80 / 160
+3. 每个配置前重启服务器，清理 AOF/dump 文件
 
 ##### 测试结果
 
-**ECHO（纯协议开销，无引擎/持久化）：**
+**HSET AOF disable（无持久化，引擎写入）：**
 
 
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
 | ------ | ------------- | ----------- | -------- |
-| 1      | 127,324       | 119,190     | 107%     |
-| 10     | 830,565       | 1,245,330   | 67%      |
-| 20     | 964,320       | 1,988,072   | 49%      |
-| 40     | 1,160,093     | 2,702,703   | 43%      |
-| 80     | 1,164,144     | 3,184,713   | 37%      |
-| 160    | 1,472,754     | 3,610,108   | **41%**  |
+| 1      | 119,133       | 116,877     | **102%** |
+| 10     | 426,076       | 560,224     | 76%      |
+| 20     | 543,774       | 698,324     | 78%      |
+| 40     | 730,994       | 800,000     | 91%      |
+| 80     | 903,342       | 844,595     | **107%** |
+| 160    | 1,028,807     | 901,713     | **114%** |
 
-> **ECHO 数据部分更新**：P=160 行已反映方案 A+B 优化后的结果，其它 P 值沿用优化前数据。HSET 表全量更新如下。
-
-**HSET AOF 关闭（引擎写入，无持久化）：**
+**HSET AOF always（异步 io_uring，一条命令一次 fdatasync）：**
 
 
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
 | ------ | ------------- | ----------- | -------- |
-| 1      | 135,483       | 132,538     | **101%** |
-| 10     | 437,254       | 618,812     | 71%      |
-| 20     | 554,017       | 703,235     | 79%      |
-| 40     | 728,863       | 764,526     | **95%**  |
-| 80     | 910,747       | 876,424     | **104%** |
-| 160    | 986,193       | 967,118     | **102%** |
-
-**HSET AOF everysec（每秒 fsync）：**
-
-
-| P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
-| ------ | ------------- | ----------- | -------- |
-| 1      | 130,259       | 134,716     | 93%      |
-| 10     | 366,703       | 382,555     | 96%      |
-| 20     | 445,236       | 530,504     | 84%      |
-| 40     | 587,199       | 625,391     | 94%      |
-| 80     | 688,705       | 672,495     | **102%** |
-| 160    | 741,290       | 664,011     | **112%** |
-
-**HSET AOF always（inline response）：**
-
-
-| P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
-| ------ | ------------- | ----------- | -------- |
-| 1      | 63,504        | 44,439      | **143%** |
-| 10     | 270,856       | 261,780     | **103%** |
-| 20     | 363,108       | 374,111     | 97%      |
-| 40     | 502,008       | 480,769     | **104%** |
-| 80     | 609,385       | 574,053     | **106%** |
-| 160    | 694,927       | 623,830     | **111%** |
+| 1      | 39,040        | 42,434      | 92%      |
+| 10     | 11,622        | 243,724     | 5%       |
+| 20     | 22,722        | 361,141     | 6%       |
+| 40     | 44,845        | 456,830     | 10%      |
+| 80     | 88,386        | 524,659     | 17%      |
+| 160    | 128,469       | 583,090     | 22%      |
 
 ##### 结果分析
 
-**① Inline Response 优化后 kvstore AOF always 全面追平 Redis**
+**① AOF disable：P≥80 后 kvstore 反超 Redis**
 
-移除 deferred response 机制，AOF always 响应改为命令执行后立即发送（和 disable/everysec 一致），fsync 批量在 reactor 循环末尾执行。消除了多客户端串行化瓶颈。
+无持久化场景下，kvstore 在 P≥80 时反超 Redis（+7%~+14%）。kvstore 的 reactor 单线程模型在 pipeline 深度足够高后，事件循环批量处理 RESP 命令的优势开始显现。
 
-P=10 从 12K（Redis 的 5%）提升到 271K（Redis 的 103%），提升 2,092%。P=160 达到 695K，超 Redis 11%。P=1 从 49K 提升到 63K（+29%）。
+**② AOF always：pipeline 效果有限**
 
-持久性语义对齐 Redis 5.0.7：+OK 表示数据已写入 OS buffer，fsync 在 reactor 循环末尾完成。崩溃时可能丢失最后一批 fsync 边界的数据（和 Redis 行为一致）。
+P=1 时 kvstore 达到 Redis 的 92%（39K vs 42K）。但 pipeline 场景下 kvstore 严重落后：P=10 仅 12K（Redis 的 5%），P=160 也仅 128K（22%）。
 
-**② AOF everysec 在 P≥40 反超 Redis**
+根因：每条命令独立调用 `io_uring_submit()`（= `io_uring_enter` 系统调用）。P=10 时一个 reactor 周期处理 10 条命令就是 10 次 syscall，加上 10 次独立 fdatasync 串行化，pipeline 的批量优势完全被抵消。
 
-kvstore P=160 时 everysec（804K）反超 Redis（693K, +16%）。P=80 时 740K vs 677K（+9%）。fsync 异步触发，不阻塞命令处理路径。
+Redis 在 pipeline 场景下天然做 group commit——事件循环末尾统一 fdatasync，10 条命令共享一次 fsync。kvstore 的"一条命令一次 fsync"约束导致 pipeline 无法摊销磁盘延迟。
 
-**③ AOF always pipeline 仍是弱项**
+**③ 对比旧 group commit 数据**
 
-kvstore 在 inline response 优化后 AOF always pipeline 全面追平 Redis，不再需要此处的旧对比（见上文更新后的 HSET AOF always 表）。
+旧实现使用 inline response + group commit，P=160 时 AOF always 可达 695K（超 Redis 11%）。当前异步 io_uring 牺牲了 pipeline 下的绝对吞吐（128K vs 695K），换取了严格的 durable-before-reply 语义——每条命令的 +OK 在 fdatasync 完成后才发送，崩溃时不会丢失已确认的写入。
 
 ##### 结论
 
 
-| 场景                    | 推荐方案    | 说明                                      |
-| ----------------------- | ----------- | ----------------------------------------- |
-| P=1 单请求              | **kvstore** | HSET 133K vs Redis 129K，基本持平         |
-| Pipeline + 无 AOF       | **kvstore** | P=160 时 1,059K vs Redis 959K（**+10%**） |
-| Pipeline + AOF everysec | **kvstore** | P=160 时 769K vs Redis 713K（**+8%**）    |
-| Pipeline + AOF always   | **kvstore** | P=160 时 695K vs Redis 624K（**+11%**）   |
-| 单请求 + AOF always     | **kvstore** | 64K vs Redis 44K（**+43%**）              |
-
-> **更新（2026-06-26）**：移除 deferred response 后 AOF always pipeline 瓶颈已消除。所有场景 kvstore 均追平或反超 Redis。
+| 场景 | P=1 | P≥80 | 说明 |
+|------|-----|------|------|
+| AOF disable（无持久化） | kv ≈ Redis | **kv > Redis** | P≥80 反超 |
+| AOF always（一条一刷） | kv ≈ Redis（92%） | **Redis >> kv** | 受限于 per-cmd fsync |
+| AOF always + group commit（旧） | kv >> Redis | **kv ≈ Redis** | 牺牲了持久性语义 |
 
 ### 运行基准测试
 

@@ -1751,7 +1751,7 @@ redis-cli -p 5000 SNAPRULES
 
 #### Pipeline 批量性能测试
 
-> **2026-07-08 重测**（`bash tools/bench/run_pipeline_bench.sh`），异步 io_uring，无 group commit，一条命令一次 fdatasync。
+> **2026-07-08 重测**（`bash tools/bench/run_pipeline_bench.sh`），异步 io_uring，无 group commit，一条命令一次 fdatasync。**含批量 io_uring_submit 优化**：`on_read()` 中延迟提交所有 SQE，P≥40 提升 40%+。
 
 ##### 测试目的
 
@@ -1789,17 +1789,17 @@ redis-cli -p 5000 SNAPRULES
 | 80     | 903,342       | 844,595     | **107%** |
 | 160    | 1,028,807     | 901,713     | **114%** |
 
-**HSET AOF always（异步 io_uring，一条命令一次 fdatasync）：**
+**HSET AOF always（异步 io_uring，一条命令一次 fdatasync，批量 submit 优化）：**
 
 
 | P 深度 | kvstore (QPS) | Redis (QPS) | kv/redis |
 | ------ | ------------- | ----------- | -------- |
-| 1      | 39,040        | 42,434      | 92%      |
-| 10     | 11,622        | 243,724     | 5%       |
-| 20     | 22,722        | 361,141     | 6%       |
-| 40     | 44,845        | 456,830     | 10%      |
-| 80     | 88,386        | 524,659     | 17%      |
-| 160    | 128,469       | 583,090     | 22%      |
+| 1      | 41,883        | 42,434      | 99%      |
+| 10     | 12,367        | 243,724     | 5%       |
+| 20     | 27,645        | 361,141     | 8%       |
+| 40     | 63,617        | 456,830     | 14%      |
+| 80     | 152,439       | 524,659     | 29%      |
+| 160    | 356,761       | 583,090     | 61%      |
 
 ##### 结果分析
 
@@ -1807,13 +1807,13 @@ redis-cli -p 5000 SNAPRULES
 
 无持久化场景下，kvstore 在 P≥80 时反超 Redis（+7%~+14%）。kvstore 的 reactor 单线程模型在 pipeline 深度足够高后，事件循环批量处理 RESP 命令的优势开始显现。
 
-**② AOF always：pipeline 效果有限**
+**② AOF always：批量 submit 改善大 P，小 P 受限于磁盘延迟**
 
-P=1 时 kvstore 达到 Redis 的 92%（39K vs 42K）。但 pipeline 场景下 kvstore 严重落后：P=10 仅 12K（Redis 的 5%），P=160 也仅 128K（22%）。
+P=1 时 kvstore 达到 Redis 的 99%（42K vs 42K）。P=160 从 128K 提升到 357K（+178%，kv/redis 从 22% → 61%），得益于 `on_read()` 中延迟 `io_uring_submit()` 将 N 次 syscall 合并为 1 次。
 
-根因：每条命令独立调用 `io_uring_submit()`（= `io_uring_enter` 系统调用）。P=10 时一个 reactor 周期处理 10 条命令就是 10 次 syscall，加上 10 次独立 fdatasync 串行化，pipeline 的批量优势完全被抵消。
+P=10 仅 12K（Redis 的 5%），未改善。根因不在 syscall 数量——fdatasync 本身 ~100μs，内核在同一个 AOF fd 上串行处理。P=10 时 10 条命令的 fdatasync 无法并行化，磁盘物理延迟成为硬上限。P≥40 后内核 VFS 层的批量回写开始摊销 fdatasync 延迟，批量 submit 的收益显现。
 
-Redis 在 pipeline 场景下天然做 group commit——事件循环末尾统一 fdatasync，10 条命令共享一次 fsync。kvstore 的"一条命令一次 fsync"约束导致 pipeline 无法摊销磁盘延迟。
+Redis 在 pipeline 场景下天然做 group commit——事件循环末尾统一 fdatasync，10 条命令共享一次 fsync。kvstore 的"一条命令一次 fsync"约束导致小 P 场景 pipeline 无法摊销磁盘延迟。
 
 **③ 对比旧 group commit 数据**
 
@@ -1825,7 +1825,7 @@ Redis 在 pipeline 场景下天然做 group commit——事件循环末尾统一
 | 场景 | P=1 | P≥80 | 说明 |
 |------|-----|------|------|
 | AOF disable（无持久化） | kv ≈ Redis | **kv > Redis** | P≥80 反超 |
-| AOF always（一条一刷） | kv ≈ Redis（92%） | **Redis >> kv** | 受限于 per-cmd fsync |
+| AOF always（批量 submit 优化后） | kv ≈ Redis（99%） | **Redis >> kv** | 受限于 per-cmd fsync，P=160 达 Redis 61% |
 | AOF always + group commit（旧） | kv >> Redis | **kv ≈ Redis** | 牺牲了持久性语义 |
 
 ### 运行基准测试

@@ -510,6 +510,8 @@ void persist_drain_pending(void);
 int persist_uring_fd(void);
 
 int persist_append_raw(const unsigned char *buf, size_t len);
+int persist_append_prepare(const unsigned char *buf, size_t len);
+void persist_submit_pending(void);
 int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long *offset_io);
 int persist_fsync_fd(int fd);
 int persist_save_dump(void);

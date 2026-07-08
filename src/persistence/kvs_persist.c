@@ -567,6 +567,10 @@ int persist_init(void) {
     if (g_aof_fd < 0) return -1;
     g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
+    /* eager-init uring so eventfd exists before reactor/proactor/ntyco epoll starts */
+    if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
+        persist_uring_init_once();
+    }
     return 0;
 }
 

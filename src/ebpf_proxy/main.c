@@ -52,6 +52,38 @@ static void signal_handler(int sig) {
     g_shutdown = 1;
 }
 
+/* 完整发送，处理 EINTR 和 partial send。
+ * 正常路径返回 0，失败返回 -1。 */
+static int proxy_send_full(int fd, const unsigned char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* 快速判断 payload 是否为复制控制命令（REPLSYNC/REPLACK/REPLDONE）。
+ * 正常 RESP 命令以 '*'/'$'/':'/'+'/'-' 开头，首字节快速拒绝。 */
+static int is_repl_control_payload(const unsigned char *payload, size_t plen) {
+    if (plen < 7 || payload[0] != 'R')
+        return 0;
+
+    if (plen >= 8 && memcmp(payload, "REPLSYNC", 8) == 0)
+        return 1;
+    if (memcmp(payload, "REPLACK", 7) == 0)
+        return 1;
+    if (plen >= 8 && memcmp(payload, "REPLDONE", 8) == 0)
+        return 1;
+
+    return 0;
+}
+
 /* ---- 辅助函数 ---- */
 static int open_pinned_map(const char *name, int *fd_out) {
     char path[512];
@@ -127,39 +159,19 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
     }
 
     /* 过滤 slave→master 复制控制命令，防止回传 slave */
-    if (plen >= 7) {
-        size_t scan = plen < 128 ? plen : 128;
-        for (size_t i = 0; i + 7 <= scan; i++) {
-            if ((scan - i >= 8 && memcmp(payload + i, "REPLSYNC", 8) == 0) ||
-                memcmp(payload + i, "REPLACK", 7) == 0 ||
-                (scan - i >= 8 && memcmp(payload + i, "REPLDONE", 8) == 0)) {
-                return 0;  /* 静默丢弃控制命令 */
-            }
-        }
+    if (is_repl_control_payload(payload, plen)) {
+        return 0;
     }
 
     if (g_state == STATE_FORWARDING) {
         if (proxy_slave_is_connected(&g_slave)) {
-            ssize_t n = send(proxy_slave_fd(&g_slave), payload, plen,
-                             MSG_NOSIGNAL);
-            if (n != (ssize_t)plen) {
-                if (n < 0) {
-                    fprintf(stderr, "ebpf-proxy: send to slave fd=%d failed "
-                            "(errno=%d: %s), buffering\n",
-                            proxy_slave_fd(&g_slave), errno, strerror(errno));
-                } else {
-                    fprintf(stderr, "ebpf-proxy: partial send %zd/%zu, "
-                            "buffering remainder\n", n, plen);
-                }
+            if (proxy_send_full(proxy_slave_fd(&g_slave), payload, plen) != 0) {
                 cache_append(&g_cache, payload, plen);
-                /* 不切换状态 — 下次 ringbuf 事件继续尝试发送 */
             }
         } else {
-            /* slave 未连接，缓存 */
             cache_append(&g_cache, payload, plen);
         }
     } else {
-        /* BUFFERING 状态 */
         cache_append(&g_cache, payload, plen);
     }
     return 0;
@@ -168,7 +180,7 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
 /* 主循环 */
 static void main_loop(void) {
     while (!g_shutdown) {
-        int rc = ring_buffer__poll(g_rb, 100 /* ms */);
+        int rc = ring_buffer__poll(g_rb, 5 /* ms */);
         if (rc < 0 && !g_shutdown) {
             fprintf(stderr, "ebpf-proxy: ring_buffer__poll error: %d\n", rc);
             break;
@@ -205,7 +217,7 @@ static void main_loop(void) {
                     /* 在退避期间继续 poll ringbuf，防止 ringbuf 满丢数据 */
                     int poll_iters = (int)(delay / 100);
                     for (int i = 0; i < poll_iters && !g_shutdown; i++) {
-                        ring_buffer__poll(g_rb, 100);
+                        ring_buffer__poll(g_rb, 5);
                     }
                     g_slave.backoff_ms *= 2;
                     if (g_slave.backoff_ms > g_slave.backoff_max_ms)

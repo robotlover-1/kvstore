@@ -13,11 +13,11 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-/* 简单计时器 */
+/* 简单计时器 — CLOCK_MONOTONIC，不受 NTP 调整影响 */
 static inline double now_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec * 1000000.0 + (double)tv.tv_usec;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000000.0 + (double)ts.tv_nsec / 1000.0;
 }
 
 static inline double now_ms(void) {

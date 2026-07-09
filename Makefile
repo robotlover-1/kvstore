@@ -159,7 +159,7 @@ TEST_EBPF_PROXY_QPS_SRC=tests/perf/test_ebpf_proxy_qps.c
 TEST_EBPF_PROXY_QPS_BIN=tests/perf/test_ebpf_proxy_qps
 
 $(TEST_EBPF_PROXY_QPS_BIN): $(TEST_EBPF_PROXY_QPS_SRC)
-	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz -lpthread
+	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz -lpthread -lm
 
 test_ebpf_proxy_qps: $(TEST_EBPF_PROXY_QPS_BIN)
 

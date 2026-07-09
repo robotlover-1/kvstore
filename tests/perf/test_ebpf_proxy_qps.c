@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -53,6 +54,9 @@
 
 static int g_payload_size = 64;
 static int g_req_count    = 50000;
+static int g_rounds       = 5;
+static int g_cpu          = -1;      /* -1 = 不使用 CPU 亲和性 */
+static const char *g_csv_file = NULL;
 static const char *g_ebpf_proxy_bin = EBPF_PROXY_BIN;
 static const char *g_client_capture_obj = CLIENT_CAPTURE_OBJ;
 static const char *g_slave_host = "127.0.0.1";
@@ -517,6 +521,23 @@ static void print_result(const char *mode, int payload, const qps_result_t *r) {
     fflush(stdout);
 }
 
+static void print_stats(const char *mode, int payload, int rounds,
+                        double mean, double median, double stddev,
+                        double min_val, double max_val) {
+    printf("%-10s  %-6d  %10.0f  %7.0f  %7.0f  %7.0f  %7.0f  %7.0f\n",
+           mode, payload, median,
+           mean, median, stddev,
+           min_val, max_val);
+    fprintf(stderr, "RESULT %-10s  %-6d  %10.0f  %7.0f  %7.0f  %7.0f  %7.0f  %7.0f\n",
+           mode, payload, median,
+           mean, median, stddev,
+           min_val, max_val);
+    printf("       %-10s     n=%-3d %9s %7s %7s %7s %7s %7s\n",
+           "", rounds,
+           "mean", "median", "stddev", "min", "max", "");
+    fflush(stdout);
+}
+
 /* ---- 单模式运行 ---- */
 static qps_result_t run_one_mode(const char *mode_name, const char *mode,
                                   slave_ctx_t *slave, int *out_slave_msgs) {
@@ -642,16 +663,97 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     return r;
 }
 
+/* ---- 统计 ---- */
+static double compute_mean(const double *vals, int n) {
+    if (n <= 0) return 0;
+    double sum = 0;
+    for (int i = 0; i < n; i++) sum += vals[i];
+    return sum / n;
+}
+
+static double compute_stddev(const double *vals, int n, double mean) {
+    if (n <= 1) return 0;
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+        double d = vals[i] - mean;
+        sum += d * d;
+    }
+    return sqrt(sum / (n - 1));
+}
+
+static double compute_median(double *vals, int n) {
+    if (n <= 0) return 0;
+    qsort(vals, (size_t)n, sizeof(double), cmp_double);
+    return n % 2 ? vals[n / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2.0;
+}
+
+/* ---- CPU 亲和性 ---- */
+static void set_cpu_affinity(int cpu) {
+    if (cpu < 0) return;
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET((unsigned)cpu, &cpuset);
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+        fprintf(stderr, "[test] sched_setaffinity CPU%d failed: %s\n",
+                cpu, strerror(errno));
+    } else {
+        fprintf(stderr, "[test] pinned to CPU%d\n", cpu);
+    }
+}
+
+/* ---- 系统预热：让 CPU 进入高频、TCP 栈预热 ---- */
+static void system_warmup(void) {
+    fprintf(stderr, "[test] system warmup (1000 reqs, not recorded)...\n");
+    fflush(stderr);
+
+    /* 启动临时 slave */
+    slave_ctx_t tmp_slave;
+    memset(&tmp_slave, 0, sizeof(tmp_slave));
+    if (!g_no_local_slave)
+        slave_start(&tmp_slave, SLAVE_PORT);
+
+    int slave_msgs = 0;
+    /* 用 none 模式跑 1000 请求预热 */
+    int saved_count = g_req_count;
+    g_req_count = 1000;
+    run_one_mode("warmup", "none", &tmp_slave, &slave_msgs);
+    g_req_count = saved_count;
+
+    if (!g_no_local_slave)
+        slave_stop(&tmp_slave);
+    sleep(1);
+}
+
+/* ---- proxy 就绪检测：轮询 pin map 代替固定 sleep ---- */
+static int proxy_wait_ready(int timeout_ms) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/proxy_cfg", BPF_PIN_PATH);
+    int waited = 0;
+    while (waited < timeout_ms) {
+        int fd = bpf_obj_get(path);
+        if (fd >= 0) { close(fd); return 0; }
+        usleep(100000);  /* 100ms */
+        waited += 100;
+    }
+    fprintf(stderr, "[test] proxy_wait_ready timeout (%dms)\n", timeout_ms);
+    return -1;
+}
+
 /* ---- 用法 ---- */
 static void usage(const char *prog) {
     fprintf(stderr,
         "用法: sudo %s [options]\n"
-        "  --mode, -m    none | sync | ebpf | all (默认: all)\n"
-        "  --payload, -p 负载大小 (默认: 64)\n"
-        "  --count, -c   请求数 (默认: 50000)\n"
-        "  --proxy-bin   ebpf-proxy 路径 (默认: ./build/ebpf_proxy)\n"
-        "  --bpf-obj     client_capture BPF 路径 (默认: build/replication/bpf/repl_client_capture.bpf.o)\n"
-        "  --help, -h    帮助\n", prog);
+        "  --mode, -m     none | sync | ebpf | all (默认: all)\n"
+        "  --payload, -p  负载大小 (默认: 64)\n"
+        "  --count, -c    每轮请求数 (默认: 50000)\n"
+        "  --rounds, -r   测量轮数，第1轮为预热 (默认: 5)\n"
+        "  --cpu N        CPU 亲和性: proxy=N+1, master=N+2 (默认: 不设置)\n"
+        "  --csv FILE     输出 CSV 到文件\n"
+        "  --proxy-bin    ebpf-proxy 路径 (默认: ./build/ebpf_proxy)\n"
+        "  --bpf-obj      client_capture BPF 路径 (默认: build/replication/bpf/repl_client_capture.bpf.o)\n"
+        "  --slave-host   远程 slave 地址 (默认: 127.0.0.1)\n"
+        "  --no-local-slave  不启动本地 slave 进程\n"
+        "  --help, -h     帮助\n", prog);
 }
 
 int main(int argc, char **argv) {
@@ -663,6 +765,9 @@ int main(int argc, char **argv) {
         {"mode", required_argument, 0, 'm'},
         {"payload", required_argument, 0, 'p'},
         {"count", required_argument, 0, 'c'},
+        {"rounds", required_argument, 0, 'r'},
+        {"cpu", required_argument, 0, 1004},
+        {"csv", required_argument, 0, 1005},
         {"proxy-bin", required_argument, 0, 1000},
         {"bpf-obj", required_argument, 0, 1001},
         {"slave-host", required_argument, 0, 1002},
@@ -671,11 +776,14 @@ int main(int argc, char **argv) {
         {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:p:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:p:c:r:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'm': mode_str = optarg; break;
         case 'p': g_payload_size = atoi(optarg); break;
         case 'c': g_req_count = atoi(optarg); break;
+        case 'r': g_rounds = atoi(optarg); break;
+        case 1004: g_cpu = atoi(optarg); break;
+        case 1005: g_csv_file = optarg; break;
         case 1000: g_ebpf_proxy_bin = optarg; break;
         case 1001: g_client_capture_obj = optarg; break;
         case 1002: g_slave_host = optarg; break;
@@ -686,36 +794,159 @@ int main(int argc, char **argv) {
     }
 
     printf("=== eBPF proxy 独立进程架构 QPS 对比 ===\n");
-    printf("payload=%d bytes, count=%d\n", g_payload_size, g_req_count);
+    printf("payload=%d bytes, count=%d, rounds=%d\n",
+           g_payload_size, g_req_count, g_rounds);
     printf("ebpf-proxy: %s\n", g_ebpf_proxy_bin);
     printf("BPF obj: %s\n\n", g_client_capture_obj);
+
+    /* CPU 亲和性 */
+    if (g_cpu >= 0) set_cpu_affinity(g_cpu);
+
+    /* 系统预热（--mode all 时） */
+    int do_all = (strcmp(mode_str, "all") == 0);
+    if (do_all) system_warmup();
+
+    /* 输出 CSV header */
+    FILE *csv = NULL;
+    if (g_csv_file) {
+        csv = fopen(g_csv_file, "w");
+        if (csv) fprintf(csv, "mode,size,rounds,mean,median,stddev,min,max\n");
+    }
 
     print_header();
 
     const char *modes[] = {"none", "sync", "ebpf"};
-    int do_all = (strcmp(mode_str, "all") == 0);
-
     int n_modes = (int)(sizeof(modes) / sizeof(modes[0]));
+
     for (int i = 0; i < n_modes; i++) {
         if (!do_all && strcmp(mode_str, modes[i]) != 0) continue;
 
-        /* 启动 slave（本地或跳过由外部管理） */
-        slave_ctx_t slave;
-        memset(&slave, 0, sizeof(slave));
-        if (!g_no_local_slave)
-            slave_start(&slave, SLAVE_PORT);
+        int use_ebpf = (strcmp(modes[i], "ebpf") == 0);
+        int use_sync = (strcmp(modes[i], "sync") == 0);
 
-        int slave_msgs = 0;
-        qps_result_t r = run_one_mode(modes[i], modes[i], &slave, &slave_msgs);
-        print_result(modes[i], g_payload_size, &r);
-
-        if (!g_no_local_slave) {
-            slave_stop(&slave);
-            fprintf(stderr, "[%-7s] slave final: %d msgs, %lld bytes\n",
-                    modes[i], slave.msg_count, slave.total_bytes);
+        /* ebpf 模式：提前启动 proxy，所有轮共享 */
+        if (use_ebpf) {
+            if (proxy_start() != 0) {
+                fprintf(stderr, "[%s] proxy start failed, skipping\n", modes[i]);
+                continue;
+            }
+            if (proxy_write_config(getpid(), SLAVE_PORT) != 0) {
+                fprintf(stderr, "[%s] proxy config failed, skipping\n", modes[i]);
+                proxy_stop();
+                continue;
+            }
+            /* 轮询等待 proxy 就绪，代替固定 usleep */
+            proxy_wait_ready(5000);
+            /* 额外等一小段时间让 proxy 连接 slave */
+            usleep(200000);
         }
-        sleep(1);
+
+        /* 收集所有轮次的结果 */
+        double *qps_vals = calloc((size_t)g_rounds, sizeof(double));
+        int completed = 0;
+
+        for (int r = 0; r < g_rounds; r++) {
+            /* 启动 slave（本地或跳过） */
+            slave_ctx_t slave;
+            memset(&slave, 0, sizeof(slave));
+            if (!g_no_local_slave)
+                slave_start(&slave, SLAVE_PORT);
+
+            /* sync 模式需要 slave_fd */
+            int slave_fd = -1;
+            if (use_sync) {
+                slave_fd = socket(AF_INET, SOCK_STREAM, 0);
+                set_nodelay(slave_fd);
+                struct sockaddr_in sa = {.sin_family = AF_INET,
+                                         .sin_port = htons(SLAVE_PORT)};
+                if (inet_pton(AF_INET, g_slave_host, &sa.sin_addr) != 1)
+                    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                if (connect(slave_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+                    perror("connect slave");
+                    close(slave_fd);
+                    slave_fd = -1;
+                } else {
+                    int snd = 262144;
+                    setsockopt(slave_fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
+                }
+            }
+
+            /* 启动 master + 运行 client */
+            master_ctx_t master;
+            void *(*thread_func)(void *) = use_sync ?
+                master_echo_sync : master_echo_none;
+            if (master_start(&master, MASTER_PORT, slave_fd, thread_func) == 0) {
+                qps_result_t result = run_qps_client();
+                master_stop(&master);
+                qps_vals[r] = result.qps;
+                completed++;
+            }
+            if (slave_fd >= 0) close(slave_fd);
+
+            /* 停止 slave */
+            if (!g_no_local_slave) {
+                slave_stop(&slave);
+                if (r == 0 || r == g_rounds - 1)
+                    fprintf(stderr, "[%-7s] round %d slave: %d msgs, %lld bytes\n",
+                            modes[i], r + 1, slave.msg_count, slave.total_bytes);
+            }
+
+            /* ebpf: 等待 proxy drain（不停止 proxy） */
+            if (use_ebpf)
+                usleep(g_no_local_slave ? 1500000 : 500000);
+
+            if (r == 0)
+                fprintf(stderr, "[%-7s] warmup done\n", modes[i]);
+            else if (r < g_rounds - 1)
+                usleep(200000);  /* 轮间短冷却 */
+        }
+
+        /* 停止 ebpf-proxy */
+        if (use_ebpf) proxy_stop();
+
+        /* 计算统计（跳过第 0 轮 warmup） */
+        int meas = g_rounds - 1;
+        if (meas > 0 && completed > 1) {
+            double *meas_vals = qps_vals + 1;  /* skip warmup */
+            double mean  = compute_mean(meas_vals, meas);
+            double median = compute_median(meas_vals, meas);
+            double stddev = compute_stddev(meas_vals, meas, mean);
+
+            /* 找 min/max（在测量轮中） */
+            double min_val = meas_vals[0], max_val = meas_vals[0];
+            for (int j = 1; j < meas; j++) {
+                if (meas_vals[j] < min_val) min_val = meas_vals[j];
+                if (meas_vals[j] > max_val) max_val = meas_vals[j];
+            }
+
+            qps_result_t stats;
+            memset(&stats, 0, sizeof(stats));
+            stats.qps     = median;
+            stats.avg_us  = mean;
+            stats.p50_us  = median;
+            stats.p99_us  = stddev;
+            stats.min_us  = min_val;
+            stats.max_us  = max_val;
+            stats.completed = meas;
+
+            print_stats(modes[i], g_payload_size, meas,
+                        mean, median, stddev, min_val, max_val);
+            fprintf(stderr, "[%-7s] stats: mean=%.0f median=%.0f stddev=%.0f "
+                    "min=%.0f max=%.0f (n=%d)\n",
+                    modes[i], mean, median, stddev, min_val, max_val, meas);
+
+            if (csv) {
+                fprintf(csv, "%s,%d,%d,%.0f,%.0f,%.0f,%.0f,%.0f\n",
+                        modes[i], g_payload_size, meas,
+                        mean, median, stddev, min_val, max_val);
+            }
+        }
+
+        free(qps_vals);
+        sleep(1);  /* 模式间冷却 */
     }
+
+    if (csv) { fclose(csv); fprintf(stderr, "CSV written to %s\n", g_csv_file); }
 
     printf("\n完成。\n");
     return 0;

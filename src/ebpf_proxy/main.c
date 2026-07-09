@@ -227,21 +227,33 @@ static void main_loop(void) {
 static void cleanup(void) {
     fprintf(stderr, "ebpf-proxy: shutting down...\n");
 
-    /* detach kprobes */
+    /* 1. detach kprobes — 停止新数据进入 ringbuf */
     if (g_kprobe_link) { bpf_link__destroy(g_kprobe_link); g_kprobe_link = NULL; }
     if (g_kretprobe_link) { bpf_link__destroy(g_kretprobe_link); g_kretprobe_link = NULL; }
 
-    /* flush 剩余缓存（best effort） */
+    /* 2. drain ringbuf — 消费所有剩余条目再释放 */
+    if (g_rb) {
+        int drained = 0;
+        for (int i = 0; i < 50; i++) {  /* 最多 5s (50 × 100ms) */
+            int n = ring_buffer__poll(g_rb, 100);
+            if (n <= 0) break;
+            drained += n;
+        }
+        if (drained > 0)
+            fprintf(stderr, "ebpf-proxy: drained %d remaining ringbuf entries\n", drained);
+    }
+
+    /* 3. flush 剩余缓存 */
     if (g_cache.head && proxy_slave_is_connected(&g_slave)) {
         fprintf(stderr, "ebpf-proxy: flushing remaining cache...\n");
         cache_flush(&g_cache, proxy_slave_fd(&g_slave));
     }
     cache_destroy(&g_cache);
 
-    /* 断开 slave */
+    /* 4. 断开 slave */
     proxy_slave_disconnect(&g_slave);
 
-    /* 释放 BPF 资源 */
+    /* 5. 释放 BPF 资源 */
     if (g_rb) { ring_buffer__free(g_rb); g_rb = NULL; }
     if (g_bpf_obj) { bpf_object__close(g_bpf_obj); g_bpf_obj = NULL; }
     if (g_client_ctl_fd >= 0) { close(g_client_ctl_fd); g_client_ctl_fd = -1; }

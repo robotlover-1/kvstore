@@ -610,12 +610,30 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     waitpid(client_pid, NULL, 0);
 
     /* — 清理 — */
+    /* 先停 master：不再有新的 read() → ringbuf 不再有新数据 */
     master_stop(&master);
     if (slave_fd >= 0) close(slave_fd);
+
     if (use_ebpf) {
+        /* master 已停，不再有新 read()。等 ebpf-proxy drain ringbuf：
+         * 先不休 proxy，让它继续 poll + forward，直到 slave 收齐数据。 */
+        int echo_count = master.echo_count;
+        fprintf(stderr, "[ebpf] master echoed %d, waiting for slave to catch up...\n",
+                echo_count);
+
+        /* 本地 slave: 轮询 pipe 中的 msg_count。远程 slave: 走外部脚本 poll。 */
+        if (!g_no_local_slave) {
+            /* 本地 slave 在子进程中，无法直接读计数。
+             * 等足够时间让 ringbuf drain（poll 间隔 100ms × 20 = 2s 上限） */
+            usleep(1000000);
+        }
+        /* 远程 slave: 外部脚本负责 poll，这里 sleep 等其收齐 */
+        if (g_no_local_slave) {
+            usleep(2000000);  /* 跨机: 多等一会 */
+        }
+
+        /* 再停 ebpf-proxy（cleanup 会 drain 剩余 ringbuf + flush 缓存 + 转发到 slave） */
         proxy_stop();
-        /* 等待 slave 线程处理完数据 */
-        usleep(200000);
     }
 
     /* 注意：slave 统计在 slave_stop() 中读取（main 中调用），此处不读 */

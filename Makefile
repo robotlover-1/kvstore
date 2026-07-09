@@ -154,6 +154,15 @@ TEST_KPROBE_REPL_QPS_BIN=tests/perf/test_kprobe_repl_qps
 $(TEST_KPROBE_REPL_QPS_BIN): $(TEST_KPROBE_REPL_QPS_SRC)
 	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz -lpthread
 
+# ---- ebpf-proxy 独立进程架构 QPS 测试 ----
+TEST_EBPF_PROXY_QPS_SRC=tests/perf/test_ebpf_proxy_qps.c
+TEST_EBPF_PROXY_QPS_BIN=tests/perf/test_ebpf_proxy_qps
+
+$(TEST_EBPF_PROXY_QPS_BIN): $(TEST_EBPF_PROXY_QPS_SRC)
+	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz -lpthread
+
+test_ebpf_proxy_qps: $(TEST_EBPF_PROXY_QPS_BIN)
+
 # ---- eBPF 独立守护进程 ----
 EBPF_DAEMON_SRC=tools/ebpf/repl_ebpf_daemon.c
 EBPF_DAEMON_BIN=tools/ebpf/repl_ebpf_daemon

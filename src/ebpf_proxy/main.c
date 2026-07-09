@@ -188,8 +188,9 @@ static void main_loop(void) {
         if (!proxy_slave_is_connected(&g_slave)) {
             if (read_slave_addr() == 0) {
                 char host[64];
-                struct in_addr in = { .s_addr = g_slave_ip };
-                inet_ntop(AF_INET, &in, host, sizeof(host));
+                snprintf(host, sizeof(host), "%u.%u.%u.%u",
+                         g_slave_ip & 0xFF, (g_slave_ip >> 8) & 0xFF,
+                         (g_slave_ip >> 16) & 0xFF, (g_slave_ip >> 24) & 0xFF);
                 proxy_slave_init(&g_slave, host, g_slave_port);
 
                 /* 指数退避 */
@@ -393,8 +394,8 @@ int main(int argc, char **argv) {
     if (read_slave_addr() == 0) {
         char host[64];
         snprintf(host, sizeof(host), "%u.%u.%u.%u",
-                 (g_slave_ip >> 24) & 0xFF, (g_slave_ip >> 16) & 0xFF,
-                 (g_slave_ip >> 8) & 0xFF, g_slave_ip & 0xFF);
+                 g_slave_ip & 0xFF, (g_slave_ip >> 8) & 0xFF,
+                 (g_slave_ip >> 16) & 0xFF, (g_slave_ip >> 24) & 0xFF);
         proxy_slave_init(&g_slave, host, g_slave_port);
         proxy_slave_connect(&g_slave);
     }

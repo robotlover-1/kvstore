@@ -116,36 +116,49 @@ struct {
 /* 从 msghdr 的 iovec 中读取已接收的数据
  * 在 kretprobe 中调用（此时数据已写入 iovec）
  *
- * iov_iter 在 msghdr 内偏移 16 字节 (msg_name 8 + msg_namelen 4 + pad 4)
- * iov 指针在 iov_iter 内偏移 24 字节 (iter_type 1 + nofault 1 + data_source 1 + pad 5 + iov_offset 8 + count 8)
- * nr_segs 紧接在 iov 之后，偏移 32 字节
- * iov 和 nr_segs 在 msg+40 处相邻 16 字节，合并为一次 bpf_probe_read_kernel */
+ * iov_iter 布局 (x86_64):
+ *   count     @ msg_iter + 16 → msg + 32 (8B)
+ *   iov/ubuf  @ msg_iter + 24 → msg + 40 (8B)
+ *   nr_segs   @ msg_iter + 32 → msg + 48 (8B)
+ *
+ * 内核 5.15 (ITER_IOVEC): nr_segs >= 1, iov 指向 iovec 结构体数组
+ * 内核 6.1+ (ITER_UBUF):  nr_segs = 0, ubuf 直接指向用户缓冲区 */
 static __always_inline int read_recv_data(unsigned long msg_ptr,
     unsigned char *buf, int max_len)
 {
-    /* 1. 合并读取 iov 指针 + nr_segs（16 字节从 msg_ptr + 40） */
-    struct { unsigned long iov_ptr; unsigned long _nr_segs; } head;
+    /* 1. 读取 count + iov/ubuf + nr_segs（24B @ msg+32） */
+    struct { unsigned long long _count; unsigned long ptr; unsigned long _nr; } head;
     if (bpf_probe_read_kernel(&head, sizeof(head),
-            (const void *)(msg_ptr + 40)) != 0)
-        return 0;
-    if (!head.iov_ptr || head._nr_segs == 0) return 0;
-
-    /* 2. 读取第一个 iovec */
-    struct { unsigned long b; unsigned long l; } vec;
-    if (bpf_probe_read_kernel(&vec, sizeof(vec),
-            (const void *)head.iov_ptr) != 0)
-        return 0;
-    if (!vec.b || vec.l == 0)
+            (const void *)(msg_ptr + 32)) != 0)
         return 0;
 
-    unsigned long long safe_len = vec.l;
+    unsigned long long safe_len;
+    unsigned long user_ptr;
+
+    if (head._nr > 0) {
+        /* ITER_IOVEC (kernel 5.15): ptr 指向 iovec 数组 */
+        if (!head.ptr) return 0;
+        struct { unsigned long b; unsigned long l; } vec;
+        if (bpf_probe_read_kernel(&vec, sizeof(vec),
+                (const void *)head.ptr) != 0)
+            return 0;
+        if (!vec.b || vec.l == 0) return 0;
+        safe_len = vec.l;
+        user_ptr = vec.b;
+    } else {
+        /* ITER_UBUF (kernel 6.1+): ptr 直接指向用户缓冲区 */
+        if (!head.ptr || head._count == 0) return 0;
+        safe_len = head._count;
+        user_ptr = head.ptr;
+    }
+
     if (safe_len > (unsigned long long)max_len)
         safe_len = (unsigned long long)max_len;
     if (safe_len == 0) return 0;
 
-    /* 3. 从用户空间读取数据（kretprobe 时数据已写入 iovec） */
+    /* 2. 从用户空间读取数据 */
     if (bpf_probe_read_user(buf, (__u32)safe_len,
-            (const void *)(unsigned long)vec.b) != 0) {
+            (const void *)user_ptr) != 0) {
         __u64 *st = bpf_map_lookup_elem(&client_stats,
             &(__u32){4});  /* READ_ERR */
         if (st) __sync_fetch_and_add(st, 1);
@@ -165,13 +178,10 @@ int kprobe_client_recv_entry(struct pt_regs *ctx)
 
     /* PID 过滤 — 只捕获 Master 进程的数据接收 */
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != (__u32)(*ctl_pid)) {
-        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){1}); /* SKIP_PID */
-        if (st) __sync_fetch_and_add(st, 1);
+    if (pid != (__u32)(*ctl_pid))
         return 0;
-    }
 
-    /* 保存 msg 指针 (si = PT_REGS_PARM2) 到 per-CPU map */
+    /* 保存 msg 指针 (si = PT_REGS_PARM2) 到 per-CPU map key=0 */
     unsigned long msg_ptr = (unsigned long)ctx->si;
     __u32 map_key = 0;
     bpf_map_update_elem(&client_entry_msg, &map_key, &msg_ptr, 0);
@@ -196,19 +206,12 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
     /* 获取 entry 保存的 msg 指针 */
     __u32 map_key = 0;
     unsigned long *msg_ptr = bpf_map_lookup_elem(&client_entry_msg, &map_key);
-    if (!msg_ptr || *msg_ptr == 0) {
-        __u64 *miss = bpf_map_lookup_elem(&client_stats, &(__u32){6}); /* RETPROBE_MISS */
-        if (miss) __sync_fetch_and_add(miss, 1);
+    if (!msg_ptr || *msg_ptr == 0)
         return 0;
-    }
 
-    /* 限制数据大小 */
-    __u32 size = (__u32)retval;
-    if (size > CLIENT_ENTRY_MAX_LEN) {
-        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){3}); /* DATA_OVR */
-        if (st) __sync_fetch_and_add(st, 1);
-        size = CLIENT_ENTRY_MAX_LEN;
-    }
+    /* 直接在 retval 上裁剪 */
+    if (retval > CLIENT_ENTRY_MAX_LEN)
+        retval = CLIENT_ENTRY_MAX_LEN;
 
     /* 读取数据到 tmpbuf */
     unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
@@ -218,85 +221,57 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
     __u32 payload_len = 0;
     __builtin_memcpy(*entry, &payload_len, 4);
 
-    int data_len = read_recv_data(*msg_ptr, (*entry) + 4, CLIENT_ENTRY_MAX_LEN);
+    int data_len;
+    {
+        struct { unsigned long long _count; unsigned long ptr; unsigned long _nr; } head;
+        if (bpf_probe_read_kernel(&head, sizeof(head),
+                (const void *)(*msg_ptr + 32)) != 0)
+            return 0;
+
+        if (head._nr > 0) {
+            /* ITER_IOVEC: iov_base 不会被 tcp_recvmsg 推进 */
+            if (!head.ptr) return 0;
+            struct { unsigned long b; unsigned long l; } vec;
+            if (bpf_probe_read_kernel(&vec, sizeof(vec),
+                    (const void *)head.ptr) != 0)
+                return 0;
+            if (!vec.b || vec.l == 0) return 0;
+            unsigned long long safe_len = vec.l;
+            if (safe_len > (unsigned long long)CLIENT_ENTRY_MAX_LEN)
+                safe_len = (unsigned long long)CLIENT_ENTRY_MAX_LEN;
+            if (safe_len == 0) return 0;
+            if (bpf_probe_read_user((*entry) + 4, (__u32)safe_len,
+                    (const void *)(unsigned long)vec.b) != 0) {
+                __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){4});
+                if (st) __sync_fetch_and_add(st, 1);
+                return 0;
+            }
+            data_len = (int)safe_len;
+        } else {
+            /* ITER_UBUF: ubuf 已被 tcp_recvmsg 推进了 retval 字节。
+             * 原始缓冲区 = 当前 ubuf - retval（两者都是已知值，不会溢出）。 */
+            if (!head.ptr || head._count == 0) return 0;
+            unsigned long orig_buf = head.ptr - (unsigned long)retval;
+            /* 直接用 bounded retval 读精确数据量 */
+            if (bpf_probe_read_user((*entry) + 4, (__u32)retval,
+                    (const void *)orig_buf) != 0) {
+                __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){4});
+                if (st) __sync_fetch_and_add(st, 1);
+                return 0;
+            }
+            data_len = (int)retval;
+        }
+    }
     if (data_len <= 0) return 0;
 
     payload_len = (__u32)data_len;
     __builtin_memcpy(*entry, &payload_len, 4);
 
-    /* ── 检测 REPLSYNC（全量同步开始）── */
-    {
-        int found = 0;
-#pragma unroll
-        for (int i = 0; i < 56; i++) {  /* 56 = 64 - 8 */
-            if (!found && i + 8 <= data_len &&
-                (*entry)[4 + i] == 'R' && (*entry)[4 + i + 1] == 'E' &&
-                (*entry)[4 + i + 2] == 'P' && (*entry)[4 + i + 3] == 'L' &&
-                (*entry)[4 + i + 4] == 'S' && (*entry)[4 + i + 5] == 'Y' &&
-                (*entry)[4 + i + 6] == 'N' && (*entry)[4 + i + 7] == 'C') {
-                found = 1;
-            }
-        }
-        if (found) {
-            __u32 ctl_key = KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE;
-            __u64 one = 1;
-            bpf_map_update_elem(&client_ctl, &ctl_key, &one, 0);
-            __u64 *st = bpf_map_lookup_elem(&client_stats,
-                &(__u32){KVS_EBPF_CLIENT_STAT_REPLSYNC_DETECT});
-            if (st) __sync_fetch_and_add(st, 1);
-        }
-    }
-
-    /* ── 检测 REPLDONE（全量同步完成）── */
-    {
-        int found = 0;
-#pragma unroll
-        for (int i = 0; i < 56; i++) {
-            if (!found && i + 8 <= data_len &&
-                (*entry)[4 + i] == 'R' && (*entry)[4 + i + 1] == 'E' &&
-                (*entry)[4 + i + 2] == 'P' && (*entry)[4 + i + 3] == 'L' &&
-                (*entry)[4 + i + 4] == 'D' && (*entry)[4 + i + 5] == 'O' &&
-                (*entry)[4 + i + 6] == 'N' && (*entry)[4 + i + 7] == 'E') {
-                found = 1;
-            }
-        }
-        if (found) {
-            /* 清除 fullsync 状态 */
-            __u32 ctl_key = KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE;
-            __u64 zero = 0;
-            bpf_map_update_elem(&client_ctl, &ctl_key, &zero, 0);
-
-            /* 写 magic flush 通知到 ringbuf */
-            __u32 magic = 0xFFFFFFFF;
-            __builtin_memcpy(*entry, &magic, 4);
-            bpf_ringbuf_output(&client_cache_ringbuf, *entry, 4, 0);
-
-            __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){7});
-            if (st) __sync_fetch_and_add(st, 1);
-
-            /* 不继续写正常 ringbuf entry（已写 magic） */
-            return 0;
-        }
-    }
-
-    /* 写入 ringbuf（正常数据路径） */
+    /* 写入 ringbuf。
+     * 注意：REPLSYNC/REPLDONE 检测和状态切换已移到 ebpf-proxy ringbuf 回调。
+     * 精简 stats 更新以减少 kretprobe 热路径开销。 */
     int entry_size = CLIENT_ENTRY_HDR_SZ + data_len;
-    if (bpf_ringbuf_output(&client_cache_ringbuf, *entry, entry_size, 0) != 0) {
-        __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){2});
-        if (st) __sync_fetch_and_add(st, 1);
-        return 0;
-    }
-
-    /* 更新统计 */
-    __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){0});
-    if (st) __sync_fetch_and_add(st, 1);
-
-    __u64 *in_progress = bpf_map_lookup_elem(&client_ctl,
-        &(__u32){KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE});
-    if (in_progress && *in_progress) {
-        st = bpf_map_lookup_elem(&client_stats, &(__u32){5});
-        if (st) __sync_fetch_and_add(st, 1);
-    }
+    bpf_ringbuf_output(&client_cache_ringbuf, *entry, entry_size, 0);
 
     return 0;
 }

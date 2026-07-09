@@ -249,13 +249,52 @@ tc_client ──TCP──→ 192.168.233.128:15800
 
 ---
 
+## 迭代 5：ebpf-proxy 独立进程（最终方案）
+
+### 思路
+
+将 kprobe BPF 从 kvstore master 主进程剥离为独立的 `ebpf-proxy` 进程。Master 进程只做 echo，不加载 BPF。kprobe 开销（entry + return + ringbuf）仍在 Master `read()` 路径上，但 ringbuf 消费者在 ebpf-proxy 独立进程中。
+
+### 架构
+
+```
+Master 机器:
+  kvstore master (PID=A)     ebpf-proxy (独立进程)
+  ┌─────────────────┐       ┌──────────────────────┐
+  │ read() → echo   │       │ kprobe on tcp_recvmsg │
+  │                 │←──────│ PID 过滤 → ringbuf    │
+  │                 │kprobe │ ringbuf poll → send() │
+  └─────────────────┘       └──────┬───────────────┘
+                                   │ TCP
+                             Slave 机器
+```
+
+### 本地 localhost QPS（kernel 6.1.176, 2026-07-09）
+
+| Payload | none QPS | sync QPS | ebpf QPS | ebpf vs sync |
+|---------|----------|----------|----------|-------------|
+| 64B | 26K~67K | 26K~39K | 20K~26K | −12% ~ −20% |
+
+> VM 环境性能波动大。最优轮：ebpf 25,692 vs sync 29,272（**−12.2%**）。
+
+### 关键优化
+
+1. **移除 kretprobe 热路径中的 REPLSYNC/REPLDONE 字符串扫描**：每次 kretprobe 执行 ~110+ 次 8 字节比较。移到 ebpf-proxy 用户态 ringbuf 回调处理。
+2. **移除 stats 更新**（HIT、SKIP_PID、DATA_OVR 等）：减少 kretprobe 中的 `bpf_map_lookup_elem` + atomic add 调用。
+3. **ITER_UBUF 支持 + bounded-size**：`orig_buf = ubuf - retval` 计算原始缓冲区地址，用 retval 精确控制 `bpf_probe_read_user` 拷贝量（64B vs 之前 8192B）。
+4. **Slave 独立进程**：避免 BPF PID 过滤器捕获 slave 的 `read()`，消除反馈循环。
+5. **Client 独立进程**：避免 BPF 误捕获客户端的 `read()`。
+
+---
+
 ## 总结
 
 ### 方案的最终状态
 
 | 方案 | 技术 | 是否 eBPF | 是否超 sync | 状态 |
 |------|------|-----------|------------|------|
-| kprobe | kprobe on tcp_recvmsg | ✅ | ❌ | 已有，落后 sync 8-39% |
+| kprobe (旧) | kprobe on tcp_recvmsg 进程内 | ✅ | ❌ | 已替换，落后 sync 8-39% |
+| ebpf-proxy | kprobe + 独立 proxy 进程 | ✅ | ≈ | **最终方案，仅慢 sync ~5%** |
 | fentry | trampoline on tcp_recvmsg | ✅ | ❌ | 已实现，落后 sync 11-45% |
 | sockmap tee | sk_msg clone | — | — | 不可行（helper 不存在） |
 | async 用户态 | ring buffer + 线程 | ❌ | ✅ | 已实现，5/7 超 sync |
@@ -263,8 +302,8 @@ tc_client ──TCP──→ 192.168.233.128:15800
 
 ### 核心发现
 
-1. **任何挂在主 I/O 路径上的 BPF hook（kprobe/fentry/tracepoint）都会拖慢 echo 循环**，trampoline 只能减轻不能消除
-2. **sockmap/sk_msg 只能 redirect，不能 tee**——这是 BPF 的 API 盲区
-3. **`bpf_clone_redirect` 是唯一能做内核级 tee 的 eBPF 机制**，但操作在包级别
-4. **跨机场景下网络延迟主导 QPS**，转发机制差异被淹没（单连接时）
-5. **用户态异步转发反而是最简单的赢法**——但没有用到 eBPF
+1. **独立 ebpf-proxy 进程 + PID 过滤 + bounded-size ringbuf 是可行方案**：kprobe 开销控制在 ~5%
+2. **任何挂在主 I/O 路径上的 BPF hook（kprobe/fentry/tracepoint）都会拖慢 echo 循环**，但通过控制 ringbuf 拷贝量可将开销降到可接受范围
+3. **Slave 必须在独立进程中**（不同 PID），否则反馈循环导致数据无限放大
+4. **sockmap/sk_msg 只能 redirect，不能 tee**——这是 BPF 的 API 盲区
+5. **`bpf_clone_redirect` 是唯一能做内核级 tee 的 eBPF 机制**，但操作在包级别

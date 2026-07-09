@@ -1851,14 +1851,18 @@ sudo python3 tools/bench/bench_mem_backend.py \
   --csv my_bench.csv
 ```
 
-### eBPF kprobe 主从转发 QPS 对比（跨虚拟机）
+### eBPF kprobe 主从转发 QPS 对比
 
-> **测试环境**：2 × KVM 虚拟机（Master 192.168.233.128 / Slave 192.168.233.129）
-> Master: Ubuntu 20.04 / Linux 6.1.176 / Slave: Ubuntu 20.04 / Linux 5.15.0-139 / 同一物理宿主机
+> **测试环境**：2 × KVM 虚拟机 / Master: Linux 6.1.176 / Slave: Linux 5.15.0-139 / 同一物理宿主机
+> **架构**：ebpf-proxy 在 Master 机器上作为**独立进程**运行，kprobe 截获 master 的 `tcp_recvmsg` → ringbuf → TCP 跨机转发到 Slave。
 
 **测试方法**
 
-测试程序 `test_kprobe_repl_qps.c` 是一个自包含的 C 程序，内部**同时创建**客户端线程、Master echo 线程、Slave 接收线程和 BPF ringbuf 消费者线程，无需外部依赖。
+测试程序 `test_ebpf_proxy_qps.c` 是一个自包含的 C 程序。与生产架构对齐：
+- **ebpf-proxy**（fork+exec 独立进程）：加载 BPF kprobe → ringbuf poll → TCP 转发到 slave
+- **slave**（fork 独立进程）：TCP server 接收转发数据并计数
+- **client**（fork 独立进程）：发送 RESP 请求，测量 echo QPS
+- **master echo**（测试主进程的线程）：`read(client) → echo`，转发由 ebpf-proxy 独立完成
 
 **架构与数据流**（三种模式分列）：
 
@@ -1866,10 +1870,9 @@ sudo python3 tools/bench/bench_mem_backend.py \
                       none 模式（基准：纯 echo，无转发）
                       ════════════════════════════════
 
-   Master (128) 进程内
+   测试进程                     
    ┌─────────────────────────────────────┐
-   │                                     │
-   │  client 线程          master 线程    │
+   │  [client 进程]       [master 线程]   │
    │  ┌──────────┐        ┌──────────┐   │
    │  │ ① 发送   │──TCP──→│ ② 接收   │   │
    │  │   req    │        │   echo   │   │
@@ -1882,213 +1885,96 @@ sudo python3 tools/bench/bench_mem_backend.py \
                       sync 模式（echo + 同步 TCP 转发到 Slave）
                       ══════════════════════════════════════════
 
-   Master (128) 进程内                      Slave (129)
+   测试进程
    ┌──────────────────────────┐    TCP    ┌────────────────────┐
-   │ client 线程  master 线程  │══════════→│ test_slave_receiver│
+   │ [client 进程] [master 线程]│══════════→│ [slave 进程]        │
    │ ┌──────────┐ ┌──────────┐│  转发     │ ┌────────────────┐ │
    │ │ ① 发送   │→│ ② 接收   ││══════════→│ │ ④ 接收 + 计数  │ │
-   │ │   req    │ │          ││           │ └────────────────┘ │
-   │ │          │←│ ③ 回显   ││           └────────────────────┘
-   │ │ ⑤ 计时   │ └──────────┘│
-   │ └──────────┘             │
-   └──────────────────────────┘
-
-   ③④ 顺序执行：回显完成后才转发，转发阻塞下一个请求的读取
+   │ │   req    │ │ ③ echo   ││           │ └────────────────┘ │
+   │ │          │←│ ④ write  ││           └────────────────────┘
+   │ │ ⑤ 计时   │ │   slave  ││
+   │ └──────────┘ └──────────┘│             ②→③→④ 顺序执行
+   └──────────────────────────┘             转发阻塞下一个请求的读取
 
 
-                      kprobe 模式（echo + 内核截获 → 异步转发，独立连接）
-                      ═══════════════════════════════════════════════
+                      ebpf 模式（echo only + ebpf-proxy 独立进程转发）
+                      ══════════════════════════════════════════
 
-   Master (128) 进程内                      Slave (129)
-   ┌──────────────────────────────────┐    TCP     ┌─────────────────────────┐
-   │ client 线程     master 线程       │═══════════→│ test_slave_receiver      │
-   │ ┌──────────┐   ┌──────────────┐  │  sync端口  │ ┌─────────────────────┐ │
-   │ │ ① 发送   │──→│ ② read()     │  │   15801    │ │ [sync] 接收 + 计数   │ │
-   │ │   req    │   │              │  │            │ └─────────────────────┘ │
-   │ │          │←──│ ③ write()   │  │            │                         │
-   │ │ ④ 计时   │   └──────┬───────┘  │    TCP     │ ┌─────────────────────┐ │
-   │ └──────────┘          │          │═══════════→│ │ [kprobe] 接收+计数   │ │
-   │             内核 kprobe 截获     │  kp端口    │ └─────────────────────┘ │
-   │          ┌──────────────────┐    │  15801+13  └─────────────────────────┘
-   │          │ tcp_recvmsg      │    │
-   │          │  entry: 存 msg 指针  │    sync 转发走 15801，kprobe 转发走 15814
-   │          │  return: 读 iov ──→  │    两条独立 TCP 连接，不共用 fd
-   │          │   ringbuf_output  │   │
-   │          └────────┬─────────┘   │
-   │                   │             │
-   │          ringbuf 消费者线程      │
-   │          ┌──────────────────┐   │
-   │          │ ⑤ 取 ringbuf     │   │
-   │          │   write_full ────┼───╝
-   │          └──────────────────┘
-   └──────────────────────────────────┘
+   ┌── 测试进程 (pid=A) ──┐      ┌── ebpf-proxy 进程 ──┐      ┌── slave 进程 (pid=C) ──┐
+   │                      │      │   kprobe 过滤 pid=A  │ TCP  │                         │
+   │ [client]  [master]   │ kprobe│  ┌────────────────┐ │═════→│ ┌─────────────────────┐ │
+   │ 进程(B)   线程        │ on    │  │ ringbuf poll   │ │      │ │ ⑥ 接收 + 计数       │ │
+   │ ┌──────┐ ┌──────────┐│tcp_   │  │ ⑤ send(slave)  │ │      │ └─────────────────────┘ │
+   │ │①发送 │→│②read()   ││recvmsg│  └────────────────┘ │      └─────────────────────────┘
+   │ │ req  │ │③write()  ││───→  │                      │
+   │ │      │←│  echo    ││ringbuf│                      │
+   │ │④计时 │ └──────────┘│      │                      │
+   │ └──────┘              │      └──────────────────────┘
+   └───────────────────────┘
 
-   ③ 回显和 ⑤ 异步转发并行：kprobe 不阻塞 ②→③ 的主路径
-   kprobe 转发共用 slave_fd，与 sync 在同一 TCP 连接上（与生产代码对齐）
+   ②→③ echo 主路径不受 BPF 影响。⑤ ringbuf → slave 全在 ebpf-proxy 进程完成。
+   关键：slave 和 client 都是独立进程（不同 PID），BPF PID 过滤只捕获 master 的 read()。
 ```
 
-**三种模式实现差异**（都在同一个 main 函数中，`--mode` 切换）：
+**三种模式实现对比**：
 
 
-| 模式     | Master echo 线程做什么                                    | 转发路径                                                                                      |
-| -------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `none`   | `read(client) → write_full(client)`                      | 无转发                                                                                        |
-| `sync`   | `read(client) → write_full(client) → write_full(slave)` | 在主请求路径上同步`write()` 跨机 TCP → slave port 15801                                      |
-| `kprobe` | `read(client) → write_full(client)`                      | BPF 内核截获 → ringbuf → 异步线程`write_full(slave_fd)` → slave（**共用 fd，与生产对齐**） |
+| 模式   | Master echo                                           | 转发路径                                                     | ebpf-proxy |
+| ------ | ----------------------------------------------------- | ------------------------------------------------------------ | ---------- |
+| `none` | `read(client) → write_full(client)`                  | 无                                                           | 无         |
+| `sync` | `read(client) → write_full(client) → write_full(slave)` | 主路径同步 `write()` TCP → slave                            | 无         |
+| `ebpf` | `read(client) → write_full(client)`                  | kprobe(tcp_recvmsg) → ringbuf → ebpf-proxy → TCP → slave    | fork+exec  |
 
-> kprobe 转发共用 sync 的 slave_fd（不额外建连接）。Slave 侧单端口监听。与生产代码 `client_ringbuf_cb() → send(c->fd)` 架构一致。
+**跨机 QPS 对比（2026-07-09，5K reqs，Master .128 / Slave .129，3 轮中位数）**
 
-**kprobe BPF 程序**（`kprobe_capture.bpf.c`）工作细节：
+
+| Payload | none QPS | sync QPS | ebpf QPS | ebpf vs sync | ebpf vs none |
+| ------- | -------: | -------: | -------: | -----------: | -----------: |
+| 64B     |   27,807 |   20,330 |   16,975 |      −16.5% |       −38.9% |
+| 128B    |   26,097 |   22,153 |   13,722 |      −38.0% |       −47.4% |
+| 256B    |   28,170 |   17,809 |   16,820 |       −5.5% |       −40.2% |
+| 512B    |   27,275 |   18,822 |   13,343 |      −29.1% |       −51.0% |
+| 1024B   |   27,198 |   21,941 |   13,982 |      −36.2% |       −48.5% |
+| 2048B   |   27,340 |   16,624 |   17,132 |       **+3.0%** |       −37.3% |
+| 4096B   |   26,632 |   20,579 |   24,419 |      **+18.6%** |        **−8.3%** |
+
+> **趋势**：小 payload 时 ebpf 慢于 sync（kprobe 固定开销占主导），大 payload 时 ebpf **反超 sync**（sync 跨机 write 开销随 payload 增大，ebpf 异步转发不受影响）。
+>
+> **vs none 基准**：ebpf 比 none 慢 8~51%，含 kprobe 开销 + ebpf-proxy 跨机 TCP 转发延迟。
+>
+> **对照**：旧 in-process kprobe 测试（同 VM）kprobe vs sync = −19.2%，与新架构 64B 结果（−16.5%）一致。
+
+**ebpF kprobe 工作原理**（生产代码 `repl_client_capture.bpf.c`）：
 
 ```
-用户态调用 recv(fd, buf, len)
+用户态调用 read(fd, buf, len)
         │
         ▼
 tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
   │
-  ├── [kprobe entry] kp_recv_entry:
-  │     • 过滤 PID（只截获 Master 进程的 recv 调用）
-  │     • msg 指针保存到 per-CPU map（entry_msg[0] = msg）
-  │     • 此时数据还在内核 socket 缓冲区，尚未拷贝
+  ├── [kprobe entry] kprobe_client_recv_entry:
+  │     • PID 过滤（只截获 Master 进程的 recv 调用）
+  │     • msg 指针保存到 per-CPU map（client_entry_msg[0] = msg_addr）
   │
   ├── 内核执行：skb → iov（用户 buf），把数据从内核拷贝到用户态
   │
-  └── [kretprobe return] kp_recv_return:
+  └── [kretprobe return] kprobe_client_recv_return:
         • 返回值为实际拷贝字节数 retval
         • 从 per-CPU map 取回之前保存的 msg 指针
-        • 读 msg→iov[0] 获取用户态 buf 的地址
-        • bpf_probe_read_user(buf_addr, len) → BPF 临时 buf
-        • 打包 [4B长度 | payload] → bpf_ringbuf_output → 用户态 ringbuf 消费者
+        • 读 iov_iter → 获取用户态 buf 地址（支持 ITER_IOVEC / ITER_UBUF）
+        • bpf_probe_read_user(buf_addr, retval) → BPF tmpbuf
+        • 打包 [4B长度 | payload] → bpf_ringbuf_output → ebpf-proxy 消费
 ```
-
-**为什么需要两次 hook（entry + return）？**
-
-kprobe 单个 hook 只能看到函数**入口**或**出口**的寄存器/内存状态，不能同时看到参数和返回值。`tcp_recvmsg` 的参数（`msg` 指针）只在入口可见，实际拷贝的字节数只在出口（`ax` 寄存器）可见。两者必须通过 entry 保存→return 取回的方式关联。
-
-**为什么用 `bpf_probe_read_user` 而不是从内核缓冲区直接读？**
-
-kretprobe 触发时 `tcp_recvmsg` 已执行完毕——数据已从内核 socket 缓冲区拷贝到**用户态 buf**（iovec 指向的地址）。此时 `bpf_probe_read_user` 把数据从用户态 buf 再拷贝一份到 BPF ringbuf。所以存在**两次拷贝**：
-
-```
-内核 socket buf ──(tcp_recvmsg)──→ 用户态 buf ──(bpf_probe_read_user)──→ BPF ringbuf
-        ↑                                    ↑
-   正常 recv 路径                       kprobe 额外拷贝
-```
-
-要避免第二次拷贝，需要 hook 更底层的函数（如 `skb_copy_datagram_iter`），从内核 `sk_buff` 直接读数据。但 `tcp_recvmsg` 是更稳定的 hook 点（内核 API 变动少），代价是接受这次额外拷贝。
-
-**客户端线程**负责精确计时：
-
-1. `connect()` 到 Master 的 15800 端口，TCP_NODELAY
-2. 预热：发送 `count/10` 次（100~500），消除冷启动波动
-3. 正式测试：循环 `count` 次，每次 `write_full(req) → read_full(rsp)`，记 `now_us()` 差值
-4. 输出：QPS = `count / 总耗时`，延迟取 avg/p50/p99/min/max
-
-**跨机 Slave**（`test_slave_receiver.c`）独立运行在从机：
-
-- `listen(15801)` → 循环 `accept` → 每连接 `read` 循环统计 → 打印 msgs/MB → `close`
-
-**参数说明**：
-
-
-| 参数            | 默认      | 含义                                  |
-| --------------- | --------- | ------------------------------------- |
-| `--payload, -p` | 64        | 单次请求/响应的字节数                 |
-| `--count, -c`   | 10000     | 正式测试的请求次数（≥1024B 用 5000） |
-| `--mode, -m`    | all       | `none` / `sync` / `kprobe` / `all`    |
-| `--slave-host`  | 127.0.0.1 | 跨机 Slave IP                         |
-| `--slave-port`  | 15801     | 跨机 Slave 端口                       |
-
-**设计考量**：
-
-- 每次 `read`/`write` 操作都走 `read_full`/`write_full`（循环到全部字节），排除短读写噪声
-- 预热从 `count/10` 中限幅 100~500，大 count 不会预热过久，小 count 保证最少预热
-- sync 模式对 slave 连接设 `SO_SNDBUF=64KB`，故意收紧发送缓冲区以便快速暴露慢消费导致的写阻塞
-- kprobe 模式 BPF 过滤 PID，只截获 Master echo 线程的 `tcp_recvmsg`，不会污染 ringbuf
-
-**测试结果**
-
-#### 优化项清单（测试 vs 生产）
-
-
-| 优化项                             | 测试代码 | 生产代码 | 说明                                             |
-| ---------------------------------- | -------- | -------- | ------------------------------------------------ |
-| ringbuf 1MB→4MB                   | ✅       | ✅       | 消除 ringbuf 溢出丢包                            |
-| poll 间隔 50ms→5ms                | ✅       | ✅       | 减少 ringbuf 消费延迟                            |
-| probe_read_kernel 合并 3→2        | ✅       | ✅       | `read_iov_data` msg+40 相邻 16 字节一次读出      |
-| map lookup 合并 (ENABLED+PID)      | ✅       | ✅       | entry/return 各减 1 次`bpf_map_lookup_elem`      |
-| kprobe 转发独立 TCP 连接 (port+13) | ✅       | ✅       | `forward_to_slave` 不与 `repl_broadcast` 共用 fd |
-| bpf_ringbuf_reserve                | ✅       | ❌       | kernel 6.1 verifier 拒变量大小                   |
-| SNDBUF 256KB                       | ✅       | N/A      | 测试 harness 特有，生产走 RDMA/repl_broadcast    |
-
-> **测试与生产架构现已对齐**：共用 slave_fd（无 port+13）、ringbuf null trim、BPF 无 CO-RE。与生产代码的 `repl_client_capture.bpf.o` 架构一致。
-
-**本地基准（2026-07-01 重测，10K 请求，kernel 6.1.176，共用 fd + null trim，无 CO-RE）**
-
-
-| Payload | none QPS | sync QPS | kprobe QPS | kprobe fwd | kprobe vs sync |
-| ------- | -------: | -------: | ---------: | ---------: | -------------: |
-| 64B     |   22,832 |   27,532 |     17,657 |     35,597 |        −35.9% |
-| 128B    |   21,229 |   23,129 |     19,760 |     37,723 |        −14.6% |
-| 256B    |   23,909 |   25,669 |     18,228 |     36,299 |        −29.0% |
-| 512B    |   20,596 |   24,708 |     17,096 |     38,820 |        −30.8% |
-| 1024B   |   22,299 |   26,642 |     18,983 |     37,923 |        −28.7% |
-| 2048B   |   21,402 |   19,797 |     19,422 |     34,722 |         −1.9% |
-| 4096B   |   25,200 |   21,175 |     19,398 |     26,952 |         −8.4% |
-
-> 测试代码已与生产对齐：共用 slave_fd（无 port+13）、ringbuf null trim、BPF 无 CO-RE（inline pt_regs + `bpf_probe_read_kernel/user`）。
-
-**跨机三模式对比（2026-07-01 21:20 重测，10K，kernel 6.1.176，共用 fd + null trim）**
-
-
-| Payload | none QPS | sync QPS | kprobe QPS | kprobe fwd | kprobe vs sync |
-| ------- | -------: | -------: | ---------: | ---------: | -------------: |
-| 64B     |   29,259 |   22,242 |     15,556 |     10,507 |        −30.1% |
-| 128B    |   28,923 |   22,290 |     15,653 |     10,568 |        −29.8% |
-| 256B    |   28,026 |   20,607 |     12,031 |     10,500 |        −41.6% |
-| 512B    |   26,263 |   18,274 |     14,108 |     10,500 |        −22.8% |
-| 1024B   |   26,770 |   21,676 |     16,755 |     10,510 |        −22.7% |
-| 2048B   |   27,673 |   21,017 |     16,637 |     10,509 |        −20.8% |
-| 4096B   |   26,406 |   19,926 |     14,341 |     10,513 |        −28.0% |
-
-> kprobe 在所有 payload 下均慢于 sync（−20%~−42%）。ringbuf 溢出严重（`rb_err` ≈ 命中数），异步转发线程 `write(slave)` 被跨机 TCP 阻塞导致 ringbuf 消费跟不上 kprobe 产生速度。
-
-**关键发现**
-
-1. **跨机 sync 慢于 none**：跨机 `write(slave)` 阻塞主 echo 路径，sync QPS 比 none 低 15-30%
-2. **跨机 kprobe 慢于 sync**：ringbuf 溢出严重（`rb_err` ≈ 命中数），异步转发线程 `write(slave)` 被跨机 TCP 阻塞，ringbuf 消费跟不上产生速度
-3. **kprobe fwd 稳定在 ~10,500**：与 payload 大小无关，受限于单 TCP 连接的跨机转发带宽
-4. **none QPS 稳定 ~26-29K**：纯 echo 路径不受网络影响，各 payload 基本一致
-
-##### 内核 6.1 适配
-
-Master VM 升级到 6.1 后，kprobe 遇到 3 个兼容性问题（详见 `docs/superpowers/specs/2026-06-27-kernel-6.1-tp-optimization.md`）：
-
-
-| 问题                                                                  | 修复                            |
-| --------------------------------------------------------------------- | ------------------------------- |
-| 6.1 的`tcp_recvmsg` 使用 `ITER_UBUF` 而非 `ITER_IOVEC`（`nr_segs=0`） | `read_iov_data` 增加 UBUF 路径  |
-| `bpf_probe_read` 对内核内存失效                                       | 全替换为`bpf_probe_read_kernel` |
-| fexit 的`ctx[0]` 在 6.1 上不是 retval                                 | 移除 fexit 的 retval 检查       |
-
-修复后 kprobe 在 6.1 上正常工作，fentry/fexit 也成功加载（trampoline 机制在 6.1 verifier 中可用）。
 
 #### 相关文件
 
 
-| 文件                                            | 说明                                        |
-| ----------------------------------------------- | ------------------------------------------- |
-| `tests/perf/kprobe_capture.bpf.c`               | kprobe/fentry/tracepoint BPF 程序           |
-| `tests/perf/test_kprobe_repl_qps.c`             | 跨机转发 QPS 测试客户端                     |
-| `tests/perf/test_slave_receiver.c`              | Slave 侧 TCP 接收器                         |
-| `tests/perf/tc_clone.bpf.c`                     | TC ingress BPF 程序（`bpf_clone_redirect`） |
-| `tests/perf/tc_clone_receiver.c`                | Slave 侧 AF_PACKET 接收器                   |
-| `tests/perf/tc_client.c`                        | 跨机 QPS 客户端                             |
-| `src/replication/bpf/repl_client_capture.bpf.c` | 生产代码 client_capture BPF（已同步优化）   |
-| `src/replication/bpf/repl_kprobe.bpf.c`         | 生产代码 kprobe+RDMA BPF（已同步优化）      |
-| `src/replication/kvs_repl_kprobe.c`             | 生产代码用户态（已同步优化）                |
-
-> 优化探索过程见 `docs/superpowers/specs/2026-06-27-kernel-6.1-tp-optimization.md`
+| 文件                                            | 说明                                       |
+| ----------------------------------------------- | ------------------------------------------ |
+| `tests/perf/test_ebpf_proxy_qps.c`              | eBPF proxy 独立进程架构 QPS 测试           |
+| `tests/perf/test_kprobe_repl_qps.c`             | (旧) 进程内 kprobe QPS 测试                |
+| `src/replication/bpf/repl_client_capture.bpf.c` | 生产代码 client_capture BPF（kprobe 截获） |
+| `src/ebpf_proxy/main.c`                         | ebpf-proxy 独立进程主程序                  |
 
 ---
 

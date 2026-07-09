@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 void proxy_slave_init(proxy_slave_ctx_t *ctx, const char *host, int port) {
     if (!ctx) return;
@@ -37,6 +38,7 @@ int proxy_slave_connect(proxy_slave_ctx_t *ctx) {
     tv.tv_sec = 1; tv.tv_usec = 0;
     setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(ctx->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    { int one = 1; setsockopt(ctx->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;

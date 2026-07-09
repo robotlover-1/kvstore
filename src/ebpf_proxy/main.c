@@ -215,7 +215,7 @@ static void main_loop(void) {
                     fprintf(stderr, "ebpf-proxy: reconnect attempt %d, "
                             "sleeping %ums\n", attempt, delay);
                     /* 在退避期间继续 poll ringbuf，防止 ringbuf 满丢数据 */
-                    int poll_iters = (int)(delay / 100);
+                    int poll_iters = (int)(delay / 5);
                     for (int i = 0; i < poll_iters && !g_shutdown; i++) {
                         ring_buffer__poll(g_rb, 5);
                     }

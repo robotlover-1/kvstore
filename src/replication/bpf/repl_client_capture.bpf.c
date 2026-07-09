@@ -237,6 +237,8 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
                 return 0;
             if (!vec.b || vec.l == 0) return 0;
             unsigned long long safe_len = vec.l;
+            if (safe_len > (unsigned long long)retval)
+                safe_len = (unsigned long long)retval;
             if (safe_len > (unsigned long long)CLIENT_ENTRY_MAX_LEN)
                 safe_len = (unsigned long long)CLIENT_ENTRY_MAX_LEN;
             if (safe_len == 0) return 0;

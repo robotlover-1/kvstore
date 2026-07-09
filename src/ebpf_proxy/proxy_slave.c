@@ -38,6 +38,12 @@ int proxy_slave_connect(proxy_slave_ctx_t *ctx) {
     tv.tv_sec = 1; tv.tv_usec = 0;
     setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(ctx->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    {
+        int snd = 1024 * 1024;
+        int rcv = 1024 * 1024;
+        setsockopt(ctx->fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
+        setsockopt(ctx->fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
+    }
     { int one = 1; setsockopt(ctx->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
 
     memset(&addr, 0, sizeof(addr));

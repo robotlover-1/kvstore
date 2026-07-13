@@ -132,39 +132,49 @@ void persist_reap_cqes(void) {
 
     struct io_uring_cqe *cqe;
     while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
-        persist_pending_t *p = TAILQ_FIRST(&g_persist_pending_head);
-        if (!p) {
-            fprintf(stderr, "persist: CQE without pending entry\n");
+        uint32_t idx = (uint32_t)cqe->user_data;
+        persist_pending_slot_t *slot;
+
+        /* resolve slot by its absolute index */
+        if (idx < g_pending_tail || idx >= g_pending_head) {
+            /* stale or out-of-range user_data; should not happen */
+            fprintf(stderr, "persist: CQE with invalid user_data %u (head=%u tail=%u)\n",
+                    idx, g_pending_head, g_pending_tail);
             io_uring_cqe_seen(&g_persist_uring, cqe);
             continue;
         }
+        slot = &g_pending_slots[idx % PERSIST_PENDING_RING_SIZE];
 
         if (cqe->res > 0) {
-            g_aof_write_offset += cqe->res;
-            p->cqe_ok++;
+            /* write CQE: advance confirmed offset */
+            if (slot->cqe_count == 0)  /* first CQE for this slot is write */
+                g_aof_write_confirmed += (long long)cqe->res;
+            slot->cqe_ok++;
         } else if (cqe->res == 0) {
-            p->cqe_ok++;
+            /* fsync with 0-byte file or similar */
+            slot->cqe_ok++;
         } else {
-            p->last_error = cqe->res;
+            slot->last_error = (int8_t)cqe->res;
         }
-        p->cqe_seen++;
+        slot->cqe_count++;
         io_uring_cqe_seen(&g_persist_uring, cqe);
 
-        if (p->cqe_seen == 2) {
-            TAILQ_REMOVE(&g_persist_pending_head, p, link);
-            if (p->cqe_ok == 2) {
-                if (p->conn && p->conn->fd > 0)
-                    queue_bytes(p->conn, p->resp, p->resp_len);
+        if (slot->cqe_count == 2) {
+            if (slot->cqe_ok == 2) {
+                if (slot->conn && slot->conn->fd > 0)
+                    queue_bytes(slot->conn, slot->resp, slot->resp_len);
             } else {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
-                        p->cqe_ok, p->last_error);
-                if (p->conn) {
-                    p->conn->fd = -1;
+                        (int)slot->cqe_ok, (int)slot->last_error);
+                if (slot->conn) {
+                    slot->conn->fd = -1;
                 }
                 g_persist_fatal_error = 1;
             }
-            kvs_free(p->resp);
-            kvs_free(p);
+            kvs_free(slot->resp);
+            slot->resp = NULL;
+            slot->conn = NULL;
+            pending_ring_advance_tail();
         }
     }
 }

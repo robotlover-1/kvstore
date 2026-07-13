@@ -4,7 +4,6 @@
 #include <sys/mman.h>
 #include <liburing.h>
 #include <sys/eventfd.h>
-#include <sys/queue.h>
 
 int g_aof_fd = -1;
 pid_t g_bgsave_pid = -1;
@@ -12,7 +11,8 @@ long long g_bgsave_last_start_ms = 0;
 long long g_bgsave_last_end_ms = 0;
 unsigned long long g_dirty_counter = 0;
 
-static long long g_aof_write_offset = 0;
+static long long g_aof_write_submitted = 0;
+static long long g_aof_write_confirmed = 0;
 
 static int g_persist_recovering = 0;
 static long long g_recover_last_total_ms = 0;
@@ -50,20 +50,28 @@ static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
 static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
 static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- async append pending queue ---- */
-typedef struct persist_pending_s {
-    conn_t             *conn;
-    unsigned char      *resp;
-    size_t              resp_len;
-    int                 cqe_seen;
-    int                 cqe_ok;
-    int                 last_error;
-    TAILQ_ENTRY(persist_pending_s) link;
-} persist_pending_t;
+/* ---- async append pending ring buffer ---- */
+#define PERSIST_PENDING_RING_SIZE  512
 
-static TAILQ_HEAD(, persist_pending_s) g_persist_pending_head = TAILQ_HEAD_INITIALIZER(g_persist_pending_head);
+typedef struct {
+    conn_t        *conn;
+    unsigned char *resp;
+    size_t         resp_len;
+    uint8_t        cqe_count;    /* 0→1→2, incremented per CQE */
+    uint8_t        cqe_ok;       /* count of successful CQEs */
+    int8_t         last_error;   /* CQE res on failure, 0 otherwise */
+} persist_pending_slot_t;
+
+static persist_pending_slot_t g_pending_slots[PERSIST_PENDING_RING_SIZE];
+static uint32_t               g_pending_head = 0;  /* next enqueue index */
+static uint32_t               g_pending_tail = 0;  /* next reap index   */
+
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
+
+/* forward declarations for ring buffer helpers */
+static void pending_ring_advance_tail(void);
+static uint32_t pending_ring_reserve(void);
 /* ---- end async append ---- */
 
 static int g_persist_uring_ready = 0;
@@ -151,6 +159,25 @@ void persist_reap_cqes(void) {
             kvs_free(p);
         }
     }
+}
+
+static uint32_t pending_ring_reserve(void) {
+    while (g_pending_head - g_pending_tail >= PERSIST_PENDING_RING_SIZE) {
+        persist_reap_cqes();  /* try to free completed slots */
+        if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
+            break;
+        /* still full: block until at least one CQE completes */
+        io_uring_submit_and_wait(&g_persist_uring, 1);
+        persist_reap_cqes();
+    }
+    uint32_t idx = g_pending_head++;
+    memset(&g_pending_slots[idx % PERSIST_PENDING_RING_SIZE], 0,
+           sizeof(persist_pending_slot_t));
+    return idx;
+}
+
+static void pending_ring_advance_tail(void) {
+    g_pending_tail++;
 }
 
 int persist_uring_fd(void) {

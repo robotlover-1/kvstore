@@ -591,8 +591,9 @@ static int finalize_rewrite_parent(void) {
     if (g_aof_fd >= 0) close(g_aof_fd);
     g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_aof_fd < 0) return -1;
-    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
-    if (g_aof_write_offset < 0) g_aof_write_offset = 0;
+    g_aof_write_confirmed = lseek(g_aof_fd, 0, SEEK_END);
+    if (g_aof_write_confirmed < 0) g_aof_write_confirmed = 0;
+    g_aof_write_submitted = g_aof_write_confirmed;
 
     pthread_mutex_lock(&g_rewrite_buf_lock);
     free_rewrite_buffer_locked();
@@ -608,8 +609,9 @@ int persist_init(void) {
     }
     g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_aof_fd < 0) return -1;
-    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
-    if (g_aof_write_offset < 0) g_aof_write_offset = 0;
+    g_aof_write_confirmed = lseek(g_aof_fd, 0, SEEK_END);
+    if (g_aof_write_confirmed < 0) g_aof_write_confirmed = 0;
+    g_aof_write_submitted = g_aof_write_confirmed;
     /* eager-init uring so eventfd exists before reactor/proactor/ntyco epoll starts */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
         persist_uring_init_once();
@@ -711,7 +713,7 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 }
 
 int persist_save_dump(void) {
-    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
+    unsigned long long aof_off = (unsigned long long)g_aof_write_confirmed;
     int rc = persist_save_dump_to(g_cfg.dump_path, aof_off);
     if (rc == 0) persist_mark_snapshot_success(g_dirty_counter);
     return rc;
@@ -764,7 +766,7 @@ int persist_bgsave_start(void) {
     if (g_bgsave_pid > 0) return 1;
 
     unsigned long long snap_dirty = g_dirty_counter;
-    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
+    unsigned long long aof_off = (unsigned long long)g_aof_write_confirmed;
     long long start_ms = kvs_now_ms();
     char tmp_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", g_cfg.dump_path, (long)getpid());

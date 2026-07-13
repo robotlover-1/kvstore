@@ -53,6 +53,7 @@ static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- async append pending ring buffer ---- */
 #define PERSIST_PENDING_RING_SIZE  512
+#define PERSIST_USERDATA_SENTINEL  UINT64_MAX  /* marks SQE not yet bound to a slot */
 
 typedef struct {
     conn_t        *conn;
@@ -132,6 +133,12 @@ void persist_reap_cqes(void) {
     while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
         uint32_t idx = (uint32_t)cqe->user_data;
         persist_pending_slot_t *slot;
+
+        /* zombie SQE from a failed prepare — skip */
+        if (cqe->user_data == PERSIST_USERDATA_SENTINEL) {
+            io_uring_cqe_seen(&g_persist_uring, cqe);
+            continue;
+        }
 
         /* resolve slot by its absolute index */
         if (idx < g_pending_tail || idx >= g_pending_head) {
@@ -658,6 +665,7 @@ void persist_submit_pending(void) {
 int persist_append_prepare(const unsigned char *buf, size_t len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
     uint32_t slot_idx;
+    off_t off;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
@@ -674,28 +682,27 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
             return KVS_PERSIST_ERR;
     }
 
-    /* reserve ring slot (may reap/block if full) */
+    /* compute offset before SQE acquisition */
+    off = (off_t)g_aof_write_submitted;
+
+    /* 1. Get both SQEs with sentinel user_data FIRST
+     *    If either fails, the sentinel-marked SQEs will be skipped by reap. */
+    sqe_w = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_w) return KVS_PERSIST_ERR;
+    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
+    sqe_w->user_data = PERSIST_USERDATA_SENTINEL;
+
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_f) return KVS_PERSIST_ERR;  /* sqe_w has sentinel — safe to abort */
+    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+    sqe_f->user_data = PERSIST_USERDATA_SENTINEL;
+
+    /* 2. Reserve ring slot AFTER both SQEs are obtained */
     slot_idx = pending_ring_reserve();
 
-    off_t off = (off_t)g_aof_write_submitted;
-
-    /* write SQE */
-    sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) {
-        g_pending_head--; /* rollback slot reservation */
-        return KVS_PERSIST_ERR;
-    }
-    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
-    sqe_w->flags |= IOSQE_IO_LINK;
+    /* 3. Bind SQEs to the slot — set real user_data and IOSQE_IO_LINK */
     sqe_w->user_data = slot_idx;
-
-    /* fsync SQE */
-    sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) {
-        g_pending_head--; /* rollback slot reservation */
-        return KVS_PERSIST_ERR;
-    }
-    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+    sqe_w->flags |= IOSQE_IO_LINK;
     sqe_f->user_data = slot_idx;
 
     g_aof_write_submitted += (long long)len;

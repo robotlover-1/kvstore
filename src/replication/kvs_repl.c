@@ -1666,6 +1666,8 @@ static int ensure_repl_backlog(void) {
 
 int repl_backlog_feed(const unsigned char *buf, size_t len) {
     if (!buf || len == 0) return 0;
+    /* 无 slave 连接时不分配 backlog，节省 10 MB */
+    if (!g_replicas) return 0;
     if (ensure_repl_backlog() != 0) return -1;
     if (len >= g_repl_backlog.cap) {
         buf += len - g_repl_backlog.cap;

@@ -126,6 +126,28 @@ static int _maybe_expand(kvs_hash_t *hash) {
     return 0;
 }
 
+/* trigger shrink if table is too sparse */
+static int _maybe_shrink(kvs_hash_t *hash) {
+    if (hash->rehash_idx >= 0) return 0;
+
+    hashtable_t *h0 = &hash->ht[0];
+    if (h0->max_slots <= HASH_INIT_SIZE) return 0;
+    if (h0->count > h0->max_slots / 8) return 0;
+
+    int new_size = h0->max_slots / 2;
+    if (new_size < HASH_INIT_SIZE) new_size = HASH_INIT_SIZE;
+
+    hashtable_t *h1 = &hash->ht[1];
+    h1->nodes = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * new_size);
+    if (!h1->nodes) return -1;
+    memset(h1->nodes, 0, sizeof(hashnode_t*) * new_size);
+    h1->max_slots = new_size;
+    h1->count = 0;
+    hash->rehash_idx = 0;
+
+    return 0;
+}
+
 /* search both tables, returns node pointer or NULL */
 static hashnode_t *_find_node(kvs_hash_t *hash, const char *key) {
     /* try ht[0] */
@@ -221,6 +243,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
                 else hash->ht[0].nodes[idx] = cur->next;
                 kvs_free(cur);  /* single alloc */
                 if (hash->ht[0].count > 0) hash->ht[0].count--;
+                _maybe_shrink(hash);
                 return 0;
             }
             prev = cur; cur = cur->next;
@@ -237,6 +260,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
                 else hash->ht[1].nodes[idx] = cur->next;
                 kvs_free(cur);  /* single alloc */
                 if (hash->ht[1].count > 0) hash->ht[1].count--;
+                _maybe_shrink(hash);
                 return 0;
             }
             prev = cur; cur = cur->next;

@@ -3,6 +3,10 @@
 #include <sys/stat.h>
 #include <limits.h>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #define KVS_MEM_LIBC 0
 #define KVS_MEM_JEMALLOC 1
 #define KVS_MEM_CUSTOM 2
@@ -463,6 +467,15 @@ static void backend_free(void *ptr) {
         case KVS_MEM_LIBC:
         default:
             free(ptr);
+#if defined(__GLIBC__)
+            {
+                static unsigned long long free_since_trim = 0;
+                if (g_mem.backend == KVS_MEM_LIBC && ++free_since_trim >= 100000) {
+                    malloc_trim(0);
+                    free_since_trim = 0;
+                }
+            }
+#endif
             return;
     }
 }

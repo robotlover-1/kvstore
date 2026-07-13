@@ -70,6 +70,9 @@ def start_kvstore(backend, port=5191):
     env = os.environ.copy()
     env.pop("KVS_MEM_JEMALLOC_ACTIVE", None)  # 清掉残留
     env.pop("LD_PRELOAD", None)
+    # jemalloc: retain:false 归还 VmSize, decay_ms:0 立即 decay
+    if backend == "jemalloc":
+        env["MALLOC_CONF"] = "dirty_decay_ms:0,muzzy_decay_ms:0,background_thread:true,retain:false"
 
     proc = subprocess.Popen(
         f"{KVSTORE_BIN} {extra}",
@@ -78,8 +81,8 @@ def start_kvstore(backend, port=5191):
         env=env,
     )
 
-    # 等待服务就绪
-    for _ in range(30):
+    # 等待服务就绪（需等 kvstore BPF proxy_cfg 重试循环 ~30s 完成）
+    for _ in range(80):
         pid = find_kvstore_pid(port)
         if pid and pid != proc.pid:
             # jemalloc re-exec → PID 变了

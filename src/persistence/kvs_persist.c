@@ -2,9 +2,9 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/mman.h>
-#include <string.h>
 #include <liburing.h>
 #include <sys/eventfd.h>
+#include <sys/queue.h>
 
 int g_aof_fd = -1;
 pid_t g_bgsave_pid = -1;
@@ -12,8 +12,7 @@ long long g_bgsave_last_start_ms = 0;
 long long g_bgsave_last_end_ms = 0;
 unsigned long long g_dirty_counter = 0;
 
-static long long g_aof_write_submitted = 0;
-static long long g_aof_write_confirmed = 0;
+static long long g_aof_write_offset = 0;
 
 static int g_persist_recovering = 0;
 static long long g_recover_last_total_ms = 0;
@@ -51,30 +50,20 @@ static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
 static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
 static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- async append pending ring buffer ---- */
-#define PERSIST_PENDING_RING_SIZE  512
-#define PERSIST_USERDATA_SENTINEL  UINT64_MAX  /* marks SQE not yet bound to a slot */
+/* ---- async append pending queue ---- */
+typedef struct persist_pending_s {
+    conn_t             *conn;
+    unsigned char      *resp;
+    size_t              resp_len;
+    int                 cqe_seen;
+    int                 cqe_ok;
+    int                 last_error;
+    TAILQ_ENTRY(persist_pending_s) link;
+} persist_pending_t;
 
-typedef struct {
-    conn_t        *conn;
-    unsigned char *resp;
-    size_t         resp_len;
-    uint8_t        cqe_count;    /* 0→1→2, incremented per CQE */
-    uint8_t        cqe_ok;       /* count of successful CQEs */
-    int8_t         last_error;   /* CQE res on failure, 0 otherwise */
-} persist_pending_slot_t;
-
-static persist_pending_slot_t g_pending_slots[PERSIST_PENDING_RING_SIZE];
-static uint32_t               g_pending_head = 0;  /* next enqueue index */
-static uint32_t               g_pending_tail = 0;  /* next reap index   */
-
+static TAILQ_HEAD(, persist_pending_s) g_persist_pending_head = TAILQ_HEAD_INITIALIZER(g_persist_pending_head);
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
-
-/* forward declarations for ring buffer helpers */
-static void pending_ring_advance_tail(void);
-static uint32_t pending_ring_reserve(void);
-static int  pending_ring_ensure_capacity(void);
 /* ---- end async append ---- */
 
 static int g_persist_uring_ready = 0;
@@ -82,14 +71,7 @@ static struct io_uring g_persist_uring;
 
 static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
-
-    struct io_uring_params params;
-    memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
-
-    if (io_uring_queue_init_params(1024, &g_persist_uring, &params) != 0)
-        return -1;
-
+    if (io_uring_queue_init(256, &g_persist_uring, 0) != 0) return -1;
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {
         io_uring_queue_exit(&g_persist_uring);
@@ -117,13 +99,15 @@ static void persist_uring_close(void) {
 }
 
 int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
-    /* The slot was already reserved by persist_append_prepare.
-     * Fill the conn/resp of the most recently reserved slot. */
-    uint32_t idx = g_pending_head - 1;
-    persist_pending_slot_t *slot = &g_pending_slots[idx % PERSIST_PENDING_RING_SIZE];
-    slot->conn = c;
-    slot->resp = resp;
-    slot->resp_len = resp_len;
+    persist_pending_t *p = (persist_pending_t *)kvs_malloc(sizeof(*p));
+    if (!p) return -1;
+    p->conn = c;
+    p->resp = resp;
+    p->resp_len = resp_len;
+    p->cqe_seen = 0;
+    p->cqe_ok = 0;
+    p->last_error = 0;
+    TAILQ_INSERT_TAIL(&g_persist_pending_head, p, link);
     return 0;
 }
 
@@ -132,88 +116,41 @@ void persist_reap_cqes(void) {
 
     struct io_uring_cqe *cqe;
     while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
-        uint32_t idx = (uint32_t)cqe->user_data;
-        persist_pending_slot_t *slot;
-
-        /* zombie SQE from a failed prepare — skip */
-        if (cqe->user_data == PERSIST_USERDATA_SENTINEL) {
+        persist_pending_t *p = TAILQ_FIRST(&g_persist_pending_head);
+        if (!p) {
+            fprintf(stderr, "persist: CQE without pending entry\n");
             io_uring_cqe_seen(&g_persist_uring, cqe);
             continue;
         }
-
-        /* resolve slot by its absolute index */
-        if (idx < g_pending_tail || idx >= g_pending_head) {
-            /* stale or out-of-range user_data; should not happen */
-            fprintf(stderr, "persist: CQE with invalid user_data %u (head=%u tail=%u)\n",
-                    idx, g_pending_head, g_pending_tail);
-            io_uring_cqe_seen(&g_persist_uring, cqe);
-            continue;
-        }
-        slot = &g_pending_slots[idx % PERSIST_PENDING_RING_SIZE];
 
         if (cqe->res > 0) {
-            /* write CQE: advance confirmed offset */
-            if (slot->cqe_count == 0)  /* first CQE for this slot is write */
-                g_aof_write_confirmed += (long long)cqe->res;
-            slot->cqe_ok++;
+            g_aof_write_offset += cqe->res;
+            p->cqe_ok++;
         } else if (cqe->res == 0) {
-            /* fsync with 0-byte file or similar */
-            slot->cqe_ok++;
+            p->cqe_ok++;
         } else {
-            slot->last_error = (int8_t)cqe->res;
+            p->last_error = cqe->res;
         }
-        slot->cqe_count++;
+        p->cqe_seen++;
         io_uring_cqe_seen(&g_persist_uring, cqe);
 
-        if (slot->cqe_count == 2) {
-            if (slot->cqe_ok == 2) {
-                if (slot->conn && slot->conn->fd > 0)
-                    queue_bytes(slot->conn, slot->resp, slot->resp_len);
+        if (p->cqe_seen == 2) {
+            TAILQ_REMOVE(&g_persist_pending_head, p, link);
+            if (p->cqe_ok == 2) {
+                if (p->conn && p->conn->fd > 0)
+                    queue_bytes(p->conn, p->resp, p->resp_len);
             } else {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
-                        (int)slot->cqe_ok, (int)slot->last_error);
-                if (slot->conn) {
-                    slot->conn->fd = -1;
+                        p->cqe_ok, p->last_error);
+                if (p->conn) {
+                    p->conn->fd = -1;
                 }
                 g_persist_fatal_error = 1;
             }
-            kvs_free(slot->resp);
-            slot->resp = NULL;
-            slot->conn = NULL;
-            pending_ring_advance_tail();
+            kvs_free(p->resp);
+            kvs_free(p);
         }
     }
-}
-
-/* ensure at least 1 free ring slot — safe to call io_uring_submit_and_wait
- * because this MUST be invoked BEFORE any SQE acquisition */
-static int pending_ring_ensure_capacity(void) {
-    if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
-        return 0;
-    /* ring full: submit all previously-prepared SQEs and wait for at
-     * least one completion to free a slot */
-    persist_submit_pending();
-    for (int tries = 0; tries < 1000; tries++) {
-        persist_reap_cqes();
-        if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
-            return 0;
-        io_uring_submit_and_wait(&g_persist_uring, 1);
-        persist_reap_cqes();
-        if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
-            return 0;
-    }
-    return -1; /* ring still full after many retries — fatal */
-}
-
-static uint32_t pending_ring_reserve(void) {
-    uint32_t idx = g_pending_head++;
-    memset(&g_pending_slots[idx % PERSIST_PENDING_RING_SIZE], 0,
-           sizeof(persist_pending_slot_t));
-    return idx;
-}
-
-static void pending_ring_advance_tail(void) {
-    g_pending_tail++;
 }
 
 int persist_uring_fd(void) {
@@ -222,7 +159,7 @@ int persist_uring_fd(void) {
 
 void persist_drain_pending(void) {
     if (!g_persist_uring_ready) return;
-    while (g_pending_head != g_pending_tail) {
+    while (!TAILQ_EMPTY(&g_persist_pending_head)) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
         persist_reap_cqes();
     }
@@ -611,9 +548,8 @@ static int finalize_rewrite_parent(void) {
     if (g_aof_fd >= 0) close(g_aof_fd);
     g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_aof_fd < 0) return -1;
-    g_aof_write_confirmed = lseek(g_aof_fd, 0, SEEK_END);
-    if (g_aof_write_confirmed < 0) g_aof_write_confirmed = 0;
-    g_aof_write_submitted = g_aof_write_confirmed;
+    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
+    if (g_aof_write_offset < 0) g_aof_write_offset = 0;
 
     pthread_mutex_lock(&g_rewrite_buf_lock);
     free_rewrite_buffer_locked();
@@ -629,9 +565,8 @@ int persist_init(void) {
     }
     g_aof_fd = open(g_cfg.aof_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_aof_fd < 0) return -1;
-    g_aof_write_confirmed = lseek(g_aof_fd, 0, SEEK_END);
-    if (g_aof_write_confirmed < 0) g_aof_write_confirmed = 0;
-    g_aof_write_submitted = g_aof_write_confirmed;
+    g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
+    if (g_aof_write_offset < 0) g_aof_write_offset = 0;
     /* eager-init uring so eventfd exists before reactor/proactor/ntyco epoll starts */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
         persist_uring_init_once();
@@ -677,8 +612,6 @@ void persist_submit_pending(void) {
 
 int persist_append_prepare(const unsigned char *buf, size_t len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
-    uint32_t slot_idx;
-    off_t off;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
@@ -687,43 +620,30 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* ensure SQ ring space — safe: no SQEs obtained yet */
-    if (io_uring_sq_space_left(&g_persist_uring) < 64) {
+    /* ensure at least 2 free SQEs — if ring is filling up with
+       deferred submits, submit and reap to free slots */
+    if (io_uring_sq_space_left(&g_persist_uring) < 2) {
         persist_submit_pending();
         persist_reap_cqes();
         if (io_uring_sq_space_left(&g_persist_uring) < 2)
             return KVS_PERSIST_ERR;
     }
 
-    /* ensure ring buffer capacity — safe: no SQEs obtained yet,
-     * so io_uring_submit_and_wait can be used without racing */
-    if (pending_ring_ensure_capacity() != 0)
-        return KVS_PERSIST_ERR;
+    off_t off = (off_t)g_aof_write_offset;
 
-    /* reserve slot before SQE acquisition — capacity guaranteed above */
-    slot_idx = pending_ring_reserve();
-
-    off = (off_t)g_aof_write_submitted;
-
-    /* fill SQEs with final user_data and link flag */
+    /* write SQE */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) {
-        g_persist_fatal_error = 1;
-        return KVS_PERSIST_ERR;
-    }
+    if (!sqe_w) return KVS_PERSIST_ERR;
     io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
-    sqe_w->user_data = slot_idx;
 
+    /* fsync SQE */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) {
-        g_persist_fatal_error = 1;
-        return KVS_PERSIST_ERR;
-    }
+    if (!sqe_f) return KVS_PERSIST_ERR;
     io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
-    sqe_f->user_data = slot_idx;
 
-    g_aof_write_submitted += (long long)len;
+    /* NOTE: do NOT call io_uring_submit() — caller batches and
+       calls persist_submit_pending() when ready */
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
@@ -738,7 +658,7 @@ int persist_append_raw(const unsigned char *buf, size_t len) {
 }
 
 int persist_save_dump(void) {
-    unsigned long long aof_off = (unsigned long long)g_aof_write_confirmed;
+    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
     int rc = persist_save_dump_to(g_cfg.dump_path, aof_off);
     if (rc == 0) persist_mark_snapshot_success(g_dirty_counter);
     return rc;
@@ -791,7 +711,7 @@ int persist_bgsave_start(void) {
     if (g_bgsave_pid > 0) return 1;
 
     unsigned long long snap_dirty = g_dirty_counter;
-    unsigned long long aof_off = (unsigned long long)g_aof_write_confirmed;
+    unsigned long long aof_off = (unsigned long long)g_aof_write_offset;
     long long start_ms = kvs_now_ms();
     char tmp_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", g_cfg.dump_path, (long)getpid());

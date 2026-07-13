@@ -2,6 +2,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <string.h>
 #include <liburing.h>
 #include <sys/eventfd.h>
 
@@ -79,7 +80,14 @@ static struct io_uring g_persist_uring;
 
 static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
-    if (io_uring_queue_init(256, &g_persist_uring, 0) != 0) return -1;
+
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
+
+    if (io_uring_queue_init_params(1024, &g_persist_uring, &params) != 0)
+        return -1;
+
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {
         io_uring_queue_exit(&g_persist_uring);

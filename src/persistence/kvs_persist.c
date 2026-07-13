@@ -74,6 +74,7 @@ static int g_persist_fatal_error = 0;
 /* forward declarations for ring buffer helpers */
 static void pending_ring_advance_tail(void);
 static uint32_t pending_ring_reserve(void);
+static int  pending_ring_ensure_capacity(void);
 /* ---- end async append ---- */
 
 static int g_persist_uring_ready = 0;
@@ -184,15 +185,27 @@ void persist_reap_cqes(void) {
     }
 }
 
-static uint32_t pending_ring_reserve(void) {
-    while (g_pending_head - g_pending_tail >= PERSIST_PENDING_RING_SIZE) {
-        persist_reap_cqes();  /* try to free completed slots */
+/* ensure at least 1 free ring slot — safe to call io_uring_submit_and_wait
+ * because this MUST be invoked BEFORE any SQE acquisition */
+static int pending_ring_ensure_capacity(void) {
+    if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
+        return 0;
+    /* ring full: submit all previously-prepared SQEs and wait for at
+     * least one completion to free a slot */
+    persist_submit_pending();
+    for (int tries = 0; tries < 1000; tries++) {
+        persist_reap_cqes();
         if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
-            break;
-        /* still full: block until at least one CQE completes */
+            return 0;
         io_uring_submit_and_wait(&g_persist_uring, 1);
         persist_reap_cqes();
+        if (g_pending_head - g_pending_tail < PERSIST_PENDING_RING_SIZE)
+            return 0;
     }
+    return -1; /* ring still full after many retries — fatal */
+}
+
+static uint32_t pending_ring_reserve(void) {
     uint32_t idx = g_pending_head++;
     memset(&g_pending_slots[idx % PERSIST_PENDING_RING_SIZE], 0,
            sizeof(persist_pending_slot_t));
@@ -674,7 +687,7 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* ensure 2 free SQEs before reserving slot */
+    /* ensure SQ ring space — safe: no SQEs obtained yet */
     if (io_uring_sq_space_left(&g_persist_uring) < 64) {
         persist_submit_pending();
         persist_reap_cqes();
@@ -682,27 +695,32 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
             return KVS_PERSIST_ERR;
     }
 
-    /* compute offset before SQE acquisition */
-    off = (off_t)g_aof_write_submitted;
+    /* ensure ring buffer capacity — safe: no SQEs obtained yet,
+     * so io_uring_submit_and_wait can be used without racing */
+    if (pending_ring_ensure_capacity() != 0)
+        return KVS_PERSIST_ERR;
 
-    /* 1. Get both SQEs with sentinel user_data FIRST
-     *    If either fails, the sentinel-marked SQEs will be skipped by reap. */
-    sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) return KVS_PERSIST_ERR;
-    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
-    sqe_w->user_data = PERSIST_USERDATA_SENTINEL;
-
-    sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) return KVS_PERSIST_ERR;  /* sqe_w has sentinel — safe to abort */
-    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
-    sqe_f->user_data = PERSIST_USERDATA_SENTINEL;
-
-    /* 2. Reserve ring slot AFTER both SQEs are obtained */
+    /* reserve slot before SQE acquisition — capacity guaranteed above */
     slot_idx = pending_ring_reserve();
 
-    /* 3. Bind SQEs to the slot — set real user_data and IOSQE_IO_LINK */
-    sqe_w->user_data = slot_idx;
+    off = (off_t)g_aof_write_submitted;
+
+    /* fill SQEs with final user_data and link flag */
+    sqe_w = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_w) {
+        g_persist_fatal_error = 1;
+        return KVS_PERSIST_ERR;
+    }
+    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
+    sqe_w->user_data = slot_idx;
+
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_f) {
+        g_persist_fatal_error = 1;
+        return KVS_PERSIST_ERR;
+    }
+    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
     sqe_f->user_data = slot_idx;
 
     g_aof_write_submitted += (long long)len;

@@ -115,15 +115,13 @@ static void persist_uring_close(void) {
 }
 
 int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
-    persist_pending_t *p = (persist_pending_t *)kvs_malloc(sizeof(*p));
-    if (!p) return -1;
-    p->conn = c;
-    p->resp = resp;
-    p->resp_len = resp_len;
-    p->cqe_seen = 0;
-    p->cqe_ok = 0;
-    p->last_error = 0;
-    TAILQ_INSERT_TAIL(&g_persist_pending_head, p, link);
+    /* The slot was already reserved by persist_append_prepare.
+     * Fill the conn/resp of the most recently reserved slot. */
+    uint32_t idx = g_pending_head - 1;
+    persist_pending_slot_t *slot = &g_pending_slots[idx % PERSIST_PENDING_RING_SIZE];
+    slot->conn = c;
+    slot->resp = resp;
+    slot->resp_len = resp_len;
     return 0;
 }
 
@@ -204,7 +202,7 @@ int persist_uring_fd(void) {
 
 void persist_drain_pending(void) {
     if (!g_persist_uring_ready) return;
-    while (!TAILQ_EMPTY(&g_persist_pending_head)) {
+    while (g_pending_head != g_pending_tail) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
         persist_reap_cqes();
     }

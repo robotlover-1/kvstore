@@ -647,6 +647,7 @@ void persist_submit_pending(void) {
 
 int persist_append_prepare(const unsigned char *buf, size_t len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
+    uint32_t slot_idx;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
@@ -655,30 +656,39 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* ensure at least 2 free SQEs — if ring is filling up with
-       deferred submits, submit and reap to free slots */
-    if (io_uring_sq_space_left(&g_persist_uring) < 2) {
+    /* ensure 2 free SQEs before reserving slot */
+    if (io_uring_sq_space_left(&g_persist_uring) < 64) {
         persist_submit_pending();
         persist_reap_cqes();
         if (io_uring_sq_space_left(&g_persist_uring) < 2)
             return KVS_PERSIST_ERR;
     }
 
-    off_t off = (off_t)g_aof_write_offset;
+    /* reserve ring slot (may reap/block if full) */
+    slot_idx = pending_ring_reserve();
+
+    off_t off = (off_t)g_aof_write_submitted;
 
     /* write SQE */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) return KVS_PERSIST_ERR;
+    if (!sqe_w) {
+        g_pending_head--; /* rollback slot reservation */
+        return KVS_PERSIST_ERR;
+    }
     io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
+    sqe_w->user_data = slot_idx;
 
     /* fsync SQE */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) return KVS_PERSIST_ERR;
+    if (!sqe_f) {
+        g_pending_head--; /* rollback slot reservation */
+        return KVS_PERSIST_ERR;
+    }
     io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+    sqe_f->user_data = slot_idx;
 
-    /* NOTE: do NOT call io_uring_submit() — caller batches and
-       calls persist_submit_pending() when ready */
+    g_aof_write_submitted += (long long)len;
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 

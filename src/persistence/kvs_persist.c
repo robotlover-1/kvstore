@@ -12,7 +12,8 @@ long long g_bgsave_last_start_ms = 0;
 long long g_bgsave_last_end_ms = 0;
 unsigned long long g_dirty_counter = 0;
 
-static long long g_aof_write_offset = 0;
+static long long g_aof_write_offset = 0;     /* confirmed by CQE */
+static long long g_aof_write_submitted = 0;  /* staged into SQE, not yet confirmed */
 
 static int g_persist_recovering = 0;
 static long long g_recover_last_total_ms = 0;
@@ -550,6 +551,7 @@ static int finalize_rewrite_parent(void) {
     if (g_aof_fd < 0) return -1;
     g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
+    g_aof_write_submitted = g_aof_write_offset;
 
     pthread_mutex_lock(&g_rewrite_buf_lock);
     free_rewrite_buffer_locked();
@@ -567,6 +569,7 @@ int persist_init(void) {
     if (g_aof_fd < 0) return -1;
     g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
+    g_aof_write_submitted = g_aof_write_offset;
     /* eager-init uring so eventfd exists before reactor/proactor/ntyco epoll starts */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
         persist_uring_init_once();
@@ -629,7 +632,7 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
             return KVS_PERSIST_ERR;
     }
 
-    off_t off = (off_t)g_aof_write_offset;
+    off_t off = (off_t)g_aof_write_submitted;
 
     /* write SQE */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
@@ -641,6 +644,8 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
     sqe_f = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_f) return KVS_PERSIST_ERR;
     io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+
+    g_aof_write_submitted += (long long)len;
 
     /* NOTE: do NOT call io_uring_submit() — caller batches and
        calls persist_submit_pending() when ready */

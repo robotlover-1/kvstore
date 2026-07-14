@@ -1,5 +1,7 @@
 #include "kvstore/kvstore.h"
 
+#define MAX_READS_PER_EVENT 16
+
 int g_epfd = -1;
 static conn_t *fdmap[65536];
 static long long g_last_expire = 0;
@@ -115,6 +117,7 @@ static void on_accept(conn_t *lc) {
 static void on_write(conn_t *c);
 
 static void on_read(conn_t *c) {
+    int reads = 0;
     while (1) {
         if (c->in_len >= sizeof(c->inbuf)) {
             close_conn(c);
@@ -125,6 +128,7 @@ static void on_read(conn_t *c) {
         if (n > 0) {
             c->in_len += (size_t)n;
             parse_resp_stream(c, c->inbuf, &c->in_len, 0);
+            if (++reads >= MAX_READS_PER_EVENT) break;
             continue;
         }
 

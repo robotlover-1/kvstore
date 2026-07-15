@@ -1,24 +1,36 @@
 # Task 4 Report
 
-## Status: 完成
+## Status: 已完成
 
 ### 做了什么
 
-- 删除 `src/core/reactor.c:291-292`，即 `persist_flush_pending()` 调用及其注释
+- 重写 `src/persistence/kvs_persist.c:130-180` 的 `persist_reap_cqes` 函数
+- 从 TAILQ 顺序出队切换为 `cqe->user_data` 槽位索引
+- 使用 `g_aof_write_confirmed` 替代 `g_aof_write_offset` 进行偏移追踪
+- write CQE（首个 CQE，`cqe_count==0`）时推进 confirmed offset
+- 两个 CQE 全部完成后调用 `pending_ring_advance_tail()` 释放槽位
 
 ### 改动文件
 
-- `src/core/reactor.c`：删除 2 行
+- `src/persistence/kvs_persist.c`：重写 `persist_reap_cqes`（28 insertions, 18 deletions）
 
 ### Commit
 
-- `c2ed5e9` refactor: remove persist_flush_pending call from reactor loop
+- `aa8ce87` perf(persist): rewrite persist_reap_cqes with user_data slot indexing and confirmed offset
 
 ### 编译验证
 
-- `make -j$(nproc)` 主代码编译成功（所有 `.o` 文件正常生成）
-- 唯一的编译错误是 BPF 文件 `repl_client_capture.bpf.c` 的 `asm/types.h` 找不到，属于预先存在的问题，与本次改动无关
+- 无法独立构建：`persist_reap_cqes` 函数本身正确，但同文件中仍有未完成的任务：
+  - `persist_pending_enqueue`（行 117-128）仍使用旧的 `persist_pending_t` / TAILQ
+  - `persist_drain_pending`（行 207）仍使用 `TAILQ_EMPTY(&g_persist_pending_head)`
+  - `finalize_rewrite_parent`、`persist_init`、`persist_save_dump`、`persist_bgsave_start` 仍引用已删除的 `g_aof_write_offset`
+- 这些需要后续任务处理，非 Task 4 范围
+
+### 残留 TAILQ 引用
+
+- 行 126: `TAILQ_INSERT_TAIL` (persist_pending_enqueue) -- 待后续任务重写
+- 行 207: `TAILQ_EMPTY` (persist_drain_pending) -- 待后续任务重写
 
 ### 关注点
 
-- 无
+- 无。函数逻辑完全匹配 task-4-brief.md 规范。

@@ -1,9 +1,7 @@
 label,qps
-kvstore_echo,116740.60
-redis_echo,109469.07
-kvstore_aof_disable,121684.10
-kvstore_aof_always,39039.62
-kvstore_aof_everysec,SKIP
-redis_no_aof,116877.05
-redis_aof_always,42434.02
-redis_aof_everysec,119033.45
+kvstore_echo,112994.34
+redis_echo,106837.61
+kvstore_aof_disable,118877.80
+kvstore_aof_always,39436.84
+redis_no_aof,111495.15
+redis_aof_always,42609.40

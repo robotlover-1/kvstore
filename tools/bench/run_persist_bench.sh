@@ -164,67 +164,53 @@ run_bench() {
     echo "$label,$qps" >> "$OUTDIR/aof_summary.csv"
 }
 
-# ==================== Phase 2: AOF + ECHO (8 配置) ====================
+# ==================== Phase 2: AOF + ECHO (6 配置) ====================
 echo ""
 echo "============================================"
-echo " Phase 2: AOF + ECHO 性能对比 (8 配置)"
+echo " Phase 2: AOF + ECHO 性能对比 (6 配置)"
 echo "============================================"
 echo "label,qps" > "$OUTDIR/aof_summary.csv"
 
 # 1. kvstore echo (AOF 关闭, 纯协议开销)
 echo ""
-echo "--- 1/8: kvstore_echo ---"
+echo "--- 1/6: kvstore_echo ---"
 start_kvstore "--aof-disable" || exit 1
 run_bench "kvstore_echo" $KVSTORE_PORT "echo"
 cleanup_all
 
 # 2. redis echo (RDB 关闭, 纯协议开销)
 echo ""
-echo "--- 2/8: redis_echo ---"
+echo "--- 2/6: redis_echo ---"
 start_redis "" || exit 1
 run_bench "redis_echo" $REDIS_PORT "echo"
 cleanup_all
 
 # 3. kvstore aof_disable (无持久化 HSET)
 echo ""
-echo "--- 3/8: kvstore_aof_disable ---"
+echo "--- 3/6: kvstore_aof_disable ---"
 start_kvstore "--aof-disable" || exit 1
 run_bench "kvstore_aof_disable" $KVSTORE_PORT HSET key:__rand_int__ value
 cleanup_all
 
 # 4. kvstore aof_always
 echo ""
-echo "--- 4/8: kvstore_aof_always ---"
+echo "--- 4/6: kvstore_aof_always ---"
 start_kvstore "--appendfsync always" || exit 1
 run_bench "kvstore_aof_always" $KVSTORE_PORT HSET key:__rand_int__ value
 cleanup_all
 
-# 5. kvstore aof_everysec
+# 5. redis no_aof (RDB 关闭, 无 AOF) — HSET 3-arg (key field value)
 echo ""
-echo "--- 5/8: kvstore_aof_everysec ---"
-start_kvstore "--appendfsync everysec" || exit 1
-run_bench "kvstore_aof_everysec" $KVSTORE_PORT HSET key:__rand_int__ value
-cleanup_all
-
-# 6. redis no_aof (RDB 关闭, 无 AOF) — HSET 3-arg (key field value)
-echo ""
-echo "--- 6/8: redis_no_aof ---"
+echo "--- 5/6: redis_no_aof ---"
 start_redis "" || exit 1
 run_bench "redis_no_aof" $REDIS_PORT HSET key:__rand_int__ __rand_int__ value
 cleanup_all
 
-# 7. redis aof_always — HSET 3-arg
+# 6. redis aof_always — HSET 3-arg
 echo ""
-echo "--- 7/8: redis_aof_always ---"
+echo "--- 6/6: redis_aof_always ---"
 start_redis "--appendonly yes --appendfsync always" || exit 1
 run_bench "redis_aof_always" $REDIS_PORT HSET key:__rand_int__ __rand_int__ value
-cleanup_all
-
-# 8. redis aof_everysec — HSET 3-arg
-echo ""
-echo "--- 8/8: redis_aof_everysec ---"
-start_redis "--appendonly yes --appendfsync everysec" || exit 1
-run_bench "redis_aof_everysec" $REDIS_PORT HSET key:__rand_int__ __rand_int__ value
 cleanup_all
 
 # ==================== Phase 3: SAVE 性能测试 ====================

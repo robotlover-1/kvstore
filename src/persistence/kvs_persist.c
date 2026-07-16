@@ -71,7 +71,7 @@ static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
    ring=1024 → 512 SQE pairs → set to 480 to leave margin. */
 #define MAX_AOF_INFLIGHT      480
 
-typedef struct {
+typedef struct persist_slot_s {
     conn_t        *conn;
     unsigned char *resp;        /* owned; freed on slot release */
     size_t         resp_len;
@@ -81,6 +81,8 @@ typedef struct {
     int            cqe_ok;      /* how many CQEs succeeded */
     int            last_error;
     int            in_use;
+    /* group commit linkage */
+    struct persist_slot_s *group_next;  /* next cmd slot in group, NULL if none */
 } persist_slot_t;
 
 static persist_slot_t g_inflight[PERSIST_INFLIGHT_SIZE];
@@ -91,6 +93,23 @@ static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
 static int g_persist_aof_registered = 0;  /* g_aof_fd registered as fixed file index 0 */
 /* ---- end async persist inflight ring ---- */
+
+/* ---- group commit (pipeline fsync batching) ----
+ *
+ * In pipeline mode (P > 1), multiple commands arrive in a single recv()
+ * batch.  Instead of one fsync per command, we link all writes together
+ * via IOSQE_IO_LINK and append a single fsync at the end.  Every command
+ * still gets its own write SQE; the fsync is shared.
+ *
+ * Group cmd slots expect 1 CQE (write).  The sync slot expects 1 CQE
+ * (fsync).  When the fsync CQE arrives, all group cmd slots are released
+ * and their responses sent — preserving appendfsync=always durability.
+ */
+static struct {
+    int             active;
+    persist_slot_t *cmd_head;  /* first cmd slot in group */
+    persist_slot_t *cmd_tail;  /* last cmd slot (for appending) */
+} g_group;
 
 static int g_persist_uring_ready = 0;
 static struct io_uring g_persist_uring;
@@ -194,51 +213,130 @@ void persist_submit_sqes(void) {
 
 /* ---- reap completions ----
  *
- * Each CQE carries the slot pointer as user_data (set in
- * persist_append_prepare).  This decouples CQE arrival order
- * from command submission order — a slot is released only
- * after both its write and fsync CQEs have arrived, regardless
- * of interleaving with other commands.
+ * Each CQE carries the slot pointer as user_data.
+ *
+ * Normal slots expect 2 CQEs (write + fsync) and release when
+ * cqe_seen reaches 2.
+ *
+ * Group-commit mode: cmd slots expect 1 CQE (write only).  A
+ * separate "sync slot" (identified by conn == NULL) carries the
+ * group fsync.  When the sync slot's CQE arrives it completes
+ * every cmd slot in the group, ensuring all responses are sent
+ * only after the shared fsync is durable.
  */
+
+static void persist_reap_one(struct io_uring_cqe *cqe) {
+    persist_slot_t *s = (persist_slot_t *)io_uring_cqe_get_data(cqe);
+    if (!s) {
+        fprintf(stderr, "persist: CQE without slot\n");
+        io_uring_cqe_seen(&g_persist_uring, cqe);
+        return;
+    }
+
+    if (cqe->res > 0) {
+        g_aof_write_offset += cqe->res;
+        s->cqe_ok++;
+    } else if (cqe->res == 0) {
+        s->cqe_ok++;
+    } else {
+        s->last_error = cqe->res;
+    }
+    s->cqe_seen++;
+    io_uring_cqe_seen(&g_persist_uring, cqe);
+
+    /* sync slot (conn==NULL): fsync CQE for a group.
+       complete every cmd slot in the linked list. */
+    if (s->conn == NULL && s->group_next != NULL) {
+        int group_ok = s->cqe_ok;  /* 1 if fsync succeeded */
+        persist_slot_t *cmd = s->group_next;
+        while (cmd) {
+            persist_slot_t *next = cmd->group_next;
+            if (group_ok) cmd->cqe_ok++;
+            cmd->cqe_seen++;  /* was 1 (write CQE), now 2 */
+            if (cmd->cqe_seen == 2) {
+                if (cmd->cqe_ok == 2 && cmd->conn && cmd->conn->fd > 0)
+                    queue_bytes(cmd->conn, cmd->resp, cmd->resp_len);
+                else if (cmd->cqe_ok != 2) {
+                    fprintf(stderr, "persist: group cmd error cqe_ok=%d\n",
+                            cmd->cqe_ok);
+                    if (cmd->conn) cmd->conn->fd = -1;
+                    g_persist_fatal_error = 1;
+                }
+                persist_inflight_release(cmd);
+            }
+            cmd = next;
+        }
+        persist_inflight_release(s);
+        return;
+    }
+
+    /* normal slot or group cmd slot (write CQE):
+       group cmd slots have cqe_seen==1 after write and wait for
+       the sync slot to bump them to 2 */
+    if (s->cqe_seen == 2) {
+        if (s->cqe_ok == 2) {
+            if (s->conn && s->conn->fd > 0)
+                queue_bytes(s->conn, s->resp, s->resp_len);
+        } else {
+            fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
+                    s->cqe_ok, s->last_error);
+            if (s->conn) s->conn->fd = -1;
+            g_persist_fatal_error = 1;
+        }
+        persist_inflight_release(s);
+    }
+    /* group cmd slot with cqe_seen==1: deferred, sync slot will release */
+}
 
 void persist_reap_completions(void) {
     if (!g_persist_uring_ready) return;
-
     struct io_uring_cqe *cqe;
-    while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
-        persist_slot_t *s = (persist_slot_t *)io_uring_cqe_get_data(cqe);
-        if (!s) {
-            fprintf(stderr, "persist: CQE without slot\n");
-            io_uring_cqe_seen(&g_persist_uring, cqe);
-            continue;
-        }
+    while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0)
+        persist_reap_one(cqe);
+}
 
-        if (cqe->res > 0) {
-            g_aof_write_offset += cqe->res;
-            s->cqe_ok++;
-        } else if (cqe->res == 0) {
-            s->cqe_ok++;
-        } else {
-            s->last_error = cqe->res;
-        }
-        s->cqe_seen++;
-        io_uring_cqe_seen(&g_persist_uring, cqe);
+/* ---- group commit API ---- */
 
-        if (s->cqe_seen == 2) {
-            if (s->cqe_ok == 2) {
-                if (s->conn && s->conn->fd > 0)
-                    queue_bytes(s->conn, s->resp, s->resp_len);
-            } else {
-                fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
-                        s->cqe_ok, s->last_error);
-                if (s->conn) {
-                    s->conn->fd = -1;
-                }
-                g_persist_fatal_error = 1;
-            }
-            persist_inflight_release(s);
-        }
+void persist_group_begin(void) {
+    if (!g_persist_uring_ready) return;
+    g_group.active = 1;
+    g_group.cmd_head = NULL;
+    g_group.cmd_tail = NULL;
+}
+
+void persist_group_commit(void) {
+    struct io_uring_sqe *sqe_f;
+    persist_slot_t *sync_slot;
+    int aof_fd;
+
+    if (!g_group.active) return;
+    g_group.active = 0;
+
+    if (g_group.cmd_head == NULL) return;  /* empty group */
+
+    /* reserve a sync slot and link it to the group's cmd list.
+       conn==NULL signals the reap path that this is a group fsync. */
+    sync_slot = persist_inflight_reserve();
+    if (!sync_slot) {
+        fprintf(stderr, "persist: group sync slot alloc failed\n");
+        return;
     }
+    sync_slot->conn = NULL;
+    sync_slot->group_next = g_group.cmd_head;  /* head of cmd linked list */
+
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_f) {
+        persist_inflight_release(sync_slot);
+        return;
+    }
+
+    aof_fd = g_persist_aof_registered ? 0 : g_aof_fd;
+    io_uring_prep_fsync(sqe_f, aof_fd, IORING_FSYNC_DATASYNC);
+    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_f, sync_slot);
+
+    /* submit all accumulated write SQEs + the trailing fsync */
+    persist_submit_sqes();
 }
 
 int persist_uring_fd(void) {
@@ -741,17 +839,15 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
 
     /* soft backpressure: try to drain a few completions when the
        inflight queue is deep.  never block — the SQ ring capacity
-       (1024 entries = 512 SQE pairs) is the hard limit.  blocking
-       here would serialize the event loop behind disk latency and
-       kill pipelined throughput. */
+       (1024 entries = 512 SQE pairs) is the hard limit. */
     if (g_inflight_count >= MAX_AOF_INFLIGHT) {
         persist_submit_sqes();
         persist_reap_completions();
     }
 
-    /* ensure at least 2 free SQEs.  with SQPOLL the kernel thread
-       frees slots quickly, so retry a few times before giving up. */
-    for (int sq_retry = 0; io_uring_sq_space_left(&g_persist_uring) < 2; sq_retry++) {
+    /* in group mode we only need 1 SQE (write); normal mode needs 2 */
+    unsigned need_sqes = g_group.active ? 1u : 2u;
+    for (int sq_retry = 0; io_uring_sq_space_left(&g_persist_uring) < need_sqes; sq_retry++) {
         persist_submit_sqes();
         persist_reap_completions();
         if (sq_retry >= 100) return KVS_PERSIST_ERR;
@@ -761,8 +857,7 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
     slot = persist_inflight_reserve();
     if (!slot) return KVS_PERSIST_ERR;
 
-    /* 2. copy AOF payload into safe buffer — the original buf may
-       point to connection input-buffer memory that will be reused */
+    /* 2. copy AOF payload into safe buffer */
     slot->aof_buf = (unsigned char *)kvs_malloc(len);
     if (!slot->aof_buf) {
         persist_inflight_release(slot);
@@ -778,8 +873,10 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
 
     off_t off = (off_t)g_aof_write_submitted;
 
-    /* 4. write SQE — bind slot via user_data.
-       use fixed-file index 0 when registered, raw fd otherwise. */
+    /* 4. write SQE — always with IOSQE_IO_LINK.
+       in group mode the writes chain together; the trailing fsync
+       (added by persist_group_commit) completes the chain.
+       in normal mode the write links to its own fsync below. */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_w) {
         persist_inflight_release(slot);
@@ -792,22 +889,35 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
     if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe_w, slot);
 
-    /* 5. fsync SQE — bind same slot, same fd strategy */
-    sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) {
-        persist_inflight_release(slot);
-        return KVS_PERSIST_ERR;
+    if (g_group.active) {
+        /* group mode: accumulate writes, no fsync yet.
+           append slot to group linked list for batch completion. */
+        slot->group_next = NULL;
+        if (g_group.cmd_tail)
+            g_group.cmd_tail->group_next = slot;
+        else
+            g_group.cmd_head = slot;
+        g_group.cmd_tail = slot;
+    } else {
+        /* 5. normal mode: fsync SQE — bind same slot */
+        sqe_f = io_uring_get_sqe(&g_persist_uring);
+        if (!sqe_f) {
+            persist_inflight_release(slot);
+            return KVS_PERSIST_ERR;
+        }
+        io_uring_prep_fsync(sqe_f,
+                            g_persist_aof_registered ? 0 : g_aof_fd,
+                            IORING_FSYNC_DATASYNC);
+        if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
+        io_uring_sqe_set_data(sqe_f, slot);
     }
-    io_uring_prep_fsync(sqe_f,
-                        g_persist_aof_registered ? 0 : g_aof_fd,
-                        IORING_FSYNC_DATASYNC);
-    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
-    io_uring_sqe_set_data(sqe_f, slot);
 
     g_aof_write_submitted += (long long)len;
 
-    /* 6. submit immediately — each command gets its own write+fsync pair */
-    persist_submit_sqes();
+    /* 6. submit immediately in normal mode; in group mode SQEs
+       accumulate and are submitted once by persist_group_commit */
+    if (!g_group.active)
+        persist_submit_sqes();
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 

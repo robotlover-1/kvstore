@@ -512,6 +512,8 @@ int persist_append_raw(const unsigned char *buf, size_t len);
 int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
                            unsigned char *resp, size_t resp_len);
 void persist_submit_sqes(void);
+void persist_group_begin(void);
+void persist_group_commit(void);
 int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long *offset_io);
 int persist_fsync_fd(int fd);
 int persist_save_dump(void);

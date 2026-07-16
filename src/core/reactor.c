@@ -120,6 +120,7 @@ static void on_read(conn_t *c) {
     int reads = 0;
     while (1) {
         if (c->in_len >= sizeof(c->inbuf)) {
+            persist_group_commit();
             close_conn(c);
             return;
         }
@@ -127,12 +128,18 @@ static void on_read(conn_t *c) {
         ssize_t n = recv(c->fd, c->inbuf + c->in_len, sizeof(c->inbuf) - c->in_len, 0);
         if (n > 0) {
             c->in_len += (size_t)n;
+            /* each recv() may contain P > 1 pipelined commands.
+               group all commands from this TCP segment so they
+               share a single fsync via IOSQE_IO_LINK chain. */
+            persist_group_begin();
             parse_resp_stream(c, c->inbuf, &c->in_len, 0);
+            persist_group_commit();
             if (++reads >= MAX_READS_PER_EVENT) break;
             continue;
         }
 
         if (n == 0) {
+            persist_group_commit();
             if (c->out_ring_len > 0) {
                 mod_events(c, EPOLLOUT);
                 return;
@@ -142,14 +149,10 @@ static void on_read(conn_t *c) {
         }
 
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        persist_group_commit();
         close_conn(c);
         return;
     }
-
-    /* persist_append_prepare now submits each command immediately,
-     * so there should be no pending SQEs to batch here.  This call
-     * is a no-op safety net. */
-    persist_submit_sqes();
 
     /* try immediate write after processing pipeline batch:
      * if parse_resp_stream queued multiple responses, send()

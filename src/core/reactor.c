@@ -146,10 +146,9 @@ static void on_read(conn_t *c) {
         return;
     }
 
-    /* batch-submit all pending AOF write+fsync SQE pairs accumulated
-     * during the parse_resp_stream loop above.  this turns N per-command
-     * io_uring_submit() syscalls into 1 (or a few for large P where the
-     * SQ ring fills up and triggers auto-flush in persist_append_prepare). */
+    /* persist_append_prepare now submits each command immediately,
+     * so there should be no pending SQEs to batch here.  This call
+     * is a no-op safety net. */
     persist_submit_pending();
 
     /* try immediate write after processing pipeline batch:

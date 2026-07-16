@@ -647,8 +647,9 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
 
     g_aof_write_submitted += (long long)len;
 
-    /* NOTE: do NOT call io_uring_submit() — caller batches and
-       calls persist_submit_pending() when ready */
+    /* submit immediately — each command gets its own write+fsync
+       pair submitted without deferring to a batch */
+    persist_submit_pending();
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 

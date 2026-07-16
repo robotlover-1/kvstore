@@ -148,24 +148,16 @@ static int persist_uring_init_once(void) {
 
     struct io_uring_params p;
     memset(&p, 0, sizeof(p));
-    /* SQPOLL: kernel thread polls SQ ring, userspace io_uring_submit()
-       becomes a cheap memory barrier instead of io_uring_enter syscall.
-       Well-suited for high-frequency small-I/O per-command submission.
-       sq_thread_idle=2000: kernel thread parks after 2s of inactivity.
-       If the kernel or system doesn't support SQPOLL, we fall back to
-       non-SQPOLL mode — not a fatal error. */
-    p.flags = IORING_SETUP_SINGLE_ISSUER
-            | IORING_SETUP_COOP_TASKRUN
-            | IORING_SETUP_SQPOLL;
-    p.sq_thread_idle = 2000;
+    /* NO SQPOLL for the sync path experiment.
+       SQPOLL adds kernel-thread scheduling overhead that hurts
+       synchronous submit_and_wait workloads — every CQE wait
+       involves waking the userspace task from the kernel thread.
+       For appendfsync=always (synchronous wait semantics), direct
+       io_uring_enter is faster. */
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
 
-    if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0) {
-        /* fallback: retry without SQPOLL */
-        memset(&p, 0, sizeof(p));
-        p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
-        if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0)
-            return -1;
-    }
+    if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0)
+        return -1;
 
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {

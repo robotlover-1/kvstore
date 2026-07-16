@@ -834,6 +834,67 @@ int persist_force_aof_flush(void) {
     return 0;
 }
 
+/* ---- minimal sync entry point (bypasses slots/groups/inflight) ----
+ *
+ * Direct io_uring write+fsync with synchronous wait for both CQEs.
+ * No slot ring, no group commit, no eventfd round-trip.
+ * Used to baseline: is the bottleneck io_uring or our machinery?
+ */
+
+int persist_append_sync(const unsigned char *buf, size_t len) {
+    struct io_uring_sqe *sqe_w, *sqe_f;
+    unsigned char *safe_buf;
+    int aof_fd;
+
+    if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
+    if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
+    if (g_persist_fatal_error) return KVS_PERSIST_ERR;
+    if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
+
+    /* copy payload — async write must not reference caller buffer */
+    safe_buf = (unsigned char *)kvs_malloc(len);
+    if (!safe_buf) return KVS_PERSIST_ERR;
+    memcpy(safe_buf, buf, len);
+
+    aof_fd = g_persist_aof_registered ? 0 : g_aof_fd;
+    off_t off = (off_t)g_aof_write_submitted;
+
+    sqe_w = io_uring_get_sqe(&g_persist_uring);
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_w || !sqe_f) {
+        kvs_free(safe_buf);
+        return KVS_PERSIST_ERR;
+    }
+
+    io_uring_prep_write(sqe_w, aof_fd, safe_buf, len, off);
+    sqe_w->flags |= IOSQE_IO_LINK;
+    if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
+
+    io_uring_prep_fsync(sqe_f, aof_fd, IORING_FSYNC_DATASYNC);
+    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
+
+    g_aof_write_submitted += (long long)len;
+
+    /* synchronous wait for both CQEs */
+    int ret = io_uring_submit_and_wait(&g_persist_uring, 2);
+    if (ret < 0) { kvs_free(safe_buf); return KVS_PERSIST_ERR; }
+
+    int cqe_count = 0, ok = 1;
+    struct io_uring_cqe *cqe;
+    while (cqe_count < 2 && io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
+        if (cqe->res > 0)
+            g_aof_write_offset += cqe->res;
+        else if (cqe->res < 0)
+            ok = 0;
+        io_uring_cqe_seen(&g_persist_uring, cqe);
+        cqe_count++;
+    }
+    kvs_free(safe_buf);
+
+    if (!ok) g_persist_fatal_error = 1;
+    return ok ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
+}
+
 /* ---- async append entry point ----
  *
  * Reserve an inflight slot, copy the AOF payload into a safe buffer,
@@ -855,6 +916,13 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
+
+    /* EXPERIMENT: minimal sync io_uring path.
+       bypass all slot/group/inflight machinery to baseline
+       raw io_uring write+fsync latency. */
+    int sync_rc = persist_append_sync(buf, len);
+    (void)c; (void)resp; (void)resp_len;
+    return sync_rc;  /* KVS_PERSIST_OK → caller sends response immediately */
 
     if (g_persist_fatal_error) return KVS_PERSIST_ERR;
 

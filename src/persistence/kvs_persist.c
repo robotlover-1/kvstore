@@ -65,7 +65,11 @@ static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
  * strict FIFO CQE ordering.
  */
 #define PERSIST_INFLIGHT_SIZE 1024
-#define MAX_AOF_INFLIGHT      128
+/* soft limit: trigger non-blocking reap when inflight reaches this.
+   must be < min(ring_entries/2, PERSIST_INFLIGHT_SIZE) so the SQ ring
+   doesn't fill up before the inflight check kicks in.
+   ring=1024 → 512 SQE pairs → set to 480 to leave margin. */
+#define MAX_AOF_INFLIGHT      480
 
 typedef struct {
     conn_t        *conn;
@@ -136,11 +140,11 @@ static int persist_uring_init_once(void) {
             | IORING_SETUP_SQPOLL;
     p.sq_thread_idle = 2000;
 
-    if (io_uring_queue_init_params(512, &g_persist_uring, &p) != 0) {
+    if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0) {
         /* fallback: retry without SQPOLL */
         memset(&p, 0, sizeof(p));
         p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
-        if (io_uring_queue_init_params(512, &g_persist_uring, &p) != 0)
+        if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0)
             return -1;
     }
 
@@ -735,24 +739,22 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* backpressure: if too many commands are in flight, reap until
-       we drop below the max-inflight threshold */
-    while (g_inflight_count >= MAX_AOF_INFLIGHT) {
+    /* soft backpressure: try to drain a few completions when the
+       inflight queue is deep.  never block — the SQ ring capacity
+       (1024 entries = 512 SQE pairs) is the hard limit.  blocking
+       here would serialize the event loop behind disk latency and
+       kill pipelined throughput. */
+    if (g_inflight_count >= MAX_AOF_INFLIGHT) {
         persist_submit_sqes();
         persist_reap_completions();
-        if (g_inflight_count >= MAX_AOF_INFLIGHT) {
-            /* still full — wait for at least one CQE */
-            io_uring_submit_and_wait(&g_persist_uring, 1);
-            persist_reap_completions();
-        }
     }
 
-    /* ensure at least 2 free SQEs */
-    if (io_uring_sq_space_left(&g_persist_uring) < 2) {
+    /* ensure at least 2 free SQEs.  with SQPOLL the kernel thread
+       frees slots quickly, so retry a few times before giving up. */
+    for (int sq_retry = 0; io_uring_sq_space_left(&g_persist_uring) < 2; sq_retry++) {
         persist_submit_sqes();
         persist_reap_completions();
-        if (io_uring_sq_space_left(&g_persist_uring) < 2)
-            return KVS_PERSIST_ERR;
+        if (sq_retry >= 100) return KVS_PERSIST_ERR;
     }
 
     /* 1. reserve slot BEFORE submit */

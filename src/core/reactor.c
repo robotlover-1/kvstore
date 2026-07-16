@@ -149,7 +149,7 @@ static void on_read(conn_t *c) {
     /* persist_append_prepare now submits each command immediately,
      * so there should be no pending SQEs to batch here.  This call
      * is a no-op safety net. */
-    persist_submit_pending();
+    persist_submit_sqes();
 
     /* try immediate write after processing pipeline batch:
      * if parse_resp_stream queued multiple responses, send()
@@ -159,7 +159,7 @@ static void on_read(conn_t *c) {
     if (c->out_ring_len > 0) mod_events(c, EPOLLIN | EPOLLOUT);
     else mod_events(c, EPOLLIN);
 
-    persist_reap_cqes();
+    persist_reap_completions();
 }
 
 static void on_write(conn_t *c) {
@@ -284,7 +284,7 @@ int reactor_start(void) {
                 uint64_t val;
                 ssize_t nread = read(fd, &val, sizeof(val));
                 (void)nread;
-                persist_reap_cqes();
+                persist_reap_completions();
                 continue;
             }
 

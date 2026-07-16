@@ -4,7 +4,6 @@
 #include <sys/mman.h>
 #include <liburing.h>
 #include <sys/eventfd.h>
-#include <sys/queue.h>
 
 int g_aof_fd = -1;
 pid_t g_bgsave_pid = -1;
@@ -12,8 +11,8 @@ long long g_bgsave_last_start_ms = 0;
 long long g_bgsave_last_end_ms = 0;
 unsigned long long g_dirty_counter = 0;
 
-static long long g_aof_write_offset = 0;     /* confirmed by CQE */
-static long long g_aof_write_submitted = 0;  /* staged into SQE, not yet confirmed */
+static long long g_aof_write_offset = 0;
+static long long g_aof_write_submitted = 0;
 
 static int g_persist_recovering = 0;
 static long long g_recover_last_total_ms = 0;
@@ -26,7 +25,7 @@ static unsigned long long g_recover_last_mmap_bytes = 0;
 static unsigned long long g_recover_last_fread_bytes = 0;
 static unsigned long long g_recover_last_tail_bytes = 0;
 
-static int g_bgsave_status = 0; /* 0 idle, 1 running, 2 ok, 3 err */
+static int g_bgsave_status = 0;
 static unsigned long long g_bgsave_base_dirty = 0;
 static long long g_last_snapshot_ms = 0;
 
@@ -38,7 +37,7 @@ int persist_aof_disable(void) {
 }
 
 static pid_t g_bgrewrite_pid = -1;
-static int g_bgrewrite_status = 0; /* 0 idle, 1 running, 2 ok, 3 err */
+static int g_bgrewrite_status = 0;
 static char g_rewrite_tmp_path[512] = {0};
 
 typedef struct rewrite_buf_node_s {
@@ -51,28 +50,87 @@ static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
 static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
 static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- async append pending queue ---- */
-typedef struct persist_pending_s {
-    conn_t             *conn;
-    unsigned char      *resp;
-    size_t              resp_len;
-    int                 cqe_seen;
-    int                 cqe_ok;
-    int                 last_error;
-    TAILQ_ENTRY(persist_pending_s) link;
-} persist_pending_t;
+/* ---- async persist inflight ring ----
+ *
+ * Fixed-size slot ring.  Each in-flight AOF command owns one slot.
+ * Both SQEs (write + fsync) carry the slot pointer as user_data,
+ * so CQEs can arrive in any order and still match the correct slot.
+ *
+ * The slot holds a safe copy of the AOF payload — the async write
+ * never references connection input-buffer memory.
+ */
+#define PERSIST_INFLIGHT_SIZE 1024
+#define MAX_AOF_INFLIGHT      480
 
-static TAILQ_HEAD(, persist_pending_s) g_persist_pending_head = TAILQ_HEAD_INITIALIZER(g_persist_pending_head);
+typedef struct persist_slot_s {
+    conn_t        *conn;
+    unsigned char *resp;
+    size_t         resp_len;
+    unsigned char *aof_buf;
+    size_t         aof_len;
+    int            cqe_seen;
+    int            cqe_ok;
+    int            last_error;
+    int            in_use;
+} persist_slot_t;
+
+static persist_slot_t g_inflight[PERSIST_INFLIGHT_SIZE];
+static int g_inflight_count = 0;
+static int g_inflight_head = 0;
+
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
-/* ---- end async append ---- */
+static int g_persist_aof_registered = 0;
+/* ---- end async persist inflight ring ---- */
 
 static int g_persist_uring_ready = 0;
 static struct io_uring g_persist_uring;
 
+/* ---- slot ring helpers ---- */
+
+static persist_slot_t *persist_inflight_reserve(void) {
+    if (g_inflight_count >= PERSIST_INFLIGHT_SIZE) return NULL;
+    for (int i = 0; i < PERSIST_INFLIGHT_SIZE; i++) {
+        int idx = (g_inflight_head + i) % PERSIST_INFLIGHT_SIZE;
+        if (!g_inflight[idx].in_use) {
+            persist_slot_t *s = &g_inflight[idx];
+            memset(s, 0, sizeof(*s));
+            s->in_use = 1;
+            g_inflight_head = (idx + 1) % PERSIST_INFLIGHT_SIZE;
+            g_inflight_count++;
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static void persist_inflight_release(persist_slot_t *s) {
+    if (!s || !s->in_use) return;
+    kvs_free(s->resp);
+    kvs_free(s->aof_buf);
+    memset(s, 0, sizeof(*s));
+    g_inflight_count--;
+}
+
+/* ---- uring lifecycle ---- */
+
 static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
-    if (io_uring_queue_init(256, &g_persist_uring, 0) != 0) return -1;
+
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
+    p.flags = IORING_SETUP_SINGLE_ISSUER
+            | IORING_SETUP_COOP_TASKRUN
+            | IORING_SETUP_SQPOLL;
+    p.sq_thread_idle = 2000;
+
+    if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0) {
+        memset(&p, 0, sizeof(p));
+        p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
+        if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0)
+            return -1;
+    }
+
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {
         io_uring_queue_exit(&g_persist_uring);
@@ -85,11 +143,20 @@ static int persist_uring_init_once(void) {
         return -1;
     }
     g_persist_uring_ready = 1;
+
+    if (g_aof_fd >= 0) {
+        if (io_uring_register_files(&g_persist_uring, &g_aof_fd, 1) == 0)
+            g_persist_aof_registered = 1;
+    }
     return 0;
 }
 
 static void persist_uring_close(void) {
     if (!g_persist_uring_ready) return;
+    if (g_persist_aof_registered) {
+        io_uring_unregister_files(&g_persist_uring);
+        g_persist_aof_registered = 0;
+    }
     if (g_persist_eventfd >= 0) {
         io_uring_unregister_eventfd(&g_persist_uring);
         close(g_persist_eventfd);
@@ -99,57 +166,60 @@ static void persist_uring_close(void) {
     g_persist_uring_ready = 0;
 }
 
-int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
-    persist_pending_t *p = (persist_pending_t *)kvs_malloc(sizeof(*p));
-    if (!p) return -1;
-    p->conn = c;
-    p->resp = resp;
-    p->resp_len = resp_len;
-    p->cqe_seen = 0;
-    p->cqe_ok = 0;
-    p->last_error = 0;
-    TAILQ_INSERT_TAIL(&g_persist_pending_head, p, link);
-    return 0;
+static void persist_reregister_aof_fd(void) {
+    if (!g_persist_aof_registered || g_aof_fd < 0) return;
+    persist_drain_pending();
+    if (io_uring_unregister_files(&g_persist_uring) != 0) {
+        g_persist_aof_registered = 0;
+        return;
+    }
+    if (io_uring_register_files(&g_persist_uring, &g_aof_fd, 1) != 0)
+        g_persist_aof_registered = 0;
 }
 
-void persist_reap_cqes(void) {
+/* ---- submit ---- */
+
+void persist_submit_sqes(void) {
+    if (!g_persist_uring_ready) return;
+    io_uring_submit(&g_persist_uring);
+}
+
+/* ---- reap completions ---- */
+
+void persist_reap_completions(void) {
     if (!g_persist_uring_ready) return;
 
     struct io_uring_cqe *cqe;
     while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
-        persist_pending_t *p = TAILQ_FIRST(&g_persist_pending_head);
-        if (!p) {
-            fprintf(stderr, "persist: CQE without pending entry\n");
+        persist_slot_t *s = (persist_slot_t *)io_uring_cqe_get_data(cqe);
+        if (!s) {
+            fprintf(stderr, "persist: CQE without slot\n");
             io_uring_cqe_seen(&g_persist_uring, cqe);
             continue;
         }
 
         if (cqe->res > 0) {
             g_aof_write_offset += cqe->res;
-            p->cqe_ok++;
+            s->cqe_ok++;
         } else if (cqe->res == 0) {
-            p->cqe_ok++;
+            s->cqe_ok++;
         } else {
-            p->last_error = cqe->res;
+            s->last_error = cqe->res;
         }
-        p->cqe_seen++;
+        s->cqe_seen++;
         io_uring_cqe_seen(&g_persist_uring, cqe);
 
-        if (p->cqe_seen == 2) {
-            TAILQ_REMOVE(&g_persist_pending_head, p, link);
-            if (p->cqe_ok == 2) {
-                if (p->conn && p->conn->fd > 0)
-                    queue_bytes(p->conn, p->resp, p->resp_len);
+        if (s->cqe_seen == 2) {
+            if (s->cqe_ok == 2) {
+                if (s->conn && s->conn->fd > 0)
+                    queue_bytes(s->conn, s->resp, s->resp_len);
             } else {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
-                        p->cqe_ok, p->last_error);
-                if (p->conn) {
-                    p->conn->fd = -1;
-                }
+                        s->cqe_ok, s->last_error);
+                if (s->conn) s->conn->fd = -1;
                 g_persist_fatal_error = 1;
             }
-            kvs_free(p->resp);
-            kvs_free(p);
+            persist_inflight_release(s);
         }
     }
 }
@@ -160,11 +230,13 @@ int persist_uring_fd(void) {
 
 void persist_drain_pending(void) {
     if (!g_persist_uring_ready) return;
-    while (!TAILQ_EMPTY(&g_persist_pending_head)) {
+    while (g_inflight_count > 0) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
-        persist_reap_cqes();
+        persist_reap_completions();
     }
 }
+
+/* ---- synchronous uring helpers ---- */
 
 static int persist_uring_wait_single(void) {
     struct io_uring_cqe *cqe = NULL;
@@ -303,21 +375,6 @@ static int replay_file(const char *path, unsigned long long skip_bytes) {
     return replay_file_mmap(path, skip_bytes);
 }
 
-/*
- * 恢复 dump 文件（统一 KVSD 格式）：
- *   [8]  uint64_t aof_offset               — AOF 偏移量，用于跳过早期 AOF
- *   重复：
- *     [1]  uint8_t  engine_id              — KVS_ENGINE_xxx
- *     [1]  uint8_t  flags                  — KVSD_FLAG_HAS_EXPIRE 等
- *     [4]  uint32_t klen
- *     [klen] key
- *     [4]  uint32_t vlen
- *     [vlen] value
- *     [8]  uint64_t expire_at_ms           — 仅当 flags & KVSD_FLAG_HAS_EXPIRE
- *
- * DOC 引擎的 value 格式：field1=val1 field2=val2 ...
- * 返回 aof_offset
- */
 unsigned long long replay_dump_file(const char *path) {
     int fd;
     struct stat st;
@@ -336,27 +393,22 @@ unsigned long long replay_dump_file(const char *path) {
     g_recover_mmap_success++;
     g_recover_last_mmap_bytes += (unsigned long long)size;
 
-    /* read AOF offset header */
     if (pos + sizeof(aof_offset) > size) goto out;
     memcpy(&aof_offset, mapped + pos, sizeof(aof_offset));
     pos += sizeof(aof_offset);
 
-    /* parse entries: engine, flags, klen, key, vlen, value, optional expire_ms */
     while (pos + 2 + 4 <= size) {
         uint8_t engine_id, flags;
         uint32_t klen, vlen;
         char *key, *value;
 
         engine_id = mapped[pos++];
-
-        /* sanity check: engine_id must be 1-5 */
         if (engine_id < 1 || engine_id > 5) {
             fprintf(stderr, "replay_dump_file: invalid engine_id %u at pos %zu (old format KVSD file?)\n",
                 (unsigned int)engine_id, pos - 1);
             break;
         }
 
-        /* read flags (new in unified KVSD format) */
         if (pos + 1 > size) break;
         flags = mapped[pos++];
 
@@ -383,7 +435,6 @@ unsigned long long replay_dump_file(const char *path) {
         value[vlen] = '\0';
         pos += vlen;
 
-        /* dispatch to correct engine */
         switch (engine_id) {
         case KVS_ENGINE_ARRAY:
             kvs_array_set(&global_array, key, value);
@@ -398,7 +449,6 @@ unsigned long long replay_dump_file(const char *path) {
             kvs_skiptable_set(&global_skiptable, key, value);
             break;
         case KVS_ENGINE_DOC:
-            /* DOC value format: "field1=val1 field2=val2 ..." */
             {
                 char *tok, *saveptr;
                 char *dup = (char *)kvs_malloc(vlen + 1);
@@ -422,7 +472,6 @@ unsigned long long replay_dump_file(const char *path) {
             break;
         }
 
-        /* restore TTL if present */
         if (flags & KVSD_FLAG_HAS_EXPIRE) {
             uint64_t expire_at_ms;
             if (pos + sizeof(expire_at_ms) <= size) {
@@ -553,6 +602,8 @@ static int finalize_rewrite_parent(void) {
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
     g_aof_write_submitted = g_aof_write_offset;
 
+    persist_reregister_aof_fd();
+
     pthread_mutex_lock(&g_rewrite_buf_lock);
     free_rewrite_buffer_locked();
     pthread_mutex_unlock(&g_rewrite_buf_lock);
@@ -570,7 +621,6 @@ int persist_init(void) {
     g_aof_write_offset = lseek(g_aof_fd, 0, SEEK_END);
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
     g_aof_write_submitted = g_aof_write_offset;
-    /* eager-init uring so eventfd exists before reactor/proactor/ntyco epoll starts */
     if (g_cfg.aof_fsync == KVS_AOF_FSYNC_ALWAYS) {
         persist_uring_init_once();
     }
@@ -608,48 +658,62 @@ int persist_force_aof_flush(void) {
     return 0;
 }
 
-void persist_submit_pending(void) {
-    if (!g_persist_uring_ready) return;
-    io_uring_submit(&g_persist_uring);
-}
+/* ---- per-command write+fsync+submit ---- */
 
-int persist_append_prepare(const unsigned char *buf, size_t len) {
+int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
+                           unsigned char *resp, size_t resp_len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
+    persist_slot_t *slot;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
-
     if (g_persist_fatal_error) return KVS_PERSIST_ERR;
-
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* ensure at least 2 free SQEs — if ring is filling up with
-       deferred submits, submit and reap to free slots */
-    if (io_uring_sq_space_left(&g_persist_uring) < 2) {
-        persist_submit_pending();
-        persist_reap_cqes();
-        if (io_uring_sq_space_left(&g_persist_uring) < 2)
-            return KVS_PERSIST_ERR;
+    if (g_inflight_count >= MAX_AOF_INFLIGHT) {
+        persist_submit_sqes();
+        persist_reap_completions();
     }
+
+    for (int sq_retry = 0; io_uring_sq_space_left(&g_persist_uring) < 2; sq_retry++) {
+        persist_submit_sqes();
+        persist_reap_completions();
+        if (sq_retry >= 100) return KVS_PERSIST_ERR;
+    }
+
+    slot = persist_inflight_reserve();
+    if (!slot) return KVS_PERSIST_ERR;
+
+    slot->aof_buf = (unsigned char *)kvs_malloc(len);
+    if (!slot->aof_buf) { persist_inflight_release(slot); return KVS_PERSIST_ERR; }
+    memcpy(slot->aof_buf, buf, len);
+    slot->aof_len = len;
+    slot->conn = c;
+    slot->resp = resp;
+    slot->resp_len = resp_len;
 
     off_t off = (off_t)g_aof_write_submitted;
 
-    /* write SQE */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) return KVS_PERSIST_ERR;
-    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
+    if (!sqe_w) { persist_inflight_release(slot); return KVS_PERSIST_ERR; }
+    io_uring_prep_write(sqe_w,
+                        g_persist_aof_registered ? 0 : g_aof_fd,
+                        slot->aof_buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
+    if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_w, slot);
 
-    /* fsync SQE */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) return KVS_PERSIST_ERR;
-    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+    if (!sqe_f) { persist_inflight_release(slot); return KVS_PERSIST_ERR; }
+    io_uring_prep_fsync(sqe_f,
+                        g_persist_aof_registered ? 0 : g_aof_fd,
+                        IORING_FSYNC_DATASYNC);
+    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_f, slot);
 
     g_aof_write_submitted += (long long)len;
 
-    /* submit immediately — each command gets its own write+fsync
-       pair submitted without deferring to a batch */
-    persist_submit_pending();
+    persist_submit_sqes();
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
@@ -657,9 +721,8 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
 }
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
-    int rc = persist_append_prepare(buf, len);
-    if (rc == KVS_PERSIST_PENDING)
-        persist_submit_pending();
+    int rc = persist_append_prepare(NULL, buf, len, NULL, 0);
+    if (rc == KVS_PERSIST_PENDING) persist_submit_sqes();
     return rc;
 }
 
@@ -705,7 +768,6 @@ int persist_recover(void) {
     g_last_snapshot_ms = kvs_now_ms();
     g_bgsave_last_end_ms = g_last_snapshot_ms;
 
-    /* 清理恢复过程中已过期的 TTL key（短 TTL 可能在恢复期间已过期） */
     kvs_active_expire_cycle(1000000);
 
     g_persist_recovering = 0;

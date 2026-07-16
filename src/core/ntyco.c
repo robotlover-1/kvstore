@@ -66,14 +66,14 @@ static void server_reader(void *arg) {
 
         c->in_len += (size_t)n;
         parse_resp_stream(c, c->inbuf, &c->in_len, 0);
-        persist_reap_cqes();  /* reap AOF CQEs after command processing */
+        persist_reap_completions();  /* reap AOF CQEs after command processing */
 
         if (c->out_ring_len > 0) {
             if (flush_output_blocking(c) != 0) {
                 close_conn_nty(c);
                 return;
             }
-            persist_reap_cqes();  /* also try after flushing output */
+            persist_reap_completions();  /* also try after flushing output */
         }
     }
 }

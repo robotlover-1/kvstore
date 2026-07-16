@@ -504,14 +504,14 @@ void persist_close(void);
 #define KVS_PERSIST_PENDING 1
 #define KVS_PERSIST_ERR     -1
 
-void persist_reap_cqes(void);
-int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len);
+void persist_reap_completions(void);
 void persist_drain_pending(void);
 int persist_uring_fd(void);
 
 int persist_append_raw(const unsigned char *buf, size_t len);
-int persist_append_prepare(const unsigned char *buf, size_t len);
-void persist_submit_pending(void);
+int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
+                           unsigned char *resp, size_t resp_len);
+void persist_submit_sqes(void);
 int persist_write_raw_fd(int fd, const unsigned char *buf, size_t len, long long *offset_io);
 int persist_fsync_fd(int fd);
 int persist_save_dump(void);

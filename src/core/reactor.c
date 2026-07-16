@@ -130,10 +130,13 @@ static void on_read(conn_t *c) {
             c->in_len += (size_t)n;
             /* each recv() may contain P > 1 pipelined commands.
                group all commands from this TCP segment so they
-               share a single fsync via IOSQE_IO_LINK chain. */
+               share a single fsync via IOSQE_IO_LINK chain.
+               then wait synchronously for the fsync to complete —
+               no eventfd→epoll round-trip needed. */
             persist_group_begin();
             parse_resp_stream(c, c->inbuf, &c->in_len, 0);
             persist_group_commit();
+            persist_drain_or_wait();
             if (++reads >= MAX_READS_PER_EVENT) break;
             continue;
         }

@@ -295,6 +295,21 @@ void persist_reap_completions(void) {
         persist_reap_one(cqe);
 }
 
+/* reap all available CQEs, then wait for at least one more if the
+   inflight queue is non-empty.  used for synchronous group commit
+   to avoid the eventfd→epoll_wait round-trip. */
+void persist_drain_or_wait(void) {
+    if (!g_persist_uring_ready) return;
+    while (g_inflight_count > 0) {
+        persist_reap_completions();
+        if (g_inflight_count == 0) break;
+        /* still have in-flight work — wait for kernel to post a CQE.
+           with SQPOLL the kernel thread handles I/O; this sleeps until
+           a CQE is ready, then we reap it above in the next iteration. */
+        io_uring_submit_and_wait(&g_persist_uring, 1);
+    }
+}
+
 /* ---- group commit API ---- */
 
 void persist_group_begin(void) {
@@ -316,22 +331,6 @@ void persist_group_commit(void) {
     g_group.active = 0;
 
     if (g_group.cmd_head == NULL) return;  /* empty group */
-
-    /* diagnostic: log group size once per ~1000 groups */
-    {
-        static long long g_group_log_count = 0;
-        static int g_group_log_sizes[16] = {0};
-        int sz = 0;
-        for (persist_slot_t *c = g_group.cmd_head; c; c = c->group_next) sz++;
-        if (sz < 16) g_group_log_sizes[sz]++;
-        if (++g_group_log_count % 1000 == 0) {
-            fprintf(stderr, "persist: group#%lld sizes: ", g_group_log_count);
-            for (int i = 1; i < 16; i++)
-                if (g_group_log_sizes[i])
-                    fprintf(stderr, "%d:%d ", i, g_group_log_sizes[i]);
-            fprintf(stderr, "\n");
-        }
-    }
 
     /* reserve a sync slot and link it to the group's cmd list.
        conn==NULL signals the reap path that this is a group fsync. */

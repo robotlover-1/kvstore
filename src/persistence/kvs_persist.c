@@ -317,6 +317,22 @@ void persist_group_commit(void) {
 
     if (g_group.cmd_head == NULL) return;  /* empty group */
 
+    /* diagnostic: log group size once per ~1000 groups */
+    {
+        static long long g_group_log_count = 0;
+        static int g_group_log_sizes[16] = {0};
+        int sz = 0;
+        for (persist_slot_t *c = g_group.cmd_head; c; c = c->group_next) sz++;
+        if (sz < 16) g_group_log_sizes[sz]++;
+        if (++g_group_log_count % 1000 == 0) {
+            fprintf(stderr, "persist: group#%lld sizes: ", g_group_log_count);
+            for (int i = 1; i < 16; i++)
+                if (g_group_log_sizes[i])
+                    fprintf(stderr, "%d:%d ", i, g_group_log_sizes[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+
     /* reserve a sync slot and link it to the group's cmd list.
        conn==NULL signals the reap path that this is a group fsync. */
     sync_slot = persist_inflight_reserve();

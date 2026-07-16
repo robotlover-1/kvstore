@@ -81,7 +81,6 @@ static int g_inflight_head = 0;
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
 static int g_persist_aof_registered = 0;
-/* ---- end async persist inflight ring ---- */
 
 static int g_persist_uring_ready = 0;
 static struct io_uring g_persist_uring;
@@ -188,8 +187,6 @@ void persist_submit_sqes(void) {
 
 void persist_reap_completions(void) {
     if (!g_persist_uring_ready) return;
-    io_uring_submit(&g_persist_uring);
-}
 
     struct io_uring_cqe *cqe;
     while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
@@ -210,8 +207,6 @@ void persist_reap_completions(void) {
         }
         s->cqe_seen++;
         io_uring_cqe_seen(&g_persist_uring, cqe);
-        return;
-    }
 
         if (s->cqe_seen == 2) {
             if (s->cqe_ok == 2) {
@@ -225,100 +220,7 @@ void persist_reap_completions(void) {
             }
             persist_inflight_release(s);
         }
-        persist_inflight_release(s);
-        return;
     }
-
-    /* normal slot or group cmd slot (write CQE):
-       group cmd slots have cqe_seen==1 after write and wait for
-       the sync slot to bump them to 2 */
-    if (s->cqe_seen == 2) {
-        if (s->cqe_ok == 2) {
-            if (s->conn && s->conn->fd > 0)
-                queue_bytes(s->conn, s->resp, s->resp_len);
-        } else {
-            fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
-                    s->cqe_ok, s->last_error);
-            if (s->conn) s->conn->fd = -1;
-            g_persist_fatal_error = 1;
-        }
-        persist_inflight_release(s);
-    }
-    /* group cmd slot with cqe_seen==1: deferred, sync slot will release */
-}
-
-void persist_reap_completions(void) {
-    if (!g_persist_uring_ready) return;
-    struct io_uring_cqe *cqe;
-    while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0)
-        persist_reap_one(cqe);
-}
-
-/* reap all available CQEs, then wait for at least one more if the
-   inflight queue is non-empty.  used for synchronous group commit
-   to avoid the eventfd→epoll_wait round-trip. */
-void persist_drain_or_wait(void) {
-    if (!g_persist_uring_ready) return;
-    while (g_inflight_count > 0) {
-        persist_reap_completions();
-        if (g_inflight_count == 0) break;
-        /* still have in-flight work — wait for kernel to post a CQE.
-           with SQPOLL the kernel thread handles I/O; this sleeps until
-           a CQE is ready, then we reap it above in the next iteration. */
-        io_uring_submit_and_wait(&g_persist_uring, 1);
-    }
-}
-
-/* ---- group commit API ---- */
-
-void persist_group_begin(void) {
-    /* don't check g_persist_uring_ready — the uring may not be
-       initialised yet (lazy init on first persist_append_prepare).
-       if AOF is disabled persist_append_prepare returns early and
-       group_commit is a no-op because cmd_head will be NULL. */
-    g_group.active = 1;
-    g_group.cmd_head = NULL;
-    g_group.cmd_tail = NULL;
-}
-
-void persist_group_commit(void) {
-    struct io_uring_sqe *sqe_f;
-    persist_slot_t *sync_slot;
-    int aof_fd;
-
-    if (!g_group.active) return;
-    g_group.active = 0;
-
-    if (g_group.cmd_head == NULL) return;  /* empty group */
-
-    /* reserve a sync slot and link it to the group's cmd list.
-       conn==NULL signals the reap path that this is a group fsync. */
-    sync_slot = persist_inflight_reserve();
-    if (!sync_slot) {
-        fprintf(stderr, "persist: group sync slot alloc failed\n");
-        return;
-    }
-    sync_slot->conn = NULL;
-    sync_slot->group_next = g_group.cmd_head;  /* head of cmd linked list */
-
-    sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) {
-        persist_inflight_release(sync_slot);
-        return;
-    }
-
-    aof_fd = g_persist_aof_registered ? 0 : g_aof_fd;
-    io_uring_prep_fsync(sqe_f, aof_fd, IORING_FSYNC_DATASYNC);
-    /* IOSQE_IO_DRAIN: fsync waits for all prior (independent) write
-       SQEs to complete before starting.  This replaces the per-write
-       IOSQE_IO_LINK chain — writes execute in parallel, fsync drains
-       them, only one serialisation point at the end. */
-    sqe_f->flags |= IOSQE_IO_DRAIN;
-    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
-    io_uring_sqe_set_data(sqe_f, sync_slot);
-
-    /* submit all accumulated write SQEs + the trailing fsync */
-    persist_submit_sqes();
 }
 
 int persist_uring_fd(void) {
@@ -408,6 +310,8 @@ static int persist_fsync_fd_best_effort(int fd) {
 int persist_fsync_fd(int fd) {
     return persist_fsync_fd_best_effort(fd);
 }
+
+/* ---- recovery (mmap / fread) ---- */
 
 static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
     FILE *fp = fopen(path, "rb");
@@ -597,6 +501,8 @@ out:
     close(fd);
     return aof_offset;
 }
+
+/* ---- snapshot / bgrewrite ---- */
 
 static int persist_flush_aof_fd(int fd) {
     if (fd < 0) return -1;
@@ -817,7 +723,6 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
     return KVS_PERSIST_PENDING;
 }
 
-/* thin wrapper for callers that don't need response deferral */
 int persist_append_raw(const unsigned char *buf, size_t len) {
     int rc = persist_append_prepare(NULL, buf, len, NULL, 0);
     if (rc == KVS_PERSIST_PENDING) persist_submit_sqes();

@@ -350,6 +350,11 @@ void persist_group_commit(void) {
 
     aof_fd = g_persist_aof_registered ? 0 : g_aof_fd;
     io_uring_prep_fsync(sqe_f, aof_fd, IORING_FSYNC_DATASYNC);
+    /* IOSQE_IO_DRAIN: fsync waits for all prior (independent) write
+       SQEs to complete before starting.  This replaces the per-write
+       IOSQE_IO_LINK chain — writes execute in parallel, fsync drains
+       them, only one serialisation point at the end. */
+    sqe_f->flags |= IOSQE_IO_DRAIN;
     if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe_f, sync_slot);
 
@@ -891,10 +896,12 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
 
     off_t off = (off_t)g_aof_write_submitted;
 
-    /* 4. write SQE — always with IOSQE_IO_LINK.
-       in group mode the writes chain together; the trailing fsync
-       (added by persist_group_commit) completes the chain.
-       in normal mode the write links to its own fsync below. */
+    /* 4. write SQE.
+       normal mode: LINK write→fsync so the fsync only fires after
+         this write hits the page cache.
+       group mode: no LINK — writes are independent and execute in
+         parallel; the trailing fsync uses IOSQE_IO_DRAIN to wait
+         for all prior writes before starting the disk flush. */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_w) {
         persist_inflight_release(slot);
@@ -903,7 +910,8 @@ int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
     io_uring_prep_write(sqe_w,
                         g_persist_aof_registered ? 0 : g_aof_fd,
                         slot->aof_buf, len, off);
-    sqe_w->flags |= IOSQE_IO_LINK;
+    if (!g_group.active)
+        sqe_w->flags |= IOSQE_IO_LINK;   /* normal: link to own fsync */
     if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe_w, slot);
 

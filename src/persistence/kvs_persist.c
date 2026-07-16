@@ -4,7 +4,6 @@
 #include <sys/mman.h>
 #include <liburing.h>
 #include <sys/eventfd.h>
-#include <sys/queue.h>
 
 int g_aof_fd = -1;
 pid_t g_bgsave_pid = -1;
@@ -51,28 +50,86 @@ static rewrite_buf_node_t *g_rewrite_buf_head = NULL;
 static rewrite_buf_node_t *g_rewrite_buf_tail = NULL;
 static pthread_mutex_t g_rewrite_buf_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- async append pending queue ---- */
-typedef struct persist_pending_s {
-    conn_t             *conn;
-    unsigned char      *resp;
-    size_t              resp_len;
-    int                 cqe_seen;
-    int                 cqe_ok;
-    int                 last_error;
-    TAILQ_ENTRY(persist_pending_s) link;
-} persist_pending_t;
+/* ---- async persist inflight ring ----
+ *
+ * Each in-flight AOF command owns one slot.  The slot holds:
+ *   - a safe copy of the AOF payload (so the async write never
+ *     references connection input-buffer memory that may be
+ *     overwritten by the next recv or memmove);
+ *   - the response buffer to send back to the client after both
+ *     write and fsync CQEs complete.
+ *
+ * Both SQEs (write + fsync) carry the slot pointer as user_data,
+ * so CQEs can arrive in any order and still match the correct slot.
+ * This replaces the previous TAILQ-based approach that assumed
+ * strict FIFO CQE ordering.
+ */
+#define PERSIST_INFLIGHT_SIZE 1024
+#define MAX_AOF_INFLIGHT      128
 
-static TAILQ_HEAD(, persist_pending_s) g_persist_pending_head = TAILQ_HEAD_INITIALIZER(g_persist_pending_head);
+typedef struct {
+    conn_t        *conn;
+    unsigned char *resp;        /* owned; freed on slot release */
+    size_t         resp_len;
+    unsigned char *aof_buf;     /* owned; safe copy for async write */
+    size_t         aof_len;
+    int            cqe_seen;    /* 0 → 1 → 2 (write CQE + fsync CQE) */
+    int            cqe_ok;      /* how many CQEs succeeded */
+    int            last_error;
+    int            in_use;
+} persist_slot_t;
+
+static persist_slot_t g_inflight[PERSIST_INFLIGHT_SIZE];
+static int g_inflight_count = 0;
+static int g_inflight_head = 0;  /* next candidate allocation index */
+
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
-/* ---- end async append ---- */
+static int g_persist_aof_registered = 0;  /* g_aof_fd registered as fixed file index 0 */
+/* ---- end async persist inflight ring ---- */
 
 static int g_persist_uring_ready = 0;
 static struct io_uring g_persist_uring;
 
+/* ---- slot ring helpers ---- */
+
+static persist_slot_t *persist_inflight_reserve(void) {
+    if (g_inflight_count >= PERSIST_INFLIGHT_SIZE) return NULL;
+
+    for (int i = 0; i < PERSIST_INFLIGHT_SIZE; i++) {
+        int idx = (g_inflight_head + i) % PERSIST_INFLIGHT_SIZE;
+        if (!g_inflight[idx].in_use) {
+            persist_slot_t *s = &g_inflight[idx];
+            memset(s, 0, sizeof(*s));
+            s->in_use = 1;
+            g_inflight_head = (idx + 1) % PERSIST_INFLIGHT_SIZE;
+            g_inflight_count++;
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static void persist_inflight_release(persist_slot_t *s) {
+    if (!s || !s->in_use) return;
+    kvs_free(s->resp);
+    kvs_free(s->aof_buf);
+    memset(s, 0, sizeof(*s));
+    g_inflight_count--;
+}
+
+/* ---- uring lifecycle ---- */
+
 static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
-    if (io_uring_queue_init(256, &g_persist_uring, 0) != 0) return -1;
+
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
+
+    if (io_uring_queue_init_params(512, &g_persist_uring, &p) != 0)
+        return -1;
+
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {
         io_uring_queue_exit(&g_persist_uring);
@@ -85,11 +142,22 @@ static int persist_uring_init_once(void) {
         return -1;
     }
     g_persist_uring_ready = 1;
+
+    /* register AOF fd as fixed file (index 0) to reduce per-SQE fd lookup cost.
+       if registration fails we fall back to normal fd — not a fatal error. */
+    if (g_aof_fd >= 0) {
+        if (io_uring_register_files(&g_persist_uring, &g_aof_fd, 1) == 0)
+            g_persist_aof_registered = 1;
+    }
     return 0;
 }
 
 static void persist_uring_close(void) {
     if (!g_persist_uring_ready) return;
+    if (g_persist_aof_registered) {
+        io_uring_unregister_files(&g_persist_uring);
+        g_persist_aof_registered = 0;
+    }
     if (g_persist_eventfd >= 0) {
         io_uring_unregister_eventfd(&g_persist_uring);
         close(g_persist_eventfd);
@@ -99,57 +167,58 @@ static void persist_uring_close(void) {
     g_persist_uring_ready = 0;
 }
 
-int persist_pending_enqueue(conn_t *c, unsigned char *resp, size_t resp_len) {
-    persist_pending_t *p = (persist_pending_t *)kvs_malloc(sizeof(*p));
-    if (!p) return -1;
-    p->conn = c;
-    p->resp = resp;
-    p->resp_len = resp_len;
-    p->cqe_seen = 0;
-    p->cqe_ok = 0;
-    p->last_error = 0;
-    TAILQ_INSERT_TAIL(&g_persist_pending_head, p, link);
-    return 0;
+/* ---- submit ---- */
+
+void persist_submit_sqes(void) {
+    if (!g_persist_uring_ready) return;
+    io_uring_submit(&g_persist_uring);
 }
 
-void persist_reap_cqes(void) {
+/* ---- reap completions ----
+ *
+ * Each CQE carries the slot pointer as user_data (set in
+ * persist_append_prepare).  This decouples CQE arrival order
+ * from command submission order — a slot is released only
+ * after both its write and fsync CQEs have arrived, regardless
+ * of interleaving with other commands.
+ */
+
+void persist_reap_completions(void) {
     if (!g_persist_uring_ready) return;
 
     struct io_uring_cqe *cqe;
     while (io_uring_peek_cqe(&g_persist_uring, &cqe) == 0) {
-        persist_pending_t *p = TAILQ_FIRST(&g_persist_pending_head);
-        if (!p) {
-            fprintf(stderr, "persist: CQE without pending entry\n");
+        persist_slot_t *s = (persist_slot_t *)io_uring_cqe_get_data(cqe);
+        if (!s) {
+            fprintf(stderr, "persist: CQE without slot\n");
             io_uring_cqe_seen(&g_persist_uring, cqe);
             continue;
         }
 
         if (cqe->res > 0) {
             g_aof_write_offset += cqe->res;
-            p->cqe_ok++;
+            s->cqe_ok++;
         } else if (cqe->res == 0) {
-            p->cqe_ok++;
+            s->cqe_ok++;
         } else {
-            p->last_error = cqe->res;
+            s->last_error = cqe->res;
         }
-        p->cqe_seen++;
+        s->cqe_seen++;
         io_uring_cqe_seen(&g_persist_uring, cqe);
 
-        if (p->cqe_seen == 2) {
-            TAILQ_REMOVE(&g_persist_pending_head, p, link);
-            if (p->cqe_ok == 2) {
-                if (p->conn && p->conn->fd > 0)
-                    queue_bytes(p->conn, p->resp, p->resp_len);
+        if (s->cqe_seen == 2) {
+            if (s->cqe_ok == 2) {
+                if (s->conn && s->conn->fd > 0)
+                    queue_bytes(s->conn, s->resp, s->resp_len);
             } else {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
-                        p->cqe_ok, p->last_error);
-                if (p->conn) {
-                    p->conn->fd = -1;
+                        s->cqe_ok, s->last_error);
+                if (s->conn) {
+                    s->conn->fd = -1;
                 }
                 g_persist_fatal_error = 1;
             }
-            kvs_free(p->resp);
-            kvs_free(p);
+            persist_inflight_release(s);
         }
     }
 }
@@ -160,11 +229,26 @@ int persist_uring_fd(void) {
 
 void persist_drain_pending(void) {
     if (!g_persist_uring_ready) return;
-    while (!TAILQ_EMPTY(&g_persist_pending_head)) {
+    while (g_inflight_count > 0) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
-        persist_reap_cqes();
+        persist_reap_completions();
     }
 }
+
+/* re-register AOF fd after bgrewrite replaces it.  must drain before
+   calling because in-flight SQEs hold a reference to the old fd index. */
+static void persist_reregister_aof_fd(void) {
+    if (!g_persist_aof_registered || g_aof_fd < 0) return;
+    persist_drain_pending();
+    if (io_uring_unregister_files(&g_persist_uring) != 0) {
+        g_persist_aof_registered = 0;
+        return;
+    }
+    if (io_uring_register_files(&g_persist_uring, &g_aof_fd, 1) != 0)
+        g_persist_aof_registered = 0;
+}
+
+/* ---- synchronous uring helpers (used by dump / fsync paths) ---- */
 
 static int persist_uring_wait_single(void) {
     struct io_uring_cqe *cqe = NULL;
@@ -553,6 +637,9 @@ static int finalize_rewrite_parent(void) {
     if (g_aof_write_offset < 0) g_aof_write_offset = 0;
     g_aof_write_submitted = g_aof_write_offset;
 
+    /* re-register new fd as fixed file so subsequent SQEs use IOSQE_FIXED_FILE */
+    persist_reregister_aof_fd();
+
     pthread_mutex_lock(&g_rewrite_buf_lock);
     free_rewrite_buffer_locked();
     pthread_mutex_unlock(&g_rewrite_buf_lock);
@@ -608,13 +695,24 @@ int persist_force_aof_flush(void) {
     return 0;
 }
 
-void persist_submit_pending(void) {
-    if (!g_persist_uring_ready) return;
-    io_uring_submit(&g_persist_uring);
-}
+/* ---- async append entry point ----
+ *
+ * Reserve an inflight slot, copy the AOF payload into a safe buffer,
+ * bind both SQEs to the slot via user_data, and submit once.
+ *
+ * On KVS_PERSIST_PENDING the caller transfers ownership of resp and
+ * must set resp = NULL.  The response is sent (and both buffers freed)
+ * when the reap loop sees cqe_seen == 2.
+ *
+ * The caller can pass resp == NULL (e.g. slave replication path) —
+ * in that case only the AOF write is performed, no client response
+ * is deferred.
+ */
 
-int persist_append_prepare(const unsigned char *buf, size_t len) {
+int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
+                           unsigned char *resp, size_t resp_len) {
     struct io_uring_sqe *sqe_w, *sqe_f;
+    persist_slot_t *slot;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
@@ -623,43 +721,88 @@ int persist_append_prepare(const unsigned char *buf, size_t len) {
 
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    /* ensure at least 2 free SQEs — if ring is filling up with
-       deferred submits, submit and reap to free slots */
+    /* backpressure: if too many commands are in flight, reap until
+       we drop below the max-inflight threshold */
+    while (g_inflight_count >= MAX_AOF_INFLIGHT) {
+        persist_submit_sqes();
+        persist_reap_completions();
+        if (g_inflight_count >= MAX_AOF_INFLIGHT) {
+            /* still full — wait for at least one CQE */
+            io_uring_submit_and_wait(&g_persist_uring, 1);
+            persist_reap_completions();
+        }
+    }
+
+    /* ensure at least 2 free SQEs */
     if (io_uring_sq_space_left(&g_persist_uring) < 2) {
-        persist_submit_pending();
-        persist_reap_cqes();
+        persist_submit_sqes();
+        persist_reap_completions();
         if (io_uring_sq_space_left(&g_persist_uring) < 2)
             return KVS_PERSIST_ERR;
     }
 
+    /* 1. reserve slot BEFORE submit */
+    slot = persist_inflight_reserve();
+    if (!slot) return KVS_PERSIST_ERR;
+
+    /* 2. copy AOF payload into safe buffer — the original buf may
+       point to connection input-buffer memory that will be reused */
+    slot->aof_buf = (unsigned char *)kvs_malloc(len);
+    if (!slot->aof_buf) {
+        persist_inflight_release(slot);
+        return KVS_PERSIST_ERR;
+    }
+    memcpy(slot->aof_buf, buf, len);
+    slot->aof_len = len;
+
+    /* 3. save conn + response */
+    slot->conn = c;
+    slot->resp = resp;
+    slot->resp_len = resp_len;
+
     off_t off = (off_t)g_aof_write_submitted;
 
-    /* write SQE */
+    /* 4. write SQE — bind slot via user_data.
+       use fixed-file index 0 when registered, raw fd otherwise. */
     sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) return KVS_PERSIST_ERR;
-    io_uring_prep_write(sqe_w, g_aof_fd, buf, len, off);
+    if (!sqe_w) {
+        persist_inflight_release(slot);
+        return KVS_PERSIST_ERR;
+    }
+    io_uring_prep_write(sqe_w,
+                        g_persist_aof_registered ? 0 : g_aof_fd,
+                        slot->aof_buf, len, off);
     sqe_w->flags |= IOSQE_IO_LINK;
+    if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_w, slot);
 
-    /* fsync SQE */
+    /* 5. fsync SQE — bind same slot, same fd strategy */
     sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) return KVS_PERSIST_ERR;
-    io_uring_prep_fsync(sqe_f, g_aof_fd, IORING_FSYNC_DATASYNC);
+    if (!sqe_f) {
+        persist_inflight_release(slot);
+        return KVS_PERSIST_ERR;
+    }
+    io_uring_prep_fsync(sqe_f,
+                        g_persist_aof_registered ? 0 : g_aof_fd,
+                        IORING_FSYNC_DATASYNC);
+    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_f, slot);
 
     g_aof_write_submitted += (long long)len;
 
-    /* submit immediately — each command gets its own write+fsync
-       pair submitted without deferring to a batch */
-    persist_submit_pending();
+    /* 6. submit immediately — each command gets its own write+fsync pair */
+    persist_submit_sqes();
 
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
     return KVS_PERSIST_PENDING;
 }
 
+/* thin wrapper for callers that don't need response deferral */
 int persist_append_raw(const unsigned char *buf, size_t len) {
-    int rc = persist_append_prepare(buf, len);
+    int rc = persist_append_prepare(NULL, buf, len, NULL, 0);
     if (rc == KVS_PERSIST_PENDING)
-        persist_submit_pending();
+        persist_submit_sqes();
     return rc;
 }
 

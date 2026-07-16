@@ -298,7 +298,10 @@ void persist_reap_completions(void) {
 /* ---- group commit API ---- */
 
 void persist_group_begin(void) {
-    if (!g_persist_uring_ready) return;
+    /* don't check g_persist_uring_ready — the uring may not be
+       initialised yet (lazy init on first persist_append_prepare).
+       if AOF is disabled persist_append_prepare returns early and
+       group_commit is a no-op because cmd_head will be NULL. */
     g_group.active = 1;
     g_group.cmd_head = NULL;
     g_group.cmd_tail = NULL;

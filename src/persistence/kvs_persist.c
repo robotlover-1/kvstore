@@ -72,7 +72,40 @@ typedef struct persist_slot_s {
     int            cqe_ok;
     int            last_error;
     int            in_use;
+    int            is_batch;
 } persist_slot_t;
+
+/* ---- batch pipeline state ----
+ *
+ * During parse_resp_stream(), AOF-always commands accumulate their payload
+ * into a single batch buffer.  persist_flush_batch() submits ONE write+ONE
+ * fsync per epoll cycle.  Responses are sent immediately (KVS_PERSIST_OK),
+ * matching Redis AOF-always semantics.
+ */
+#define PERSIST_BATCH_INIT_CAP  (64 * 1024)    /* 64 KB initial */
+#define PERSIST_BATCH_MAX_CAP   (1024 * 1024)  /* 1 MB hard limit */
+
+static unsigned char *g_batch_buf  = NULL;
+static size_t         g_batch_len  = 0;
+static size_t         g_batch_cap  = 0;
+
+static int batch_ensure_cap(size_t needed) {
+    if (g_batch_cap >= needed) return 0;
+    size_t new_cap = g_batch_cap ? g_batch_cap : PERSIST_BATCH_INIT_CAP;
+    while (new_cap < needed) {
+        new_cap *= 2;
+        if (new_cap > PERSIST_BATCH_MAX_CAP) {
+            new_cap = PERSIST_BATCH_MAX_CAP;
+            break;
+        }
+    }
+    if (new_cap < needed) return -1;
+    unsigned char *p = (unsigned char *)kvs_realloc(g_batch_buf, new_cap);
+    if (!p) return -1;
+    g_batch_buf = p;
+    g_batch_cap = new_cap;
+    return 0;
+}
 
 static persist_slot_t g_inflight[PERSIST_INFLIGHT_SIZE];
 static int g_inflight_count = 0;
@@ -183,6 +216,79 @@ void persist_submit_sqes(void) {
     io_uring_submit(&g_persist_uring);
 }
 
+/* ---- batch flush (one write + one fsync + one submit) ---- */
+
+void persist_flush_batch(void) {
+    struct io_uring_sqe *sqe_w, *sqe_f;
+    persist_slot_t *slot;
+
+    if (!g_persist_uring_ready) return;
+    if (g_batch_len == 0) return;
+
+    /* reap to free inflight slots */
+    persist_reap_completions();
+
+    if (g_inflight_count >= MAX_AOF_INFLIGHT) {
+        persist_reap_completions();
+    }
+
+    /* ensure SQ space for 2 SQEs */
+    for (int sq_retry = 0; io_uring_sq_space_left(&g_persist_uring) < 2; sq_retry++) {
+        persist_submit_sqes();
+        persist_reap_completions();
+        if (sq_retry >= 100) {
+            fprintf(stderr, "persist_flush_batch: no SQ space after retries\n");
+            return;
+        }
+    }
+
+    slot = persist_inflight_reserve();
+    if (!slot) {
+        fprintf(stderr, "persist_flush_batch: no inflight slot\n");
+        return;
+    }
+
+    /* transfer batch buffer ownership to slot */
+    slot->aof_buf  = g_batch_buf;
+    slot->aof_len  = g_batch_len;
+    slot->conn     = NULL;         /* batch marker */
+    slot->resp     = NULL;
+    slot->resp_len = 0;
+    slot->is_batch = 1;
+
+    off_t off = (off_t)(g_aof_write_submitted - (long long)g_batch_len);
+
+    sqe_w = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_w) {
+        persist_inflight_release(slot);
+        return;
+    }
+    io_uring_prep_write(sqe_w,
+                        g_persist_aof_registered ? 0 : g_aof_fd,
+                        slot->aof_buf, slot->aof_len, off);
+    sqe_w->flags |= IOSQE_IO_LINK;
+    if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_w, slot);
+
+    sqe_f = io_uring_get_sqe(&g_persist_uring);
+    if (!sqe_f) {
+        persist_inflight_release(slot);
+        return;
+    }
+    io_uring_prep_fsync(sqe_f,
+                        g_persist_aof_registered ? 0 : g_aof_fd,
+                        IORING_FSYNC_DATASYNC);
+    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe_f, slot);
+
+    io_uring_submit(&g_persist_uring);
+
+    /* reset accumulation state — batch buffer ownership transferred to slot */
+    g_batch_buf  = NULL;
+    g_batch_len  = 0;
+    g_batch_cap  = 0;
+}
+
 /* ---- reap completions ---- */
 
 void persist_reap_completions(void) {
@@ -210,12 +316,18 @@ void persist_reap_completions(void) {
 
         if (s->cqe_seen == 2) {
             if (s->cqe_ok == 2) {
-                if (s->conn && s->conn->fd > 0)
-                    queue_bytes(s->conn, s->resp, s->resp_len);
+                if (!s->is_batch) {
+                    /* per-command slot (legacy / non-batch paths) */
+                    if (s->conn && s->conn->fd > 0)
+                        queue_bytes(s->conn, s->resp, s->resp_len);
+                }
+                /* batch slot: no deferred responses, just free buffer */
             } else {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
                         s->cqe_ok, s->last_error);
-                if (s->conn) s->conn->fd = -1;
+                if (!s->is_batch && s->conn) {
+                    s->conn->fd = -1;
+                }
                 g_persist_fatal_error = 1;
             }
             persist_inflight_release(s);
@@ -229,6 +341,7 @@ int persist_uring_fd(void) {
 
 void persist_drain_pending(void) {
     if (!g_persist_uring_ready) return;
+    persist_flush_batch();
     while (g_inflight_count > 0) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
         persist_reap_completions();
@@ -661,72 +774,48 @@ int persist_force_aof_flush(void) {
     return 0;
 }
 
-/* ---- per-command write+fsync+submit ---- */
+/* ---- batch-accumulate write commands ----
+ *
+ * Append the AOF payload into an accumulating batch buffer.
+ * Returns KVS_PERSIST_OK immediately — the caller sends the response
+ * without waiting for fsync (like Redis AOF always semantics).
+ * The actual write+fsync+submit happens once per epoll cycle
+ * in persist_flush_batch().
+ */
 
 int persist_append_prepare(conn_t *c, const unsigned char *buf, size_t len,
                            unsigned char *resp, size_t resp_len) {
-    struct io_uring_sqe *sqe_w, *sqe_f;
-    persist_slot_t *slot;
+    (void)c;
+    (void)resp;
+    (void)resp_len;
 
     if (g_aof_fd < 0) return g_aof_disabled ? KVS_PERSIST_OK : KVS_PERSIST_ERR;
     if (g_cfg.aof_fsync != KVS_AOF_FSYNC_ALWAYS) return KVS_PERSIST_OK;
     if (g_persist_fatal_error) return KVS_PERSIST_ERR;
     if (persist_uring_init_once() != 0) return KVS_PERSIST_ERR;
 
-    if (g_inflight_count >= MAX_AOF_INFLIGHT) {
-        persist_submit_sqes();
-        persist_reap_completions();
+    /* reap any completed batches — makes inflight slots available */
+    persist_reap_completions();
+
+    /* flush if batch buffer is full */
+    if (g_batch_len + len > g_batch_cap && g_batch_cap >= PERSIST_BATCH_MAX_CAP) {
+        persist_flush_batch();
     }
 
-    for (int sq_retry = 0; io_uring_sq_space_left(&g_persist_uring) < 2; sq_retry++) {
-        persist_submit_sqes();
-        persist_reap_completions();
-        if (sq_retry >= 100) return KVS_PERSIST_ERR;
-    }
+    if (batch_ensure_cap(g_batch_len + len) != 0) return KVS_PERSIST_ERR;
 
-    slot = persist_inflight_reserve();
-    if (!slot) return KVS_PERSIST_ERR;
-
-    slot->aof_buf = (unsigned char *)kvs_malloc(len);
-    if (!slot->aof_buf) { persist_inflight_release(slot); return KVS_PERSIST_ERR; }
-    memcpy(slot->aof_buf, buf, len);
-    slot->aof_len = len;
-    slot->conn = c;
-    slot->resp = resp;
-    slot->resp_len = resp_len;
-
-    off_t off = (off_t)g_aof_write_submitted;
-
-    sqe_w = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_w) { persist_inflight_release(slot); return KVS_PERSIST_ERR; }
-    io_uring_prep_write(sqe_w,
-                        g_persist_aof_registered ? 0 : g_aof_fd,
-                        slot->aof_buf, len, off);
-    sqe_w->flags |= IOSQE_IO_LINK;
-    if (g_persist_aof_registered) sqe_w->flags |= IOSQE_FIXED_FILE;
-    io_uring_sqe_set_data(sqe_w, slot);
-
-    sqe_f = io_uring_get_sqe(&g_persist_uring);
-    if (!sqe_f) { persist_inflight_release(slot); return KVS_PERSIST_ERR; }
-    io_uring_prep_fsync(sqe_f,
-                        g_persist_aof_registered ? 0 : g_aof_fd,
-                        IORING_FSYNC_DATASYNC);
-    if (g_persist_aof_registered) sqe_f->flags |= IOSQE_FIXED_FILE;
-    io_uring_sqe_set_data(sqe_f, slot);
+    memcpy(g_batch_buf + g_batch_len, buf, len);
+    g_batch_len += len;
 
     g_aof_write_submitted += (long long)len;
 
-    persist_submit_sqes();
-
     if (g_bgrewrite_pid > 0) append_to_rewrite_buffer(buf, len);
 
-    return KVS_PERSIST_PENDING;
+    return KVS_PERSIST_OK;
 }
 
 int persist_append_raw(const unsigned char *buf, size_t len) {
-    int rc = persist_append_prepare(NULL, buf, len, NULL, 0);
-    if (rc == KVS_PERSIST_PENDING) persist_submit_sqes();
-    return rc;
+    return persist_append_prepare(NULL, buf, len, NULL, 0);
 }
 
 int persist_save_dump(void) {

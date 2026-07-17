@@ -146,11 +146,6 @@ static void on_read(conn_t *c) {
         return;
     }
 
-    /* persist_append_prepare now submits each command immediately,
-     * so there should be no pending SQEs to batch here.  This call
-     * is a no-op safety net. */
-    persist_submit_sqes();
-
     /* try immediate write after processing pipeline batch:
      * if parse_resp_stream queued multiple responses, send()
      * them now instead of waiting for next epoll_wait→EPOLLOUT */
@@ -321,6 +316,11 @@ int reactor_start(void) {
             }
         }
 
+        /* flush accumulated AOF batch once per epoll cycle:
+         * all commands from all connections are batched into
+         * one write + one fsync + one submit. */
+        persist_flush_batch();
+        if (persist_uring_fd() >= 0) persist_reap_completions();
     }
 
     return 0;

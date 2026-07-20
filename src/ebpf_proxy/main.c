@@ -186,13 +186,28 @@ static void main_loop(void) {
             break;
         }
 
-        /* 检查 fullsync 状态变化 */
+        /* 检查 fullsync 状态变化
+         * client_ctl[3] 由 master 进程在 queue_snapshot/REPLDONE 时写入:
+         *   1 = 全量同步开始 → 切 BUFFERING
+         *   0 = 全量同步结束 → flush 缓存 → 切 FORWARDING */
         __u64 fs_val = 0;
         if (read_client_ctl_u64(3, &fs_val) == 0) {
             if (fs_val == 1 && g_state == STATE_FORWARDING) {
                 g_state = STATE_BUFFERING;
-                fprintf(stderr, "ebpf-proxy: REPLSYNC detected, "
+                fprintf(stderr, "ebpf-proxy: fullsync start (client_ctl[3]=1), "
                         "state=BUFFERING\n");
+            } else if (fs_val == 0 && g_state == STATE_BUFFERING) {
+                fprintf(stderr, "ebpf-proxy: fullsync end (client_ctl[3]=0), "
+                        "flushing cache...\n");
+                if (proxy_slave_is_connected(&g_slave)) {
+                    int sent = cache_flush(&g_cache, proxy_slave_fd(&g_slave));
+                    fprintf(stderr, "ebpf-proxy: cache flushed (%d items), "
+                            "state=FORWARDING\n", sent);
+                } else {
+                    fprintf(stderr, "ebpf-proxy: slave not connected, "
+                            "deferring cache flush\n");
+                }
+                g_state = STATE_FORWARDING;
             }
         }
 

@@ -558,6 +558,29 @@ int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int s
     return 0;
 }
 
+/* 通知 ebpf-proxy 全量同步状态变化（通过 pinned client_ctl map key=3）。
+ * client_ctl map 属于 repl_client_capture.bpf.c，由 ebpf-proxy 进程 pin 到 bpffs。
+ * master 进程通过 bpf_obj_get() 打开并写入，ebpf-proxy 在主循环中轮询检测。 */
+static void repl_notify_ebpf_proxy_fullsync(int in_progress) {
+#if KVS_ENABLE_EBPF
+    char path[512];
+    int fd;
+    if (!g_cfg.ebpf_pin_path[0]) return;
+    snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
+    fd = bpf_obj_get(path);
+    if (fd < 0) {
+        /* ebpf-proxy 可能未启动，静默跳过 */
+        return;
+    }
+    __u32 key = 3;  /* KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE */
+    __u64 val = in_progress ? 1 : 0;
+    bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+    close(fd);
+#else
+    (void)in_progress;
+#endif
+}
+
 static int queue_snapshot(conn_t *c) {
     char hdr[128];
     char tmp_path[512];
@@ -581,6 +604,9 @@ static int queue_snapshot(conn_t *c) {
 
     /* 全量同步期间抑制增量广播，避免 KVSD 数据流被 repl_broadcast 写穿插 */
     g_repl_fullsync_in_progress = 1;
+
+    /* 通知 ebpf-proxy 进入 BUFFERING 状态，增量数据先缓存，等全量完成后再 flush */
+    repl_notify_ebpf_proxy_fullsync(1);
 
     /* 尝试启动 RDMA */
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
@@ -1158,6 +1184,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
             c->repl_fullsync_pending = 0;
             g_repl_fullsync_in_progress = 0;
+
+            /* 通知 ebpf-proxy 全量同步结束，flush 缓存 → 恢复 FORWARDING */
+            repl_notify_ebpf_proxy_fullsync(0);
+
             /* 回放全量同步期间积压的增量数据。
              * 用 backlog 自身的 start_offset，而非 c->repl_offset_sent
              * （后者在 queue_snapshot 中设置为全量开始时的值，但 backlog

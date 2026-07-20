@@ -43,6 +43,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <sys/mman.h>
 #include "common.h"
 
 /* ---- 配置 ---- */
@@ -72,15 +73,19 @@ typedef struct {
     int pipe_fd;  /* 父进程读端，接收 slave 统计 */
     int msg_count;
     long long total_bytes;
+    /* 共享内存 — slave 实时更新计数器，父进程轮询读取 */
+    volatile int *live_count;
+    int shm_fd;
 } slave_ctx_t;
 
 static volatile sig_atomic_t g_slave_running = 1;
 static void slave_sig_handler(int sig) { (void)sig; g_slave_running = 0; }
 
-static void slave_process_main(int port, int pipe_wr) {
+static void slave_process_main(int port, int pipe_wr, volatile int *live_count) {
     /* 子进程：TCP server */
     signal(SIGTERM, slave_sig_handler);
     signal(SIGINT, slave_sig_handler);
+    if (live_count) *live_count = 0;
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("slave: socket"); _exit(1); }
@@ -119,6 +124,7 @@ static void slave_process_main(int port, int pipe_wr) {
             if (n <= 0) break;
             msg_count++;
             total_bytes += n;
+            if (live_count) *live_count = msg_count;
         }
         close(fd);
     }
@@ -137,6 +143,14 @@ static int slave_start(slave_ctx_t *s, int port) {
     memset(s, 0, sizeof(*s));
     s->port = port;
 
+    /* 共享内存 — 让父进程实时轮询 slave 的 msg_count */
+    s->shm_fd = -1;
+    s->live_count = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s->live_count == MAP_FAILED) {
+        perror("slave mmap"); s->live_count = NULL;
+    }
+
     int pipe_fds[2];
     if (pipe(pipe_fds) < 0) { perror("pipe"); return -1; }
 
@@ -148,7 +162,7 @@ static int slave_start(slave_ctx_t *s, int port) {
         close(pipe_fds[0]);  /* 关闭读端 */
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
-        slave_process_main(port, pipe_fds[1]);
+        slave_process_main(port, pipe_fds[1], s->live_count);
         /* never returns */
     }
 
@@ -203,6 +217,10 @@ static void slave_stop(slave_ctx_t *s) {
     if (read(s->pipe_fd, &b, sizeof(b)) == sizeof(b))
         s->total_bytes = b;
     close(s->pipe_fd);
+    if (s->live_count && s->live_count != MAP_FAILED) {
+        munmap((void *)s->live_count, sizeof(int));
+        s->live_count = NULL;
+    }
     s->pid = 0;
 }
 
@@ -824,21 +842,34 @@ int main(int argc, char **argv) {
         int use_ebpf = (strcmp(modes[i], "ebpf") == 0);
         int use_sync = (strcmp(modes[i], "sync") == 0);
 
-        /* ebpf 模式：提前启动 proxy，所有轮共享 */
+        /* ebpf 模式：提前启动 proxy，所有轮共享。
+         * slave 也需要跨轮复用 — 否则每轮重启 slave 会导致
+         * ebpf-proxy 的 TCP 连接断开（fd 仍 open 但对端已死），
+         * proxy_slave_is_connected() 只看 fd>0 无法检测断连。 */
+        slave_ctx_t ebpf_slave;
+        memset(&ebpf_slave, 0, sizeof(ebpf_slave));
+        if (use_ebpf && !g_no_local_slave) {
+            /* slave 先于 proxy 启动，确保 proxy connect 立即成功 */
+            slave_start(&ebpf_slave, SLAVE_PORT);
+            usleep(100000);  /* 给 slave listen 一点时间 */
+        }
+
         if (use_ebpf) {
             if (proxy_start() != 0) {
                 fprintf(stderr, "[%s] proxy start failed, skipping\n", modes[i]);
+                if (!g_no_local_slave) slave_stop(&ebpf_slave);
                 continue;
             }
             if (proxy_write_config(getpid(), SLAVE_PORT) != 0) {
                 fprintf(stderr, "[%s] proxy config failed, skipping\n", modes[i]);
                 proxy_stop();
+                if (!g_no_local_slave) slave_stop(&ebpf_slave);
                 continue;
             }
             /* 轮询等待 proxy 就绪，代替固定 usleep */
             proxy_wait_ready(5000);
-            /* 额外等一小段时间让 proxy 连接 slave */
-            usleep(200000);
+            /* 等 proxy 连接上已启动的 slave */
+            usleep(500000);
         }
 
         /* 收集所有轮次的结果 */
@@ -846,11 +877,16 @@ int main(int argc, char **argv) {
         int completed = 0;
 
         for (int r = 0; r < g_rounds; r++) {
-            /* 启动 slave（本地或跳过） */
+            /* 启动 slave（ebpf 模式 slave 跨轮复用，见上方） */
             slave_ctx_t slave;
             memset(&slave, 0, sizeof(slave));
-            if (!g_no_local_slave)
-                slave_start(&slave, SLAVE_PORT);
+            int slave_is_shared = (use_ebpf && !g_no_local_slave);
+            if (!slave_is_shared) {
+                if (!g_no_local_slave)
+                    slave_start(&slave, SLAVE_PORT);
+            } else {
+                slave = ebpf_slave;  /* 复用跨轮 slave，共享其 live_count */
+            }
 
             /* sync 模式需要 slave_fd */
             int slave_fd = -1;
@@ -875,25 +911,64 @@ int main(int argc, char **argv) {
             master_ctx_t master;
             void *(*thread_func)(void *) = use_sync ?
                 master_echo_sync : master_echo_none;
+            double t_wall_start = now_us();
             if (master_start(&master, MASTER_PORT, slave_fd, thread_func) == 0) {
                 qps_result_t result = run_qps_client();
                 master_stop(&master);
-                qps_vals[r] = result.qps;
+
+                /* ebpf 模式: 客户端 echo 完成不代表转发完成。
+                 * 轮询 slave 共享内存计数器，直到收齐所有消息。
+                 * 有效 QPS = N / (echo时间 + slave drain时间) */
+                if (use_ebpf && !g_no_local_slave && slave.live_count) {
+                    int target = result.completed > 0 ? result.completed : g_req_count;
+                    int last = 0, stale = 0;
+                    for (int w = 0; w < 500; w++) {
+                        int cur = *slave.live_count;
+                        if (cur >= target) break;
+                        if (cur == last) {
+                            stale++;
+                            if (stale > 40) break;  /* 2s 无进展则超时 */
+                        } else {
+                            stale = 0;
+                            last = cur;
+                        }
+                        usleep(50000);  /* 50ms */
+                    }
+                    double t_wall_end = now_us();
+                    double total_elapsed = t_wall_end - t_wall_start;
+                    qps_vals[r] = total_elapsed > 0
+                        ? (double)target / total_elapsed * 1e6 : 0;
+                    fprintf(stderr, "[ebpf  ] round %d: echo_qps=%.0f "
+                            "slave_msgs=%d/%d drain+echo_qps=%.0f "
+                            "elapsed=%.0fus\n",
+                            r + 1, result.qps,
+                            *slave.live_count, target, qps_vals[r],
+                            total_elapsed);
+                } else {
+                    qps_vals[r] = result.qps;
+                }
                 completed++;
             }
             if (slave_fd >= 0) close(slave_fd);
 
-            /* 停止 slave */
-            if (!g_no_local_slave) {
+            /* 停止 slave（ebpf 模式 slave 跨轮复用，最后一轮后统一停止） */
+            if (!slave_is_shared && !g_no_local_slave) {
                 slave_stop(&slave);
                 if (r == 0 || r == g_rounds - 1)
                     fprintf(stderr, "[%-7s] round %d slave: %d msgs, %lld bytes\n",
                             modes[i], r + 1, slave.msg_count, slave.total_bytes);
+            } else if (slave_is_shared) {
+                /* ebpf 跨轮 slave: 只打印，不停止 */
+                if (r == 0 || r == g_rounds - 1)
+                    fprintf(stderr, "[%-7s] round %d slave live_count=%d\n",
+                            modes[i], r + 1,
+                            ebpf_slave.live_count ? *ebpf_slave.live_count : -1);
             }
 
-            /* ebpf: 等待 proxy drain（不停止 proxy） */
-            if (use_ebpf)
-                usleep(g_no_local_slave ? 1500000 : 500000);
+            /* ebpf: 等待 proxy drain（远程 slave 仍需要固定等待） */
+            if (use_ebpf && g_no_local_slave)
+                usleep(1500000);
+            /* 本地 slave: 已通过 live_count 轮询确认收齐，无需固定等待 */
 
             if (r == 0)
                 fprintf(stderr, "[%-7s] warmup done\n", modes[i]);
@@ -901,8 +976,15 @@ int main(int argc, char **argv) {
                 usleep(200000);  /* 轮间短冷却 */
         }
 
-        /* 停止 ebpf-proxy */
+        /* 停止 ebpf-proxy（先于 slave，避免 proxy 写已关闭的 fd） */
         if (use_ebpf) proxy_stop();
+        /* 停止 ebpf 跨轮 slave */
+        if (use_ebpf && !g_no_local_slave) {
+            fprintf(stderr, "[%-7s] final slave: live_count=%d\n",
+                    modes[i],
+                    ebpf_slave.live_count ? *ebpf_slave.live_count : -1);
+            slave_stop(&ebpf_slave);
+        }
 
         /* 计算统计（跳过第 0 轮 warmup） */
         int meas = g_rounds - 1;

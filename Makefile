@@ -173,11 +173,12 @@ $(EBPF_DAEMON_BIN): $(EBPF_DAEMON_SRC)
 # ---- ebpf-proxy 独立代理进程 ----
 EBPF_PROXY_SRC = src/ebpf_proxy/main.c src/ebpf_proxy/proxy_cache.c src/ebpf_proxy/proxy_slave.c
 EBPF_PROXY_BIN = build/ebpf_proxy
-EBPF_PROXY_CFLAGS = -Wall -Wextra -O2 -I./include
+EBPF_PROXY_CFLAGS = -Wall -Wextra -O2 -I./include -I./third_party/libbpf/include
+EBPF_LIBBPF_A = third_party/libbpf/lib/libbpf.a
 
-$(EBPF_PROXY_BIN): $(EBPF_PROXY_SRC)
+$(EBPF_PROXY_BIN): $(EBPF_PROXY_SRC) $(EBPF_LIBBPF_A)
 	@mkdir -p build
-	$(CC) $(EBPF_PROXY_CFLAGS) -o $@ $(EBPF_PROXY_SRC) -lbpf -lelf -lz -lpthread
+	$(CC) $(EBPF_PROXY_CFLAGS) -o $@ $(EBPF_PROXY_SRC) $(EBPF_LIBBPF_A) -lelf -lz -lpthread
 
 ebpf-proxy: $(EBPF_PROXY_BIN)
 

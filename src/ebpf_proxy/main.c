@@ -7,6 +7,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -25,6 +26,38 @@ static proxy_state_t g_state = STATE_FORWARDING;
 static proxy_slave_ctx_t g_slave;
 static cache_ctx_t g_cache;
 
+/* ---- 批量发送 ---- */
+#define BATCH_MAX 64
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
+static struct iovec g_batch_iov[BATCH_MAX];
+static int g_batch_count = 0;
+
+static void batch_flush(void) {
+    if (g_batch_count == 0) return;
+    if (!proxy_slave_is_connected(&g_slave)) {
+        g_batch_count = 0;
+        return;
+    }
+    int fd = proxy_slave_fd(&g_slave);
+    for (int off = 0; off < g_batch_count; ) {
+        int remain = g_batch_count - off;
+        int chunk = remain > IOV_MAX ? IOV_MAX : remain;
+        ssize_t n = writev(fd, &g_batch_iov[off], chunk);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            for (int i = off; i < g_batch_count; i++)
+                cache_append(&g_cache,
+                    (unsigned char *)g_batch_iov[i].iov_base,
+                    g_batch_iov[i].iov_len);
+            break;
+        }
+        off += chunk;
+    }
+    g_batch_count = 0;
+}
+
 /* BPF map fds */
 static int g_client_ctl_fd = -1;
 static int g_proxy_cfg_fd = -1;
@@ -34,9 +67,9 @@ static int g_client_stats_fd = -1;
 static struct bpf_object *g_bpf_obj = NULL;
 static struct ring_buffer *g_rb = NULL;
 
-/* kprobe links */
-static struct bpf_link *g_kprobe_link = NULL;
-static struct bpf_link *g_kretprobe_link = NULL;
+/* fentry + fexit links */
+static struct bpf_link *g_fentry_link = NULL;
+static struct bpf_link *g_fexit_link = NULL;
 
 /* config */
 static char g_pin_path[256] = "/sys/fs/bpf/kvstore_repl_sockmap";
@@ -50,22 +83,6 @@ static int g_slave_port = 0;
 static void signal_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
-}
-
-/* 完整发送，处理 EINTR 和 partial send。
- * 正常路径返回 0，失败返回 -1。 */
-static int proxy_send_full(int fd, const unsigned char *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        off += (size_t)n;
-    }
-    return 0;
 }
 
 /* 快速判断 payload 是否为复制控制命令（REPLSYNC/REPLACK/REPLDONE）。
@@ -147,7 +164,8 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
     size_t plen = (size_t)payload_len;
 
     if (payload_len == 0xFFFFFFFF) {
-        /* magic flush signal */
+        /* magic flush signal: 先 flush batch，再 flush cache */
+        batch_flush();
         fprintf(stderr, "ebpf-proxy: REPLDONE detected, flushing cache...\n");
         int sent = cache_flush(&g_cache, proxy_slave_fd(&g_slave));
         if (sent >= 0) {
@@ -163,13 +181,16 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
         return 0;
     }
 
-    if (g_state == STATE_FORWARDING) {
-        if (proxy_slave_is_connected(&g_slave)) {
-            if (proxy_send_full(proxy_slave_fd(&g_slave), payload, plen) != 0) {
-                cache_append(&g_cache, payload, plen);
-            }
+    if (g_state == STATE_FORWARDING && proxy_slave_is_connected(&g_slave)) {
+        if (g_batch_count < BATCH_MAX) {
+            g_batch_iov[g_batch_count].iov_base = payload;
+            g_batch_iov[g_batch_count].iov_len  = plen;
+            g_batch_count++;
         } else {
-            cache_append(&g_cache, payload, plen);
+            batch_flush();
+            g_batch_iov[0].iov_base = payload;
+            g_batch_iov[0].iov_len  = plen;
+            g_batch_count = 1;
         }
     } else {
         cache_append(&g_cache, payload, plen);
@@ -180,11 +201,13 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
 /* 主循环 */
 static void main_loop(void) {
     while (!g_shutdown) {
-        int rc = ring_buffer__poll(g_rb, 5 /* ms */);
+        int rc = ring_buffer__poll(g_rb, 1 /* ms */);
         if (rc < 0 && !g_shutdown) {
             fprintf(stderr, "ebpf-proxy: ring_buffer__poll error: %d\n", rc);
             break;
         }
+
+        batch_flush();
 
         /* 检查 fullsync 状态变化
          * client_ctl[3] 由 master 进程在 queue_snapshot/REPLDONE 时写入:
@@ -254,9 +277,9 @@ static void main_loop(void) {
 static void cleanup(void) {
     fprintf(stderr, "ebpf-proxy: shutting down...\n");
 
-    /* 1. detach kprobes — 停止新数据进入 ringbuf */
-    if (g_kprobe_link) { bpf_link__destroy(g_kprobe_link); g_kprobe_link = NULL; }
-    if (g_kretprobe_link) { bpf_link__destroy(g_kretprobe_link); g_kretprobe_link = NULL; }
+    /* 1. detach fentry+fexit — 停止新数据进入 ringbuf */
+    if (g_fentry_link) { bpf_link__destroy(g_fentry_link); g_fentry_link = NULL; }
+    if (g_fexit_link) { bpf_link__destroy(g_fexit_link); g_fexit_link = NULL; }
 
     /* 2. drain ringbuf — 消费所有剩余条目再释放 */
     if (g_rb) {
@@ -330,21 +353,21 @@ static int load_and_attach_bpf(void) {
     if (open_pinned_map("client_stats", &g_client_stats_fd) != 0)
         fprintf(stderr, "ebpf-proxy: open client_stats failed\n");
 
-    /* attach kprobe entry */
-    prog = bpf_object__find_program_by_name(g_bpf_obj, "kprobe_client_recv_entry");
-    if (!prog) { fprintf(stderr, "ebpf-proxy: find kprobe entry failed\n"); return -1; }
-    g_kprobe_link = bpf_program__attach(prog);
-    if (libbpf_get_error(g_kprobe_link)) {
-        fprintf(stderr, "ebpf-proxy: attach kprobe entry failed\n");
+    /* attach fentry */
+    prog = bpf_object__find_program_by_name(g_bpf_obj, "fentry_tcp_recvmsg");
+    if (!prog) { fprintf(stderr, "ebpf-proxy: find fentry failed\n"); return -1; }
+    g_fentry_link = bpf_program__attach(prog);
+    if (libbpf_get_error(g_fentry_link)) {
+        fprintf(stderr, "ebpf-proxy: attach fentry failed\n");
         return -1;
     }
 
-    /* attach kretprobe return */
-    prog = bpf_object__find_program_by_name(g_bpf_obj, "kprobe_client_recv_return");
-    if (!prog) { fprintf(stderr, "ebpf-proxy: find kretprobe return failed\n"); return -1; }
-    g_kretprobe_link = bpf_program__attach(prog);
-    if (libbpf_get_error(g_kretprobe_link)) {
-        fprintf(stderr, "ebpf-proxy: attach kretprobe return failed\n");
+    /* attach fexit */
+    prog = bpf_object__find_program_by_name(g_bpf_obj, "fexit_tcp_recvmsg");
+    if (!prog) { fprintf(stderr, "ebpf-proxy: find fexit failed\n"); return -1; }
+    g_fexit_link = bpf_program__attach(prog);
+    if (libbpf_get_error(g_fexit_link)) {
+        fprintf(stderr, "ebpf-proxy: attach fexit failed\n");
         return -1;
     }
 
@@ -354,7 +377,7 @@ static int load_and_attach_bpf(void) {
     g_rb = ring_buffer__new(bpf_map__fd(rb_map), ringbuf_callback, NULL, NULL);
     if (!g_rb) { fprintf(stderr, "ebpf-proxy: ring_buffer__new failed\n"); return -1; }
 
-    fprintf(stderr, "ebpf-proxy: BPF loaded, kprobes attached\n");
+    fprintf(stderr, "ebpf-proxy: BPF loaded, fentry+fexit attached\n");
     return 0;
 }
 

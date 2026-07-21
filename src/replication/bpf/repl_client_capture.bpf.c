@@ -1,23 +1,12 @@
 // ============================================================
-// repl_client_capture.bpf.c — kprobe BPF 程序
+// repl_client_capture.bpf.c — fentry + fexit BPF 程序
 //
-// Hook tcp_recvmsg，捕获 Master 接收的客户端写入数据。
+// fentry: 保存 msg 指针和 msg_iter.count（用于 fexit 计算 retval）
+// fexit:  从 msg->msg_iter 读取已接收的数据，写入 ringbuf
 //
-// 使用 kprobe (entry) + kretprobe (return) 组合:
-//   1. entry: 保存 msg 指针到 per-CPU map（供 return 使用）
-//   2. return: 从 msg->msg_iter->iov 中读取接收到的数据
-//
-// 全量同步期间 (FULLSYNC_IN_PROGRESS=1 in client_ctl[3]):
-//   数据写入 client_cache_ringbuf 缓存，全量同步完成后 flush 到 slave
-//
-// 全量同步完成后 (FULLSYNC_IN_PROGRESS=0):
-//   数据仍然写入 ringbuf，用户态回调直接处理
-//
-// x86_64 调用约定 (tcp_recvmsg):
-//   struct sock *sk   = di (PT_REGS_PARM1)
-//   struct msghdr *msg = si (PT_REGS_PARM2)
-//   size_t size        = dx (PT_REGS_PARM3)
-//   返回值 (rax)       = 实际接收字节数
+// kernel 6.1 的 fexit 不提供返回值，也不支持 bpf_get_func_ret()。
+// 通过 fentry 保存 msg_iter.count，fexit 中计算:
+//   retval = count_before - count_after
 // ============================================================
 
 #include <linux/bpf.h>
@@ -31,31 +20,22 @@
 #define CLIENT_ENTRY_HDR_SZ    4
 #define CLIENT_ENTRY_MAX_LEN   8192
 
-#define KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE  3
-#define KVS_EBPF_CLIENT_STAT_REPLSYNC_DETECT 8
+/* 从 msg+32 读取 {_count, ptr, _nr} 的偏移 */
+struct iov_head {
+    unsigned long long _count;
+    unsigned long ptr;
+    unsigned long _nr;
+};
 
-/* x86_64 pt_regs */
-struct pt_regs {
-    unsigned long r15;    unsigned long r14;
-    unsigned long r13;    unsigned long r12;
-    unsigned long bp;     unsigned long bx;
-    unsigned long r11;    unsigned long r10;
-    unsigned long r9;     unsigned long r8;
-    unsigned long ax;     unsigned long cx;
-    unsigned long dx;     unsigned long si;
-    unsigned long di;     unsigned long orig_ax;
-    unsigned long ip;     unsigned long cs;
-    unsigned long flags;  unsigned long sp;
-    unsigned long ss;
+/* fentry→fexit 传递: msg_ptr + count_before */
+struct fexit_ctx {
+    unsigned long msg_ptr;
+    unsigned long long count_before;
+    int valid;
 };
 
 /* ---- BPF Maps ---- */
 
-/* Control Map:
- * [1]: CTL_PID              — 0=禁用, !=0=(enabled, PID=low32)
- * [2]: LISTEN_PORT          — Master 监听端口（用于过滤客户端连接）
- * [3]: FULLSYNC_IN_PROGRESS — 1=全量同步进行中 0=正常
- */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 8);
@@ -63,8 +43,6 @@ struct {
     __type(value, __u64);
 } client_ctl SEC(".maps");
 
-/* proxy_cfg — master↔ebpf-proxy 共享配置通道
- * BPF 内核代码不读写此 map，仅用于随 BPF 加载自动创建并 pin */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16);
@@ -72,17 +50,6 @@ struct {
     __type(value, __u64);
 } proxy_cfg SEC(".maps");
 
-/* Stats Map:
- * [0]: HIT              — 总命中次数
- * [1]: SKIP_PID         — PID 不匹配跳过
- * [2]: RB_ERR           — ringbuf 写入错误
- * [3]: DATA_OVR         — 数据超过上限
- * [4]: READ_ERR         — probe_read 失败
- * [5]: CACHED           — 缓存条目数
- * [6]: RETPROBE_MISS    — kretprobe 未找到 entry 保存的 msg 指针
- * [7]: REPLDONE_DETECT  — 探测到 REPLDONE
- * [8]: REPLSYNC_DETECT  — 探测到 REPLSYNC
- */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 16);
@@ -90,13 +57,11 @@ struct {
     __type(value, __u64);
 } client_stats SEC(".maps");
 
-/* Ringbuf — 缓存客户端写入数据 */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 22);  /* 4MB */
+    __uint(max_entries, 1 << 22);
 } client_cache_ringbuf SEC(".maps");
 
-/* 临时缓冲区（per-CPU，避免 BPF 栈 512B 限制） */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -104,132 +69,77 @@ struct {
     __type(value, unsigned char[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN]);
 } client_tmpbuf SEC(".maps");
 
-/* 用于 kprobe→kretprobe 传递 msg 指针的 per-CPU map
- * key=0: 存储 msg 指针 (unsigned long) */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, unsigned long);
-} client_entry_msg SEC(".maps");
+    __type(value, struct fexit_ctx);
+} client_fexit_ctx SEC(".maps");
 
-/* 从 msghdr 的 iovec 中读取已接收的数据
- * 在 kretprobe 中调用（此时数据已写入 iovec）
- *
- * iov_iter 布局 (x86_64):
- *   count     @ msg_iter + 16 → msg + 32 (8B)
- *   iov/ubuf  @ msg_iter + 24 → msg + 40 (8B)
- *   nr_segs   @ msg_iter + 32 → msg + 48 (8B)
- *
- * 内核 5.15 (ITER_IOVEC): nr_segs >= 1, iov 指向 iovec 结构体数组
- * 内核 6.1+ (ITER_UBUF):  nr_segs = 0, ubuf 直接指向用户缓冲区 */
-static __always_inline int read_recv_data(unsigned long msg_ptr,
-    unsigned char *buf, int max_len)
+/* ──── fentry: 保存 msg_ptr + count_before ──── */
+SEC("fentry/tcp_recvmsg")
+int fentry_tcp_recvmsg(__u64 *ctx)
 {
-    /* 1. 读取 count + iov/ubuf + nr_segs（24B @ msg+32） */
-    struct { unsigned long long _count; unsigned long ptr; unsigned long _nr; } head;
-    if (bpf_probe_read_kernel(&head, sizeof(head),
-            (const void *)(msg_ptr + 32)) != 0)
-        return 0;
-
-    unsigned long long safe_len;
-    unsigned long user_ptr;
-
-    if (head._nr > 0) {
-        /* ITER_IOVEC (kernel 5.15): ptr 指向 iovec 数组 */
-        if (!head.ptr) return 0;
-        struct { unsigned long b; unsigned long l; } vec;
-        if (bpf_probe_read_kernel(&vec, sizeof(vec),
-                (const void *)head.ptr) != 0)
-            return 0;
-        if (!vec.b || vec.l == 0) return 0;
-        safe_len = vec.l;
-        user_ptr = vec.b;
-    } else {
-        /* ITER_UBUF (kernel 6.1+): ptr 直接指向用户缓冲区 */
-        if (!head.ptr || head._count == 0) return 0;
-        safe_len = head._count;
-        user_ptr = head.ptr;
-    }
-
-    if (safe_len > (unsigned long long)max_len)
-        safe_len = (unsigned long long)max_len;
-    if (safe_len == 0) return 0;
-
-    /* 2. 从用户空间读取数据 */
-    if (bpf_probe_read_user(buf, (__u32)safe_len,
-            (const void *)user_ptr) != 0) {
-        __u64 *st = bpf_map_lookup_elem(&client_stats,
-            &(__u32){4});  /* READ_ERR */
-        if (st) __sync_fetch_and_add(st, 1);
-        return 0;
-    }
-    return (int)safe_len;
-}
-
-/* ──── Entry kprobe: 保存 msg 指针供 kretprobe 使用 ──── */
-SEC("kprobe/tcp_recvmsg")
-int kprobe_client_recv_entry(struct pt_regs *ctx)
-{
-    /* CTL_PID=0 表示禁用，无需额外 ENABLED 键 */
     __u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
     if (!ctl_pid || !*ctl_pid)
         return 0;
 
-    /* PID 过滤 — 只捕获 Master 进程的数据接收 */
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != (__u32)(*ctl_pid))
         return 0;
 
-    /* 保存 msg 指针 (si = PT_REGS_PARM2) 到 per-CPU map key=0 */
-    unsigned long msg_ptr = (unsigned long)ctx->si;
-    __u32 map_key = 0;
-    bpf_map_update_elem(&client_entry_msg, &map_key, &msg_ptr, 0);
+    unsigned long msg_ptr = (unsigned long)ctx[1];
+    if (!msg_ptr) return 0;
 
+    struct iov_head head;
+    if (bpf_probe_read_kernel(&head, sizeof(head),
+            (const void *)(msg_ptr + 32)) != 0)
+        return 0;
+
+    __u32 map_key = 0;
+    struct fexit_ctx e = {
+        .msg_ptr = msg_ptr,
+        .count_before = head._count,
+        .valid = 1,
+    };
+    bpf_map_update_elem(&client_fexit_ctx, &map_key, &e, 0);
     return 0;
 }
 
-/* ──── Return kretprobe: 从 iovec 读取接收到的数据 ──── */
-SEC("kretprobe/tcp_recvmsg")
-int kprobe_client_recv_return(struct pt_regs *ctx)
+/* ──── fexit: 读取数据，写入 ringbuf ──── */
+SEC("fexit/tcp_recvmsg")
+int fexit_tcp_recvmsg(__u64 *ctx)
 {
-    /* CTL_PID=0 表示禁用 */
-    __u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
-    if (!ctl_pid || !*ctl_pid)
+    __u32 map_key = 0;
+
+    struct fexit_ctx *ec = bpf_map_lookup_elem(&client_fexit_ctx, &map_key);
+    if (!ec || !ec->valid || ec->msg_ptr == 0)
+        return 0;
+    ec->valid = 0;  /* 消费标记 */
+
+    /* 读取当前 iov 头，计算 retval = count_before - count_after */
+    struct iov_head head;
+    if (bpf_probe_read_kernel(&head, sizeof(head),
+            (const void *)(ec->msg_ptr + 32)) != 0)
         return 0;
 
-    /* 获取返回值 = 实际接收字节数 */
-    long retval = (long)ctx->ax;
+    long long count_after = (long long)head._count;
+    long long count_before = (long long)ec->count_before;
+    long retval = (long)(count_before - count_after);
     if (retval <= 0)
         return 0;
 
-    /* 获取 entry 保存的 msg 指针 */
-    __u32 map_key = 0;
-    unsigned long *msg_ptr = bpf_map_lookup_elem(&client_entry_msg, &map_key);
-    if (!msg_ptr || *msg_ptr == 0)
-        return 0;
-
-    /* 直接在 retval 上裁剪 */
     if (retval > CLIENT_ENTRY_MAX_LEN)
         retval = CLIENT_ENTRY_MAX_LEN;
 
-    /* 读取数据到 tmpbuf */
     unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
     entry = bpf_map_lookup_elem(&client_tmpbuf, &map_key);
     if (!entry) return 0;
 
-    __u32 payload_len = 0;
-    __builtin_memcpy(*entry, &payload_len, 4);
-
     int data_len;
+    unsigned long user_ptr;
     {
-        struct { unsigned long long _count; unsigned long ptr; unsigned long _nr; } head;
-        if (bpf_probe_read_kernel(&head, sizeof(head),
-                (const void *)(*msg_ptr + 32)) != 0)
-            return 0;
-
         if (head._nr > 0) {
-            /* ITER_IOVEC: iov_base 不会被 tcp_recvmsg 推进 */
             if (!head.ptr) return 0;
             struct { unsigned long b; unsigned long l; } vec;
             if (bpf_probe_read_kernel(&vec, sizeof(vec),
@@ -239,42 +149,29 @@ int kprobe_client_recv_return(struct pt_regs *ctx)
             unsigned long long safe_len = vec.l;
             if (safe_len > (unsigned long long)retval)
                 safe_len = (unsigned long long)retval;
-            if (safe_len > (unsigned long long)CLIENT_ENTRY_MAX_LEN)
-                safe_len = (unsigned long long)CLIENT_ENTRY_MAX_LEN;
+            if (safe_len > CLIENT_ENTRY_MAX_LEN)
+                safe_len = CLIENT_ENTRY_MAX_LEN;
             if (safe_len == 0) return 0;
-            if (bpf_probe_read_user((*entry) + 4, (__u32)safe_len,
-                    (const void *)(unsigned long)vec.b) != 0) {
-                __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){4});
-                if (st) __sync_fetch_and_add(st, 1);
-                return 0;
-            }
             data_len = (int)safe_len;
+            user_ptr = (unsigned long)vec.b;
         } else {
-            /* ITER_UBUF: ubuf 已被 tcp_recvmsg 推进了 retval 字节。
-             * 原始缓冲区 = 当前 ubuf - retval（两者都是已知值，不会溢出）。 */
             if (!head.ptr || head._count == 0) return 0;
             unsigned long orig_buf = head.ptr - (unsigned long)retval;
-            /* 直接用 bounded retval 读精确数据量 */
-            if (bpf_probe_read_user((*entry) + 4, (__u32)retval,
-                    (const void *)orig_buf) != 0) {
-                __u64 *st = bpf_map_lookup_elem(&client_stats, &(__u32){4});
-                if (st) __sync_fetch_and_add(st, 1);
-                return 0;
-            }
             data_len = (int)retval;
+            user_ptr = orig_buf;
         }
     }
-    if (data_len <= 0) return 0;
+    if (data_len <= 0 || user_ptr == 0) return 0;
 
-    payload_len = (__u32)data_len;
+    __u32 payload_len = (__u32)data_len;
     __builtin_memcpy(*entry, &payload_len, 4);
 
-    /* 写入 ringbuf。
-     * 注意：REPLSYNC/REPLDONE 检测和状态切换已移到 ebpf-proxy ringbuf 回调。
-     * 精简 stats 更新以减少 kretprobe 热路径开销。 */
-    int entry_size = CLIENT_ENTRY_HDR_SZ + data_len;
-    bpf_ringbuf_output(&client_cache_ringbuf, *entry, entry_size, 0);
+    if (bpf_probe_read_user((*entry) + 4, (__u32)data_len,
+            (const void *)user_ptr) != 0)
+        return 0;
 
+    bpf_ringbuf_output(&client_cache_ringbuf, *entry,
+                        CLIENT_ENTRY_HDR_SZ + data_len, 0);
     return 0;
 }
 

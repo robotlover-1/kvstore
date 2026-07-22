@@ -69,10 +69,12 @@ struct {
     __type(value, unsigned char[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN]);
 } client_tmpbuf SEC(".maps");
 
+/* Hash map keyed by pid_tgid：避免 fentry→fexit CPU 迁移导致 per-CPU
+ * slot 错位。fexit 消费后 delete，不依赖 valid 标记。 */
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u64);
     __type(value, struct fexit_ctx);
 } client_fexit_ctx SEC(".maps");
 
@@ -96,13 +98,13 @@ int fentry_tcp_recvmsg(__u64 *ctx)
             (const void *)(msg_ptr + 32)) != 0)
         return 0;
 
-    __u32 map_key = 0;
+    __u64 tid_key = bpf_get_current_pid_tgid();
     struct fexit_ctx e = {
         .msg_ptr = msg_ptr,
         .count_before = head._count,
         .valid = 1,
     };
-    bpf_map_update_elem(&client_fexit_ctx, &map_key, &e, 0);
+    bpf_map_update_elem(&client_fexit_ctx, &tid_key, &e, BPF_ANY);
     return 0;
 }
 
@@ -110,68 +112,73 @@ int fentry_tcp_recvmsg(__u64 *ctx)
 SEC("fexit/tcp_recvmsg")
 int fexit_tcp_recvmsg(__u64 *ctx)
 {
-    __u32 map_key = 0;
+    __u64 tid_key = bpf_get_current_pid_tgid();
 
-    struct fexit_ctx *ec = bpf_map_lookup_elem(&client_fexit_ctx, &map_key);
+    struct fexit_ctx *ec = bpf_map_lookup_elem(&client_fexit_ctx, &tid_key);
     if (!ec || !ec->valid || ec->msg_ptr == 0)
         return 0;
-    ec->valid = 0;  /* 消费标记 */
 
     /* 读取当前 iov 头，计算 retval = count_before - count_after */
     struct iov_head head;
     if (bpf_probe_read_kernel(&head, sizeof(head),
             (const void *)(ec->msg_ptr + 32)) != 0)
-        return 0;
+        goto out;
 
     long long count_after = (long long)head._count;
     long long count_before = (long long)ec->count_before;
     long retval = (long)(count_before - count_after);
     if (retval <= 0)
-        return 0;
+        goto out;
 
     if (retval > CLIENT_ENTRY_MAX_LEN)
         retval = CLIENT_ENTRY_MAX_LEN;
 
-    unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
-    entry = bpf_map_lookup_elem(&client_tmpbuf, &map_key);
-    if (!entry) return 0;
-
-    int data_len;
-    unsigned long user_ptr;
     {
-        if (head._nr > 0) {
-            if (!head.ptr) return 0;
-            struct { unsigned long b; unsigned long l; } vec;
-            if (bpf_probe_read_kernel(&vec, sizeof(vec),
-                    (const void *)head.ptr) != 0)
-                return 0;
-            if (!vec.b || vec.l == 0) return 0;
-            unsigned long long safe_len = vec.l;
-            if (safe_len > (unsigned long long)retval)
-                safe_len = (unsigned long long)retval;
-            if (safe_len > CLIENT_ENTRY_MAX_LEN)
-                safe_len = CLIENT_ENTRY_MAX_LEN;
-            if (safe_len == 0) return 0;
-            data_len = (int)safe_len;
-            user_ptr = (unsigned long)vec.b;
-        } else {
-            if (!head.ptr || head._count == 0) return 0;
-            unsigned long orig_buf = head.ptr - (unsigned long)retval;
-            data_len = (int)retval;
-            user_ptr = orig_buf;
+        __u32 tmp_key = 0;
+        unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
+        entry = bpf_map_lookup_elem(&client_tmpbuf, &tmp_key);
+        if (!entry) goto out;
+
+        int data_len;
+        unsigned long user_ptr;
+        {
+            if (head._nr > 0) {
+                if (!head.ptr) goto out;
+                struct { unsigned long b; unsigned long l; } vec;
+                if (bpf_probe_read_kernel(&vec, sizeof(vec),
+                        (const void *)head.ptr) != 0)
+                    goto out;
+                if (!vec.b || vec.l == 0) goto out;
+                unsigned long long safe_len = vec.l;
+                if (safe_len > (unsigned long long)retval)
+                    safe_len = (unsigned long long)retval;
+                if (safe_len > CLIENT_ENTRY_MAX_LEN)
+                    safe_len = CLIENT_ENTRY_MAX_LEN;
+                if (safe_len == 0) goto out;
+                data_len = (int)safe_len;
+                user_ptr = (unsigned long)vec.b;
+            } else {
+                if (!head.ptr || head._count == 0) goto out;
+                unsigned long orig_buf = head.ptr - (unsigned long)retval;
+                data_len = (int)retval;
+                user_ptr = orig_buf;
+            }
         }
+        if (data_len <= 0 || user_ptr == 0) goto out;
+
+        __u32 payload_len = (__u32)data_len;
+        __builtin_memcpy(*entry, &payload_len, 4);
+
+        if (bpf_probe_read_user((*entry) + 4, (__u32)data_len,
+                (const void *)user_ptr) != 0)
+            goto out;
+
+        bpf_ringbuf_output(&client_cache_ringbuf, *entry,
+                            CLIENT_ENTRY_HDR_SZ + data_len, 0);
     }
-    if (data_len <= 0 || user_ptr == 0) return 0;
 
-    __u32 payload_len = (__u32)data_len;
-    __builtin_memcpy(*entry, &payload_len, 4);
-
-    if (bpf_probe_read_user((*entry) + 4, (__u32)data_len,
-            (const void *)user_ptr) != 0)
-        return 0;
-
-    bpf_ringbuf_output(&client_cache_ringbuf, *entry,
-                        CLIENT_ENTRY_HDR_SZ + data_len, 0);
+out:
+    bpf_map_delete_elem(&client_fexit_ctx, &tid_key);
     return 0;
 }
 

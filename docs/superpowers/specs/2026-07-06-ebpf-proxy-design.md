@@ -1,7 +1,7 @@
 # eBPF Proxy 独立进程设计
 
-> 日期: 2026-07-06
-> 状态: 设计完成，待评审
+> 日期: 2026-07-06（初版）, 2026-07-22（更新 fentry+fexit + batch send）
+> 状态: 已实现，当前分支 `refactor/fentry-fexit-optimize`
 
 ## 1. 目标
 
@@ -176,26 +176,45 @@ master 在启动完成后打开 pinned `proxy_cfg` 写入 PID 和端口。slave 
 
 文件：[src/replication/bpf/repl_client_capture.bpf.c](src/replication/bpf/repl_client_capture.bpf.c)
 
-### 6.1 移除
+### 6.1 当前实现：fentry+fexit（kernel 6.1 trampoline）
 
-- `SEC("kprobe/tcp_sendmsg")` 函数 `kprobe_client_sendmsg` — 不再需要检测 master 发出的 REPLDONE
-- `client_entry_msg` per-CPU map — 如果不再被 sendmsg probe 使用则移除
+kprobe/kretprobe 已替换为 fentry+fexit：
 
-### 6.2 保留
+```c
+// fentry/tcp_recvmsg: 保存 msg_ptr + msg_iter.count
+SEC("fentry/tcp_recvmsg")
+int fentry_tcp_recvmsg(__u64 *ctx) {
+    // PID 过滤 (client_ctl[1])
+    unsigned long msg_ptr = ctx[1];  // ctx[0]=sk, ctx[1]=msg
+    // 读取 iov_iter head @ msg+32
+    struct iov_head head;
+    bpf_probe_read_kernel(&head, sizeof(head), (void *)(msg_ptr + 32));
 
-- `kprobe/tcp_recvmsg`（entry）— 不变，保存 msg 指针到 per-CPU map
-- `kretprobe/tcp_recvmsg`（return）— 保留基本抓包逻辑
+    __u64 tid_key = bpf_get_current_pid_tgid();  // HASH key
+    struct fexit_ctx e = { .msg_ptr = msg_ptr, .count_before = head._count };
+    bpf_map_update_elem(&client_fexit_ctx, &tid_key, &e, BPF_ANY);
+}
 
-### 6.3 新增：REPLSYNC 检测
+// fexit/tcp_recvmsg: delta 计算 retval，读数据写 ringbuf
+SEC("fexit/tcp_recvmsg")
+int fexit_tcp_recvmsg(__u64 *ctx) {
+    __u64 tid_key = bpf_get_current_pid_tgid();
+    struct fexit_ctx *ec = bpf_map_lookup_elem(&client_fexit_ctx, &tid_key);
+    if (!ec || !ec->msg_ptr) goto out;
 
-在 kretprobe 中，读数据后扫描 "REPLSYNC" 子串（同现有 REPLDONE 检测方式）。匹配后设置 `client_ctl[3] = 1`。
+    retval = count_before - count_after;  // delta 计算实际接收字节数
+    bpf_probe_read_user(entry + 4, data_len, user_ptr);
+    bpf_ringbuf_output(&client_cache_ringbuf, entry, 4 + data_len, 0);
+out:
+    bpf_map_delete_elem(&client_fexit_ctx, &tid_key);
+}
+```
 
-### 6.4 改动：REPLDONE 检测
+**为什么用 HASH map `client_fexit_ctx`**：kernel 6.1 PREEMPT_DYNAMIC 下 `tcp_recvmsg` 可能在 fentry 和 fexit 之间迁移 CPU。PERCPU_ARRAY 会导致 fexit 读到错误 slot，数据丢失 ~45%。HASH map key=`bpf_get_current_pid_tgid()` 不受 CPU 迁移影响，fexit 消费后 delete。
 
-将原来在 `kprobe_client_sendmsg` 中的 REPLDONE 检测逻辑移到 kretprobe recvmsg 中。检测到 REPLDONE 后：
-- 设置 `client_ctl[3] = 0`
-- 写 magic value `0xFFFFFFFF` 到 ringbuf（通知 proxy flush）
-- 更新 `client_stats[7]`（REPLDONE_DETECT）
+### 6.2 REPLSYNC/REPLDONE 检测
+
+已移到 ebpf-proxy 用户态 ringbuf 回调中处理，减少 BPF 热路径开销。
 
 ## 7. ebpf-proxy 进程设计
 
@@ -223,24 +242,40 @@ ebpf-proxy --pin-path /sys/fs/bpf/kvstore_repl_sockmap
 - master 先于 proxy 启动：master 用 `bpf_obj_get()` 重试打开 pinned map（等待步骤 3-4 完成），打开后立即写入，proxy 在步骤 5 立刻读到
 - master 重启：master 重新 `bpf_obj_get()` 打开已有 pinned map，写入新配置，proxy 主循环中检测到变化后更新
 
-### 7.3 ringbuf 回调
+### 7.3 ringbuf 回调 + batch writev
+
+数据不逐条 `send()`，改为攒批 `writev` (BATCH_MAX=64)：
 
 ```c
+static struct iovec g_batch_iov[BATCH_MAX];
+static int g_batch_count = 0;
+
 void ringbuf_callback(void *data, size_t len) {
     uint32_t payload_len = *(uint32_t*)data;
     unsigned char *payload = (unsigned char*)data + 4;
 
-    if (payload_len == 0xFFFFFFFF) {  // magic: flush signal
+    if (payload_len == 0xFFFFFFFF) {  // magic: REPLDONE flush signal
+        batch_flush();
         flush_cache_to_slave();
         state = FORWARDING;
         return;
     }
 
-    if (state == FORWARDING) {
-        send(slave_fd, payload, payload_len, MSG_NOSIGNAL);
-    } else {  // BUFFERING
+    // 过滤 REPLSYNC/REPLACK/REPLDONE（首字节非 RESP 命令字符）
+    if (is_repl_control_payload(payload, payload_len)) return;
+
+    if (state == FORWARDING && proxy_slave_is_connected(&g_slave)) {
+        g_batch_iov[g_batch_count++] = (struct iovec){payload, payload_len};
+        if (g_batch_count >= BATCH_MAX) batch_flush();
+    } else {
         append_to_cache(payload, payload_len);
     }
+}
+
+static void batch_flush(void) {
+    if (g_batch_count == 0) return;
+    writev(slave_fd, g_batch_iov, g_batch_count);  // 单次系统调用
+    g_batch_count = 0;
 }
 ```
 
@@ -255,16 +290,22 @@ void ringbuf_callback(void *data, size_t len) {
 
 ```c
 for (;;) {
-    ring_buffer__poll(rb, 100 /* timeout_ms */);
+    ring_buffer__poll(rb, 1 /* ms, 原 100ms */);
+
+    batch_flush();  // 每次 poll 后 flush 批
 
     // 检查 fullsync_state 是否变化
     int fs = read_client_ctl(FULLSYNC_STATE);
     if (fs == 1 && state == FORWARDING) state = BUFFERING;
+    if (fs == 0 && state == BUFFERING) { flush_cache_to_slave(); state = FORWARDING; }
 
-    // 检查 slave 连接健康
+    // 检查 slave 连接健康 + 重连
     if (slave_disconnected()) reconnect_slave();
 
-    // 信号处理
+    // 如果 FORWARDING 且 slave 在线且有缓存数据，尝试 flush
+    if (state == FORWARDING && slave_connected() && cache_has_data())
+        flush_cache_to_slave();
+
     if (shutdown_requested) goto cleanup;
 }
 ```
@@ -408,11 +449,60 @@ client_capture_bpf: src/replication/bpf/repl_client_capture.bpf.c
 - `tests/test_repl_basic.c`
 - `tests/test_repl_gap.c`
 
-## 13. 风险与未决事项
+## 13. QPS 测试方法
+
+测试程序：`tests/perf/test_ebpf_proxy_qps`
+
+### 13.1 三种模式
+
+| 模式 | master 行为 | 转发路径 |
+|------|------------|---------|
+| none | read(client) → echo | 不转发 |
+| sync | read(client) → echo → write(slave_fd) | 同步转发，在 master 热路径 |
+| ebpf | read(client) → echo | proxy 异步转发，BPF fentry+fexit 截获 |
+
+### 13.2 QPS 测量口径
+
+```
+t_start = now_us()
+  master_start()             # pthread, bind, listen
+  run_qps_client()           # fork client: warmup + N 次 write/read
+  master_stop()              # pthread_join
+  [ebpf] ringbuf drain 检测  # 临时 ring_buffer reader poll
+t_end = now_us()
+
+wall_qps = N / (t_end - t_start) × 1e6
+```
+
+sync: `write(slave_fd)` 在 master 线程内同步完成。
+ebpf: `ebpf_wait_ringbuf_drain()` 创建临时 ring_buffer reader，poll 直到 ringbuf 空。此时 proxy 最后一个 `writev` 已完成，数据到达 slave TCP 发送缓冲。**两者 t_end 等价。**
+
+### 13.3 跨机测试
+
+支持 `--master-host`、`--slave-host`、`--client-only`、`--no-client` 参数，可拆分部署：
+
+```
+Master+Proxy (128)              Slave+Client (129)
+./test --mode ebpf              ./slave_receiver 15901 &
+  --no-client                    ./test --client-only
+  --no-local-slave                 --master-host 192.168.233.128
+  --slave-host 192.168.233.129
+```
+
+### 13.4 当前跨机结果（client+slave on 129, 64B, 3 runs median）
+
+| mode | QPS |
+|------|-----|
+| sync | 2,873 |
+| ebpf | 2,896 |
+
+4KB payload 时 ebpf 反超 sync 37%（3365 vs 2462）。详见 `docs/ebpf-forwarding-optimization-journey.md`。
+
+## 14. 风险与未决事项
 
 | 风险 | 缓解措施 |
 |------|---------|
-| kprobe 在 proxy 独立进程后 detach 时机 | proxy 退出时保证 detach，避免 kernel panic |
+| fentry+fexit 间 CPU 迁移丢数据 | HASH map key=pid_tgid 替代 PERCPU_ARRAY |
 | proxy 缓存 flush 期间 slave 断连 | best effort send，失败后丢弃缓存，记录 stats |
 | master 和 proxy 竞争 BPF maps | client_ctl key 3 只由 BPF 程序写入，userspace 只读 |
-| REPLSYNC/REPLDONE 跨 TCP segment 分片 | BPF 用同现有 REPLDONE 检测逻辑：在 ringbuf entry 的前 64 字节中扫描匹配 |
+| REPLSYNC/REPLDONE 跨 TCP segment 分片 | 用户态 ringbuf 回调中扫描匹配 |

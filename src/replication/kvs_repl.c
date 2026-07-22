@@ -1925,6 +1925,9 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
 static int repl_slave_send_repldone(void);
 
 void repl_slave_finish_fullsync(void) {
+    static int already_done = 0;
+    if (already_done) return;
+    already_done = 1;
     g_slave_loading_fullsync = 0;
     g_slave_fullsync_target_bytes = 0;
     g_slave_fullsync_loaded_bytes = 0;

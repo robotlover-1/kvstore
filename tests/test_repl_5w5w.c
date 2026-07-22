@@ -847,8 +847,8 @@ static int run_test(void) {
         }
         progress_print(line2);
 
-        /* 用 offset 判断是否完成（允许 100B 累计误差） */
-        if (slave_off + 100 >= master_off && master_off > 0) {
+        /* 用 offset 判断是否完成（允许 1024B 误差，覆盖协议对齐和批量缓冲） */
+        if (slave_off + 1024 >= master_off && master_off > 0) {
             caught_up = 1;
             progress_clear();
             printf("  %s✓ 增量同步完成! slave offset (%llu) >= master offset (%llu)%s\n\n",

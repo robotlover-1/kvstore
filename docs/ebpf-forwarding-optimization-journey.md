@@ -307,3 +307,121 @@ Master 机器:
 3. **Slave 必须在独立进程中**（不同 PID），否则反馈循环导致数据无限放大
 4. **sockmap/sk_msg 只能 redirect，不能 tee**——这是 BPF 的 API 盲区
 5. **`bpf_clone_redirect` 是唯一能做内核级 tee 的 eBPF 机制**，但操作在包级别
+
+
+## 迭代 6：fentry+fexit + batch send + libbpf 1.5.0（当前分支 `refactor/fentry-fexit-optimize`）
+
+### 改动概述
+
+| 维度 | 改动 |
+|------|------|
+| BPF hook | kprobe/kretprobe → fentry+fexit (kernel 6.1 trampoline, CC=0) |
+| retval 获取 | `ctx->ax` → `count_before - count_after` (delta 计算，因 fexit 不暴露返回值) |
+| fentry→fexit 传递 | PERCPU_ARRAY → HASH (key=`pid_tgid`)，防止 PREEMPT 下 CPU 迁移丢数据 |
+| 转发发送 | 逐条 `send()` → 批量 `writev()` (BATCH_MAX=64) |
+| ringbuf poll | 5ms → 1ms |
+| libbpf | 0.5.0 动态链接 → 1.5.0 静态链接 (`third_party/libbpf/lib/libbpf.a`) |
+
+### BPF：fentry+fexit 实现
+
+```c
+// fentry/tcp_recvmsg: 保存 msg_ptr + msg_iter.count
+SEC("fentry/tcp_recvmsg")
+int fentry_tcp_recvmsg(__u64 *ctx) {
+    // PID 过滤 (client_ctl[1])
+    unsigned long msg_ptr = ctx[1];  // ctx[0]=sk, ctx[1]=msg, ctx[2]=len, ...
+    // 读取 iov_iter head @ msg+32
+    struct iov_head { u64 _count; u64 ptr; u64 _nr; } head;
+    bpf_probe_read_kernel(&head, sizeof(head), (void *)(msg_ptr + 32));
+
+    __u64 tid_key = bpf_get_current_pid_tgid();  // HASH key
+    struct fexit_ctx e = { .msg_ptr = msg_ptr, .count_before = head._count };
+    bpf_map_update_elem(&client_fexit_ctx, &tid_key, &e, BPF_ANY);
+}
+
+// fexit/tcp_recvmsg: 计算 retval，读数据写 ringbuf
+SEC("fexit/tcp_recvmsg")
+int fexit_tcp_recvmsg(__u64 *ctx) {
+    __u64 tid_key = bpf_get_current_pid_tgid();
+    struct fexit_ctx *ec = bpf_map_lookup_elem(&client_fexit_ctx, &tid_key);
+    if (!ec || !ec->msg_ptr) goto out;
+
+    // 读取当前 iov head，计算 retval = count_before - count_after
+    retval = count_before - count_after;
+    // 读用户态数据 → tmpbuf → ringbuf
+    bpf_probe_read_user(entry + 4, data_len, user_ptr);
+    bpf_ringbuf_output(&client_cache_ringbuf, entry, 4 + data_len, 0);
+out:
+    bpf_map_delete_elem(&client_fexit_ctx, &tid_key);
+}
+```
+
+**关键修复：PERCPU_ARRAY → HASH**。kernel 6.1 PREEMPT_DYNAMIC 下 `tcp_recvmsg` 在 fentry 和 fexit 之间可能被迁移到不同 CPU，PERCPU_ARRAY 导致 fexit 读到错误 slot（valid=0，跳过不捕获），数据丢失 ~45%。改为 HASH map key=`pid_tgid`，fexit 消费后 delete。
+
+### 用户态：batch writev
+
+```c
+#define BATCH_MAX 64
+static struct iovec g_batch_iov[BATCH_MAX];
+
+// ringbuf 回调: 数据追加到 batch，满则 flush
+g_batch_iov[g_batch_count++] = (struct iovec){payload, plen};
+if (g_batch_count >= BATCH_MAX) batch_flush();
+
+// 主循环每次 poll 后 flush
+ring_buffer__poll(g_rb, 1);  // 1ms 超时
+batch_flush();  // writev(slave_fd, iov, count)
+```
+
+### 测试方法：QPS 口径
+
+三种模式统一测量：`t_start = before master_start → ... → t_end = after master_stop + ringbuf drain`。
+
+- **sync**: `write_full(slave_fd)` 在 master 线程内同步完成，t_end 即数据到 TCP 发送缓冲
+- **ebpf**: `t_end` 前调用 `ebpf_wait_ringbuf_drain()`——临时 ring_buffer reader poll 直到 ringbuf 空，proxy 最后一个 `writev` 已完成
+
+两者 t_end 等价：数据到达 slave TCP 发送缓冲区。
+
+### 跨机 QPS（client+slave on 192.168.233.129, master+proxy on 128, 3 runs median, payload=64B）
+
+| mode | QPS | 说明 |
+|------|-----|------|
+| sync | 2,873 | RTT(129↔128) + slave write 在 echo 后 |
+| ebpf | 2,896 | RTT(129↔128) + BPF fentry+fexit 开销，无 slave write 阻塞 |
+
+小负载持平——网络 RTT 主导延迟。
+
+### 跨机多 payload 对比
+
+| payload | sync | ebpf | ebpf/sync |
+|---------|-----:|-----:|----------:|
+| 64B     | 2873 | 2896 | 1.01x |
+| 128B    | 3124 | 2871 | 0.92x |
+| 256B    | 2974 | 2948 | 0.99x |
+| 512B    | 3012 | 2915 | 0.97x |
+| 1KB     | 2850 | 2847 | 1.00x |
+| 2KB     | 2664 | 2055 | 0.77x |
+| 4KB     | 2462 | 3365 | **1.37x** |
+
+**分析**：小负载持平。2KB ebpf 慢（`bpf_probe_read_user` 2KB 开销大于 sync 的 2KB TCP write）。4KB ebpf 反超 37%——sync 的 4KB slave write 跨机延迟卡住下一个 `read(client_fd)`，ebpf 异步转发消除阻塞。
+
+### 改动文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/replication/bpf/repl_client_capture.bpf.c` | kprobe→fentry+fexit, PERCPU_ARRAY→HASH |
+| `src/ebpf_proxy/main.c` | batch writev, 1ms poll, libbpf 1.5.0 |
+| `tests/perf/test_ebpf_proxy_qps.c` | 统一 wall_qps, ringbuf drain 检测, --master-host/--client-only/--no-client, slave 校验 |
+| `third_party/libbpf/` | 新增 libbpf 1.5.0 头文件 + libbpf.a |
+| `Makefile` | ebpf-proxy 静态链接 libbpf.a |
+
+### 方案最终状态（更新）
+
+| 方案 | 技术 | 小负载 vs sync | 大负载 vs sync | 状态 |
+|------|------|---------------|---------------|------|
+| kprobe (旧) | kprobe 进程内 | ❌ (-16%~-39%) | ❌ | 废弃 |
+| ebpf-proxy (旧) | kprobe + 独立 proxy + send() | ≈ (-5%) | ≈ | 废弃 |
+| **ebpf-proxy（当前）** | **fentry+fexit + batch writev** | **≈ (持平)** | **✅ (+37% at 4KB)** | **当前** |
+| sockmap tee | sk_msg clone | — | — | 不可行 |
+| async 用户态 | ring buffer + 线程 | ✅ | ✅ | 备选 |
+| TC clone | bpf_clone_redirect + VXLAN | ≈ | ≈ | 已实现 |

@@ -45,7 +45,8 @@ kv_config_t g_cfg = {
     .rdma_ib_port = 1,
     .rdma_gid_idx = 1,
     .rdma_port = 0,
-    .rdma_recv_slots = 64,
+    .rdma_send_slots = 0,           /* 0 = use KVS_RDMA_SEND_SLOTS_DEFAULT (16) */
+    .rdma_recv_slots = 0,           /* 0 = use KVS_RDMA_RECV_SLOTS_DEFAULT (64) */
     .rdma_chunk_size = BUFFER_CAP * 4,
     .rdma_qp_wr_depth = 64,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
@@ -253,6 +254,9 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rdma-port") && i + 1 < argc) {
             g_cfg.rdma_port = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--rdma-send-slots") && i + 1 < argc) {
+            g_cfg.rdma_send_slots = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--rdma-recv-slots") && i + 1 < argc) {
             g_cfg.rdma_recv_slots = atoi(argv[++i]);
         }
@@ -379,6 +383,7 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "rdma_ib_port")) g_cfg.rdma_ib_port = atoi(value);
     else if (!strcmp(key, "rdma_gid_idx")) g_cfg.rdma_gid_idx = atoi(value);
     else if (!strcmp(key, "rdma_port")) g_cfg.rdma_port = atoi(value);
+    else if (!strcmp(key, "rdma_send_slots")) g_cfg.rdma_send_slots = atoi(value);
     else if (!strcmp(key, "rdma_recv_slots")) g_cfg.rdma_recv_slots = atoi(value);
     else if (!strcmp(key, "rdma_chunk_size")) g_cfg.rdma_chunk_size = atoi(value);
     else if (!strcmp(key, "rdma_qp_wr_depth")) g_cfg.rdma_qp_wr_depth = atoi(value);
@@ -545,17 +550,41 @@ int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int s
             rc = repl_fullsync_send(c, buf + off, chunk);
         }
         if (rc != 0) {
-            /* ring buffer full — 重试 send，等待 TCP 窗口释放 */
-            for (int r = 0; r < 30; r++) {
-                ssize_t w = send(c->fd, buf + off, chunk, MSG_NOSIGNAL);
-                if (w == (ssize_t)chunk) break;
-                if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
-                usleep(100000);  /* 100ms */
-            }
+            /* P2.3 修复: repl_fullsync_send 已尝试 RDMA → TCP 回退，
+             * 此处不应再绕过传输层直接 send()。直接返回失败，不推进 off。
+             * 传输层已通过 repl_transport_trigger_fallback 禁用后续 RDMA 重试。 */
+            return -1;
         }
         off += chunk;
     }
+    /* P3.1b: flush 尾部 batch（不足 KVS_RDMA_BATCH_MAX 的积累 WR） */
+    if (!strcasecmp(repl_fullsync_transport_name(), "rdma")) {
+        repl_rdma_flush_batch();
+    }
     return 0;
+}
+
+/* 通知 ebpf-proxy 全量同步状态变化（通过 pinned client_ctl map key=3）。
+ * client_ctl map 属于 repl_client_capture.bpf.c，由 ebpf-proxy 进程 pin 到 bpffs。
+ * master 进程通过 bpf_obj_get() 打开并写入，ebpf-proxy 在主循环中轮询检测。 */
+static void repl_notify_ebpf_proxy_fullsync(int in_progress) {
+#if KVS_ENABLE_EBPF
+    char path[512];
+    int fd;
+    if (!g_cfg.ebpf_pin_path[0]) return;
+    snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
+    fd = bpf_obj_get(path);
+    if (fd < 0) {
+        /* ebpf-proxy 可能未启动，静默跳过 */
+        return;
+    }
+    __u32 key = 3;  /* KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE */
+    __u64 val = in_progress ? 1 : 0;
+    bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+    close(fd);
+#else
+    (void)in_progress;
+#endif
 }
 
 static int queue_snapshot(conn_t *c) {
@@ -581,6 +610,9 @@ static int queue_snapshot(conn_t *c) {
 
     /* 全量同步期间抑制增量广播，避免 KVSD 数据流被 repl_broadcast 写穿插 */
     g_repl_fullsync_in_progress = 1;
+
+    /* 通知 ebpf-proxy 进入 BUFFERING 状态，增量数据先缓存，等全量完成后再 flush */
+    repl_notify_ebpf_proxy_fullsync(1);
 
     /* 尝试启动 RDMA */
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
@@ -1158,6 +1190,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
             c->repl_fullsync_pending = 0;
             g_repl_fullsync_in_progress = 0;
+
+            /* 通知 ebpf-proxy 全量同步结束，flush 缓存 → 恢复 FORWARDING */
+            repl_notify_ebpf_proxy_fullsync(0);
+
             /* 回放全量同步期间积压的增量数据。
              * 用 backlog 自身的 start_offset，而非 c->repl_offset_sent
              * （后者在 queue_snapshot 中设置为全量开始时的值，但 backlog
@@ -1254,6 +1290,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "replica_max_applied_offset_ack:%llu\n"
             "replica_max_durable_offset_ack:%llu\n"
             "replica_min_ack_age_ms:%lld\n"
+            "rdma_send_slots:%d\n"
             "rdma_recv_slots:%d\n"
             "rdma_chunk_size:%d\n"
             "rdma_qp_wr_depth:%d\n"
@@ -2385,6 +2422,7 @@ int main(int argc, char **argv) {
                 "  --rdma-port PORT        RDMA 监听端口 (默认 0 = main+1)\n"
                 "  --rdma-ib-port PORT     RDMA IB 端口 (默认 1)\n"
                 "  --rdma-gid-idx IDX      RDMA GID 索引 (默认 1)\n"
+                "  --rdma-send-slots N     发送管道深度 (默认 16)\n"
                 "  --rdma-recv-slots N     接收槽位数 (默认 64)\n"
                 "  --rdma-chunk-size SIZE  分块大小 (默认 262144)\n"
                 "  --rdma-qp-wr-depth N    QP 队列深度 (默认 64)\n"

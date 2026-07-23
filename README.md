@@ -1398,6 +1398,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 > **测试环境**：Linux 6.1.176 / KVM 虚拟机 / glibc 2.35
 >
 > **本次改进**：新增三项内存优化
+>
 > 1. Hash 表自动缩容 — bucket 数组在 `count < max_slots/8` 时缩小回初始大小，释放 ~4 MB
 > 2. Backlog 延迟分配 — 无 slave 连接时不分配 10 MB 环形缓冲区
 > 3. libc `malloc_trim` — 每 10w 次 free 触发一次，强制 glibc 归还 arena
@@ -1445,11 +1446,11 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 **③ 虚拟内存归还率（VmSize）：三种后端释放后 VmSize 均大幅收缩**——libc（72,400 → 7,144 KB）、jemalloc（95,732 → 30,748 KB）、custom（70,452 → 7,956 KB）。jemalloc VmSize 基线 30 MB 高于其他后端，是因为 `retain:false` 下 jemalloc 仍需要 ~30 MB 虚拟地址空间维持内部结构。
 
 
-| 后端         | 峰值 VmRSS | 释放后 VmRSS | 释放率     | 释放后 VmSize |
-| ------------ | ---------- | ------------ | ---------- | ------------- |
-| **libc**     | 70,312 KB  | 3,764 KB     | **99.4%**  | 7,144 KB      |
-| **jemalloc** | 72,456 KB  | 7,476 KB     | **97.1%**  | 30,748 KB     |
-| **custom**   | 68,276 KB  | 5,780 KB     | **96.7%**  | 7,956 KB      |
+| 后端         | 峰值 VmRSS | 释放后 VmRSS | 释放率    | 释放后 VmSize |
+| ------------ | ---------- | ------------ | --------- | ------------- |
+| **libc**     | 70,312 KB  | 3,764 KB     | **99.4%** | 7,144 KB      |
+| **jemalloc** | 72,456 KB  | 7,476 KB     | **97.1%** | 30,748 KB     |
+| **custom**   | 68,276 KB  | 5,780 KB     | **96.7%** | 7,956 KB      |
 
 - **libc**：`malloc_trim(0)` 每 10w 次 free 触发，释放率从无优化时的 32% 提升至 99.4%。VmSize 同步收缩（hash 缩容 + trim 共同作用）。
 - **jemalloc**：`retain:false` 下 VmSize 可完全归还（95,732 → 30,748 KB），VmRSS 仅比基线高 ~2 MB。**需 `MALLOC_CONF` 主动配置**——系统默认 jemalloc 不启用 `retain:false`，默认 `retain:true` 只 madvise 不 munmap。
@@ -1457,21 +1458,22 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 
 **④ 三项优化的影响分解**
 
-| 优化 | 影响的后端 | 节省内存（释放后） |
-|------|----------|------------------|
-| Hash 表缩容 (`_maybe_shrink`) | 全部 | ~4 MB（bucket 数组从 1M 槽缩至 4K 槽） |
-| Backlog 延迟分配 | 全部 | 10 MB（standalone master 不再分配） |
-| libc `malloc_trim` | libc | ~50 MB（glibc arena 归还 OS） |
-| jemalloc `retain:false` | jemalloc | ~65 MB（VmSize 从 96 MB 降至 31 MB） |
+
+| 优化                          | 影响的后端 | 节省内存（释放后）                     |
+| ----------------------------- | ---------- | -------------------------------------- |
+| Hash 表缩容 (`_maybe_shrink`) | 全部       | ~4 MB（bucket 数组从 1M 槽缩至 4K 槽） |
+| Backlog 延迟分配              | 全部       | 10 MB（standalone master 不再分配）    |
+| libc`malloc_trim`             | libc       | ~50 MB（glibc arena 归还 OS）          |
+| jemalloc`retain:false`        | jemalloc   | ~65 MB（VmSize 从 96 MB 降至 31 MB）   |
 
 **⑤ 三种后端的适用场景**
 
 
-| 后端         | 适用场景                                           | 注意                                               |
-| ------------ | -------------------------------------------------- | -------------------------------------------------- |
-| **libc**     | 通用场景，基线占用最低，释放最彻底（99%）           | 需 `malloc_trim` 每 10w free 触发                  |
-| **jemalloc** | 长时间运行、高并发；推荐 `retain:false` 归还 VmSize | VmSize 基线 ~30 MB（retain:false 下），需 MALLOC_CONF 配置 |
-| **custom**   | 高频 alloc/free、数据量稳定（O(1) 无碎片）          | 数据量波动极大时部分页无法回收                      |
+| 后端         | 适用场景                                           | 注意                                                       |
+| ------------ | -------------------------------------------------- | ---------------------------------------------------------- |
+| **libc**     | 通用场景，基线占用最低，释放最彻底（99%）          | 需`malloc_trim` 每 10w free 触发                           |
+| **jemalloc** | 长时间运行、高并发；推荐`retain:false` 归还 VmSize | VmSize 基线 ~30 MB（retain:false 下），需 MALLOC_CONF 配置 |
+| **custom**   | 高频 alloc/free、数据量稳定（O(1) 无碎片）         | 数据量波动极大时部分页无法回收                             |
 
 > **注意**：custom 已实现空闲页回收。如果数据量在单页 chunk 数（~500-2000 个）范围内波动，部分页始终无法完全空闲，物理内存不会下降。极端场景下仍建议 **libc** 或 **jemalloc**。
 
@@ -1542,12 +1544,12 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 *效果*：每条目 `chunk_total = 16 + 56 = 72B`（vs 旧 80B），省 8 字节 × 1M = 8 MB。峰值 VmSize 89 MB → **81 MB**（与 libc 差距 11%）。
 
 
-| 阶段                               | 峰值 VmSize   | vs libc   | bytes/条目 | 释放率  |
-| ---------------------------------- | ------------- | --------- | ---------- | ------- |
-| 初始 (8 class, 24B header, 无回收) | 96,592 KB     | +32%      | 98.9       | 0%      |
-| P1: 空闲页回收                     | 96,592 KB     | +32%      | 98.9       | 86%     |
-| P2: 17 级密集 class                | 88,764 KB     | +22%      | 90.9       | 86%     |
-| P3: 压缩 header 24→16B            | 80,956 KB     | +11%      | 82.9       | 85%     |
+| 阶段                               | 峰值 VmSize   | vs libc   | bytes/条目 | 释放率    |
+| ---------------------------------- | ------------- | --------- | ---------- | --------- |
+| 初始 (8 class, 24B header, 无回收) | 96,592 KB     | +32%      | 98.9       | 0%        |
+| P1: 空闲页回收                     | 96,592 KB     | +32%      | 98.9       | 86%       |
+| P2: 17 级密集 class                | 88,764 KB     | +22%      | 90.9       | 86%       |
+| P3: 压缩 header 24→16B            | 80,956 KB     | +11%      | 82.9       | 85%       |
 | **P4: free_stack 索引 16→4B**     | **80,696 KB** | **-2.5%** | **82.6**   | **74.3%** |
 | *libc 基线*                        | *82,764 KB*   | —        | *84.7*     | *32.4%*   |
 
@@ -1580,22 +1582,22 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 ##### 测试结果
 
 > **2026-07-08 重测**（异步 io_uring，无 group commit，一条命令一次 fdatasync）
-> 
+>
 > **测试工具**：`redis-benchmark -n 1000000 -c 50 -P 1 -d 64 -r 1000000`
-> 
+>
 > **运行方式**：`bash tools/bench/run_persist_bench.sh`
 
 
-| 配置                               | ECHO (QPS)  | HSET (QPS)  | vs baseline |
-| ---------------------------------- | ----------- | ----------- | ----------- |
-| **kvstore** (ECHO 基线)            | **116,741** | —          | —          |
-| ├─ AOF 关闭（`--aof-disable`）   | —          | **121,684** | baseline    |
-| ├─ AOF always（异步 io_uring）   | —          | **39,040**  | 32%         |
-| └─ AOF everysec                   | —          | N/A         | 不支持      |
-| **Redis 5.0.7** (ECHO 基线)        | **109,469** | —          | —          |
-| ├─ 无 AOF                        | —          | **116,877** | baseline    |
-| ├─ AOF always                    | —          | **42,434**  | 36%         |
-| └─ AOF everysec                  | —          | **119,033** | 102%        |
+| 配置                             | ECHO (QPS)  | HSET (QPS)  | vs baseline |
+| -------------------------------- | ----------- | ----------- | ----------- |
+| **kvstore** (ECHO 基线)          | **116,741** | —          | —          |
+| ├─ AOF 关闭（`--aof-disable`） | —          | **121,684** | baseline    |
+| ├─ AOF always（异步 io_uring） | —          | **39,040**  | 32%         |
+| └─ AOF everysec                | —          | N/A         | 不支持      |
+| **Redis 5.0.7** (ECHO 基线)      | **109,469** | —          | —          |
+| ├─ 无 AOF                      | —          | **116,877** | baseline    |
+| ├─ AOF always                  | —          | **42,434**  | 36%         |
+| └─ AOF everysec                | —          | **119,033** | 102%        |
 
 > **注意**：kvstore AOF always（39,040）已接近 Redis AOF always（42,434），达到 Redis 的 **92%**。此测试使用异步 io_uring 实现，**不依赖 group commit**，每条命令独立 write + fdatasync。
 
@@ -1672,7 +1674,7 @@ time redis-cli -p 5190 SAVE
 
 
 | 场景                  | 数据量 | SAVE 次数 | 写入 QPS（中位数） | 范围 (min–max) | 平均每次 SAVE | 有效 QPS |
-| --------------------- | ------ | --------- | ------------------ | -------------- | ------------- | -------- |
+| --------------------- | ------ | --------- | ------------------ | --------------- | ------------- | -------- |
 | **100w → SAVE × 1** | 100万  | 1         | **119,133**        | 117K–121K      | 5,071ms       | 74,886   |
 | 10w → SAVE × 10     | 10万   | 10        | **118,624**        | 117K–121K      | 505ms         | 17,021   |
 | 1w → SAVE × 100     | 1万    | 100       | **111,111**        | 104K–115K      | 54.5ms        | 1,802    |
@@ -1704,7 +1706,7 @@ SAVE 耗时与数据量近似正比（~3.85ms/千条，大样本下线性度 >0.
 
 
 | 场景                  | 数据量 | SAVE 次数 | 写入 QPS（中位数） | 范围 (min–max) | 平均每次 SAVE | 有效 QPS |
-| --------------------- | ------ | --------- | ------------------ | -------------- | ------------- | -------- |
+| --------------------- | ------ | --------- | ------------------ | --------------- | ------------- | -------- |
 | **100w → SAVE × 1** | 100万  | 1         | **39,841**         | 38K–45K        | 7,708ms       | 27,601   |
 | 10w → SAVE × 10     | 10万   | 10        | **40,519**         | 35K–48K        | 753.7ms       | 10,066   |
 | 1w → SAVE × 100     | 1万    | 100       | **34,965**         | 23K–55K        | 76.8ms        | 1,250    |
@@ -1714,12 +1716,13 @@ SAVE 耗时与数据量近似正比（~3.85ms/千条，大样本下线性度 >0.
 
 **为什么小数据量波动大？** 不是 hash 表问题（kvstore 使用渐进式 rehash，和 Redis 一样，单次操作只移动 10 个桶）。纯粹是**样本量太小**：
 
+
 | 数据量 | 总请求数 | 运行时间 | fdatasync 样本数 |
-|--------|---------|---------|-----------------|
-| 1k | 1000 | ~30ms | 1000 |
-| 1w | 10000 | ~300ms | 10000 |
-| 10w | 100000 | ~3s | 100000 |
-| 100w | 1000000 | ~28s | 1000000 |
+| ------ | -------- | -------- | ---------------- |
+| 1k     | 1000     | ~30ms    | 1000             |
+| 1w     | 10000    | ~300ms   | 10000            |
+| 10w    | 100000   | ~3s      | 100000           |
+| 100w   | 1000000  | ~28s     | 1000000          |
 
 单次 fdatasync 延迟在 10–50µs 之间波动（磁盘调度、内核写回时机）。1000 个样本太小，几次偏高延迟就能把平均 QPS 拉低一半。100 万样本足够大，波动自然被平均掉。这是统计学问题——掷硬币 10 次出现 7 次正面很正常，掷 10000 次基本趋近 50%。
 
@@ -1837,11 +1840,11 @@ Redis 在 pipeline 场景下天然做 group commit——事件循环末尾统一
 ##### 结论
 
 
-| 场景 | P=1 | P≥80 | 说明 |
-|------|-----|------|------|
-| AOF disable（无持久化） | kv ≈ Redis | **kv > Redis** | P≥80 反超 |
+| 场景                             | P=1                | P≥80           | 说明                                     |
+| -------------------------------- | ------------------ | --------------- | ---------------------------------------- |
+| AOF disable（无持久化）          | kv ≈ Redis        | **kv > Redis**  | P≥80 反超                               |
 | AOF always（批量 submit 优化后） | kv ≈ Redis（99%） | **Redis >> kv** | 受限于 per-cmd fsync，P=160 达 Redis 61% |
-| AOF always + group commit（旧） | kv >> Redis | **kv ≈ Redis** | 牺牲了持久性语义 |
+| AOF always + group commit（旧）  | kv >> Redis        | **kv ≈ Redis** | 牺牲了持久性语义                         |
 
 ### 运行基准测试
 
@@ -1866,100 +1869,88 @@ sudo python3 tools/bench/bench_mem_backend.py \
   --csv my_bench.csv
 ```
 
-### eBPF kprobe 主从转发 QPS 对比
+### eBPF fentry+fexit 主从转发 QPS 对比
 
-> **测试环境**：2 × KVM 虚拟机 / Master: Linux 6.1.176 / Slave: Linux 5.15.0-139 / 同一物理宿主机
-> **架构**：ebpf-proxy 在 Master 机器上作为**独立进程**运行，kprobe 截获 master 的 `tcp_recvmsg` → ringbuf → TCP 跨机转发到 Slave。
+> **测试环境**：2 × KVM 虚拟机 / Master+proxy: 192.168.233.128 (Linux 6.1.176) / Slave: 192.168.233.129 (Linux 5.15)
+> **架构**：ebpf-proxy 在 Master 机器上作为**独立进程**运行，fentry+fexit 截获 master 的 `tcp_recvmsg` → ringbuf → batch writev → TCP 跨机转发到 Slave。
+> **分支**：`refactor/fentry-fexit-optimize`（2026-07-22）
 
 **测试方法**
 
-测试程序 `test_ebpf_proxy_qps.c` 是一个自包含的 C 程序。与生产架构对齐：
-- **ebpf-proxy**（fork+exec 独立进程）：加载 BPF kprobe → ringbuf poll → TCP 转发到 slave
-- **slave**（fork 独立进程）：TCP server 接收转发数据并计数
-- **client**（fork 独立进程）：发送 RESP 请求，测量 echo QPS
-- **master echo**（测试主进程的线程）：`read(client) → echo`，转发由 ebpf-proxy 独立完成
+测试程序 `test_ebpf_proxy_qps.c` 支持灵活部署：
 
-**架构与数据流**（三种模式分列）：
+```bash
+# 本地全组件：master + client + slave + proxy 在同一进程
+sudo ./tests/perf/test_ebpf_proxy_qps --mode all --payload 64 --count 5000 --rounds 5
 
-```
-                      none 模式（基准：纯 echo，无转发）
-                      ════════════════════════════════
-
-   测试进程                     
-   ┌─────────────────────────────────────┐
-   │  [client 进程]       [master 线程]   │
-   │  ┌──────────┐        ┌──────────┐   │
-   │  │ ① 发送   │──TCP──→│ ② 接收   │   │
-   │  │   req    │        │   echo   │   │
-   │  │          │←──TCP─│ ③ 响应   │   │
-   │  │ ④ 计时   │        └──────────┘   │
-   │  └──────────┘                       │
-   └─────────────────────────────────────┘
-
-
-                      sync 模式（echo + 同步 TCP 转发到 Slave）
-                      ══════════════════════════════════════════
-
-   测试进程
-   ┌──────────────────────────┐    TCP    ┌────────────────────┐
-   │ [client 进程] [master 线程]│══════════→│ [slave 进程]        │
-   │ ┌──────────┐ ┌──────────┐│  转发     │ ┌────────────────┐ │
-   │ │ ① 发送   │→│ ② 接收   ││══════════→│ │ ④ 接收 + 计数  │ │
-   │ │   req    │ │ ③ echo   ││           │ └────────────────┘ │
-   │ │          │←│ ④ write  ││           └────────────────────┘
-   │ │ ⑤ 计时   │ │   slave  ││
-   │ └──────────┘ └──────────┘│             ②→③→④ 顺序执行
-   └──────────────────────────┘             转发阻塞下一个请求的读取
-
-
-                      ebpf 模式（echo only + ebpf-proxy 独立进程转发）
-                      ══════════════════════════════════════════
-
-   ┌── 测试进程 (pid=A) ──┐      ┌── ebpf-proxy 进程 ──┐      ┌── slave 进程 (pid=C) ──┐
-   │                      │      │   kprobe 过滤 pid=A  │ TCP  │                         │
-   │ [client]  [master]   │ kprobe│  ┌────────────────┐ │═════→│ ┌─────────────────────┐ │
-   │ 进程(B)   线程        │ on    │  │ ringbuf poll   │ │      │ │ ⑥ 接收 + 计数       │ │
-   │ ┌──────┐ ┌──────────┐│tcp_   │  │ ⑤ send(slave)  │ │      │ └─────────────────────┘ │
-   │ │①发送 │→│②read()   ││recvmsg│  └────────────────┘ │      └─────────────────────────┘
-   │ │ req  │ │③write()  ││───→  │                      │
-   │ │      │←│  echo    ││ringbuf│                      │
-   │ │④计时 │ └──────────┘│      │                      │
-   │ └──────┘              │      └──────────────────────┘
-   └───────────────────────┘
-
-   ②→③ echo 主路径不受 BPF 影响。⑤ ringbuf → slave 全在 ebpf-proxy 进程完成。
-   关键：slave 和 client 都是独立进程（不同 PID），BPF PID 过滤只捕获 master 的 read()。
+# 跨机部署：master+proxy 在 128，client+slave 在 129
+# 128: master + proxy 等待远端 client
+sudo ./tests/perf/test_ebpf_proxy_qps --mode ebpf --no-client --no-local-slave \
+    --slave-host 192.168.233.129 --count 5000
+# 129: slave 接收 + client 发送
+./slave_receiver 15901 &
+./test_ebpf_proxy_qps --client-only --master-host 192.168.233.128 --count 5000
 ```
 
-**三种模式实现对比**：
+**QPS 测量口径**（三种模式统一）：
+
+```
+t_start = now_us()
+  master_start()          # pthread, bind, listen
+  run_qps_client()        # fork client: warmup(10%) + N 次 write/read echo
+  master_stop()           # pthread_join
+  [ebpf] ringbuf drain    # 临时 ring_buffer reader poll 直到排空
+t_end = now_us()
+wall_qps = N / (t_end - t_start) × 1e6
+```
+
+sync 的 `write(slave_fd)` 在 master 线程内同步完成，ebpf 的 ringbuf drain 检测等价——数据到达 slave TCP 发送缓冲区。
+
+**架构与数据流**（两种模式）：
+
+```
+
+                    sync 模式（echo + 同步 TCP 转发到 Slave）
+                    ══════════════════════════════════════════
+
+ 测试进程
+ ┌──────────────────────────┐    TCP    ┌────────────────────┐
+ │ [client 进程] [master 线程]│══════════→│ [slave 进程]        │
+ │ ┌──────────┐ ┌──────────┐│  转发     │ ┌────────────────┐ │
+ │ │ ① 发送   │→│ ② 接收   ││══════════→│ │ ④ 接收 + 计数  │ │
+ │ │   req    │ │ ③ echo   ││           │ └────────────────┘ │
+ │ │          │←│ ④ write  ││           └────────────────────┘
+ │ │ ⑤ 计时   │ │   slave  ││
+ │ └──────────┘ └──────────┘│          ②→③→④ 顺序执行
+ └──────────────────────────┘          转发阻塞下一个请求的读取
 
 
-| 模式   | Master echo                                           | 转发路径                                                     | ebpf-proxy |
-| ------ | ----------------------------------------------------- | ------------------------------------------------------------ | ---------- |
-| `none` | `read(client) → write_full(client)`                  | 无                                                           | 无         |
-| `sync` | `read(client) → write_full(client) → write_full(slave)` | 主路径同步 `write()` TCP → slave                            | 无         |
-| `ebpf` | `read(client) → write_full(client)`                  | kprobe(tcp_recvmsg) → ringbuf → ebpf-proxy → TCP → slave    | fork+exec  |
+                    ebpf 模式（echo only + ebpf-proxy 独立进程异步转发）
+                    ══════════════════════════════════════════
 
-**跨机 QPS 对比（2026-07-09，5K reqs，Master .128 / Slave .129，3 轮中位数）**
+ ┌── 测试进程 (pid=A) ──┐    ┌── ebpf-proxy 进程 ──┐    ┌── slave 进程 (pid=C) ──┐
+ │                      │    │  fentry+fexit 过滤 A  │TCP │                         │
+ │ [client]  [master]   │hook│ ┌──────────────────┐ │═══→│ ┌─────────────────────┐ │
+ │ 进程(B)   线程        │on  │ │ ringbuf poll(1ms)│ │    │ │ ⑥ 接收 + 计数       │ │
+ │ ┌──────┐ ┌──────────┐│tcp_│ │ ⑤ batch writev  │ │    │ └─────────────────────┘ │
+ │ │①发送 │→│②read()   ││recv│ └──────────────────┘ │    └─────────────────────────┘
+ │ │ req  │ │③write()  ││msg │                        │
+ │ │      │←│  echo    ││───→│                        │
+ │ │④计时 │ └──────────┘│ring│                        │
+ │ └──────┘              │buf │                        │
+ └───────────────────────┘    └────────────────────────┘
 
+ ②→③ echo 主路径不受转发阻塞。⑤ ringbuf → writev → slave 全在 proxy 进程完成。
+```
 
-| Payload | none QPS | sync QPS | ebpf QPS | ebpf vs sync | ebpf vs none |
-| ------- | -------: | -------: | -------: | -----------: | -----------: |
-| 64B     |   27,807 |   20,330 |   16,975 |      −16.5% |       −38.9% |
-| 128B    |   26,097 |   22,153 |   13,722 |      −38.0% |       −47.4% |
-| 256B    |   28,170 |   17,809 |   16,820 |       −5.5% |       −40.2% |
-| 512B    |   27,275 |   18,822 |   13,343 |      −29.1% |       −51.0% |
-| 1024B   |   27,198 |   21,941 |   13,982 |      −36.2% |       −48.5% |
-| 2048B   |   27,340 |   16,624 |   17,132 |       **+3.0%** |       −37.3% |
-| 4096B   |   26,632 |   20,579 |   24,419 |      **+18.6%** |        **−8.3%** |
+**两种模式实现对比**：
 
-> **趋势**：小 payload 时 ebpf 慢于 sync（kprobe 固定开销占主导），大 payload 时 ebpf **反超 sync**（sync 跨机 write 开销随 payload 增大，ebpf 异步转发不受影响）。
->
-> **vs none 基准**：ebpf 比 none 慢 8~51%，含 kprobe 开销 + ebpf-proxy 跨机 TCP 转发延迟。
->
-> **对照**：旧 in-process kprobe 测试（同 VM）kprobe vs sync = −19.2%，与新架构 64B 结果（−16.5%）一致。
+| 模式   | Master echo                                               | 转发路径                                                            | ebpf-proxy |
+| ------ | --------------------------------------------------------- | ------------------------------------------------------------------- | ---------- |
+| `sync` | `read(client) → write_full(client) → write_full(slave)` | 主路径同步 `write()` TCP → slave                                    | 无         |
+| `ebpf` | `read(client) → write_full(client)`                      | fentry+fexit(tcp_recvmsg) → ringbuf → proxy batch writev → slave | fork+exec  |
 
-**ebpF kprobe 工作原理**（生产代码 `repl_client_capture.bpf.c`）：
+**BPF 实现**（`src/replication/bpf/repl_client_capture.bpf.c`）：
 
 ```
 用户态调用 read(fd, buf, len)
@@ -1967,29 +1958,44 @@ sudo python3 tools/bench/bench_mem_backend.py \
         ▼
 tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
   │
-  ├── [kprobe entry] kprobe_client_recv_entry:
-  │     • PID 过滤（只截获 Master 进程的 recv 调用）
-  │     • msg 指针保存到 per-CPU map（client_entry_msg[0] = msg_addr）
+  ├── [fentry] fentry_tcp_recvmsg:
+  │     • PID 过滤（client_ctl[1]，只截获 Master 进程的 recv）
+  │     • 读取 msg_iter.count（count_before），保存到 HASH map（key=pid_tgid）
+  │     • HASH map 防止 PREEMPT 下 fentry→fexit CPU 迁移丢数据
   │
   ├── 内核执行：skb → iov（用户 buf），把数据从内核拷贝到用户态
   │
-  └── [kretprobe return] kprobe_client_recv_return:
-        • 返回值为实际拷贝字节数 retval
-        • 从 per-CPU map 取回之前保存的 msg 指针
+  └── [fexit] fexit_tcp_recvmsg:
+        • HASH map 取出 count_before，读当前 count_after
+        • retval = count_before - count_after（kernel 6.1 fexit 不提供返回值）
         • 读 iov_iter → 获取用户态 buf 地址（支持 ITER_IOVEC / ITER_UBUF）
         • bpf_probe_read_user(buf_addr, retval) → BPF tmpbuf
-        • 打包 [4B长度 | payload] → bpf_ringbuf_output → ebpf-proxy 消费
+        • 打包 [4B长度 | payload] → bpf_ringbuf_output → proxy 消费
+        • bpf_map_delete_elem 清理 HASH entry
 ```
 
-#### 相关文件
+**用户态 batch send**：proxy ringbuf 回调不逐条 `send()`，攒批 64 条 → `writev()` 单次系统调用发送。
+
+**跨机 QPS 对比（client+slave on 192.168.233.129, master+proxy on 128, 3 runs median）**
 
 
-| 文件                                            | 说明                                       |
-| ----------------------------------------------- | ------------------------------------------ |
-| `tests/perf/test_ebpf_proxy_qps.c`              | eBPF proxy 独立进程架构 QPS 测试           |
-| `tests/perf/test_kprobe_repl_qps.c`             | (旧) 进程内 kprobe QPS 测试                |
-| `src/replication/bpf/repl_client_capture.bpf.c` | 生产代码 client_capture BPF（kprobe 截获） |
-| `src/ebpf_proxy/main.c`                         | ebpf-proxy 独立进程主程序                  |
+| Payload | sync QPS | ebpf QPS | ebpf vs sync |
+| ------- | -------: | -------: | -----------: |
+| 64B     |    2,873 |    2,896 |        +0.8% |
+| 128B    |    3,124 |    2,871 |       −8.1% |
+| 256B    |    2,974 |    2,948 |       −0.9% |
+| 512B    |    3,012 |    2,915 |       −3.2% |
+| 1KB     |    2,850 |    2,847 |       −0.1% |
+| 2KB     |    2,664 |    2,055 |      −22.9% |
+| 4KB     |    2,462 |    3,365 |   **+36.7%** |
+
+> **分析**：
+>
+> - **小负载（≤1KB）**：ebpf ≈ sync。网络 RTT（129↔128 ~300μs）主导延迟，sync 的 slave write 和 ebpf 的 BPF overhead 都被藏在 RTT 后面。
+> - **2KB**：ebpf 慢 23%，`bpf_probe_read_user` 拷贝 2KB 的开销 > sync 的跨机 TCP write。
+> - **4KB**：ebpf **反超 37%**。sync 的 `write_full(slave_fd, 4KB)` 跨机 TCP 写阻塞下一个 `read(client_fd)`，ebpf 异步转发消除阻塞。
+> - **本质**：payload 大到 slave write 网络延迟 > echo RTT 时，ebpf 异步转发收益显现。转折点约在 2-4KB。
+
 
 ---
 
@@ -1999,7 +2005,7 @@ tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
 
 **测试方法**
 
-共 4 种传输方式，3 个自研 C 程序 + 1 个标准工具。全部测跨机单方向吞吐量（Master → Slave）。
+共 4 种传输方式，3 个自研 C 程序 + 1 个标准工具。全部测跨机单方向吞吐量（Master → Slave）。**计时统一在发方**（客户端），数据量统一为发方实际发出的字节数，保证口径一致。
 
 ---
 
@@ -2018,14 +2024,15 @@ iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps
 
 `test_sendfile_throughput.c`：
 
-**服务端**：`listen → accept → read 循环计数 → 计时 → 打印吞吐量`
+**服务端**：`listen → accept → read 循环计数 → 打印总接收量`（纯接收，不计时）
 
 **客户端**：
 
 1. 创建临时文件 `/tmp/perf_test_file`：`write_full` 填充 `iters × size` 字节（'S'）
 2. 连接服务端 TCP
-3. `for i in 0..iters:` `sendfile(sock_fd, file_fd, &offset, size)` —— 内核直接搬运文件页到 socket 缓冲区，不走用户态
-4. `shutdown(SHUT_WR)` 通知服务端结束 → 服务端统计耗时
+3. `t0 = now_us()` → `for i in 0..iters:` `sendfile(sock_fd, file_fd, &offset, size)` → `t1 = now_us()`
+4. `shutdown(SHUT_WR)` 通知服务端结束
+5. 吞吐量 = `(total_sent × 8) / elapsed_s`（`total_sent` 为 `sendfile()` 实际返回的发送字节数）
 
 ```c
 // 核心调用：一次 sendfile 搬运 size 字节
@@ -2129,39 +2136,48 @@ throughput = (actual_iters * size * 8) / elapsed_s   // bps
 | 内核协议栈    |  TCP 全栈  |     TCP 全栈     | 绕过，UDP 封装 | 绕过，UDP 封装 |
 | 远端 CPU 参与 | 参与 recv |    参与 recv    |   **不参与**   |   参与 recv   |
 | 连接管理      |  TCP 握手  |     TCP 握手     |    rdma_cm    |    rdma_cm    |
+| 计时端        |    发方    |      发方       |     发方       |     发方      |
 
-理论预期：RDMA WRITE > RDMA SEND ≈ sendfile > iperf3 TCP。但在 KVM + Soft-RoCE 虚拟网络中，UDP 封装和虚拟交换机处理成为瓶颈，**结果倒挂**。
+理论预期（硬件 RDMA）：RDMA WRITE > RDMA SEND > sendfile ≈ iperf3 TCP。但在 Soft-RoCE + KVM 虚拟网络中，rxe 每个 WR 需在内核软件路径按 Path MTU 构造多个语义各异的 RoCEv2 包，而 TCP 的 TSO/GSO 将分段推迟到 virtio/NIC 层完成，**结果倒挂**。
 
 **测试结果**
 
+> **2026-07-23 重测**（v5，测试与生产全量同步传输路径一致）
+>
+> **测试方法**：
+> - RDMA v5：`IBV_WR_SEND`，send_slots=16，recv_slots=64，QP depth=64，batch post（`wr.next` 链接 8 WR），选择性 signaling（每 8 WR 1 CQE），batch tracker 批量回收，seq/len header，FIN/ACK 握手，ACK RECV 预投递，独立 ACK send buffer。**双指标**：`send-local` 和 `e2e`
+> - sendfile：短发送循环补齐，服务端 ACK 确认，双指标
+> - iperf3：`-t 5` 发方均值
+> - 全部 64KB payload，3 次取中位数，计时统一在发方
 
-| 传输方式   | Payload |         吞吐量 | 对比 iperf3 |
-| ---------- | ------- | -------------: | ----------: |
-| iperf3 TCP | —      | **5,370 Mbps** |        基准 |
-| sendfile   | 4KB     |     5,430 Mbps |       +1.1% |
-| sendfile   | 64KB    |     5,700 Mbps |       +6.1% |
-| sendfile   | 256KB   |     5,620 Mbps |       +4.7% |
-| sendfile   | 1MB     |     5,580 Mbps |       +3.9% |
-| RDMA WRITE | 4KB     |       833 Mbps |     −84.5% |
-| RDMA SEND  | 4KB     |       912 Mbps |     −83.0% |
-| RDMA WRITE | 64KB    |       967 Mbps |     −82.0% |
-| RDMA SEND  | 64KB    |       862 Mbps |     −83.9% |
-| RDMA WRITE | 256KB   |     1,010 Mbps |     −81.2% |
-| RDMA SEND  | 256KB   |       984 Mbps |     −81.7% |
-| RDMA WRITE | 1MB     | **1,020 Mbps** |     −81.0% |
-| RDMA SEND  | 1MB     |       994 Mbps |     −81.5% |
 
-> **2026-06-26 重测**（3 次取中位数，4KB 用 15000 iters 保证 ≥60MB 数据量）
+| 传输方式 | send-local | e2e (ACK) | 对比 iperf3 |
+| -------- | ---------: | --------: | ----------: |
+| iperf3 TCP | — | **4,414 Mbps** | 基准 |
+| sendfile (64KB) | — | 4,480 Mbps | +1.5% |
+| RDMA SEND v5 (64KB) | 334 Mbps | 330 Mbps | −92.5% |
+
+> sendfile 的 send-local 和 e2e 几乎一致（TCP shutdown 后数据基本已送达）。
+> RDMA 的 send-local 和 e2e 差距 ~100ms（FIN → server 处理 → ACK 回传的 RTT）。
+> RDMA WC 5001/0 error，ACK 确认成功，seq 无错误。
 
 **关键发现**
 
-1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA 操作通过 RoCEv2 UDP 封装，吞吐量仅为 TCP 的 ~7-18%
-2. **本地 RDMA 可达 45 Gbps**（同机 rxe0 loopback，64KB × 500 iters），证明代码路径本身高效，瓶颈在网络
-3. **kernel 6.1 rxe 跨机性能回归**：kernel 6.1 rxe 发包吞吐仅为 kernel 5.15 的 ~40%（365 vs 892 Mbps，同代码同网络）。本地 loopback 不受影响（6.1 反而更快），问题出在 rxe RoCEv2 UDP 发送路径与 KVM 虚拟网络的交互
-4. **RDMA WRITE ≈ RDMA SEND**：瓶颈在底层 RoCEv2 UDP 路径，而非 RDMA 操作类型
-5. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 基本持平（5.4-5.7 Gbps），跨机场景内核 TCP 栈已充分优化
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA SEND e2e ~330 Mbps，仅为 TCP 的 ~7.5%。根因是 rxe 按 Path MTU (1024B) 将每个 64KB WR 切为 ~64 个 RoCEv2 包，每包在 CPU 上独立构造（不同 BTH opcode/PSN/ICRC），无法利用通用 UDP GSO/USO。对应的包速率约 40-43 Kpps
 
-> **注意**：硬件 RDMA（InfiniBand / 硬件 RoCE）跨机吞吐量预期远超 TCP。Soft-RoCE 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。kernel 版本对 rxe 跨机性能影响显著，如需稳定基线建议固定 kernel 版本。
+2. **Batch post + 选择性 CQE 未带来吞吐提升**：v4/v5 与 v3 吞吐无显著差异（~330 vs ~325 Mbps），确认当前瓶颈不在 `ibv_post_send()` 次数或 CQE 数量，而在 rxe 逐包软件处理及 UDP/IP/virtio/softirq 路径
+
+3. **~40 Kpps 是当前单核观察值，不等于硬件上限**：实测约 40-43 K 个 RoCE 包/秒，对应单核 system ~73%。这可能受限于单个 CPU 的 RXE 处理、virtio 单队列、UDP 流被 RSS 固定到同一队列或 guest vCPU 调度。只有排除上述因素后才可称为"单核包处理上限"；多 QP 跨核可能进一步提升
+
+4. **本地 RDMA 可达 76.8 Gbps**（同机 rxe0 loopback），证明应用层 RDMA 代码路径本身高效，瓶颈在跨机网络的每包软件处理
+
+5. **sendfile ≈ iperf3**：`sendfile()` 零拷贝接近 iperf3 裸 TCP，跨机 ~4.5 Gbps 链路基本跑满。TCP 通过 TSO/GSO 将分段推迟到 virtio/NIC 层完成
+
+6. **下一步方向**：
+   - **Path MTU**：当前虚拟网络端到端 MTU 受限（guest virtio → TAP → bridge/OVS → 宿主机物理 NIC → 交换机），任意一层 ≤1500 则 QP Path MTU 无法从 1024 提到 4096。修改需宿主机权限
+   - **多 QP**：测试程序可立即增加 2/4/8 线程+QP 验证跨核扩展；生产代码需增加 chunk 序号 (`sync_id` + `chunk_seq`)、按序重排和 `pwrite` 按 offset 写盘，成本中等但不需重写同步系统
+   - **CPU 绑核**：guest 内 `taskset` 可隔离应用线程；完整分离 RXE、guest softirq、vhost 和宿主机 NIC IRQ 需宿主机权限
+   - **硬件 RoCE NIC**：NIC 自取 WQE、自主分片、构造 RoCEv2 包，CPU 只写 doorbell
 
 ---
 

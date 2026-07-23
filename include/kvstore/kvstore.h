@@ -300,6 +300,7 @@ typedef struct {
     int rdma_ib_port;
     int rdma_gid_idx;
     int rdma_port;          /* RDMA listener port (0 = auto: main port + 1) */
+    int rdma_send_slots;
     int rdma_recv_slots;
     int rdma_chunk_size;
     int rdma_qp_wr_depth;
@@ -429,6 +430,7 @@ const char *repl_realtime_transport_name(void);
 int repl_transport_send(conn_t *c, const unsigned char *buf, size_t len);
 int repl_transport_send_many(conn_t *c, const unsigned char *buf1, size_t len1, const unsigned char *buf2, size_t len2);
 int repl_fullsync_send(conn_t *c, const unsigned char *buf, size_t len);
+int repl_rdma_flush_batch(void);  /* P3.1b: flush RDMA send batch */
 int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len);
 int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len);
 int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int send_ctx);

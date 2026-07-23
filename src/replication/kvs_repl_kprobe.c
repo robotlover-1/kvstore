@@ -1137,10 +1137,12 @@ void repl_kprobe_fwd_health_check(void) {
         last_logged = g_fwd_log_count;
     }
 
-    /* 1. 无写流量 — 不判故障，检查恢复条件 */
+    /* 1. 无写流量 — 不判故障，检查恢复条件。
+     * ebpf+tcp 由 proxy 独立进程转发，跳过 kprobe 健康检查。 */
     if (now - g_last_write_ts > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {
         pthread_mutex_lock(&g_repl_lock);
         for (conn_t *c = g_replicas; c; c = c->next_replica) {
+            if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) continue;
             if (!c->fwd_healthy && !c->repl_draining
                 && !c->repl_fullsync_pending) {
                 c->fwd_healthy = 1;
@@ -1153,9 +1155,11 @@ void repl_kprobe_fwd_health_check(void) {
         return;
     }
 
-    /* 2. 有写流量 — 检查 per-slave 转发活跃度 */
+    /* 2. 有写流量 — 检查 per-slave 转发活跃度
+     * 仅对 kprobe-rdma 有效，ebpf+tcp 由 proxy 独立进程处理，跳过 */
     pthread_mutex_lock(&g_repl_lock);
     for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) continue;
         if (!c->fwd_healthy) continue;
         if (c->repl_draining || c->repl_fullsync_pending) continue;
         if (now - c->fwd_last_active > KVS_KPROBE_FWD_HEALTH_TIMEOUT) {

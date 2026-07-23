@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -59,8 +60,11 @@ static int g_cpu          = -1;      /* -1 = 不使用 CPU 亲和性 */
 static const char *g_csv_file = NULL;
 static const char *g_ebpf_proxy_bin = EBPF_PROXY_BIN;
 static const char *g_client_capture_obj = CLIENT_CAPTURE_OBJ;
+static const char *g_master_host = "127.0.0.1";
 static const char *g_slave_host = "127.0.0.1";
 static int g_no_local_slave = 0;
+static int g_client_only = 0;  /* 仅运行客户端，连远端 master */
+static int g_no_client = 0;    /* 不运行客户端，等待远端 client 连接 */
 
 /* ---- Slave 进程（独立 PID，避免 BPF 反馈循环）----
  * Slave 必须在独立进程中运行，因为 BPF kprobe 按 PID 过滤。
@@ -324,7 +328,7 @@ static void *master_echo_sync(void *arg) {
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     struct sockaddr_in addr = {.sin_family = AF_INET,
-                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+                               .sin_addr.s_addr = htonl(INADDR_ANY),
                                .sin_port = htons(m->port)};
     bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
     listen(listen_fd, 1);
@@ -406,8 +410,9 @@ static void client_process_main(void) {
     set_nodelay(fd);
 
     struct sockaddr_in addr = {.sin_family = AF_INET,
-                               .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
                                .sin_port = htons(MASTER_PORT)};
+    if (inet_pton(AF_INET, g_master_host, &addr.sin_addr) != 1)
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     for (int retry = 0; retry < 50; retry++) {
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
@@ -636,29 +641,8 @@ static qps_result_t run_one_mode(const char *mode_name, const char *mode,
     if (slave_fd >= 0) close(slave_fd);
 
     if (use_ebpf) {
-        /* master 已停，不再有新 read()。等 ebpf-proxy drain ringbuf：
-         * 先不休 proxy，让它继续 poll + forward，直到 slave 收齐数据。 */
-        int echo_count = master.echo_count;
-        fprintf(stderr, "[ebpf] master echoed %d, waiting for slave to catch up...\n",
-                echo_count);
-
-        /* 本地 slave: 轮询 pipe 中的 msg_count。远程 slave: 走外部脚本 poll。 */
-        if (!g_no_local_slave) {
-            /* 本地 slave 在子进程中，无法直接读计数。
-             * 等足够时间让 ringbuf drain（poll 间隔 100ms × 20 = 2s 上限） */
-            usleep(1000000);
-        }
-        /* 远程 slave: 外部脚本负责 poll，这里 sleep 等其收齐 */
-        if (g_no_local_slave) {
-            usleep(2000000);  /* 跨机: 多等一会 */
-        }
-
-        /* 再停 ebpf-proxy（cleanup 会 drain 剩余 ringbuf + flush 缓存 + 转发到 slave） */
         proxy_stop();
     }
-
-    /* 注意：slave 统计在 slave_stop() 中读取（main 中调用），此处不读 */
-    (void)out_slave_msgs;
 
     return r;
 }
@@ -724,6 +708,37 @@ static void system_warmup(void) {
     sleep(1);
 }
 
+/* ---- ebpf ringbuf 排空检测 ----
+ * master_stop 后 ringbuf 可能还有 proxy 未消费的条目。
+ * 创建临时 ring_buffer reader，poll 直到无数据返回，
+ * 此时 proxy 已将最后一批 writev 推入 slave TCP 发送缓冲。 */
+static int drain_rb_cb(void *ctx, void *data, size_t len) {
+    (void)ctx; (void)data; (void)len;
+    return 0;
+}
+static int ebpf_wait_ringbuf_drain(int timeout_ms) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/client_cache_ringbuf", BPF_PIN_PATH);
+    int map_fd = bpf_obj_get(path);
+    if (map_fd < 0) return -1;
+
+    /* 临时 reader：ringbuf 是多消费者，不会干扰 proxy 的 reader */
+    struct ring_buffer *rb = ring_buffer__new(map_fd, drain_rb_cb, NULL, NULL);
+    if (!rb) { close(map_fd); return -1; }
+
+    int drained = 0;
+    for (int i = 0; i < timeout_ms; i++) {
+        if (ring_buffer__poll(rb, 1) <= 0) {
+            drained = 1;
+            break;
+        }
+    }
+
+    ring_buffer__free(rb);
+    close(map_fd);
+    return drained ? 0 : -1;
+}
+
 /* ---- proxy 就绪检测：轮询 pin map 代替固定 sleep ---- */
 static int proxy_wait_ready(int timeout_ms) {
     char path[512];
@@ -751,7 +766,8 @@ static void usage(const char *prog) {
         "  --csv FILE     输出 CSV 到文件\n"
         "  --proxy-bin    ebpf-proxy 路径 (默认: ./build/ebpf_proxy)\n"
         "  --bpf-obj      client_capture BPF 路径 (默认: build/replication/bpf/repl_client_capture.bpf.o)\n"
-        "  --slave-host   远程 slave 地址 (默认: 127.0.0.1)\n"
+        "  --master-host  客户端连接 master 的地址 (默认: 127.0.0.1)\n"
+        "  --slave-host   转发目标 slave 地址 (默认: 127.0.0.1)\n"
         "  --no-local-slave  不启动本地 slave 进程\n"
         "  --help, -h     帮助\n", prog);
 }
@@ -770,8 +786,11 @@ int main(int argc, char **argv) {
         {"csv", required_argument, 0, 1005},
         {"proxy-bin", required_argument, 0, 1000},
         {"bpf-obj", required_argument, 0, 1001},
+        {"master-host", required_argument, 0, 1006},
         {"slave-host", required_argument, 0, 1002},
         {"no-local-slave", no_argument, 0, 1003},
+        {"client-only", no_argument, 0, 1007},
+        {"no-client", no_argument, 0, 1008},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}};
 
@@ -788,6 +807,9 @@ int main(int argc, char **argv) {
         case 1001: g_client_capture_obj = optarg; break;
         case 1002: g_slave_host = optarg; break;
         case 1003: g_no_local_slave = 1; break;
+        case 1006: g_master_host = optarg; break;
+        case 1007: g_client_only = 1; break;
+        case 1008: g_no_client = 1; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -801,6 +823,13 @@ int main(int argc, char **argv) {
 
     /* CPU 亲和性 */
     if (g_cpu >= 0) set_cpu_affinity(g_cpu);
+
+    /* --client-only: 仅运行客户端，连远端 master，不做转发 */
+    if (g_client_only) {
+        qps_result_t r = run_qps_client();
+        printf("client-only: qps=%.0f completed=%d\n", r.qps, r.completed);
+        return 0;
+    }
 
     /* 系统预热（--mode all 时） */
     int do_all = (strcmp(mode_str, "all") == 0);
@@ -824,21 +853,34 @@ int main(int argc, char **argv) {
         int use_ebpf = (strcmp(modes[i], "ebpf") == 0);
         int use_sync = (strcmp(modes[i], "sync") == 0);
 
-        /* ebpf 模式：提前启动 proxy，所有轮共享 */
+        /* ebpf 模式：提前启动 proxy，所有轮共享。
+         * slave 也需要跨轮复用 — 否则每轮重启 slave 会导致
+         * ebpf-proxy 的 TCP 连接断开（fd 仍 open 但对端已死），
+         * proxy_slave_is_connected() 只看 fd>0 无法检测断连。 */
+        slave_ctx_t ebpf_slave;
+        memset(&ebpf_slave, 0, sizeof(ebpf_slave));
+        if (use_ebpf && !g_no_local_slave) {
+            /* slave 先于 proxy 启动，确保 proxy connect 立即成功 */
+            slave_start(&ebpf_slave, SLAVE_PORT);
+            usleep(100000);  /* 给 slave listen 一点时间 */
+        }
+
         if (use_ebpf) {
             if (proxy_start() != 0) {
                 fprintf(stderr, "[%s] proxy start failed, skipping\n", modes[i]);
+                if (!g_no_local_slave) slave_stop(&ebpf_slave);
                 continue;
             }
             if (proxy_write_config(getpid(), SLAVE_PORT) != 0) {
                 fprintf(stderr, "[%s] proxy config failed, skipping\n", modes[i]);
                 proxy_stop();
+                if (!g_no_local_slave) slave_stop(&ebpf_slave);
                 continue;
             }
             /* 轮询等待 proxy 就绪，代替固定 usleep */
             proxy_wait_ready(5000);
-            /* 额外等一小段时间让 proxy 连接 slave */
-            usleep(200000);
+            /* 等 proxy 连接上已启动的 slave */
+            usleep(500000);
         }
 
         /* 收集所有轮次的结果 */
@@ -846,11 +888,16 @@ int main(int argc, char **argv) {
         int completed = 0;
 
         for (int r = 0; r < g_rounds; r++) {
-            /* 启动 slave（本地或跳过） */
+            /* 启动 slave（ebpf 模式 slave 跨轮复用，见上方） */
             slave_ctx_t slave;
             memset(&slave, 0, sizeof(slave));
-            if (!g_no_local_slave)
-                slave_start(&slave, SLAVE_PORT);
+            int slave_is_shared = (use_ebpf && !g_no_local_slave);
+            if (!slave_is_shared) {
+                if (!g_no_local_slave)
+                    slave_start(&slave, SLAVE_PORT);
+            } else {
+                slave = ebpf_slave;  /* 复用跨轮 slave */
+            }
 
             /* sync 模式需要 slave_fd */
             int slave_fd = -1;
@@ -875,25 +922,76 @@ int main(int argc, char **argv) {
             master_ctx_t master;
             void *(*thread_func)(void *) = use_sync ?
                 master_echo_sync : master_echo_none;
+
+            if (g_no_client) {
+                /* 仅启动 master，等待远端 client 连接并完成。
+                 * 不调 master_stop（会 shutdown 导致 accept 报错），
+                 * 直接 pthread_join 等 client 关闭连接后 master 线程自然退出。 */
+                if (master_start(&master, MASTER_PORT, slave_fd,
+                                 thread_func) == 0) {
+                    fprintf(stderr, "[%-7s] master ready (pid=%d), "
+                            "waiting for client...\n",
+                            modes[i], getpid());
+                    pthread_join(master.thread, NULL);
+                    close(master.listen_fd);
+                    if (use_ebpf)
+                        ebpf_wait_ringbuf_drain(100);
+                    fprintf(stderr, "[%-7s] client done, drained\n",
+                            modes[i]);
+                }
+                /* 只运行一轮 */
+                break;
+            }
+
+            double t_wall_start = now_us();
             if (master_start(&master, MASTER_PORT, slave_fd, thread_func) == 0) {
                 qps_result_t result = run_qps_client();
                 master_stop(&master);
-                qps_vals[r] = result.qps;
+
+                /* ebpf: 等 proxy 排空 ringbuf 并 writev 到 slave TCP 发送缓冲。
+                 * proxy 每 1ms poll，排空后 writev 即完成。
+                 * 此时与 sync 的 write_full 返回点等价。 */
+                if (use_ebpf)
+                    ebpf_wait_ringbuf_drain(100 /* ms */);
+
+                double t_wall_end = now_us();
+                double total_elapsed = t_wall_end - t_wall_start;
+                int n_done = result.completed > 0 ? result.completed : g_req_count;
+                qps_vals[r] = total_elapsed > 0
+                    ? (double)n_done / total_elapsed * 1e6 : 0;
                 completed++;
+
+                fprintf(stderr, "[%-7s] round %d: echo_qps=%.0f wall_qps=%.0f "
+                        "elapsed=%.0fus\n",
+                        modes[i], r + 1, result.qps, qps_vals[r], total_elapsed);
             }
             if (slave_fd >= 0) close(slave_fd);
 
-            /* 停止 slave */
-            if (!g_no_local_slave) {
+            /* 停止 slave（ebpf 模式 slave 跨轮复用，最后一轮后统一停止） */
+            if (!slave_is_shared && !g_no_local_slave) {
                 slave_stop(&slave);
-                if (r == 0 || r == g_rounds - 1)
+                /* sync: 校验每轮 slave 收全数据（含客户端 warmup） */
+                if (use_sync) {
+                    int warmup = g_req_count / 10;
+                    if (warmup < 100) warmup = 100;
+                    if (warmup > 500) warmup = 500;
+                    long long rnd_expected = (long long)g_payload_size *
+                                             (g_req_count + warmup);
+                    fprintf(stderr, "[%-7s] round %d slave: %d msgs, %lld bytes "
+                            "(expected %lld) %s\n",
+                            modes[i], r + 1, slave.msg_count, slave.total_bytes,
+                            rnd_expected,
+                            slave.total_bytes == rnd_expected ? "OK" : "MISMATCH");
+                } else {
                     fprintf(stderr, "[%-7s] round %d slave: %d msgs, %lld bytes\n",
                             modes[i], r + 1, slave.msg_count, slave.total_bytes);
+                }
+            } else if (slave_is_shared) {
+                /* ebpf 跨轮 slave: 只打印，不停止 */
+                if (r == 0 || r == g_rounds - 1)
+                    fprintf(stderr, "[%-7s] round %d slave shared (pid=%d)\n",
+                            modes[i], r + 1, ebpf_slave.pid);
             }
-
-            /* ebpf: 等待 proxy drain（不停止 proxy） */
-            if (use_ebpf)
-                usleep(g_no_local_slave ? 1500000 : 500000);
 
             if (r == 0)
                 fprintf(stderr, "[%-7s] warmup done\n", modes[i]);
@@ -901,8 +999,25 @@ int main(int argc, char **argv) {
                 usleep(200000);  /* 轮间短冷却 */
         }
 
-        /* 停止 ebpf-proxy */
+        /* 停止 ebpf-proxy（先于 slave，避免 proxy 写已关闭的 fd） */
         if (use_ebpf) proxy_stop();
+        /* 停止 ebpf 跨轮 slave */
+        if (use_ebpf && !g_no_local_slave) {
+            slave_stop(&ebpf_slave);
+            /* 数据校验：ebpf 转发是否完整到达 slave（含每轮客户端 warmup） */
+            int warmup = g_req_count / 10;
+            if (warmup < 100) warmup = 100;
+            if (warmup > 500) warmup = 500;
+            long long expected_bytes = (long long)g_payload_size *
+                                       (g_req_count + warmup) * g_rounds;
+            fprintf(stderr, "[%-7s] final slave: msgs=%d bytes=%lld "
+                    "expected=%lld\n",
+                    modes[i], ebpf_slave.msg_count, ebpf_slave.total_bytes,
+                    expected_bytes);
+            fprintf(stderr, "[%-7s] slave data integrity: %s\n",
+                    modes[i],
+                    ebpf_slave.total_bytes == expected_bytes ? "OK" : "MISMATCH");
+        }
 
         /* 计算统计（跳过第 0 轮 warmup） */
         int meas = g_rounds - 1;

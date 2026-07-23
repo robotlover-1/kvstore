@@ -2163,26 +2163,21 @@ throughput = (actual_iters * size * 8) / elapsed_s   // bps
 
 **关键发现**
 
-1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA SEND e2e ~330 Mbps，仅为 TCP 的 ~7.5%。根因是 rxe 按 Path MTU (1024B) 将每个 64KB WR 切为 ~64 个 RoCEv2 包，每包在 CPU 上独立构造（不同 BTH opcode/PSN/ICRC），无法利用通用 UDP GSO/USO。~40,900 pps 已接近单核 rxe 软件处理上限
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA SEND e2e ~330 Mbps，仅为 TCP 的 ~7.5%。根因是 rxe 按 Path MTU (1024B) 将每个 64KB WR 切为 ~64 个 RoCEv2 包，每包在 CPU 上独立构造（不同 BTH opcode/PSN/ICRC），无法利用通用 UDP GSO/USO。对应的包速率约 40-43 Kpps
 
-2. **Batch post + 选择性 CQE 未带来吞吐提升**：v4/v5 的批量 post（8 WR 链式）和选择性 signaling（每 8 WR 1 CQE）与 v3（逐 WR post + 全 signal）吞吐无显著差异（~330 vs ~325 Mbps），确认当前瓶颈不在 `ibv_post_send()` 次数或 CQE 数量，而在 rxe 逐包软件处理及 UDP/IP/virtio/softirq 路径
+2. **Batch post + 选择性 CQE 未带来吞吐提升**：v4/v5 与 v3 吞吐无显著差异（~330 vs ~325 Mbps），确认当前瓶颈不在 `ibv_post_send()` 次数或 CQE 数量，而在 rxe 逐包软件处理及 UDP/IP/virtio/softirq 路径
 
-3. **本地 RDMA 可达 76.8 Gbps**（同机 rxe0 loopback），证明应用层 RDMA 代码路径本身高效，瓶颈在跨机网络的每包 virtio/KVM 处理
+3. **~40 Kpps 是当前单核观察值，不等于硬件上限**：实测约 40-43 K 个 RoCE 包/秒，对应单核 system ~73%。这可能受限于单个 CPU 的 RXE 处理、virtio 单队列、UDP 流被 RSS 固定到同一队列或 guest vCPU 调度。只有排除上述因素后才可称为"单核包处理上限"；多 QP 跨核可能进一步提升
 
-4. **sendfile ≈ iperf3**：`sendfile()` 零拷贝接近 iperf3 裸 TCP，跨机 ~4.5 Gbps 链路基本跑满
+4. **本地 RDMA 可达 76.8 Gbps**（同机 rxe0 loopback），证明应用层 RDMA 代码路径本身高效，瓶颈在跨机网络的每包软件处理
 
-5. **下一步方向**：提高 Path MTU（需 KVM 宿主机支持 jumbo frames）→ 多 QP 跨核扩展 → 硬件 RoCE NIC。继续增大 send_slots 或减小 BATCH_MAX 不会改变单核 pps 瓶颈
+5. **sendfile ≈ iperf3**：`sendfile()` 零拷贝接近 iperf3 裸 TCP，跨机 ~4.5 Gbps 链路基本跑满。TCP 通过 TSO/GSO 将分段推迟到 virtio/NIC 层完成
 
-4. **sendfile ≈ iperf3 TCP**：TCP + TSO/GSO 将分段推迟到 virtio/NIC 层，跨机可跑满 ~4.5 Gbps 链路
-
-5. **跨机 RDMA 慢的机理**（Path MTU 1024，CPU3 单核 system ~73%）：
-   - rxe requester 逐个构造 64 个 RoCEv2 包/WR → UDP tunnel → qdisc → dev_queue_xmit → virtio
-   - 每个包语义不同（BTH/PSN/ICRC），必须软件生成，无法推迟到下层 offload
-   - 同 TCP 对比：TCP 构造大 skb → TSO/GSO 在下层复制相同 TCP 头拆成 ~45 段，per-byte CPU 开销低近两个数量级
-
-6. **硬件 RDMA 无此问题**：硬件 RoCE NIC 的 `ibv_post_send()` 只是用户态写 WQE + MMIO doorbell，NIC 自取 WQE、自主分片、构造 RoCEv2 包
-
-> **注意**：Soft-RoCE (rxe) 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。kernel 版本对 rxe 跨机性能影响显著（kernel 6.1 仅为 5.15 的 ~40%）。
+6. **下一步方向**：
+   - **Path MTU**：当前虚拟网络端到端 MTU 受限（guest virtio → TAP → bridge/OVS → 宿主机物理 NIC → 交换机），任意一层 ≤1500 则 QP Path MTU 无法从 1024 提到 4096。修改需宿主机权限
+   - **多 QP**：测试程序可立即增加 2/4/8 线程+QP 验证跨核扩展；生产代码需增加 chunk 序号 (`sync_id` + `chunk_seq`)、按序重排和 `pwrite` 按 offset 写盘，成本中等但不需重写同步系统
+   - **CPU 绑核**：guest 内 `taskset` 可隔离应用线程；完整分离 RXE、guest softirq、vhost 和宿主机 NIC IRQ 需宿主机权限
+   - **硬件 RoCE NIC**：NIC 自取 WQE、自主分片、构造 RoCEv2 包，CPU 只写 doorbell
 
 ---
 

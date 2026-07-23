@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <stdint.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -69,10 +70,9 @@ static int run_server(int port) {
     }
     set_nodelay(conn);
 
-    /* 接收并丢弃数据，统计 */
+    /* 接收数据并统计，收到 EOF 后发送 ACK */
     char buf[65536];
     size_t total = 0;
-    double t0 = now_us();
 
     while (1) {
         ssize_t n = read(conn, buf, sizeof(buf));
@@ -80,14 +80,12 @@ static int run_server(int port) {
         total += (size_t)n;
     }
 
-    double t1 = now_us();
-    double elapsed_s = (t1 - t0) / 1000000.0;
-    double throughput_bps = (double)(total * 8) / elapsed_s;
+    /* 发送 ACK：总接收量 */
+    uint64_t ack[2] = { total, 0 };  /* total_bytes, checksum (reserved) */
+    write_full(conn, ack, sizeof(ack));
 
-    printf("\n=== sendfile 吞吐量结果（服务端）===\n");
+    printf("\n=== sendfile 接收统计（服务端，ACK 已发送）===\n");
     printf("  总接收:     %.2f MB\n", (double)total / (1024.0 * 1024.0));
-    printf("  耗时:       %.3f s\n", elapsed_s);
-    printf("  吞吐量:     %s\n", throughput_str(throughput_bps));
 
     close(conn);
     close(listen_fd);
@@ -159,43 +157,62 @@ static int run_client(const char *host, size_t buf_size, int iters, int port) {
     }
     set_nodelay(sock);
 
-    /* sendfile 传输 */
+    /* sendfile 传输（循环补齐短发送） */
     size_t total_sent = 0;
     double t0 = now_us();
 
     off_t offset = 0;
     for (int i = 0; i < iters; i++) {
-        ssize_t n = sendfile(sock, fd, &offset, buf_size);
-        if (n < 0) {
-            perror("sendfile");
-            break;
+        size_t left = buf_size;
+        while (left > 0) {
+            ssize_t n = sendfile(sock, fd, &offset, left);
+            if (n > 0) {
+                left -= (size_t)n;
+                total_sent += (size_t)n;
+                continue;
+            }
+            if (n == 0) {
+                /* 文件到头，重置 offset 继续 */
+                offset = 0;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                usleep(100); continue;
+            }
+            /* 其他错误 */
+            perror("sendfile"); goto done_send;
         }
-        if (n == 0) {
-            /* 文件到头，重置 offset */
-            offset = 0;
-            n = sendfile(sock, fd, &offset, buf_size);
-            if (n <= 0) break;
-        }
-        total_sent += (size_t)n;
     }
 
+done_send:
     /* 确保数据已发送 */
     shutdown(sock, SHUT_WR);
+    double t1_send = now_us();
 
-    double t1 = now_us();
-    double elapsed_s = (t1 - t0) / 1000000.0;
-    double throughput_bps = (double)(total_sent * 8) / elapsed_s;
+    /* 等待服务端 ACK */
+    uint64_t ack[2] = {0, 0};
+    ssize_t ack_n = read_full(sock, ack, sizeof(ack));
+    double t1_ack = now_us();
 
-    printf("\n=== sendfile 吞吐量结果（客户端）===\n");
+    double elapsed_send_s = (t1_send - t0) / 1000000.0;
+    double elapsed_ack_s  = (t1_ack - t0) / 1000000.0;
+    double throughput_send_bps = (double)(total_sent * 8) / elapsed_send_s;
+    double throughput_ack_bps  = (double)(total_sent * 8) / elapsed_ack_s;
+
+    printf("\n=== sendfile 吞吐量结果 ===\n");
     printf("  payload:    %zu bytes\n", buf_size);
     printf("  iters:      %d\n", iters);
     printf("  总发送:     %.2f MB\n", (double)total_sent / (1024.0 * 1024.0));
-    printf("  耗时:       %.3f s\n", elapsed_s);
-    printf("  吞吐量:     %s\n", throughput_str(throughput_bps));
-
-    /* 等待服务端确认收到 */
-    char dummy;
-    if (read(sock, &dummy, 1) < 0) { /* ignore */ }
+    if (ack_n == (ssize_t)sizeof(ack)) {
+        printf("  服务端确认: %.2f MB (ACK recv)\n",
+               (double)ack[0] / (1024.0 * 1024.0));
+    }
+    printf("\n");
+    printf("  [send-local] 耗时: %.3f s  吞吐量: %s\n",
+           elapsed_send_s, throughput_str(throughput_send_bps));
+    printf("  [e2e (ACK)]  耗时: %.3f s  吞吐量: %s\n",
+           elapsed_ack_s, throughput_str(throughput_ack_bps));
 
     close(sock);
     close(fd);

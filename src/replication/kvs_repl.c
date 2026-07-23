@@ -90,16 +90,27 @@ static char g_slave_state_path[512] = {0};
 static conn_t g_rdma_master_replica_conn = {0};
 
 #if KVS_ENABLE_RDMA
-#define KVS_RDMA_RECV_SLOTS_MAX 64
-#define KVS_RDMA_RECV_SLOTS_DEFAULT 32
+#define KVS_RDMA_RECV_SLOTS_MAX 128
+#define KVS_RDMA_RECV_SLOTS_DEFAULT 64             /* P3: 32→64 */
 #define KVS_RDMA_CHUNK_SIZE_DEFAULT (BUFFER_CAP * 4)
 #define KVS_RDMA_QP_WR_DEPTH_DEFAULT 64
 
 /* ---- Pipeline Constants ---- */
-#define KVS_RDMA_PIPELINE_DEPTH      4   /* 多发送缓冲区深度 */
+#define KVS_RDMA_SEND_SLOTS_MAX   64              /* P3: 最大发送管道深度 */
+#define KVS_RDMA_SEND_SLOTS_DEFAULT 16            /* P3: 默认 16（原固定 4） */
 #define KVS_RDMA_CQ_BATCH            8   /* CQ 批量 poll 大小 */
-#define KVS_RDMA_BATCH_MAX           8   /* 批量 send WR 上限 */
-#define KVS_RDMA_PIPELINE_WR_ID_FLAG 0x80000000UL  /* wr_id 高位标记，区分 pipeline send vs recv */
+#define KVS_RDMA_BATCH_MAX           8   /* 批量 send WR 上限（wr.next 链） */
+#define KVS_RDMA_SIGNAL_INTERVAL     8   /* P3: 每 N 个 WR 产生 1 个 CQE */
+#define KVS_RDMA_MAX_BATCH_TRACKERS  64  /* P3.2: 最多追踪 64 个 batch（64×8=512 slot） */
+#define KVS_RDMA_PIPELINE_WR_ID_FLAG 0x80000000UL  /* wr_id 高位标记 pipeline send */
+
+/* P3.2: batch tracker — 追踪批量 post 中各 slot，选择性 signal 时用于批量回收 */
+typedef struct {
+    int slots[KVS_RDMA_BATCH_MAX];
+    int count;
+    int signaled_slot;  /* 该 batch 中被 signaled 的 slot 索引 */
+    int active;         /* 1 = pending, 0 = free */
+} rdma_batch_tracker_t;
 
 typedef enum repl_rdma_state_e {
     REPL_RDMA_STATE_INIT = 0,
@@ -162,15 +173,29 @@ typedef struct repl_rdma_ctx_s {
     int connected;
     repl_rdma_state_t state;
     /* ---- Pipeline 发送缓冲区 ---- */
-    repl_rdma_send_slot_t send_slots[KVS_RDMA_PIPELINE_DEPTH];
+    repl_rdma_send_slot_t send_slots[KVS_RDMA_SEND_SLOTS_MAX];
     int send_pipeline_head;          /* 下一个可用的空闲 slot 索引 */
     int send_slots_in_flight;        /* 当前 outstanding send WR 数 */
-    int send_pipeline_depth;         /* 当前生效的 pipeline 深度（≤ KVS_RDMA_PIPELINE_DEPTH） */
+    int send_pipeline_depth;         /* 当前生效的 pipeline 深度（≤ KVS_RDMA_SEND_SLOTS_MAX） */
     int send_pipeline_enabled;       /* 是否启用 pipeline 模式 */
 
     /* ---- CQ 轮询线程 ---- */
     pthread_t cq_poll_thread;        /* CQ 轮询线程 ID */
     int cq_poll_thread_running;      /* CQ 轮询线程是否运行 */
+
+    /* P3.3: 条件变量 — CQ 线程释放 slot 后唤醒发送线程。
+     * 使用 g_repl_rdma_send_lock 作为保护锁，pthread_cond_wait 会原子解锁等。
+     */
+    pthread_cond_t send_slot_cond;
+
+    /* P3.1b: 批量 post — 积累 WR 后一次 ibv_post_send */
+    int pending_batch_count;
+    int pending_batch_slots[KVS_RDMA_BATCH_MAX];
+    size_t pending_batch_lens[KVS_RDMA_BATCH_MAX];
+
+    /* P3.2: batch tracker — 选择性 signal 时追踪 batch → 批量回收 */
+    rdma_batch_tracker_t batch_trackers[KVS_RDMA_MAX_BATCH_TRACKERS];
+    int batch_tracker_next;  /* 下一个可用 tracker 索引 */
 } repl_rdma_ctx_t;
 
 static repl_rdma_ctx_t g_repl_rdma_ctx = {0};
@@ -241,6 +266,13 @@ static int repl_rdma_cfg_recv_slots(void) {
     return v;
 }
 
+static int repl_rdma_cfg_send_slots(void) {
+    int v = g_cfg.rdma_send_slots;
+    if (v <= 0) v = KVS_RDMA_SEND_SLOTS_DEFAULT;
+    if (v > KVS_RDMA_SEND_SLOTS_MAX) v = KVS_RDMA_SEND_SLOTS_MAX;
+    return v;
+}
+
 static int repl_rdma_cfg_qp_wr_depth(void) {
     int v = g_cfg.rdma_qp_wr_depth;
     int min_depth = repl_rdma_cfg_recv_slots() * 2;
@@ -265,6 +297,7 @@ static void repl_rdma_refresh_runtime_cfg(void) {
 /* 前向声明 */
 static int repl_rdma_pending_recv_push(int slot, size_t len);
 static int repl_rdma_pending_recv_pop(int *slot_out, size_t *len_out);
+static int repl_rdma_flush_batch_locked(void);
 static void repl_rdma_stop_cq_poll_thread(void);
 static volatile int g_cq_poll_thread_exited = 0;
 static int repl_rdma_start_cq_poll_thread(void);
@@ -289,10 +322,26 @@ static int repl_rdma_acquire_send_slot(int timeout_ms) {
         }
         /* 所有 slot 均在飞行中 */
         if (g_repl_rdma_ctx.cq_poll_thread_running) {
-            /* CQ 轮询线程在后台运行，不直接 poll CQ，等它释放 slot */
+            /* P3.3: CQ 线程 release_send_slot 时 signal，pthread_cond_timedwait
+             * 原子解锁 g_repl_rdma_send_lock → 等待 → 重新加锁。
+             * 50ms 超时作回退（CQ 线程可能阻塞在 ibv_get_cq_event）。 */
             if (timeout_ms <= 0) break;
-            if (kvs_now_ms() >= deadline) break;
-            usleep(500);
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                long long remaining_ms = deadline - kvs_now_ms();
+                if (remaining_ms <= 0) break;
+                if (remaining_ms > 50) remaining_ms = 50;
+                ts.tv_sec += (time_t)(remaining_ms / 1000);
+                ts.tv_nsec += (long)((remaining_ms % 1000) * 1000000);
+                if (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec++; ts.tv_nsec -= 1000000000L;
+                }
+                /* cond_wait 会原子释放锁并在被唤醒时重新加锁，
+                 * 这正是我们需要的——释放锁让 CQ 线程可以 signal */
+                pthread_cond_timedwait(&g_repl_rdma_ctx.send_slot_cond,
+                                       &g_repl_rdma_send_lock, &ts);
+            }
             continue;
         }
         /* CQ 轮询线程未运行：直接 poll CQ 回收 completion */
@@ -337,6 +386,10 @@ static void repl_rdma_release_send_slot(int slot) {
         g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
         g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
         g_repl_rdma_ctx.send_slots_in_flight--;
+        /* P3.3: 通知等待 slot 的发送线程 */
+        pthread_mutex_lock(&g_repl_rdma_send_lock);
+        pthread_cond_signal(&g_repl_rdma_ctx.send_slot_cond);
+        pthread_mutex_unlock(&g_repl_rdma_send_lock);
     }
 }
 
@@ -390,7 +443,7 @@ static void repl_rdma_reset_conn_ctx(int preserve_listener) {
     }
     g_repl_rdma_ctx.send_buf_cap = 0;
     /* 清理 pipeline 多发送缓冲区 */
-    for (i = 0; i < KVS_RDMA_PIPELINE_DEPTH; ++i) {
+    for (i = 0; i < KVS_RDMA_SEND_SLOTS_MAX; ++i) {
         if (g_repl_rdma_ctx.send_slots[i].mr) {
             ibv_dereg_mr(g_repl_rdma_ctx.send_slots[i].mr);
             g_repl_rdma_ctx.send_slots[i].mr = NULL;
@@ -405,7 +458,7 @@ static void repl_rdma_reset_conn_ctx(int preserve_listener) {
     }
     g_repl_rdma_ctx.send_pipeline_head = 0;
     g_repl_rdma_ctx.send_slots_in_flight = 0;
-    g_repl_rdma_ctx.send_pipeline_depth = KVS_RDMA_PIPELINE_DEPTH;
+    g_repl_rdma_ctx.send_pipeline_depth = KVS_RDMA_SEND_SLOTS_MAX;
     g_repl_rdma_ctx.send_pipeline_enabled = 0;
     g_repl_rdma_ctx.recv_buf_cap = 0;
     memset(g_repl_rdma_ctx.pending_recv_slots, 0, sizeof(g_repl_rdma_ctx.pending_recv_slots));
@@ -643,6 +696,12 @@ static int repl_rdma_connect_handshake(void) {
 
 static int repl_rdma_prepare_buffers(void) {
     repl_rdma_refresh_runtime_cfg();
+    /* P3.3: 初始化条件变量（若已初始化则跳过） */
+    static int cond_inited = 0;
+    if (!cond_inited) {
+        pthread_cond_init(&g_repl_rdma_ctx.send_slot_cond, NULL);
+        cond_inited = 1;
+    }
     size_t cap = repl_rdma_cfg_chunk_size();
     if (cap < BUFFER_CAP) cap = BUFFER_CAP;
     int i;
@@ -650,9 +709,10 @@ static int repl_rdma_prepare_buffers(void) {
     /* 分配 pipeline 多发送缓冲区 */
     g_repl_rdma_ctx.send_slots_in_flight = 0;
     g_repl_rdma_ctx.send_pipeline_head = 0;
-    g_repl_rdma_ctx.send_pipeline_depth = KVS_RDMA_PIPELINE_DEPTH;
+    g_repl_rdma_ctx.send_slots_in_flight = 0;
+    g_repl_rdma_ctx.send_pipeline_depth = repl_rdma_cfg_send_slots(); /* P3: 从配置读取 */
     g_repl_rdma_ctx.send_pipeline_enabled = 1;
-    for (i = 0; i < KVS_RDMA_PIPELINE_DEPTH; ++i) {
+    for (i = 0; i < KVS_RDMA_SEND_SLOTS_MAX; ++i) {
         g_repl_rdma_ctx.send_slots[i].buf = (unsigned char *)kvs_malloc(cap);
         if (!g_repl_rdma_ctx.send_slots[i].buf) {
             repl_rdma_log("prepare_buffers", "pipeline send buffer alloc failed");
@@ -744,6 +804,67 @@ static unsigned char *repl_rdma_dup_recv_payload(int slot, size_t len) {
     if (!copy) return NULL;
     memcpy(copy, g_repl_rdma_ctx.recv_slots[slot].buf, len);
     return copy;
+}
+
+/* P3.5: 获取一个已注册的发送 slot buffer 指针，供 pread() 直接写入。
+ * 返回 0 成功，-1 无空闲 slot。调用者写入后必须调用 repl_rdma_commit_write_slot()。 */
+int repl_rdma_get_write_slot(unsigned char **ptr, size_t *cap) {
+    int slot;
+    pthread_mutex_lock(&g_repl_rdma_send_lock);
+    if (repl_rdma_drain_cm_events_nonblock() != 0 ||
+        !g_repl_rdma_ctx.connected || !g_repl_rdma_ctx.id || !g_repl_rdma_ctx.id->qp ||
+        !g_repl_rdma_ctx.send_pipeline_enabled) {
+        pthread_mutex_unlock(&g_repl_rdma_send_lock);
+        return -1;
+    }
+    slot = repl_rdma_acquire_send_slot(5000);
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_repl_rdma_send_lock);
+        return -1;
+    }
+    g_repl_rdma_ctx.send_slots[slot].in_flight = 1;
+    g_repl_rdma_ctx.send_slots[slot].wr_id = (uint64_t)slot | KVS_RDMA_PIPELINE_WR_ID_FLAG;
+    g_repl_rdma_ctx.send_slots_in_flight++;
+    *ptr = g_repl_rdma_ctx.send_slots[slot].buf;
+    *cap = g_repl_rdma_ctx.send_slots[slot].cap;
+    /* 返回 slot 索引（编码在 cap 高位，hack for batch flush） */
+    g_repl_rdma_ctx.pending_batch_slots[g_repl_rdma_ctx.pending_batch_count] = slot;
+    /* caller must set pending_batch_lens */
+    pthread_mutex_unlock(&g_repl_rdma_send_lock);
+    return 0;
+}
+
+/* P3.5: 提交已写入的 send slot。调用者通过 get_write_slot 获取 slot 后直接写入，
+ * 然后调用本函数提交，由 batch flush 机制批量 post。
+ * 必须在同一线程中调用，不重新获取锁（get_write_slot 已释放）。 */
+int repl_rdma_commit_write_slot(size_t len) {
+    pthread_mutex_lock(&g_repl_rdma_send_lock);
+    if (!g_repl_rdma_ctx.connected || g_repl_rdma_ctx.pending_batch_count <= 0) {
+        pthread_mutex_unlock(&g_repl_rdma_send_lock);
+        return -1;
+    }
+    int bi = g_repl_rdma_ctx.pending_batch_count - 1;
+    g_repl_rdma_ctx.pending_batch_lens[bi] = len;
+    g_repl_rdma_ctx.pending_batch_count = bi + 1;
+    /* batch 满时 flush */
+    if (g_repl_rdma_ctx.pending_batch_count >= KVS_RDMA_BATCH_MAX) {
+        if (repl_rdma_flush_batch_locked() != 0) {
+            pthread_mutex_unlock(&g_repl_rdma_send_lock);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&g_repl_rdma_send_lock);
+    return 0;
+}
+
+/* P3.4: 零复制 — 返回注册 MR buffer 的直接指针，不 malloc+memcpy。
+ * 调用者使用完毕后必须调用 repl_rdma_repost_recv(slot) 归还。 */
+static unsigned char *repl_rdma_recv_direct(int slot, size_t *len) {
+    if (slot < 0 || slot >= g_repl_rdma_ctx.active_recv_slots) return NULL;
+    if (!g_repl_rdma_ctx.recv_slots[slot].buf) return NULL;
+    if (*len > g_repl_rdma_ctx.recv_slots[slot].cap)
+        *len = g_repl_rdma_ctx.recv_slots[slot].cap;
+    return g_repl_rdma_ctx.recv_slots[slot].buf;
 }
 
 static int repl_rdma_wait_cq_send_completion(int timeout_ms) {
@@ -887,6 +1008,88 @@ static int repl_rdma_wait_cq_recv_completion(int timeout_ms, int *slot_out, size
     }
 }
 
+/* P3.1b: 批量 flush — 将积累的 WR 链式提交，一次 ibv_post_send。
+ * 调用者必须持有 g_repl_rdma_send_lock。失败时回退所有待发送 slot。 */
+static int repl_rdma_flush_batch_locked(void) {
+    int count = g_repl_rdma_ctx.pending_batch_count;
+    if (count == 0) return 0;
+    struct ibv_sge sge[KVS_RDMA_BATCH_MAX];
+    struct ibv_send_wr wr[KVS_RDMA_BATCH_MAX];
+    struct ibv_send_wr *bad_wr = NULL;
+
+    /* P3.2: 注册 batch tracker — 用于选择性 signal 时批量回收 unsignaled slot */
+    int tracker_idx = -1;
+    {
+        int next = g_repl_rdma_ctx.batch_tracker_next;
+        for (int t = 0; t < KVS_RDMA_MAX_BATCH_TRACKERS; t++) {
+            int idx = (next + t) % KVS_RDMA_MAX_BATCH_TRACKERS;
+            if (!g_repl_rdma_ctx.batch_trackers[idx].active) {
+                tracker_idx = idx;
+                g_repl_rdma_ctx.batch_tracker_next = (idx + 1) % KVS_RDMA_MAX_BATCH_TRACKERS;
+                break;
+            }
+        }
+    }
+    /* 若 tracker 耗尽（不应发生，512 slots 足够），退化为全 signal */
+    int signal_every = (tracker_idx >= 0) ? KVS_RDMA_SIGNAL_INTERVAL : 1;
+    int signaled_slot = -1;
+
+    for (int i = 0; i < count; i++) {
+        int slot = g_repl_rdma_ctx.pending_batch_slots[i];
+        memset(&sge[i], 0, sizeof(sge[i]));
+        sge[i].addr = (uintptr_t)g_repl_rdma_ctx.send_slots[slot].buf;
+        sge[i].length = (uint32_t)g_repl_rdma_ctx.pending_batch_lens[i];
+        sge[i].lkey = g_repl_rdma_ctx.send_slots[slot].mr->lkey;
+        memset(&wr[i], 0, sizeof(wr[i]));
+        wr[i].wr_id = (uint64_t)slot | KVS_RDMA_PIPELINE_WR_ID_FLAG;
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+        wr[i].opcode = IBV_WR_SEND;
+        /* P3.2: 仅每 signal_every 个 WR 中最后一个 signaled */
+        int do_signal = ((i + 1) % signal_every == 0) || (i == count - 1);
+        wr[i].send_flags = do_signal ? IBV_SEND_SIGNALED : 0;
+        if (do_signal) signaled_slot = slot;
+        wr[i].next = (i < count - 1) ? &wr[i + 1] : NULL;
+        /* 填充 tracker */
+        if (tracker_idx >= 0 && i < KVS_RDMA_BATCH_MAX) {
+            g_repl_rdma_ctx.batch_trackers[tracker_idx].slots[i] = slot;
+        }
+    }
+    /* 注册 tracker */
+    if (tracker_idx >= 0) {
+        g_repl_rdma_ctx.batch_trackers[tracker_idx].count = count;
+        g_repl_rdma_ctx.batch_trackers[tracker_idx].signaled_slot = signaled_slot;
+        g_repl_rdma_ctx.batch_trackers[tracker_idx].active = 1;
+    }
+
+    if (ibv_post_send(g_repl_rdma_ctx.id->qp, &wr[0], &bad_wr) != 0) {
+        /* 回退 tracker */
+        if (tracker_idx >= 0) g_repl_rdma_ctx.batch_trackers[tracker_idx].active = 0;
+        /* 回退所有 slot 预占 */
+        for (int i = 0; i < count; i++) {
+            int slot = g_repl_rdma_ctx.pending_batch_slots[i];
+            g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
+            g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
+            g_repl_rdma_ctx.send_slots_in_flight--;
+        }
+        repl_rdma_log("flush_batch", "ibv_post_send batch failed");
+        g_repl_rdma_ctx.connected = 0;
+        g_repl_rdma_ctx.pending_batch_count = 0;
+        return -1;
+    }
+    g_repl_rdma_ctx.pending_batch_count = 0;
+    return 0;
+}
+
+/* P3.1b: 供外部调用的 flush（在发送循环结束后 flush 尾部 batch） */
+int repl_rdma_flush_batch(void) {
+    int rc;
+    pthread_mutex_lock(&g_repl_rdma_send_lock);
+    rc = repl_rdma_flush_batch_locked();
+    pthread_mutex_unlock(&g_repl_rdma_send_lock);
+    return rc;
+}
+
 static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
     struct ibv_sge sge;
     struct ibv_send_wr wr;
@@ -916,29 +1119,24 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
             pthread_mutex_unlock(&g_repl_rdma_send_lock);
             return -1;
         }
-        /* 拷贝数据到 slot buffer */
+        /* 拷贝数据到 slot buffer，积累到 batch，满时批量 post */
         memcpy(g_repl_rdma_ctx.send_slots[slot].buf, buf, len);
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = (uintptr_t)g_repl_rdma_ctx.send_slots[slot].buf;
-        sge.length = (uint32_t)len;
-        sge.lkey = g_repl_rdma_ctx.send_slots[slot].mr->lkey;
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id = (uint64_t)slot | KVS_RDMA_PIPELINE_WR_ID_FLAG;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        if (ibv_post_send(g_repl_rdma_ctx.id->qp, &wr, &bad_wr) != 0) {
-            repl_rdma_log("try_send", "pipeline ibv_post_send failed");
-            repl_rdma_release_send_slot(slot);
-            g_repl_rdma_ctx.connected = 0;
-            pthread_mutex_unlock(&g_repl_rdma_send_lock);
-            return -1;
-        }
-        /* 标记 in_flight，立即返回（不等待 CQ） */
+        /* P2.1: post 前预占 slot */
         g_repl_rdma_ctx.send_slots[slot].in_flight = 1;
-        g_repl_rdma_ctx.send_slots[slot].wr_id = wr.wr_id;
+        g_repl_rdma_ctx.send_slots[slot].wr_id = (uint64_t)slot | KVS_RDMA_PIPELINE_WR_ID_FLAG;
         g_repl_rdma_ctx.send_slots_in_flight++;
+        /* 加入 batch */
+        int bi = g_repl_rdma_ctx.pending_batch_count;
+        g_repl_rdma_ctx.pending_batch_slots[bi] = slot;
+        g_repl_rdma_ctx.pending_batch_lens[bi] = len;
+        g_repl_rdma_ctx.pending_batch_count++;
+        /* batch 满或单次发送时立即 flush */
+        if (g_repl_rdma_ctx.pending_batch_count >= KVS_RDMA_BATCH_MAX) {
+            if (repl_rdma_flush_batch_locked() != 0) {
+                pthread_mutex_unlock(&g_repl_rdma_send_lock);
+                return -1;
+            }
+        }
         pthread_mutex_unlock(&g_repl_rdma_send_lock);
         return 0;
     }
@@ -976,25 +1174,26 @@ static int repl_rdma_try_send(const unsigned char *buf, size_t len) {
 #endif
 
 /* ---- 自适应 Pipeline 深度调节 ----
- * 根据当前 in_flight 数量动态调整 send_pipeline_depth。
- * 目标：保持 pipeline 深度与传输速率匹配，避免过度 in_flight 导致 OOO。
- * 在 CQ 轮询线程中定期调用。
+ * P2.2: 已禁用。缩小 depth 时高位 slot 的 completion 会被跳过（slot >= depth
+ * 检查拒绝释放），导致 in_flight 泄漏和 slot 永久占用。
+ * 后续若需动态调节，应区分 slot_capacity 和 active_window:
+ *   - slot_capacity 不变，始终按 KVS_RDMA_SEND_SLOTS_MAX 回收所有 completion
+ *   - window 只限制 acquire 时不越过当前窗口
  */
-#define KVS_RDMA_PIPELINE_DEPTH_MIN 2
+#if 0  /* P2.2: 已禁用 */
+#define KVS_RDMA_SEND_SLOTS_MAX_MIN 2
 
 static void repl_rdma_adjust_pipeline_depth(void) {
     int in_flight = g_repl_rdma_ctx.send_slots_in_flight;
     int depth = g_repl_rdma_ctx.send_pipeline_depth;
 
-    if (in_flight <= depth / 2 && depth < KVS_RDMA_PIPELINE_DEPTH) {
-        /* pipeline 利用率低 → 增加深度 */
+    if (in_flight <= depth / 2 && depth < KVS_RDMA_SEND_SLOTS_MAX) {
         g_repl_rdma_ctx.send_pipeline_depth = depth + 1;
 #if KVS_REPL_DEBUG
         fprintf(stderr, "repl rdma: pipeline depth %d -> %d (in_flight=%d)\n",
             depth, depth + 1, in_flight);
 #endif
-    } else if (in_flight >= depth && depth > KVS_RDMA_PIPELINE_DEPTH_MIN) {
-        /* pipeline 饱和 → 减少深度 */
+    } else if (in_flight >= depth && depth > KVS_RDMA_SEND_SLOTS_MAX_MIN) {
         g_repl_rdma_ctx.send_pipeline_depth = depth - 1;
 #if KVS_REPL_DEBUG
         fprintf(stderr, "repl rdma: pipeline depth %d -> %d (in_flight=%d)\n",
@@ -1002,9 +1201,10 @@ static void repl_rdma_adjust_pipeline_depth(void) {
 #endif
     }
 }
+#endif /* P2.2 */
 
 /* ---- CQ completion 处理函数（CQ 轮询线程和 fallback 路径共用）---- */
-static void repl_rdma_cq_process_wc(struct ibv_wc *wc, int *adapt_counter) {
+static void repl_rdma_cq_process_wc(struct ibv_wc *wc) {
     if (wc->status != IBV_WC_SUCCESS) {
         fprintf(stderr, "repl rdma: cq_poll error status=%d opcode=%d wr_id=0x%lx\n",
             wc->status, wc->opcode, (unsigned long)wc->wr_id);
@@ -1015,11 +1215,23 @@ static void repl_rdma_cq_process_wc(struct ibv_wc *wc, int *adapt_counter) {
     }
     if (wc->opcode == IBV_WC_SEND) {
         if (wc->wr_id & KVS_RDMA_PIPELINE_WR_ID_FLAG) {
-            int slot = (int)(wc->wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
-            repl_rdma_release_send_slot(slot);
-            if (adapt_counter && ++(*adapt_counter) >= 16) {
-                repl_rdma_adjust_pipeline_depth();
-                *adapt_counter = 0;
+            int signaled_slot = (int)(wc->wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
+            /* P3.2: 查找匹配的 batch tracker，批量回收 unsignaled slot */
+            int batch_found = 0;
+            for (int t = 0; t < KVS_RDMA_MAX_BATCH_TRACKERS; t++) {
+                rdma_batch_tracker_t *tr = &g_repl_rdma_ctx.batch_trackers[t];
+                if (tr->active && tr->signaled_slot == signaled_slot) {
+                    for (int s = 0; s < tr->count; s++) {
+                        repl_rdma_release_send_slot(tr->slots[s]);
+                    }
+                    tr->active = 0;
+                    batch_found = 1;
+                    break;
+                }
+            }
+            if (!batch_found) {
+                /* 未找到 tracker（旧式全 signal 模式或错误恢复）*/
+                repl_rdma_release_send_slot(signaled_slot);
             }
         }
     } else if (wc->opcode == IBV_WC_RECV) {
@@ -1042,7 +1254,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
     struct ibv_wc wc_batch[KVS_RDMA_CQ_BATCH];
     struct ibv_cq *ev_cq;
     void *ev_ctx;
-    int adapt_counter = 0;
+    /* P2.2: adapt_counter 已移除（暂停动态 pipeline 调节） */
 
     repl_rdma_log("cq_poll", "thread started");
     while (g_repl_rdma_ctx.cq_poll_thread_running && g_repl_rdma_ctx.connected) {
@@ -1061,7 +1273,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
             int n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
             if (n <= 0) break;
             for (int i = 0; i < n; i++) {
-                repl_rdma_cq_process_wc(&wc_batch[i], &adapt_counter);
+                repl_rdma_cq_process_wc(&wc_batch[i]);
                 if (!g_repl_rdma_ctx.connected) break;
             }
             if (!g_repl_rdma_ctx.connected) break;
@@ -1079,7 +1291,7 @@ static void *repl_rdma_cq_poll_thread(void *arg) {
             int n = ibv_poll_cq(cq, KVS_RDMA_CQ_BATCH, wc_batch);
             if (n > 0) {
                 for (int i = 0; i < n; i++) {
-                    repl_rdma_cq_process_wc(&wc_batch[i], &adapt_counter);
+                    repl_rdma_cq_process_wc(&wc_batch[i]);
                     if (!g_repl_rdma_ctx.connected) break;
                 }
                 /* 有数据，不阻塞等待，立即继续 re-arm→drain 循环 */
@@ -2355,22 +2567,18 @@ static void *slave_thread(void *arg) {
                     size_t rdma_blen = 0;
                     if (repl_rdma_wait_cq_recv_completion(100, &recv_slot, &rdma_blen) == 0
                         && recv_slot >= 0 && rdma_blen > 0) {
-                        unsigned char *payload;
-                        if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
-                            rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
-                        payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
-                        if (payload) {
-                            if (repl_rdma_repost_recv(recv_slot) == 0) {
-                                if (blen + rdma_blen <= sizeof(buf)) {
-                                    memcpy(buf + blen, payload, rdma_blen);
-                                    blen += rdma_blen;
+                        /* P3.4: 零复制 — 直接读注册 buffer，省去 malloc+memcpy */
+                        {
+                            size_t dlen = rdma_blen;
+                            unsigned char *direct = repl_rdma_recv_direct(recv_slot, &dlen);
+                            if (direct) {
+                                if (blen + dlen <= sizeof(buf)) {
+                                    memcpy(buf + blen, direct, dlen);
+                                    blen += dlen;
                                     had_new_data = 1;
-                                } else {
-                                    fprintf(stderr, "kprobe rdma: slave buffer overflow blen=%zu rdma=%zu\n",
-                                        blen, rdma_blen);
                                 }
+                                repl_rdma_repost_recv(recv_slot);
                             }
-                            kvs_free(payload);
                         }
                     }
                 }
@@ -2554,22 +2762,21 @@ static void *slave_thread(void *arg) {
                         size_t rdma_blen = 0;
                         if (repl_rdma_wait_cq_recv_completion(100, &recv_slot, &rdma_blen) == 0
                             && recv_slot >= 0 && rdma_blen > 0) {
-                            unsigned char *payload;
-                            if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
-                                rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
-                            payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
-                            if (payload) {
-                                if (repl_rdma_repost_recv(recv_slot) == 0) {
-                                    if (blen + rdma_blen <= sizeof(buf)) {
-                                        memcpy(buf + blen, payload, rdma_blen);
-                                        blen += rdma_blen;
+                            /* P3.4: 零复制 */
+                            {
+                                size_t dlen = rdma_blen;
+                                unsigned char *direct = repl_rdma_recv_direct(recv_slot, &dlen);
+                                if (direct) {
+                                    if (blen + dlen <= sizeof(buf)) {
+                                        memcpy(buf + blen, direct, dlen);
+                                        blen += dlen;
                                         had_new_data = 1;
                                     } else {
                                         fprintf(stderr, "repl ebpf-tcp: buffer overflow blen=%zu rdma=%zu\n",
-                                            blen, rdma_blen);
+                                            blen, dlen);
                                     }
+                                    repl_rdma_repost_recv(recv_slot);
                                 }
-                                kvs_free(payload);
                             }
                         }
                     }
@@ -2694,24 +2901,23 @@ static void *slave_thread(void *arg) {
                     size_t rdma_blen = 0;
                     if (repl_rdma_wait_cq_recv_completion(100, &recv_slot, &rdma_blen) == 0
                         && recv_slot >= 0 && rdma_blen > 0) {
-                        unsigned char *payload;
-                        if (rdma_blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap)
-                            rdma_blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
-                        payload = repl_rdma_dup_recv_payload(recv_slot, rdma_blen);
-                        if (payload) {
-                            if (repl_rdma_repost_recv(recv_slot) == 0) {
+                        /* P3.4: 零复制 */
+                        {
+                            size_t dlen = rdma_blen;
+                            unsigned char *direct = repl_rdma_recv_direct(recv_slot, &dlen);
+                            if (direct) {
                                 fprintf(stderr, "repl rdma: slave_debug_rdma - recv_slot=%d rdma_blen=%zu blen_before=%zu buf_size=%zu\n",
-                                    recv_slot, rdma_blen, blen, sizeof(buf));
-                                if (blen + rdma_blen <= sizeof(buf)) {
-                                    memcpy(buf + blen, payload, rdma_blen);
-                                    blen += rdma_blen;
+                                    recv_slot, dlen, blen, sizeof(buf));
+                                if (blen + dlen <= sizeof(buf)) {
+                                    memcpy(buf + blen, direct, dlen);
+                                    blen += dlen;
                                     had_new_data = 1;
                                 } else {
                                     fprintf(stderr, "repl rdma: slave_debug_rdma - BUFFER OVERFLOW! blen=%zu rdma_blen=%zu sizeof(buf)=%zu\n",
-                                        blen, rdma_blen, sizeof(buf));
+                                        blen, dlen, sizeof(buf));
                                 }
+                                repl_rdma_repost_recv(recv_slot);
                             }
-                            kvs_free(payload);
                         }
                     }
                 }
@@ -2792,33 +2998,30 @@ static void *slave_thread(void *arg) {
                 }
                 recv_slot = -1;
                 if (repl_rdma_wait_cq_recv_completion(2000, &recv_slot, &blen) == 0 && recv_slot >= 0 && blen > 0) {
-                    unsigned char *payload;
-                    if (blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap) blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
-                    payload = repl_rdma_dup_recv_payload(recv_slot, blen);
-                    if (!payload) {
-                        repl_rdma_log("slave_loop", "failed to copy recv payload");
-                        break;
-                    }
-                    if (repl_rdma_repost_recv(recv_slot) != 0) {
-                        kvs_free(payload);
-                        repl_rdma_log("slave_loop", "failed to repost recv");
-                        break;
-                    }
-                    if (stream_len + blen > sizeof(stream_buf)) {
-                        kvs_free(payload);
-                        stream_len = 0;
-                        repl_rdma_log("slave_loop", "stream buffer overflow while appending recv payload");
-                        break;
-                    }
-#if KVS_ENABLE_RDMA
+                    /* P3.4: 零复制 */
                     {
-                        size_t preview_len = blen < 96 ? blen : 96;
-                        fprintf(stderr, "repl rdma: slave_chunk - recv_len=%zu preview=%.*s\n", blen, (int)preview_len, payload);
-                    }
+                        size_t dlen = blen;
+                        unsigned char *direct = repl_rdma_recv_direct(recv_slot, &dlen);
+                        if (!direct) {
+                            repl_rdma_log("slave_loop", "failed to get recv direct");
+                            break;
+                        }
+                        if (stream_len + dlen > sizeof(stream_buf)) {
+                            repl_rdma_repost_recv(recv_slot);
+                            stream_len = 0;
+                            repl_rdma_log("slave_loop", "stream buffer overflow while appending recv payload");
+                            break;
+                        }
+#if KVS_ENABLE_RDMA
+                        {
+                            size_t preview_len = dlen < 96 ? dlen : 96;
+                            fprintf(stderr, "repl rdma: slave_chunk - recv_len=%zu preview=%.*s\n", dlen, (int)preview_len, direct);
+                        }
 #endif
-                    memcpy(stream_buf + stream_len, payload, blen);
-                    stream_len += blen;
-                    kvs_free(payload);
+                        memcpy(stream_buf + stream_len, direct, dlen);
+                        stream_len += dlen;
+                        repl_rdma_repost_recv(recv_slot);
+                    }
                     parse_resp_stream(NULL, stream_buf, &stream_len, 1);
                     repl_slave_ack_heartbeat();
                     repl_rdma_set_state(REPL_RDMA_STATE_STEADY, "processed_replication_chunk");
@@ -3117,27 +3320,24 @@ static void *rdma_master_listener_thread(void *arg) {
                 if (repl_rdma_wait_cq_recv_completion(2000, &recv_slot, &recv_len) != 0 || recv_slot < 0 || recv_len == 0) {
                     continue;
                 }
-                blen = recv_len;
-                if (blen > g_repl_rdma_ctx.recv_slots[recv_slot].cap) blen = g_repl_rdma_ctx.recv_slots[recv_slot].cap;
-                payload = repl_rdma_dup_recv_payload(recv_slot, blen);
-                if (!payload) {
-                    repl_rdma_log("listener", "failed to copy recv payload");
-                    break;
+                /* P3.4: 零复制 */
+                {
+                    size_t dlen = recv_len;
+                    unsigned char *direct = repl_rdma_recv_direct(recv_slot, &dlen);
+                    if (!direct) {
+                        repl_rdma_log("listener", "failed to get recv direct");
+                        break;
+                    }
+                    if (stream_len + dlen > sizeof(stream_buf)) {
+                        repl_rdma_repost_recv(recv_slot);
+                        stream_len = 0;
+                        repl_rdma_log("listener", "stream buffer overflow while appending recv payload");
+                        break;
+                    }
+                    memcpy(stream_buf + stream_len, direct, dlen);
+                    stream_len += dlen;
+                    repl_rdma_repost_recv(recv_slot);
                 }
-                if (repl_rdma_repost_recv(recv_slot) != 0) {
-                    kvs_free(payload);
-                    repl_rdma_log("listener", "failed to repost recv");
-                    break;
-                }
-                if (stream_len + blen > sizeof(stream_buf)) {
-                    kvs_free(payload);
-                    stream_len = 0;
-                    repl_rdma_log("listener", "stream buffer overflow while appending recv payload");
-                    break;
-                }
-                memcpy(stream_buf + stream_len, payload, blen);
-                stream_len += blen;
-                kvs_free(payload);
                 parse_resp_stream(&g_rdma_master_replica_conn, stream_buf, &stream_len, 0);
                 if (initial_recv_start_ms != 0) {
                     fprintf(stderr, "repl rdma: listener_initial_payload_ok - elapsed_ms=%lld recv_len=%zu\n", kvs_now_ms() - initial_recv_start_ms, recv_len);

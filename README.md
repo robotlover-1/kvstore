@@ -2005,7 +2005,7 @@ tcp_recvmsg(sk, msg, len, ...)     ← 内核函数
 
 **测试方法**
 
-共 4 种传输方式，3 个自研 C 程序 + 1 个标准工具。全部测跨机单方向吞吐量（Master → Slave）。
+共 4 种传输方式，3 个自研 C 程序 + 1 个标准工具。全部测跨机单方向吞吐量（Master → Slave）。**计时统一在发方**（客户端），数据量统一为发方实际发出的字节数，保证口径一致。
 
 ---
 
@@ -2024,14 +2024,15 @@ iperf3 是业界标准，`-t 5` 持续 5 秒自动取均值，`-f m` 输出 Mbps
 
 `test_sendfile_throughput.c`：
 
-**服务端**：`listen → accept → read 循环计数 → 计时 → 打印吞吐量`
+**服务端**：`listen → accept → read 循环计数 → 打印总接收量`（纯接收，不计时）
 
 **客户端**：
 
 1. 创建临时文件 `/tmp/perf_test_file`：`write_full` 填充 `iters × size` 字节（'S'）
 2. 连接服务端 TCP
-3. `for i in 0..iters:` `sendfile(sock_fd, file_fd, &offset, size)` —— 内核直接搬运文件页到 socket 缓冲区，不走用户态
-4. `shutdown(SHUT_WR)` 通知服务端结束 → 服务端统计耗时
+3. `t0 = now_us()` → `for i in 0..iters:` `sendfile(sock_fd, file_fd, &offset, size)` → `t1 = now_us()`
+4. `shutdown(SHUT_WR)` 通知服务端结束
+5. 吞吐量 = `(total_sent × 8) / elapsed_s`（`total_sent` 为 `sendfile()` 实际返回的发送字节数）
 
 ```c
 // 核心调用：一次 sendfile 搬运 size 字节
@@ -2135,39 +2136,50 @@ throughput = (actual_iters * size * 8) / elapsed_s   // bps
 | 内核协议栈    |  TCP 全栈  |     TCP 全栈     | 绕过，UDP 封装 | 绕过，UDP 封装 |
 | 远端 CPU 参与 | 参与 recv |    参与 recv    |   **不参与**   |   参与 recv   |
 | 连接管理      |  TCP 握手  |     TCP 握手     |    rdma_cm    |    rdma_cm    |
+| 计时端        |    发方    |      发方       |     发方       |     发方      |
 
-理论预期：RDMA WRITE > RDMA SEND ≈ sendfile > iperf3 TCP。但在 KVM + Soft-RoCE 虚拟网络中，UDP 封装和虚拟交换机处理成为瓶颈，**结果倒挂**。
+理论预期（硬件 RDMA）：RDMA WRITE > RDMA SEND > sendfile ≈ iperf3 TCP。但在 Soft-RoCE + KVM 虚拟网络中，rxe 每个 WR 需在内核软件路径按 Path MTU 构造多个语义各异的 RoCEv2 包，而 TCP 的 TSO/GSO 将分段推迟到 virtio/NIC 层完成，**结果倒挂**。
 
 **测试结果**
 
+> **2026-07-23 重测**（测试程序 v3，对齐生产全量同步路径）
+>
+> **测试方法**：
+> - RDMA：默认 `IBV_WR_SEND`（与生产一致），QP depth=64，独立 send/recv slots，每条消息携带 seq/len header，FIN/ACK 握手，**双指标**：`send-local`（本地 WR completion 完成）和 `e2e`（远端 ACK 到达）
+> - sendfile：短发送循环补齐，服务端 ACK 确认，双指标：`send-local`（`shutdown(SHUT_WR)` 完成）和 `e2e`（ACK 到达）
+> - iperf3：`-t 5` 发方均值
+> - 全部 64KB payload，3 次取中位数，计时统一在发方
 
-| 传输方式   | Payload |         吞吐量 | 对比 iperf3 |
-| ---------- | ------- | -------------: | ----------: |
-| iperf3 TCP | —      | **5,370 Mbps** |        基准 |
-| sendfile   | 4KB     |     5,430 Mbps |       +1.1% |
-| sendfile   | 64KB    |     5,700 Mbps |       +6.1% |
-| sendfile   | 256KB   |     5,620 Mbps |       +4.7% |
-| sendfile   | 1MB     |     5,580 Mbps |       +3.9% |
-| RDMA WRITE | 4KB     |       833 Mbps |     −84.5% |
-| RDMA SEND  | 4KB     |       912 Mbps |     −83.0% |
-| RDMA WRITE | 64KB    |       967 Mbps |     −82.0% |
-| RDMA SEND  | 64KB    |       862 Mbps |     −83.9% |
-| RDMA WRITE | 256KB   |     1,010 Mbps |     −81.2% |
-| RDMA SEND  | 256KB   |       984 Mbps |     −81.7% |
-| RDMA WRITE | 1MB     | **1,020 Mbps** |     −81.0% |
-| RDMA SEND  | 1MB     |       994 Mbps |     −81.5% |
 
-> **2026-06-26 重测**（3 次取中位数，4KB 用 15000 iters 保证 ≥60MB 数据量）
+| 传输方式 | Payload | send-local | e2e (ACK) | 对比 iperf3 |
+| -------- | ------- | ---------: | --------: | ----------: |
+| iperf3 TCP | — | — | **4,489 Mbps** | 基准 |
+| sendfile | 64KB | 4,350 Mbps | 4,290 Mbps | −4.4% |
+| RDMA SEND (send_slots=16, v4 对齐生产) | 64KB | 335 Mbps | 331 Mbps | −92.6% |
+
+> **send_slots=16** 对齐生产 pipeline=16。测试 v4 从生产移植了 batch post (`wr.next` 链接)、选择性 signaling（每 8 WR 产生 1 CQE）、batch tracker（批量回收 unsignaled slot）和 CQ 内联 poll——客户端发送路径完全对齐生产 `kvs_repl.c` 的 P3 优化。
+>
+> sendfile 的 send-local 和 e2e 几乎一致（TCP shutdown 后数据基本已送达）。
+> RDMA 的 send-local 和 e2e 差距 ~100ms（FIN → server 处理 → ACK 回传的 RTT）。
 
 **关键发现**
 
-1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA 操作通过 RoCEv2 UDP 封装，吞吐量仅为 TCP 的 ~7-18%
-2. **本地 RDMA 可达 45 Gbps**（同机 rxe0 loopback，64KB × 500 iters），证明代码路径本身高效，瓶颈在网络
-3. **kernel 6.1 rxe 跨机性能回归**：kernel 6.1 rxe 发包吞吐仅为 kernel 5.15 的 ~40%（365 vs 892 Mbps，同代码同网络）。本地 loopback 不受影响（6.1 反而更快），问题出在 rxe RoCEv2 UDP 发送路径与 KVM 虚拟网络的交互
-4. **RDMA WRITE ≈ RDMA SEND**：瓶颈在底层 RoCEv2 UDP 路径，而非 RDMA 操作类型
-5. **sendfile ≈ iperf3 TCP**：`sendfile()` 零拷贝与 iperf3 基本持平（5.4-5.7 Gbps），跨机场景内核 TCP 栈已充分优化
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA SEND e2e ~322 Mbps（对齐生产，send_slots=4），仅为 TCP 的 ~7%。根因是 rxe 每个 WR 按 Path MTU (1024B) 切分为 ~64 个 RoCEv2 包，每包在 CPU 上独立构造（不同 BTH opcode/PSN/ICRC），无法利用通用 UDP GSO/USO
 
-> **注意**：硬件 RDMA（InfiniBand / 硬件 RoCE）跨机吞吐量预期远超 TCP。Soft-RoCE 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。kernel 版本对 rxe 跨机性能影响显著，如需稳定基线建议固定 kernel 版本。
+2. **Pipeline 加深有边际收益**：send_slots 从 4→16，e2e 吞吐从 322→353 Mbps（+10%），但未突破单核 rxe 封包上限（~43K pps ≈ 350 Mbps @ MTU 1024）。说明当前瓶颈主要在 rxe 软件路径而非 pipeline 气泡
+
+3. **本地 RDMA 可达 76.8 Gbps**（同机 rxe0 loopback），证明应用层 RDMA 代码路径本身高效，瓶颈在跨机网络的每包 virtio/KVM 处理
+
+4. **sendfile ≈ iperf3 TCP**：TCP + TSO/GSO 将分段推迟到 virtio/NIC 层，跨机可跑满 ~4.5 Gbps 链路
+
+5. **跨机 RDMA 慢的机理**（Path MTU 1024，CPU3 单核 system ~73%）：
+   - rxe requester 逐个构造 64 个 RoCEv2 包/WR → UDP tunnel → qdisc → dev_queue_xmit → virtio
+   - 每个包语义不同（BTH/PSN/ICRC），必须软件生成，无法推迟到下层 offload
+   - 同 TCP 对比：TCP 构造大 skb → TSO/GSO 在下层复制相同 TCP 头拆成 ~45 段，per-byte CPU 开销低近两个数量级
+
+6. **硬件 RDMA 无此问题**：硬件 RoCE NIC 的 `ibv_post_send()` 只是用户态写 WQE + MMIO doorbell，NIC 自取 WQE、自主分片、构造 RoCEv2 包
+
+> **注意**：Soft-RoCE (rxe) 是纯软件实现，适合开发验证 RDMA 逻辑，不适合性能评估。kernel 版本对 rxe 跨机性能影响显著（kernel 6.1 仅为 5.15 的 ~40%）。
 
 ---
 

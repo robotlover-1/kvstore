@@ -204,6 +204,8 @@ static uint32_t simple_crc(const unsigned char *data, size_t len) {
 
 /* ========== v4: 对齐生产 — batch post + selective signal + batch tracker ========== */
 
+static int flush_batch(rdma_res_t *r);
+
 /* 释放单个 slot（对齐 repl_rdma_release_send_slot） */
 static void release_send_slot(rdma_res_t *r, int slot) {
     if (slot >= 0 && slot < r->send_slot_count) {
@@ -253,6 +255,9 @@ static int acquire_send_slot(rdma_res_t *r) {
                 return i;
             }
         }
+        /* flush 残量 batch（send_slots < BATCH_MAX 时 batch 永不满） */
+        if (r->pending_batch_count > 0)
+            flush_batch(r);
         /* 无空闲 slot → poll CQ（对齐生产内联 poll） */
         cq_poll_and_release(r, 16);
         if (r->send_slots_in_flight >= r->send_slot_count)
@@ -385,7 +390,7 @@ static int run_server(int port, size_t buf_size,
            port, recv_slot_count, qp_depth);
     fflush(stdout);
 
-    if (wait_cm_event(r.ec, RDMA_CM_EVENT_CONNECT_REQUEST, &event, 30000) != 0) {
+    if (wait_cm_event(r.ec, RDMA_CM_EVENT_CONNECT_REQUEST, &event, 120000) != 0) {
         goto cleanup;
     }
     r.id = event->id;

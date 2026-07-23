@@ -2142,33 +2142,36 @@ throughput = (actual_iters * size * 8) / elapsed_s   // bps
 
 **测试结果**
 
-> **2026-07-23 重测**（测试程序 v3，对齐生产全量同步路径）
+> **2026-07-23 重测**（v5，测试与生产全量同步传输路径一致）
 >
 > **测试方法**：
-> - RDMA：默认 `IBV_WR_SEND`（与生产一致），QP depth=64，独立 send/recv slots，每条消息携带 seq/len header，FIN/ACK 握手，**双指标**：`send-local`（本地 WR completion 完成）和 `e2e`（远端 ACK 到达）
-> - sendfile：短发送循环补齐，服务端 ACK 确认，双指标：`send-local`（`shutdown(SHUT_WR)` 完成）和 `e2e`（ACK 到达）
+> - RDMA v5：`IBV_WR_SEND`，send_slots=16，recv_slots=64，QP depth=64，batch post（`wr.next` 链接 8 WR），选择性 signaling（每 8 WR 1 CQE），batch tracker 批量回收，seq/len header，FIN/ACK 握手，ACK RECV 预投递，独立 ACK send buffer。**双指标**：`send-local` 和 `e2e`
+> - sendfile：短发送循环补齐，服务端 ACK 确认，双指标
 > - iperf3：`-t 5` 发方均值
 > - 全部 64KB payload，3 次取中位数，计时统一在发方
 
 
-| 传输方式 | Payload | send-local | e2e (ACK) | 对比 iperf3 |
-| -------- | ------- | ---------: | --------: | ----------: |
-| iperf3 TCP | — | — | **4,489 Mbps** | 基准 |
-| sendfile | 64KB | 4,350 Mbps | 4,290 Mbps | −4.4% |
-| RDMA SEND (send_slots=16, v4 对齐生产) | 64KB | 335 Mbps | 331 Mbps | −92.6% |
+| 传输方式 | send-local | e2e (ACK) | 对比 iperf3 |
+| -------- | ---------: | --------: | ----------: |
+| iperf3 TCP | — | **4,414 Mbps** | 基准 |
+| sendfile (64KB) | — | 4,480 Mbps | +1.5% |
+| RDMA SEND v5 (64KB) | 334 Mbps | 330 Mbps | −92.5% |
 
-> **send_slots=16** 对齐生产 pipeline=16。测试 v4 从生产移植了 batch post (`wr.next` 链接)、选择性 signaling（每 8 WR 产生 1 CQE）、batch tracker（批量回收 unsignaled slot）和 CQ 内联 poll——客户端发送路径完全对齐生产 `kvs_repl.c` 的 P3 优化。
->
 > sendfile 的 send-local 和 e2e 几乎一致（TCP shutdown 后数据基本已送达）。
 > RDMA 的 send-local 和 e2e 差距 ~100ms（FIN → server 处理 → ACK 回传的 RTT）。
+> RDMA WC 5001/0 error，ACK 确认成功，seq 无错误。
 
 **关键发现**
 
-1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA SEND e2e ~322 Mbps（对齐生产，send_slots=4），仅为 TCP 的 ~7%。根因是 rxe 每个 WR 按 Path MTU (1024B) 切分为 ~64 个 RoCEv2 包，每包在 CPU 上独立构造（不同 BTH opcode/PSN/ICRC），无法利用通用 UDP GSO/USO
+1. **Soft-RoCE 跨机 RDMA 远低于 TCP**：RDMA SEND e2e ~330 Mbps，仅为 TCP 的 ~7.5%。根因是 rxe 按 Path MTU (1024B) 将每个 64KB WR 切为 ~64 个 RoCEv2 包，每包在 CPU 上独立构造（不同 BTH opcode/PSN/ICRC），无法利用通用 UDP GSO/USO。~40,900 pps 已接近单核 rxe 软件处理上限
 
-2. **Pipeline 加深有边际收益**：send_slots 从 4→16，e2e 吞吐从 322→353 Mbps（+10%），但未突破单核 rxe 封包上限（~43K pps ≈ 350 Mbps @ MTU 1024）。说明当前瓶颈主要在 rxe 软件路径而非 pipeline 气泡
+2. **Batch post + 选择性 CQE 未带来吞吐提升**：v4/v5 的批量 post（8 WR 链式）和选择性 signaling（每 8 WR 1 CQE）与 v3（逐 WR post + 全 signal）吞吐无显著差异（~330 vs ~325 Mbps），确认当前瓶颈不在 `ibv_post_send()` 次数或 CQE 数量，而在 rxe 逐包软件处理及 UDP/IP/virtio/softirq 路径
 
 3. **本地 RDMA 可达 76.8 Gbps**（同机 rxe0 loopback），证明应用层 RDMA 代码路径本身高效，瓶颈在跨机网络的每包 virtio/KVM 处理
+
+4. **sendfile ≈ iperf3**：`sendfile()` 零拷贝接近 iperf3 裸 TCP，跨机 ~4.5 Gbps 链路基本跑满
+
+5. **下一步方向**：提高 Path MTU（需 KVM 宿主机支持 jumbo frames）→ 多 QP 跨核扩展 → 硬件 RoCE NIC。继续增大 send_slots 或减小 BATCH_MAX 不会改变单核 pps 瓶颈
 
 4. **sendfile ≈ iperf3 TCP**：TCP + TSO/GSO 将分段推迟到 virtio/NIC 层，跨机可跑满 ~4.5 Gbps 链路
 

@@ -353,6 +353,7 @@ static int repl_rdma_acquire_send_slot(int timeout_ms) {
                     (wc.wr_id & KVS_RDMA_PIPELINE_WR_ID_FLAG)) {
                     int done_slot = (int)(wc.wr_id & ~KVS_RDMA_PIPELINE_WR_ID_FLAG);
                     if (done_slot >= 0 && done_slot < g_repl_rdma_ctx.send_pipeline_depth) {
+                        /* 已持有 g_repl_rdma_send_lock（调用者 try_send 加锁），安全修改 */
                         g_repl_rdma_ctx.send_slots[done_slot].in_flight = 0;
                         g_repl_rdma_ctx.send_slots[done_slot].wr_id = 0;
                         g_repl_rdma_ctx.send_slots_in_flight--;
@@ -382,15 +383,18 @@ static int repl_rdma_acquire_send_slot(int timeout_ms) {
 
 /* ---- Pipeline: 释放一个 send slot（由 CQ completion 回调调用）---- */
 static void repl_rdma_release_send_slot(int slot) {
+    /* P0: 状态修改必须在锁内，避免与发送线程 acquire 扫描形成数据竞争 */
+    pthread_mutex_lock(&g_repl_rdma_send_lock);
     if (slot >= 0 && slot < g_repl_rdma_ctx.send_pipeline_depth) {
-        g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
-        g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
-        g_repl_rdma_ctx.send_slots_in_flight--;
-        /* P3.3: 通知等待 slot 的发送线程 */
-        pthread_mutex_lock(&g_repl_rdma_send_lock);
-        pthread_cond_signal(&g_repl_rdma_ctx.send_slot_cond);
-        pthread_mutex_unlock(&g_repl_rdma_send_lock);
+        if (g_repl_rdma_ctx.send_slots[slot].in_flight) {
+            g_repl_rdma_ctx.send_slots[slot].in_flight = 0;
+            g_repl_rdma_ctx.send_slots[slot].wr_id = 0;
+            g_repl_rdma_ctx.send_slots_in_flight--;
+        }
     }
+    /* P3.3: 通知等待 slot 的发送线程 */
+    pthread_cond_signal(&g_repl_rdma_ctx.send_slot_cond);
+    pthread_mutex_unlock(&g_repl_rdma_send_lock);
 }
 
 static int repl_rdma_pending_recv_push(int slot, size_t len) {
@@ -857,7 +861,8 @@ int repl_rdma_commit_write_slot(size_t len) {
     return 0;
 }
 
-/* P3.4: 零复制 — 返回注册 MR buffer 的直接指针，不 malloc+memcpy。
+/* P3.4: 单次复制 — 返回注册 MR buffer 的直接指针，省去 malloc+memcpy。
+ * 调用者仍会 memcpy 到 stream_buf 等消费缓冲区，这是从"两次复制"降为"一次复制"。
  * 调用者使用完毕后必须调用 repl_rdma_repost_recv(slot) 归还。 */
 static unsigned char *repl_rdma_recv_direct(int slot, size_t *len) {
     if (slot < 0 || slot >= g_repl_rdma_ctx.active_recv_slots) return NULL;

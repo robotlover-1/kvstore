@@ -51,7 +51,7 @@
 #define DEFAULT_MODE          "send"       /* v3: 默认 SEND，对齐生产 */
 #define DEFAULT_SEND_SLOTS    16           /* v4: 对齐生产 pipeline=16 */
 #define DEFAULT_RECV_SLOTS    64           /* v4: 对齐生产 recv_slots=64 */
-#define DEFAULT_QP_DEPTH      64           /* 对齐生产 KVS_RDMA_QP_WR_DEPTH_DEFAULT=64 */
+#define DEFAULT_QP_DEPTH      64           /* 测试用；生产 min_depth = recv_slots*2 ≥ 128 */
 
 #define BATCH_MAX              8           /* v4: 对齐生产 KVS_RDMA_BATCH_MAX */
 #define SIGNAL_INTERVAL        8           /* v4: 对齐生产 KVS_RDMA_SIGNAL_INTERVAL */
@@ -331,6 +331,9 @@ static int run_server(int port, size_t buf_size,
     struct rdma_cm_event *event = NULL;
     int ret = -1;
     size_t slot_size = HDR_SIZE + buf_size;
+    /* P0: 独立 ACK send buffer（声明在顶部，cleanup 可安全访问） */
+    unsigned char *ack_send_buf = NULL;
+    struct ibv_mr *ack_send_mr = NULL;
 
     memset(&r, 0, sizeof(r));
     r.buf_size = buf_size;
@@ -433,6 +436,13 @@ static int run_server(int port, size_t buf_size,
            recv_slot_count, slot_size);
     fflush(stdout);
 
+    /* P0: 独立 ACK send buffer — 不复用 recv_slots[0]，避免与接收数据并发覆盖 */
+    ack_send_buf = aligned_alloc(4096, sizeof(ack_msg_t));
+    if (ack_send_buf) {
+        ack_send_mr = ibv_reg_mr(r.pd, ack_send_buf, sizeof(ack_msg_t),
+                                 IBV_ACCESS_LOCAL_WRITE);
+    }
+
     /* 预投递所有 RECV WR */
     for (int i = 0; i < recv_slot_count; i++) {
         struct ibv_sge sge = {
@@ -492,12 +502,14 @@ static int run_server(int port, size_t buf_size,
                         .total_bytes = payload_bytes,
                         .msg_count = msg_count,
                         .seq_errors = seq_errors };
-                    /* 用第一个 recv slot 做临时发送 buffer */
-                    memcpy(r.recv_slots[0].buf, &ack, sizeof(ack));
+                    /* P0: 使用独立 ACK buffer，不复用 recv slot */
+                    if (ack_send_buf && ack_send_mr) {
+                        memcpy(ack_send_buf, &ack, sizeof(ack));
+                    }
                     struct ibv_sge sge = {
-                        .addr = (uint64_t)(uintptr_t)r.recv_slots[0].buf,
+                        .addr = (uint64_t)(uintptr_t)(ack_send_buf ? ack_send_buf : r.recv_slots[0].buf),
                         .length = sizeof(ack_msg_t),
-                        .lkey = r.recv_slots[0].mr->lkey };
+                        .lkey = (ack_send_mr ? ack_send_mr : r.recv_slots[0].mr)->lkey };
                     struct ibv_send_wr wr = {
                         .wr_id = 0, .sg_list = &sge, .num_sge = 1,
                         .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED };
@@ -545,6 +557,8 @@ cleanup:
         }
         free(r.recv_slots);
     }
+    if (ack_send_mr) ibv_dereg_mr(ack_send_mr);
+    free(ack_send_buf);
     if (r.pd) ibv_dealloc_pd(r.pd);
     if (r.id) rdma_destroy_id(r.id);
     if (r.listen_id) rdma_destroy_id(r.listen_id);
@@ -687,6 +701,26 @@ static int run_client(const char *host, size_t buf_size, int iters,
     int is_write = (strcmp(mode, "write") == 0);
     int actual_iters = 0;
 
+    /* P0: ACK RECV 预投递 — 建连后、计时前就 post，避免服务端 FIN→ACK 到达时 RQ 为空 */
+    int uses_fin = !is_write;
+    if (uses_fin) {
+        ack_buf = (unsigned char *)aligned_alloc(4096, sizeof(ack_msg_t));
+        if (ack_buf) {
+            ack_mr = ibv_reg_mr(r.pd, ack_buf, sizeof(ack_msg_t),
+                                IBV_ACCESS_LOCAL_WRITE);
+        }
+        if (ack_mr) {
+            struct ibv_sge sge = {
+                .addr = (uint64_t)(uintptr_t)ack_buf,
+                .length = sizeof(ack_msg_t),
+                .lkey = ack_mr->lkey };
+            struct ibv_recv_wr recv_wr = {
+                .wr_id = 0xAC0000, .sg_list = &sge, .num_sge = 1 };
+            struct ibv_recv_wr *bad = NULL;
+            ibv_post_recv(r.id->qp, &recv_wr, &bad);
+        }
+    }
+
     /* 计时起点 */
     double t0_send = now_us();
 
@@ -732,7 +766,6 @@ static int run_client(const char *host, size_t buf_size, int iters,
     }
 
     /* 发送 FIN（SEND 模式，走 batch 路径确保 FIN 在所有数据之后） */
-    int uses_fin = !is_write;
     if (uses_fin) {
         /* flush 残量 batch 后再发 FIN */
         if (r.pending_batch_count > 0) flush_batch(&r);
@@ -754,41 +787,22 @@ static int run_client(const char *host, size_t buf_size, int iters,
     double elapsed_send_s = (t1_send - t0_send) / 1000000.0;
     double throughput_send_bps = (double)((size_t)actual_iters * buf_size * 8) / elapsed_send_s;
 
-    /* 等待 ACK → 记录端到端时间 */
+    /* P0: 等待 ACK（RECV 已在计时前预投递） */
     double t1_ack = t1_send;
     int ack_received = 0;
-    if (uses_fin) {
-        /* 分配 ACK 接收 buffer + MR */
-        ack_buf = (unsigned char *)aligned_alloc(4096, sizeof(ack_msg_t));
-        if (ack_buf) {
-            ack_mr = ibv_reg_mr(r.pd, ack_buf, sizeof(ack_msg_t),
-                                IBV_ACCESS_LOCAL_WRITE);
-        }
-        /* 投递 RECV WR 接收 ACK */
-        if (ack_mr) {
-            struct ibv_sge sge = {
-                .addr = (uint64_t)(uintptr_t)ack_buf,
-                .length = sizeof(ack_msg_t),
-                .lkey = ack_mr->lkey };
-            struct ibv_recv_wr recv_wr = {
-                .wr_id = 0xAC0000, .sg_list = &sge, .num_sge = 1 };
-            struct ibv_recv_wr *bad = NULL;
-            if (ibv_post_recv(r.id->qp, &recv_wr, &bad) == 0) {
-                /* 等待 RECV completion */
-                struct ibv_wc wc[4];
-                int ack_retries = 0;
-                while (ack_retries < 100) {
-                    int n = ibv_poll_cq(r.cq, 4, wc);
-                    for (int i = 0; i < n; i++) {
-                        if (wc[i].opcode == IBV_WC_RECV && wc[i].status == IBV_WC_SUCCESS) {
-                            ack_received = 1;
-                            break;
-                        }
-                    }
-                    if (ack_received) break;
-                    usleep(100000); ack_retries++;
+    if (uses_fin && ack_mr) {
+        struct ibv_wc wc[4];
+        int ack_retries = 0;
+        while (ack_retries < 100) {
+            int n = ibv_poll_cq(r.cq, 4, wc);
+            for (int i = 0; i < n; i++) {
+                if (wc[i].opcode == IBV_WC_RECV && wc[i].status == IBV_WC_SUCCESS) {
+                    ack_received = 1;
+                    break;
                 }
             }
+            if (ack_received) break;
+            usleep(100000); ack_retries++;
         }
         t1_ack = now_us();
     }

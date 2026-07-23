@@ -52,6 +52,26 @@
 #define DEFAULT_SEND_SLOTS    16           /* v4: 对齐生产 pipeline=16 */
 #define DEFAULT_RECV_SLOTS    64           /* v4: 对齐生产 recv_slots=64 */
 #define DEFAULT_QP_DEPTH      64           /* 测试用；生产 min_depth = recv_slots*2 ≥ 128 */
+#define DEFAULT_QP_COUNT      1            /* 默认单 QP；>1 启多 QP 并行 */
+
+/* 多 QP 线程上下文 */
+typedef struct {
+    int qp_idx;
+    const char *host;
+    int port;
+    size_t buf_size;
+    int iters;
+    int send_slot_count;
+    int qp_depth;
+    /* 返回值 */
+    double throughput_send_bps;
+    double throughput_ack_bps;
+    int actual_iters;
+    int wc_completed;
+    int wc_errors;
+    int ack_received;
+    int thread_ok;
+} qp_thread_ctx_t;
 
 #define BATCH_MAX              8           /* v4: 对齐生产 KVS_RDMA_BATCH_MAX */
 #define SIGNAL_INTERVAL        8           /* v4: 对齐生产 KVS_RDMA_SIGNAL_INTERVAL */
@@ -569,7 +589,8 @@ cleanup:
 /* ========== 客户端 ========== */
 static int run_client(const char *host, size_t buf_size, int iters,
                       const char *mode, int port,
-                      int send_slot_count, int qp_depth) {
+                      int send_slot_count, int qp_depth,
+                      qp_thread_ctx_t *ctx_out) {
     rdma_res_t r;
     struct rdma_cm_event *event = NULL;
     int ret = -1;
@@ -811,7 +832,18 @@ static int run_client(const char *host, size_t buf_size, int iters,
         ? (double)((size_t)actual_iters * buf_size * 8) / elapsed_ack_s
         : 0.0;
 
+    /* 如果有 ctx_out，写回结果（多 QP 模式下使用） */
+    if (ctx_out) {
+        ctx_out->throughput_send_bps = throughput_send_bps;
+        ctx_out->throughput_ack_bps = uses_fin ? throughput_ack_bps : 0;
+        ctx_out->actual_iters = actual_iters;
+        ctx_out->wc_completed = r.send_completed;
+        ctx_out->wc_errors = r.send_wc_errors;
+        ctx_out->ack_received = ack_received;
+    }
+
     /* 打印结果 */
+    if (!ctx_out) {
     printf("\n=== RDMA 吞吐量结果 ===\n");
     printf("  模式:       %s\n", is_write ? "RDMA_WRITE (非生产微基准)" : "RDMA_SEND (对齐生产)");
     printf("  payload:    %zu bytes (+%zu header)\n", buf_size, HDR_SIZE);
@@ -833,6 +865,7 @@ static int run_client(const char *host, size_t buf_size, int iters,
     } else {
         printf("  [e2e (ACK)]  WRITE 模式无远端确认\n");
     }
+    } /* !ctx_out: suppress print in multi-QP mode */
 
     ret = 0;
 
@@ -853,6 +886,16 @@ cleanup:
     if (r.id) rdma_destroy_id(r.id);
     if (r.ec) rdma_destroy_event_channel(r.ec);
     return ret;
+}
+
+/* ========== 多 QP 线程入口 ========== */
+static void *run_client_thread(void *arg) {
+    qp_thread_ctx_t *ctx = (qp_thread_ctx_t *)arg;
+    int port = ctx->port + ctx->qp_idx;
+    int rc = run_client(ctx->host, ctx->buf_size, ctx->iters, "send",
+                        port, ctx->send_slot_count, ctx->qp_depth, ctx);
+    ctx->thread_ok = (rc == 0) ? 1 : 0;
+    return NULL;
 }
 
 /* ========== Main ========== */
@@ -887,6 +930,7 @@ int main(int argc, char **argv) {
     int send_slot_count = DEFAULT_SEND_SLOTS;
     int recv_slot_count = DEFAULT_RECV_SLOTS;
     int qp_depth = DEFAULT_QP_DEPTH;
+    int qp_count = DEFAULT_QP_COUNT;
 
     struct option long_opts[] = {
         {"host",       required_argument, 0, 'H'},
@@ -898,6 +942,7 @@ int main(int argc, char **argv) {
         {"send-slots", required_argument, 0, 1003},
         {"recv-slots", required_argument, 0, 1004},
         {"qp-depth",   required_argument, 0, 1005},
+        {"qp-count",   required_argument, 0, 1006},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}};
 
@@ -913,6 +958,7 @@ int main(int argc, char **argv) {
         case 1003: send_slot_count = atoi(optarg); break;
         case 1004: recv_slot_count = atoi(optarg); break;
         case 1005: qp_depth = atoi(optarg); break;
+        case 1006: qp_count = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -927,7 +973,62 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    return server_mode
-        ? run_server(port, buf_size, recv_slot_count, qp_depth)
-        : run_client(host, buf_size, iters, mode, port, send_slot_count, qp_depth);
+    if (server_mode) {
+        /* 多 QP 服务端：顺序接受 N 个连接 */
+        int ok = 0;
+        for (int qi = 0; qi < qp_count; qi++) {
+            if (run_server(port + qi, buf_size, recv_slot_count, qp_depth) == 0)
+                ok++;
+        }
+        return (ok == qp_count) ? 0 : 1;
+    }
+
+    /* 客户端：单 QP 或多 QP 并行 */
+    if (qp_count <= 1) {
+        return run_client(host, buf_size, iters, mode, port,
+                          send_slot_count, qp_depth, NULL);
+    }
+
+    /* 多 QP 客户端 */
+    qp_thread_ctx_t *ctxs = calloc((size_t)qp_count, sizeof(qp_thread_ctx_t));
+    pthread_t *threads = calloc((size_t)qp_count, sizeof(pthread_t));
+    if (!ctxs || !threads) { perror("calloc"); return 1; }
+
+    for (int qi = 0; qi < qp_count; qi++) {
+        ctxs[qi].qp_idx = qi;
+        ctxs[qi].host = host;
+        ctxs[qi].port = port;
+        ctxs[qi].buf_size = buf_size;
+        ctxs[qi].iters = iters / qp_count;
+        ctxs[qi].send_slot_count = send_slot_count;
+        ctxs[qi].qp_depth = qp_depth;
+        pthread_create(&threads[qi], NULL, run_client_thread, &ctxs[qi]);
+    }
+
+    /* 等待所有线程，聚合结果 */
+    double tput_sum = 0;
+    int total_iters = 0, total_wc = 0, total_err = 0, all_ok = 1;
+    for (int qi = 0; qi < qp_count; qi++) {
+        pthread_join(threads[qi], NULL);
+        total_iters += ctxs[qi].actual_iters;
+        total_wc += ctxs[qi].wc_completed;
+        total_err += ctxs[qi].wc_errors;
+        if (!ctxs[qi].thread_ok) all_ok = 0;
+        if (ctxs[qi].throughput_send_bps > 0)
+            tput_sum += ctxs[qi].throughput_send_bps;
+    }
+
+    printf("\n=== 多 QP 聚合结果 (qp_count=%d) ===\n", qp_count);
+    printf("  总 iters:   %d\n", total_iters);
+    printf("  总 WC:      %d (errors=%d)\n", total_wc, total_err);
+    printf("  聚合吞吐:   %s\n", throughput_str(tput_sum));
+    for (int qi = 0; qi < qp_count; qi++) {
+        printf("  QP%d: %s (iters=%d WC=%d)\n",
+               qi, throughput_str(ctxs[qi].throughput_send_bps),
+               ctxs[qi].actual_iters, ctxs[qi].wc_completed);
+    }
+
+    free(ctxs);
+    free(threads);
+    return all_ok ? 0 : 1;
 }

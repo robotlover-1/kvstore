@@ -889,6 +889,15 @@ cleanup:
 }
 
 /* ========== 多 QP 线程入口 ========== */
+typedef struct { int port; size_t buf_size; int recv_slots; int qp_depth; } srv_thread_arg_t;
+
+static void *run_server_thread(void *arg) {
+    srv_thread_arg_t *a = (srv_thread_arg_t *)arg;
+    int rc = run_server(a->port, a->buf_size, a->recv_slots, a->qp_depth);
+    free(a);
+    return (void *)(intptr_t)rc;
+}
+
 static void *run_client_thread(void *arg) {
     qp_thread_ctx_t *ctx = (qp_thread_ctx_t *)arg;
     int port = ctx->port + ctx->qp_idx;
@@ -974,12 +983,27 @@ int main(int argc, char **argv) {
     }
 
     if (server_mode) {
-        /* 多 QP 服务端：顺序接受 N 个连接 */
+        if (qp_count <= 1) {
+            return run_server(port, buf_size, recv_slot_count, qp_depth);
+        }
+        /* 多 QP 服务端：N 个线程并行 accept，避免顺序阻塞导致后面的 listener 超时 */
+        pthread_t *sthreads = calloc((size_t)qp_count, sizeof(pthread_t));
+        if (!sthreads) { perror("calloc"); return 1; }
+        for (int qi = 0; qi < qp_count; qi++) {
+            srv_thread_arg_t *sarg = malloc(sizeof(srv_thread_arg_t));
+            sarg->port = port + qi;
+            sarg->buf_size = buf_size;
+            sarg->recv_slots = recv_slot_count;
+            sarg->qp_depth = qp_depth;
+            pthread_create(&sthreads[qi], NULL, run_server_thread, sarg);
+        }
         int ok = 0;
         for (int qi = 0; qi < qp_count; qi++) {
-            if (run_server(port + qi, buf_size, recv_slot_count, qp_depth) == 0)
-                ok++;
+            void *ret = NULL;
+            pthread_join(sthreads[qi], &ret);
+            if (ret == 0) ok++;
         }
+        free(sthreads);
         return (ok == qp_count) ? 0 : 1;
     }
 
